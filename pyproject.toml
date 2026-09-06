@@ -1,6 +1,6 @@
 [project]
 name = "computer-use-mcp"
-version = "0.4.0"
+version = "0.4.1"
 description = "Cortex - a safe, screenshot-grounded computer-use MCP server that lets AI agents see, decide and act on the Windows desktop with semantic verification"
 requires-python = ">=3.11"
 dependencies = [

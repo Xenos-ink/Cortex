@@ -198,7 +198,7 @@ Creates a guarded session and returns the session state plus `allowed_processes`
 
 **`computer_observe(session_id)`**
 
-Captures the current screen and returns `{ "observation": ..., "digest": <sha256 of the screenshot payload>, "observation_id": ..., "active_app": ... }`. The `observation` object carries the base64 screenshot, dimensions, cursor position, coordinate-space classification, monitor identity (bounds, primary flag, DPI scales), and the full window/process identity. This explicit tool is not rate-gated — every capture writes an audit row, so hammering clients generate audit volume at their own discretion; the `run_goal` loop is the rate-gated path. `computer_screenshot(session_id)` is a compatibility alias returning the same shape.
+Captures the current screen and returns MCP content blocks: one `ImageContent` block carrying the screenshot itself (`image/png`) — so vision-capable client models receive a real image, not text — plus one `TextContent` block with the JSON metadata `{ "observation": ..., "digest": <sha256 of the screenshot payload>, "observation_id": ..., "active_app": ..., "image_format": "image/png" }`. The `observation` object carries dimensions, cursor position, coordinate-space classification, monitor identity (bounds, primary flag, DPI scales), and the full window/process identity; the raw base64 never travels as text. Error paths still return the structured error dict. This explicit tool is not rate-gated — every capture writes an audit row, so hammering clients generate audit volume at their own discretion; the `run_goal` loop is the rate-gated path. `computer_screenshot(session_id)` is a compatibility alias returning the same blocks.
 
 **`computer_execute(session_id, action, x=None, y=None, text=None, keys=None, delta=0, approved=False, expected_effect=None, x2=None, y2=None, target=None)`**
 
@@ -318,39 +318,43 @@ A realistic direct-control session: Notepad is open on the desktop; the agent st
 **2. Observe — check what is on screen and get the grounding identity:**
 
 ```json
-// computer_observe { "session_id": "0f4a…" }  (response, trimmed)
-{
-  "observation": {
-    "image_base64": "iVBORw0KGgoAAAANS…",
-    "width": 1920,
-    "height": 1080,
-    "active_window": "Untitled - Notepad",
-    "cursor_x": 960,
-    "cursor_y": 540,
-    "coordinate_scale_x": 1.0,
-    "coordinate_space": "verified_passthrough",
-    "observation_id": "c4d8e2a1…",
-    "timestamp": "2026-09-05T12:00:00.123456Z",
-    "monitor": { "id": "monitor-0", "index": 0, "bounds": [0, 0, 1920, 1080], "is_primary": true, "dpi_scale_x": 1.0, "dpi_scale_y": 1.0 },
-    "active_window_info": {
-      "hwnd": 197216,
-      "pid": 8123,
-      "process_name": "notepad.exe",
-      "exe_path": "C:\\Windows\\System32\\notepad.exe",
-      "window_class": "Notepad",
-      "title": "Untitled - Notepad",
-      "bounds": [4, 4, 1024, 768]
-    },
-    "ocr_text": null,
-    "ui_elements": null
+// computer_observe { "session_id": "0f4a…" }  (response, trimmed — content blocks)
+[
+  { "type": "text", "text": "{
+      \"observation\": {
+        \"width\": 1920,
+        \"height\": 1080,
+        \"active_window\": \"Untitled - Notepad\",
+        \"cursor_x\": 960,
+        \"cursor_y\": 540,
+        \"coordinate_scale_x\": 1.0,
+        \"coordinate_space\": \"verified_passthrough\",
+        \"observation_id\": \"c4d8e2a1…\",
+        \"timestamp\": \"2026-09-05T12:00:00.123456Z\",
+        \"monitor\": { \"id\": \"monitor-0\", \"index\": 0, \"bounds\": [0, 0, 1920, 1080], \"is_primary\": true, \"dpi_scale_x\": 1.0, \"dpi_scale_y\": 1.0 },
+        \"active_window_info\": {
+          \"hwnd\": 197216,
+          \"pid\": 8123,
+          \"process_name\": \"notepad.exe\",
+          \"exe_path\": \"C:\\\\Windows\\\\System32\\\\notepad.exe\",
+          \"window_class\": \"Notepad\",
+          \"title\": \"Untitled - Notepad\",
+          \"bounds\": [4, 4, 1024, 768]
+        },
+        \"ocr_text\": null,
+        \"ui_elements\": null
+      },
+      \"digest\": \"3f7a…\",
+      \"observation_id\": \"c4d8e2a1…\",
+      \"active_app\": \"notepad.exe\",
+      \"image_format\": \"image/png\"
+    }"
   },
-  "digest": "3f7a…",
-  "observation_id": "c4d8e2a1…",
-  "active_app": "notepad.exe"
-}
+  { "type": "image", "data": "iVBORw0KGgoAAAANS…", "mimeType": "image/png" }
+]
 ```
 
-`ocr_text` and `ui_elements` are extension-point fields; without an OCR/UIA integration they stay `null` and the runtime grounds by coordinates.
+The screenshot arrives as a real `image` content block (visible to vision-capable client models); the text block carries only the grounding metadata — the raw base64 never travels as text. `ocr_text` and `ui_elements` are extension-point fields; without an OCR/UIA integration they stay `null` and the runtime grounds by coordinates.
 
 **3. Type a line and state the expected effect — this is what drives semantic verification:**
 

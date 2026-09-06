@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import tempfile
@@ -40,6 +41,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ImageContent, TextContent
 
 from .agent import ComputerUseAgent
 from .audit import AuditLogger, Metrics
@@ -861,8 +863,15 @@ def stop_session(session_id: str) -> dict[str, object]:
 
 
 @mcp.tool()
-def computer_observe(session_id: str) -> dict[str, object]:
-    """Return the current observation state used for grounding: screenshot, dimensions, window, and cursor."""
+def computer_observe(session_id: str) -> Any:
+    """Return the current observation state used for grounding: screenshot, dimensions, window, and cursor.
+
+    On success this returns MCP content blocks: one TextContent carrying the
+    observation metadata (dimensions, active window, digest, coordinate scale —
+    never the raw base64) and one ImageContent carrying the screenshot itself, so
+    vision-capable clients receive it as a real image rather than as text.
+    Error paths still return the structured error dict.
+    """
     try:
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
@@ -885,16 +894,21 @@ def computer_observe(session_id: str) -> dict[str, object]:
     except Exception:
         logger.debug("observation audit failed", exc_info=True)
     bundle.metrics.incr("screenshot_count")
-    return {
-        "observation": observation.model_dump(),
+    metadata = {
+        "observation": observation.model_dump(mode="json", exclude={"image_base64"}),
         "digest": digest,
         "observation_id": observation.observation_id,
         "active_app": info.process_name if info is not None else observation.active_window,
+        "image_format": "image/png",
     }
+    return [
+        TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
+        ImageContent(type="image", data=observation.image_base64, mimeType="image/png"),
+    ]
 
 
 @mcp.tool()
-def computer_screenshot(session_id: str) -> dict[str, object]:
+def computer_screenshot(session_id: str) -> Any:
     """Compatibility alias for the raw screenshot observation."""
     return computer_observe(session_id)
 

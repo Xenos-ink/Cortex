@@ -963,6 +963,43 @@ async def test_stop_session_removes_bundle_and_blocks_tools(
     assert unknown["error"] == "unknown_session"
 
 
+async def test_computer_observe_returns_image_content_block(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vision fix: observe/screenshot return a real MCP ImageContent block — never base64 as text.
+
+    A vision-capable client model can only see a screenshot delivered as an image
+    content block; a base64 string inside JSON text is invisible to the vision
+    channel (and floods the context). The metadata text must stay bounded and free
+    of the raw image data.
+    """
+    session_id, _bundle, _backend, _provider = make_session(monkeypatch)
+
+    result = server.computer_observe(session_id)
+    assert isinstance(result, list) and len(result) == 2
+    text_block, image_block = result
+    assert text_block.type == "text"
+    assert image_block.type == "image"
+    assert image_block.mimeType == "image/png"
+    decoded = base64.b64decode(image_block.data, validate=True)
+    assert decoded.startswith(b"\x89PNG\r\n\x1a\n")  # real PNG bytes, not a text blob
+
+    payload = json.loads(text_block.text)
+    assert "image_base64" not in text_block.text  # no base64 ever travels as text
+    assert "image_base64" not in payload["observation"]
+    assert payload["image_format"] == "image/png"
+    assert payload["observation"]["width"] > 0
+    assert payload["observation"]["height"] > 0
+    assert payload["digest"]
+    assert payload["observation_id"] == payload["observation"]["observation_id"]
+
+    alias = server.computer_screenshot(session_id)
+    assert isinstance(alias, list) and len(alias) == 2
+    assert alias[0].type == "text"
+    assert alias[1].type == "image" and alias[1].mimeType == "image/png"
+    assert "image_base64" not in alias[0].text
+
+
 async def test_pre_stopped_run_yields_failure_not_vacuous_ok() -> None:
     """D2: a run on a stopped session must not report ok=True over an empty result list."""
     state = SessionState(session_id="pre-stopped", stopped=True, dry_run=False)
