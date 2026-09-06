@@ -6,8 +6,9 @@ STRUCTURALLY — by class name or stable attributes — so recovery stays below 
 layer and does not depend on sibling import surfaces that evolve in parallel waves.
 
 Doctrine (Goal.md section 8, master-mission P0-B):
-- Failures are classified into the 12-value :class:`~computer_use_mcp.models.FailureClass`
-  taxonomy; :class:`TaskStopped` is NOT a failure (the classifier returns ``None``).
+- Failures are classified into the 13-value :class:`~computer_use_mcp.models.FailureClass`
+  taxonomy (12 pinned values plus the additive ``SUBTASK_FAILED``, master-mission 003
+  conflict C8); :class:`TaskStopped` is NOT a failure (the classifier returns ``None``).
 - Recovery is bounded: per-action and per-task recovery budgets come from
   :class:`~computer_use_mcp.limits.Limits` (defaults 2/action, 6/task); a budget that is
   exhausted terminates the task safely instead of looping.
@@ -49,6 +50,10 @@ class RecoveryStrategy(StrEnum):
     REPLAN = "replan"
     TERMINATE_SAFELY = "terminate_safely"
     COMPLETE = "complete"
+    # Additive (master-mission 003 conflict C8): a whole subtask failed after its bounded
+    # in-subtask recovery; the long-running orchestrator may replan the REMAINING subtasks
+    # a bounded number of times instead of abandoning the goal immediately.
+    REPLAN_REMAINING = "replan_remaining"
 
 
 # --- structural exception recognition (no sibling imports) --------------------------------
@@ -366,6 +371,21 @@ class RecoveryController:
                 ),
                 termination_reason=TerminationReason.BLOCKED_SAFETY,
                 details={"phase": context.phase},
+            )
+
+        if failure_class is FailureClass.SUBTASK_FAILED:
+            # Additive mapping (master-mission 003 conflict C8): the subtask already ran its
+            # bounded in-subtask recovery and failed; the ORCHESTRATOR decides whether a
+            # bounded replan of the remaining subtasks is safe. This plan itself executes
+            # nothing and never retries the failed subtask.
+            return RecoveryPlan(
+                strategy=RecoveryStrategy.REPLAN_REMAINING,
+                failure_class=failure_class,
+                reason=(
+                    "The subtask failed after exhausting its bounded in-subtask recovery; "
+                    "the remaining subtasks require a bounded replan."
+                ),
+                details={"phase": context.phase, "message": context.message[:300]},
             )
 
         if failure_class in {FailureClass.UNRECOVERABLE, FailureClass.UNKNOWN}:

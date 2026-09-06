@@ -42,6 +42,19 @@ AuditEventType = Literal[
     "limit_exceeded",
     "session_start",
     "session_stop",
+    # Long-running sessions (master-mission 003, additive; existing members untouched):
+    # subtask lifecycle, bounded replanning, checkpoints, resume, approval epochs,
+    # boundary health checks.
+    "subtask_created",
+    "subtask_started",
+    "subtask_completed",
+    "subtask_failed",
+    "subtask_paused",
+    "replan",
+    "checkpoint",
+    "resume",
+    "approval_epoch",
+    "health_check",
 ]
 
 _REDACTED_STR_FIELDS = (

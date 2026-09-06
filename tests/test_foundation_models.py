@@ -318,7 +318,10 @@ def test_risk_level_members() -> None:
     assert {member.value for member in RiskLevel} == {"low", "medium", "high", "critical"}
 
 
-def test_failure_class_has_exactly_the_pinned_12_values() -> None:
+def test_failure_class_has_exactly_the_pinned_13_values() -> None:
+    # 13 values since master-mission 003 (conflict C8): additive FailureClass.SUBTASK_FAILED
+    # for whole-subtask failure after bounded in-subtask recovery; all 12 original members
+    # and their order are untouched.
     assert {member.name for member in FailureClass} == {
         "STALE_COORDINATES",
         "MOVED_UI",
@@ -332,8 +335,9 @@ def test_failure_class_has_exactly_the_pinned_12_values() -> None:
         "UNRECOVERABLE",
         "LOW_CONFIDENCE",
         "UNKNOWN",
+        "SUBTASK_FAILED",
     }
-    assert len(FailureClass) == 12
+    assert len(FailureClass) == 13
 
 
 def test_termination_reason_members() -> None:

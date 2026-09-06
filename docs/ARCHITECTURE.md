@@ -7,11 +7,15 @@ pipeline support, allowlist-gated focus, deterministic verification). This docum
 describes the code as it exists
 at the open-source release HEAD; every claim is traceable to a named module under
 `src/computer_use_mcp/` (or `benchmarks/`, `tests/e2e/`) and, where noted, to the test
-suite (standard suite: **496 passed, 7 skipped** — the skips are the gated
+suite (standard suite: **857 passed, 7 skipped** — the skips are the gated
 real-Windows E2E desktop tests; `ruff check src tests benchmarks` clean at HEAD;
 observed on the reference machine). The layered rules and pinned contracts come from the
 mission architecture (master mission §5–§6); where reality differs from the plan, this
-document records reality.
+document records reality. The Long-Running Sessions wave (an orchestration layer ABOVE the
+executor: subtasks, deterministic plan validation, bounded context, checkpoints/resume,
+approval epochs, health checks) is documented in §15; sections 1–14 describe the executor
+and its contracts, which are unchanged (the §2/§8/§9 counts — tools, limits, audit event
+types — include the wave's additive members).
 
 ## 1. Scope and shape
 
@@ -63,7 +67,7 @@ agent.py           closed-loop phase machine         → audit, backend, groundi
                    (ComputerUseAgent)                  limits, models, observation,
                                                        recovery, safety, state,
                                                        validator, verification
-server.py          6 MCP tools + wiring              → agent, audit, backend,
+server.py          10 MCP tools + wiring             → agent, audit, backend,
                                                        limits, models, provider,
                                                        safety, state (+ mcp SDK)
 ```
@@ -305,7 +309,9 @@ budget gates it instead).
 ## 8. Limits (`limits.py`)
 
 Defaults per master mission §6; `Limits.validate()` clamps into safe ranges and
-`LimitExceeded` (carrying the field name) terminates the task cleanly.
+`LimitExceeded` (carrying the field name) terminates the task cleanly. The table lists
+the 9 per-task limits enforced by `LimitEnforcer`; the same dataclass now carries 18
+fields total (the 9 session-level additions are listed below the table).
 
 | Limit | Default | Clamp range | Enforced by |
 |---|---|---|---|
@@ -322,13 +328,20 @@ Defaults per master mission §6; `Limits.validate()` clamps into safe ranges and
 `start_session(limits=…)` accepts a dict of these field names; unknown names or
 non-numeric values are rejected fail-closed (`invalid_limits`).
 
+Long-running sessions add 9 session-level fields to the same `Limits` dataclass (18
+fields total): `max_session_seconds`, `max_session_actions`, `max_session_model_calls`,
+`max_session_steps`, `max_subtasks`, `context_summarize_every`, `approval_epoch_seconds`,
+`approval_epoch_actions`, `health_check_interval` — same clamping discipline, enforced by
+the `SessionBudgetTracker` / approval-epoch / health mechanisms (§15.11, §15.9, §15.8).
+
 ## 9. Audit + metrics (`audit.py`)
 
 **AuditEvent schema** (Goal.md §17 field set): `timestamp` (UTC), `session_id`,
 `task_id`, `observation_id`, `action_id`, `event_type`, `active_app` (process name,
 title fallback), `risk`, `result`, `duration_ms`, `metadata` (dict, redacted).
 
-Event types (15): `observation`, `model_decision`, `grounding`, `validation`,
+Event types (25 total — the 15 executor types below plus the 10 long-running additions
+listed in §15.12): `observation`, `model_decision`, `grounding`, `validation`,
 `safety`, `approval`, `execution`, `verification`, `recovery`, `failure`, `stop`,
 `emergency_stop`, `limit_exceeded`, `session_start`, `session_stop`.
 
@@ -616,3 +629,370 @@ numbers, not performance claims; scores require a real vision-provider run.
 - Benchmark output is harness validation only; no score exists.
 - No OS-level sandbox or VM isolation; `pyautogui` failsafe corner is the only
   physical backstop.
+
+## 15. Long-Running Runtime (orchestration layer)
+
+Long-running sessions add an orchestration layer for goals too large for one `run_goal`
+call: the goal is decomposed into subtasks, and the subtasks execute sequentially — each
+through the SAME closed-loop executor of §4. Session state persists server-side between
+MCP calls; checkpoints on disk allow stop/resume.
+
+### 15.1 Layering and the single-executor invariant
+
+**The Long-Running Runtime does NOT replace the closed-loop executor and contains no
+execution loop of its own.** Every subtask is executed by exactly ONE call to
+`ComputerUseAgent.run(subtask.description, run_state, approval)` — the §4 phase machine
+runs verbatim for each subtask. The runtime decides WHEN a subtask runs, never HOW an
+action happens. There are no background threads and no schedulers: everything (budget
+checks, approval-epoch gates, health checks, checkpoint cadence) is evaluated
+deterministically at orchestration boundaries, inside MCP tool calls. One subtask
+execution runs at a time per session (a dedicated non-reentrant execution lock; a second
+concurrent call raises the typed `RuntimeBusyError`).
+
+New modules and their import edges (extending the §2 map, measured from the imports):
+
+```
+plan_validator.py   deterministic LLM-plan rejection  → models
+subtask_manager.py  subtask entities + dependency     → models, plan_validator
+                    graph (RLock, fixed transitions)
+context_manager.py  bounded context + summarizer      → limits, redaction
+checkpoint_manager.py atomic/redacted/versioned       → limits, models, plan_validator,
+                    checkpoints                         redaction, state
+approval.py         approval epochs + raise-only      → limits, models
+                    unattended modifier
+health.py           boundary-evaluated health checks  → limits, redaction
+resume_manager.py   fail-closed resume bundles        → checkpoint_manager, limits,
+                                                        context_manager, subtask_manager,
+                                                        models, redaction
+long_running.py     LongRunningRuntime (orchestrator) → subtask_manager, plan_validator,
+                                                        limits, context_manager,
+                                                        checkpoint_manager, approval,
+                                                        health, models, audit, redaction
+server.py           +4 MCP tools, +2 trailing params  → long_running, checkpoint_manager,
+                                                        context_manager, resume_manager,
+                                                        plan_validator, subtask_manager, …
+```
+
+Server wiring: one shared `CheckpointManager` + `ResumeManager` per process; the
+per-session `LongRunningRuntime` is created lazily on first subtask-tool use and persists
+in the session bundle (`bundle.extra["long_running"]`). The only change to the executor
+is the `set_enforcer` seam (§15.10).
+
+Data flow of one orchestration step:
+
+```text
+ MCP tool call (run_goal auto_subtasks / run_subtask)
+       v
+ LongRunningRuntime  (orchestration only)
+   |  budget.check_all() .............. shared SessionBudgetTracker (monotonic)
+   |  epoch gate ...................... ApprovalEpochManager (+ raise-only unattended modifier)
+   |  boundary health ................. HealthMonitor.maybe_check()
+   v
+ SubtaskManager.ready_set() --deterministic head--> ONE agent.run(subtask)   <- existing
+   |        ^                                          |                      executor (§4)
+   |        |                                 fresh LimitEnforcer installed
+   |  fail -> transitive dependents            via agent.set_enforcer()
+   |  blocked (dependency graph)                       |
+   |                                         consumption deltas written back -> shared tracker
+   v
+ ContextManager (bounded window + summary)   CheckpointManager (atomic/redacted/versioned)
+   |                                                |
+   +------- periodic 50 steps / 30 min + lifecycle triggers -----> checkpoint.json
+```
+
+### 15.2 Subtask Manager (`subtask_manager.py`)
+
+Thread-safe (RLock) owner of one session's subtask entities and dependency graph; no
+execution. The `Subtask` entity (`models.py`): `subtask_id` (1..128 chars, stable and
+serializable — snapshot/restore round-trips it losslessly), `description` (1..2000),
+`status`, `depends_on` (≤ 50), `created_at`/`started_at`/`completed_at`,
+`recovery_attempts`, bounded `results` (`SUBTASK_RESULTS_CAP = 20`, oldest evicted,
+`screenshot_after_base64` stripped before storage), and `failure` info
+(`FailureClass.SUBTASK_FAILED`, error ≤ 2000 chars, recovery attempts, last known state
+≤ 1000 chars, timestamp). Statuses (`SubtaskStatus`): `pending`, `running`, `completed`,
+`failed`, `blocked`, `paused`. Every transition follows the fixed `TRANSITIONS` table
+(deterministic; terminal states move nowhere; `pending -> failed` is legal — a
+never-started subtask may be failed when it can no longer be executed safely). Creation
+validates in a fixed order: ceiling → description → id → dependency shape →
+self-dependency → unknown dependency → duplicate dependency → cycle. Hard ceiling:
+`MAX_SUBTASKS = 50` (constructor clamps 1..50). Read APIs are bounded: `list()` returns
+per-subtask summaries with bounded fields plus result/recovery **counts** (never result
+payloads); `counts()` carries every status key. `snapshot()`/`restore()` round-trip the
+full graph (restore refuses duplicates, unknown/self deps, cycles, oversize — fail-closed,
+manager left empty on failure).
+
+### 15.3 Dependency graph (ready set, blocked propagation)
+
+- `ready_set()`: subtask ids that are `pending` with **all** dependencies `completed`,
+  in deterministic creation order. The orchestrator picks the head of this list; nothing
+  else selects work. `start()` re-checks and raises `SubtaskNotReadyError` (carrying the
+  unmet dependency ids) when gated — a subtask never starts on incomplete prerequisites.
+- Blocked propagation: `fail()` moves the failed subtask to terminal `failed` and
+  transitively moves its `pending|paused` dependents to `blocked` (BFS over reverse
+  edges). A terminal-failed prerequisite can never complete, so that branch is
+  permanently unrunnable; `requeue()` (`blocked -> pending`) exists only for bounded
+  replan rewiring.
+- Dead-branch doctrine (`_dead_ids` = terminal-failed ids plus their transitive
+  dependents): when no executable work remains and the non-dead remainder is empty, the
+  runtime attempts a bounded replan (≤ `MAX_REPLAN_ATTEMPTS = 3` per session; replacement
+  entries never depend on dead ids and pass the plan validator); if it cannot replace the
+  dead branch, the session terminates `UNRECOVERABLE` — it never continues with unknown
+  correctness.
+
+### 15.4 Deterministic Plan Validator (`plan_validator.py`)
+
+An LLM plan is an **UNTRUSTED SUGGESTION**, never a source of truth. The validator is a
+pure layer: no I/O, no execution, no clock reads — the same input always yields the same
+verdict, and ANY violation rejects the WHOLE plan (no partial acceptance). Eleven stable
+rejection codes, one per rule: `malformed_plan`, `malformed_subtask_entry`,
+`too_many_subtasks` (plan entries above the remaining capacity, ceiling 50), `empty_plan`,
+`duplicate_subtask_id`, `unknown_dependency`, `self_dependency`, `dependency_cycle`,
+`invalid_status`, `non_pending_status` (a plan can never fast-track work past execution —
+only `pending` is plannable), `unsafe_content` (control characters in executable text).
+Accepted entries are created through `SubtaskManager.create` in deterministic topological
+order (dependencies first), which re-checks cap/dependency/cycle rules — the planner can
+never bypass dependency validation, resource limits, or safety policy (they live in other
+layers and are not influenced by plan contents). The provider side
+(`provider.plan_subtasks(goal, *, context_notes=None)`) returns clipped untrusted data
+(`temperature=0`, JSON-response format) and executes nothing.
+
+### 15.5 Context Manager (`context_manager.py`)
+
+Bounded conversation state; nothing grows unbounded:
+
+- **Recent window**: a deque capped in 5..10 entries (`RECENT_HISTORY_MIN`/
+  `RECENT_HISTORY_MAX`, default cap 10), each entry redacted and truncated to 1000 chars
+  on a safe code-point boundary (`safe_truncate` never splits a surrogate pair, a
+  combining-mark cluster, a ZWJ/variation-selector join, or a flag pair); an entry
+  identical to the immediately preceding one is dropped (repetitive detail).
+- **Plan notes**: capped deque (default 50 notes × 500 chars), safe truncation.
+- **Summaries**: category lists capped at 20 items × 300 chars, scalars 500 chars, notes
+  4000 chars; everything redacted at ingest and re-clamped on the way out.
+- **Trigger**: `record_step()` returns due when `steps - steps_at_last_summary >=
+  context_summarize_every` (default 25, clamp 1..500); the orchestrator awaits
+  `summarize()` at the boundary — at most ONE summarization per boundary.
+- **Summarizer**: the provider's `summarize_context` (temperature 0, JSON) is invoked
+  with a bounded `SummarizationRequest` (tracked state + recent window + plan notes —
+  never the full history). On absence, failure, or malformed output the manager falls
+  back to a deterministic bounded summary built from tracked state; `summarize()` never
+  raises into the caller. Tracked controller-owned facts (goal, current task,
+  app/window state) always survive a partial summarizer result.
+- **Model payload**: `build_request_payload()` exposes ONLY the compressed summary +
+  bounded recent window + plan notes — the full history is never sent to the model.
+- Snapshot/restore is versioned and fail-closed (malformed input raises; never a partial
+  restore).
+
+The runtime additionally folds the executor's cross-run history into this bounded window
+between subtasks (`_fold_history`), so the executor's `max_context_items` gate cannot be
+exhausted by accumulated prior runs.
+
+### 15.6 Checkpoint Manager (`checkpoint_manager.py`)
+
+Durable per-session state under `<base>/<sanitized session_id>/checkpoint.json`
+(`CHECKPOINT_FILENAME`); `base` comes from `COMPUTER_USE_MCP_CHECKPOINT_DIR`
+(`ENV_VAR_CHECKPOINT_DIR`) or defaults to `<temp>/computer-use-mcp/checkpoints`.
+
+- **Atomic write**: serialize → redact → size-check BEFORE any filesystem mutation;
+  temp file in the destination directory, `fsync`, `os.replace`. A failure removes the
+  temp file and leaves the previous valid checkpoint untouched.
+- **Redaction + secret gate**: every string VALUE passes `redact_text`; if any value
+  still trips `contains_secret` the write is REFUSED (`CheckpointRedactionError`, before
+  any disk touch). The gate is per-value, not on the serialized JSON, so an inert
+  `[REDACTED:*]` placeholder value does not falsely trip while a surviving secret blocks
+  the write. No secrets, no screenshots (`screenshot_after_base64` must be `None` in
+  every persisted result), no unbounded text.
+- **Versioned**: `CHECKPOINT_SCHEMA_VERSION = 1` gates loading; unknown/newer versions
+  are rejected, never loaded best-effort.
+- **Sealed (tamper-evident)**: every written checkpoint carries an HMAC-SHA256 integrity
+  seal (`IntegritySeal`, persisted in the payload's `integrity` field) over a canonical
+  serialization of the tamper-sensitive fields — `session_id`, `continuation_of`, `goal`,
+  `current_subtask_id`, `budget` (minus its `snapshot_version` format tag), `limits`,
+  `subtasks` — keyed by a per-installation random key at `<base>/.integrity_key`
+  (`INTEGRITY_KEY_FILENAME`; created exclusively on first write, `O_CREAT|O_EXCL`, mode
+  0600 where the OS honors it; never inside a session directory, never logged). Honest
+  scope: the seal defends the checkpoint FILE against out-of-band tampering; an attacker
+  who can also read/replace the key file (same-user/full-disk access) can re-seal forged
+  state and is OUT OF SCOPE — the OS user boundary is the control for that adversary.
+- **Fail-closed load**: size cap (`MAX_CHECKPOINT_BYTES = 8 MB`), JSON parse, then the
+  seal is verified BEFORE any payload parsing (missing/malformed/mismatching seals — or
+  a missing/replaced key, which load NEVER recreates — raise
+  `CheckpointValidationError`), then full structural/type/self-consistency validation
+  plus deterministic ceiling cross-checks (`budget.subtasks ≤ limits.max_subtasks`,
+  `budget.steps ≤ limits.max_session_steps`): subtask snapshots parseable and within
+  caps, budget counters numeric and non-negative, limits **canonical** (exactly the
+  current `Limits.validate()` output — a checkpoint that could enlarge the budget on
+  resume is refused), subtask count within the checkpoint's own ceiling, no
+  self/unknown dependencies or cycles, `current_subtask_id` present in the graph,
+  bounded recent history (≤ 50 entries × 1000 chars). A corrupt file raises
+  `CheckpointValidationError` — never deleted, repaired, or partially loaded.
+- **Cadence**: `should_checkpoint` is the pure periodic rule — every
+  `CHECKPOINT_EVERY_STEPS = 50` steps or `CHECKPOINT_EVERY_SECONDS = 1800` (30 min),
+  whichever first. Lifecycle triggers (`LIFECYCLE_TRIGGERS`) checkpoint immediately:
+  `subtask_completed`, `subtask_failed`, `subtask_transition`, `before_session_end`,
+  `before_resume` (plus `periodic` and `manual`). `stop_session` writes the
+  `before_session_end` checkpoint best-effort before the kill path (a durability failure
+  never blocks stopping; a checkpoint is not a safety gate).
+- **Payload** (`CheckpointPayload`): session snapshot (status, dry_run, require_approval,
+  max_steps, max_retries_per_action, min_confidence, stopped), environment expectations
+  (foreground process/window + allowlists — the resume re-verification source),
+  termination state, current subtask, the verbatim `SubtaskManager`/`SessionBudgetTracker`/
+  `ContextManager` snapshots, the exact `Limits` in force, `continuation_of`, trigger,
+  schema version, UTC `created_at`, and the `integrity` seal (always present on disk —
+  load refuses unsealed payloads). The budget snapshot's `elapsed_seconds` is persisted
+  rounded to 3 decimals (millisecond precision — semantics-preserving for the elapsed
+  anchor the resume re-bases).
+
+### 15.7 Resume Manager (`resume_manager.py`)
+
+Resume is a CONTINUATION, not a new session. `ResumeManager.prepare(path,
+current_environment=…)` loads and validates the checkpoint — the integrity seal and the
+deterministic budget-ceiling cross-checks are verified BEFORE any restore is attempted,
+so a tampered, unsigned, or key-orphaned checkpoint never reaches bundle construction
+(`CheckpointValidationError` → `invalid_checkpoint` at the MCP surface) — then rebuilds a
+`ResumeBundle`: the payload, the continuation identity (`payload.continuation_of` or the
+payload's own session id — the live session keeps its new id and carries the old one as
+`continuation_of`), restored `SubtaskManager`/`SessionBudgetTracker`/`ContextManager`
+holding EXACTLY the checkpointed state, the session snapshot, the recorded environment
+expectations, and a pre-flight checklist (`checkpoint_valid`, `limits_preserved`,
+`subtasks_restored`, `budget_restored`, `context_restored`).
+
+- **Counters restored, never reset**: `SessionBudgetTracker.restore` SETS counters to
+  checkpoint values (a counter already higher is never lowered — monotonic), re-bases the
+  monotonic elapsed-time anchor so elapsed time continues from the snapshot (wall-clock
+  changes cannot refill the duration budget), and fails closed on malformed input. The
+  bundle verifies restored counters EQUAL the checkpoint values.
+- **No limit enlargement**: the bundle's limits are the checkpoint's own limits,
+  re-clamped by the current mechanism (`limits_resolved`); canonical equality is already
+  enforced at load. The server adopts them for the enforcer and executor — the resumed
+  session also re-adopts the checkpointed session settings (dry_run, require_approval,
+  max_steps, max_retries_per_action, min_confidence).
+- **Environment re-verification (stale-state enforcement)**: the current foreground
+  process/window is compared (casefold) against the recorded expectations, and the
+  current foreground identity is checked against the recorded allowlists
+  (`matches_allowlist`: conservative case-insensitive exact or trailing-`*` prefix — the
+  resume-side re-verification hook only; the live executor keeps its stricter machinery).
+  Missing current identity is treated as a MISMATCH, never a pass. With
+  `current_environment` supplied, verification runs eagerly and any failure raises
+  `ResumeRefusalError` (typed `resume_refused` at the MCP surface) — the freshly created
+  session is discarded and nothing partially restores. The server reads the current
+  environment from a real backend observation; a failed observation yields empty identity
+  fields, which fail closed.
+- **Approval is never resurrected**: `ApprovalEpochManager.snapshot()` deliberately has
+  no restore counterpart; a resumed session must obtain fresh approval via an explicit
+  grant (an MCP call with `approve_next_action=True`).
+
+### 15.8 Health Monitor (`health.py`)
+
+Boundary-evaluated environment verification — no background thread, no scheduler, not a
+second execution loop (the monitor holds no action executor and never performs actions).
+
+- `maybe_check()` evaluates ONLY when a check is due: at least
+  `Limits.health_check_interval` seconds (default 600, clamp 60..3600) since the last
+  check; otherwise it returns `None` without touching a probe. The first call on a fresh
+  monitor is due (baseline at the first boundary).
+- The world is read ONLY through five injected probes (observation validity, active app,
+  active window, hung indicators, environment expectation) bound by the runtime to the
+  real session backend. A monitor constructed without probes gets fail-closed defaults
+  that can never report `healthy`. A probe failure is fail-closed data (worst-case
+  reading for that dimension), never an exception.
+- **Verdict matrix (deterministic)**: an unexpected APPLICATION (foreground app differs
+  from the recorded expectation, or its identity became unavailable) → `UNSAFE`;
+  window-title drift, stale/invalid observation, hung indicators, or an unverifiable
+  expectation → `DEGRADED`; everything verified → `HEALTHY`. Recommendations
+  (`continue`/`recover`/`pause`) are routing data; the CALLER decides and acts.
+- **Runtime boundary handling** (`_boundary_health`): `UNSAFE` → the approval epoch is
+  invalidated immediately (APPLICATION_CHANGED or ENVIRONMENT_CHANGED — the environment
+  changed materially) and execution stops (`blocked_safety` termination);
+  `DEGRADED` → ONE bounded re-evaluation, then pause if still not healthy. Probe-supplied
+  strings are redacted and bounded in the result.
+
+### 15.9 Approval Epochs and the unattended modifier (`approval.py`)
+
+- **Dual-axis expiry**: an epoch expires when its wall-clock age reaches
+  `Limits.approval_epoch_seconds` (default 1800 = 30 min, clamp 60..86400) OR its count
+  of interactive actions reaches `Limits.approval_epoch_actions` (default 50, clamp
+  1..1000) — whichever comes first (inclusive boundaries, fail-closed).
+- **Material change invalidates immediately** (`invalidate`, typed `InvalidationReason`):
+  `application_changed`, `process_changed`, `risk_escalated`, `goal_changed`,
+  `policy_changed`, `environment_changed`. Idempotent; the first cause is retained.
+- **`require_approval=false` is NOT an unlimited pass**: it is modeled as a full-scope
+  epoch (the standing grant covers interactive actions without the per-action flow) that
+  STILL expires on both axes and dies on invalidation like any other epoch.
+- **Fail-closed gate** (`authorize_action`): a dead epoch refuses with
+  `requires_fresh_approval=True` REGARDLESS of any per-action approval — the caller must
+  stop and request fresh approval; a per-action approval can never resurrect a dead
+  epoch. Nothing auto-renews; `grant()` is the only renewal path (a fresh epoch with
+  reset clocks/counters). In the runtime, the only grant sources are session start and
+  an explicit MCP call with `approve_next_action=True` (which also restarts the
+  unattended clock). The per-call approval budget stays exactly 1 (run_goal semantics).
+- **Prolonged unattended execution** (`effective_protection`, spec §12): once the session
+  has run without human interaction for ≥ `PROLONGED_UNATTENDED_SECONDS = 3600` s
+  (inclusive), a pure RAISE-ONLY modifier activates — `LOW` is treated as `MEDIUM`,
+  `MEDIUM` as `HIGH`, `HIGH`/`CRITICAL` stay — it can never LOWER protection for any
+  input, and there is NO fifth `RiskLevel`. While active, non-routine actions (original
+  risk ≥ MEDIUM) require fresh approval, and a full-scope standing grant may not START
+  new subtasks (the boundary epoch gate holds with an explicit `unattended_hold` reason
+  until a fresh human grant).
+
+### 15.10 The agent seam: `set_enforcer`
+
+The single justified change to the executor (`agent.py`): `ComputerUseAgent.set_enforcer(
+enforcer)` swaps the per-run `LimitEnforcer` and rebuilds the `RecoveryController` (which
+shares the enforcer's live counters). No loop phase, ordering, approval, or verification
+semantics change — this only re-binds which counters gate a run, giving each subtask a
+fresh per-subtask budget scope (SubtasksProtocol §3). Everything else in §4 is untouched;
+there is no second executor.
+
+### 15.11 Shared budgets, monotonic write-back, and the step cap
+
+- **Per-subtask scope**: each subtask run installs a FRESH `LimitEnforcer(limits)` via
+  `set_enforcer`; the per-task limits (§8) gate the run exactly as before.
+- **Shared session budget**: `SessionBudgetTracker` (RLock-protected) counts the
+  session-level dimensions — duration, actions, model calls, steps, subtasks — across
+  every subtask and run of a session. `check_all()` gates every subtask start and every
+  orchestration boundary; exhaustion raises `SessionBudgetExceeded` (a `LimitExceeded`
+  subclass, so the existing typed `limit_exceeded` surfaces and audited-termination
+  handling apply unchanged).
+- **Monotonic write-back**: after each run, the sub-enforcer's snapshot deltas (actions,
+  model calls) and the step delta are recorded onto the shared tracker. The tracker only
+  ever grows within a session's life — a subtask can never reset, shrink, or refill a
+  session counter.
+- **Subtask step cap**: a run's `max_steps` is additionally capped to
+  `step_count + remaining_session_steps` (`_capped_run_state`), so one subtask can never
+  overspend the shared step budget even though the executor bounds itself by
+  `state.max_steps`.
+- **Restore**: `snapshot()`/`restore()` are checkpoint-compatible (versioned); restore
+  sets counters to checkpoint values (never zeroes them) and re-bases the elapsed anchor
+  (§15.7).
+
+### 15.12 MCP surface, bounded responses, and audit
+
+- **Tools** (§11 covers the six existing ones): `create_subtask(session_id, description,
+  depends_on=None)`, `list_subtasks(session_id)`, `run_subtask(session_id, subtask_id,
+  approve_next_action=False)`, `get_session_progress(session_id)`. Trailing-optional
+  additions follow the §10 discipline: `run_goal(..., auto_subtasks=False)` and
+  `start_session(..., resume_from_checkpoint=None)` (omitting them is byte-identical;
+  `run_goal(auto_subtasks=True)` keeps the run_goal response shape and adds
+  `planned_subtasks`, `executed_subtasks`, `replan_attempts`, `detail`, `progress`).
+- **Deterministic progress**: the percentage is computed from manager state —
+  `round(100 * completed / total, 2)`, 0.0 with zero subtasks — never invented; the
+  response carries status, counts, current subtask, elapsed seconds (from the shared
+  tracker), resource counters/limits, approval-epoch snapshot, checkpoint status, and the
+  replan budget (`replan_attempts_used` / `replan_attempts_max`).
+- **Bounded responses** (§19 discipline): orchestration result lists are capped
+  (`MAX_ORCHESTRATION_RESULTS = 200`), `detail` fields at 500 chars, list summaries at
+  300-char fields, goal echoes at 2000 chars redacted; `list_subtasks` never returns
+  result payloads or history. Typed error codes include `subtask_not_ready`
+  (+ `unmet_dependencies`), `subtask_limit_exceeded`, `unknown_subtask`,
+  `subtask_already_exists`, `invalid_subtask`, `unknown_dependency`, `self_dependency`,
+  `dependency_cycle`, `invalid_transition`, `runtime_busy`, `planner_unavailable`,
+  `plan_rejected` (+ codes), `subtask_not_runnable`, `resume_refused`,
+  `invalid_checkpoint`, `checkpoint_error`.
+- **Audit**: new event types — `subtask_created`, `subtask_started`,
+  `subtask_completed`, `subtask_failed`, `subtask_paused`, `replan`, `checkpoint`,
+  `resume`, `approval_epoch`, `health_check` (existing 15 types untouched; all metadata
+  passes the same write-time redaction).
+- **Degradation without a key**: planner unavailability is a typed, fail-closed
+  degradation — the session stays fully usable for manual `create_subtask` (no planner
+  key needed); the context summarizer similarly falls back to its deterministic bounded
+  summary.

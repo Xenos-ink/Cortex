@@ -44,12 +44,40 @@ from mcp.server.fastmcp import FastMCP
 from .agent import ComputerUseAgent
 from .audit import AuditLogger, Metrics
 from .backend import ComputerBackend, LocalComputerBackend
+from .checkpoint_manager import (
+    CheckpointError,
+    CheckpointManager,
+    CheckpointTrigger,
+    CheckpointValidationError,
+)
+from .context_manager import ContextManager
 from .limits import LimitEnforcer, LimitExceeded, Limits
-from .models import ExecutionResult, GroundedAction, SessionState
+from .long_running import (
+    LongRunningError,
+    LongRunningRuntime,
+    PlannerUnavailableError,
+    RuntimeBusyError,
+    SubtaskNotRunnableError,
+)
+from .models import ExecutionResult, GroundedAction, SessionState, SubtaskStatus
+from .plan_validator import PlanRejectedError
 from .provider import OpenAICompatibleVisionProvider
 from .redaction import redact_text
+from .resume_manager import ResumeBundle, ResumeManager, ResumeRefusalError
 from .safety import SafetyPolicy
 from .state import SessionContext, SessionLimitExceeded, SessionRegistry, TaskStopped
+from .subtask_manager import (
+    DependencyCycleError,
+    InvalidSubtaskError,
+    InvalidTransitionError,
+    SelfDependencyError,
+    SubtaskAlreadyExistsError,
+    SubtaskError,
+    SubtaskLimitExceeded,
+    SubtaskNotReadyError,
+    UnknownDependencyError,
+    UnknownSubtaskError,
+)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -82,6 +110,10 @@ _bundles: dict[str, _SessionBundle] = {}
 _stopped_sessions: dict[str, str] = {}
 _STOPPED_SESSION_MEMORY = 1024
 _lock = threading.RLock()
+# Long-running session persistence (master-mission 003): one shared checkpoint store
+# (env-var override honored) and the resume manager built on top of it.
+_checkpoint_manager = CheckpointManager()
+_resume_manager = ResumeManager(_checkpoint_manager)
 
 
 class _UnknownSession(KeyError):
@@ -159,6 +191,28 @@ class _LazyProvider:
                 "Provider does not expose judge_change; model-based verification is unavailable."
             )
         return delegate(before_b64, after_b64, expected_effect)
+
+    async def plan_subtasks(self, goal: str, **kwargs: Any) -> Any:
+        """Delegate the long-running planner call (lazy; typed failure without a key)."""
+        provider = self._resolve()
+        delegate = getattr(provider, "plan_subtasks", None)
+        if not callable(delegate):
+            raise TypeError("Provider does not expose plan_subtasks; planning is unavailable.")
+        result = delegate(goal, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    async def summarize_context(self, request: Any) -> Any:
+        """Delegate the bounded context summarizer (ContextManager falls back on failure)."""
+        provider = self._resolve()
+        delegate = getattr(provider, "summarize_context", None)
+        if not callable(delegate):
+            raise TypeError("Provider does not expose summarize_context.")
+        result = delegate(request)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
 
 @dataclass
@@ -326,6 +380,260 @@ def _parse_limits(limits: dict[str, Any] | None) -> Limits:
     return Limits(**kwargs).validate()  # type: ignore[arg-type]
 
 
+# --- long-running session wiring (master-mission 003, additive) -----------------------------
+
+
+def _build_runtime(
+    bundle: _SessionBundle,
+    *,
+    goal: str = "",
+    resume_bundle: ResumeBundle | None = None,
+    resumed: bool = False,
+) -> LongRunningRuntime:
+    """Construct the per-session orchestration runtime over the EXISTING bundle pieces."""
+    provider = bundle.agent.provider
+    if resume_bundle is not None:
+        # Restore the checkpoint's context into a FRESH ContextManager bound to the
+        # (lazy) provider summarizer — snapshot/restore is lossless per A3's contract.
+        context = ContextManager(
+            goal=resume_bundle.goal,
+            summarizer=(
+                (lambda request: provider.summarize_context(request))  # type: ignore[union-attr]
+                if provider is not None and hasattr(provider, "summarize_context")
+                else None
+            ),
+            summarize_every=resume_bundle.limits.context_summarize_every,
+        )
+        context.restore(resume_bundle.context.snapshot())
+        return LongRunningRuntime(
+            session_id=bundle.context.session_id,
+            goal=resume_bundle.goal,
+            agent=bundle.agent,
+            state=bundle.state,
+            limits=resume_bundle.limits,
+            backend=bundle.backend,
+            auditor=bundle.auditor,
+            metrics=bundle.metrics,
+            checkpoint_manager=_checkpoint_manager,
+            provider=provider,
+            allowed_processes=list(bundle.extra.get("allowed_processes") or []),
+            allowed_windows=list(bundle.state.allowed_windows or []),
+            subtasks=resume_bundle.subtasks,
+            budget=resume_bundle.budget,
+            context=context,
+            continuation_of=resume_bundle.continuation_identity,
+            expected_environment=resume_bundle.environment,
+            resumed=resumed,
+        )
+    return LongRunningRuntime(
+        session_id=bundle.context.session_id,
+        goal=goal,
+        agent=bundle.agent,
+        state=bundle.state,
+        limits=bundle.limits,
+        backend=bundle.backend,
+        auditor=bundle.auditor,
+        metrics=bundle.metrics,
+        checkpoint_manager=_checkpoint_manager,
+        provider=provider,
+        allowed_processes=list(bundle.extra.get("allowed_processes") or []),
+        allowed_windows=list(bundle.state.allowed_windows or []),
+    )
+
+
+def _get_or_create_runtime(bundle: _SessionBundle) -> LongRunningRuntime:
+    """Return the session's runtime, creating it lazily on first subtask-tool use."""
+    runtime = bundle.extra.get("long_running")
+    if isinstance(runtime, LongRunningRuntime):
+        return runtime
+    runtime = _build_runtime(bundle, goal=str(bundle.context.task.goal or ""))
+    bundle.extra["long_running"] = runtime
+    return runtime
+
+
+def _current_environment_from_backend(backend: Any) -> dict[str, Any]:
+    """Fresh CURRENT environment reading for resume verification (fail-closed on absence).
+
+    A failed observation returns empty identity fields — the resume verification treats
+    missing identity as a mismatch, never as a pass (stale-state enforcement, spec 14).
+    """
+    try:
+        observation = backend.observe()
+    except Exception:  # noqa: BLE001 - unusable environment is fail-closed data
+        return {}
+    info = getattr(observation, "active_window_info", None)
+    process = None
+    title = None
+    if info is not None:
+        process = str(info.process_name) if getattr(info, "process_name", None) else None
+        title = str(info.title) if getattr(info, "title", None) else None
+    if title is None and getattr(observation, "active_window", None):
+        title = str(observation.active_window)
+    return {"active_process_name": process, "active_window_title": title}
+
+
+def _resume_error_response(exc: Exception, path: str) -> dict[str, object]:
+    """Typed fail-closed resume refusal responses (never a partial restore)."""
+    if isinstance(exc, ResumeRefusalError):
+        code = "resume_refused"
+    elif isinstance(exc, CheckpointValidationError):
+        code = "invalid_checkpoint"
+    elif isinstance(exc, CheckpointError):
+        code = "checkpoint_error"
+    else:
+        code = type(exc).__name__
+    payload: dict[str, object] = {
+        "ok": False,
+        "error": code,
+        "message": str(exc)[:2000],
+        "checkpoint": str(path),
+    }
+    checks = getattr(exc, "checks", None)
+    if checks is not None and hasattr(checks, "summary"):
+        payload["checks"] = checks.summary()
+    return payload
+
+
+_SUBTASK_ERROR_CODES: tuple[tuple[type[Exception], str], ...] = (
+    (SubtaskLimitExceeded, "subtask_limit_exceeded"),
+    (UnknownSubtaskError, "unknown_subtask"),
+    (SubtaskAlreadyExistsError, "subtask_already_exists"),
+    (InvalidSubtaskError, "invalid_subtask"),
+    (UnknownDependencyError, "unknown_dependency"),
+    (SelfDependencyError, "self_dependency"),
+    (DependencyCycleError, "dependency_cycle"),
+    (InvalidTransitionError, "invalid_transition"),
+)
+
+
+def _subtask_error_response(exc: Exception) -> dict[str, object]:
+    """Structured, typed error payloads for subtask/orchestration failures."""
+    if isinstance(exc, SubtaskNotReadyError):
+        return {
+            "ok": False,
+            "error": "subtask_not_ready",
+            "message": str(exc),
+            "subtask_id": exc.subtask_id,
+            "unmet_dependencies": list(exc.unmet),
+        }
+    for exc_type, code in _SUBTASK_ERROR_CODES:
+        if isinstance(exc, exc_type):
+            payload: dict[str, object] = {"ok": False, "error": code, "message": str(exc)}
+            subtask_id = getattr(exc, "subtask_id", None)
+            if subtask_id:
+                payload["subtask_id"] = subtask_id
+            return payload
+    long_running_codes: tuple[tuple[type[Exception], str], ...] = (
+        (RuntimeBusyError, "runtime_busy"),
+        (PlannerUnavailableError, "planner_unavailable"),
+        (SubtaskNotRunnableError, "subtask_not_runnable"),
+    )
+    for exc_type, code in long_running_codes:
+        if isinstance(exc, exc_type):
+            return {"ok": False, "error": code, "message": str(exc)}
+    return {"ok": False, "error": type(exc).__name__, "message": str(exc)}
+
+
+def _run_goal_stopped_response(session_id: str, approve_next_action: bool) -> dict[str, object]:
+    """The standard run_goal stopped-session response shape (E6 contract, D1/D2)."""
+    memory = _stopped_sessions.get(session_id, {})
+    stopped_result = ExecutionResult(
+        ok=False,
+        action=GroundedAction(action="done"),
+        message="Session is stopped; run_goal refused (fail-closed stopped-session policy).",
+    )
+    return {
+        "ok": False,
+        "approval_budget_remaining": 1 if approve_next_action else 0,
+        "results": [stopped_result.model_dump()],
+        "session_id": session_id,
+        "task_id": str(memory.get("task_id", "")),
+        "termination_reason": "stopped_by_user",
+        "stopped": True,
+        "requires_approval": False,
+        "step_count": int(memory.get("step_count", 0)),
+        "metrics": memory.get("metrics") or {"counters": {}, "latencies": {}},
+    }
+
+
+async def _run_goal_auto_subtasks(
+    session_id: str, goal: str, approve_next_action: bool
+) -> dict[str, object]:
+    """Long-Running/Multi-Subtask mode of ``run_goal`` (spec section 10, additive).
+
+    Plan (provider -> deterministic validation) -> sequential subtask execution through
+    the EXISTING executor, all within this call's budget semantics; the response keeps
+    the run_goal shape with additive subtask fields. Existing callers (default off) are
+    byte-identical.
+    """
+    try:
+        bundle = _get_live_bundle(session_id)
+    except _StoppedSession:
+        return _run_goal_stopped_response(session_id, approve_next_action)
+    except _UnknownSession as exc:
+        return _error_response(exc)
+    runtime = _get_or_create_runtime(bundle)
+    planned = 0
+    try:
+        runtime.set_goal(goal)
+        entries = await runtime.plan_from_llm(goal)
+        planned = len(entries)
+    except (PlannerUnavailableError, PlanRejectedError) as exc:
+        code = "planner_unavailable" if isinstance(exc, PlannerUnavailableError) else "plan_rejected"
+        payload: dict[str, object] = {
+            "ok": False,
+            "error": code,
+            "message": str(exc)[:2000],
+            "session_id": session_id,
+            "planned_subtasks": 0,
+        }
+        if isinstance(exc, PlanRejectedError):
+            payload["codes"] = list(exc.codes)[:10]
+        return payload
+    try:
+        outcome = await runtime.run_pending_subtasks(approve_next_action=approve_next_action)
+    except RuntimeBusyError as exc:
+        return {"ok": False, "error": "runtime_busy", "message": str(exc), "session_id": session_id}
+    except LimitExceeded as exc:
+        return {
+            "ok": False,
+            "error": "limit_exceeded",
+            "limit": exc.limit_name,
+            "message": str(exc),
+            "session_id": session_id,
+        }
+    task = bundle.agent.task
+    results_payload: list[dict[str, object]] = []
+    for item in outcome.results:
+        results_payload.append(_redact_result_payload(item.model_dump()))
+    if task.status.value == "stopped" and session_id in _bundles:
+        # F7: an internally-armed kill path that terminated this run gets the SAME
+        # bundle hygiene as run_goal (the stop was already audited in-run).
+        _close_stopped_bundle(
+            session_id, bundle, source="run_goal_kill_path", audit_stop_events=False
+        )
+    return {
+        "ok": bool(outcome.ok),
+        "approval_budget_remaining": outcome.approval_budget_remaining,
+        "results": results_payload,
+        "session_id": session_id,
+        "task_id": task.task_id,
+        "termination_reason": outcome.termination_reason,
+        "stopped": bool(
+            outcome.stopped or bundle.state.stopped or task.status.value == "stopped"
+        ),
+        "requires_approval": bool(outcome.requires_approval or bundle.agent.approval_denied),
+        "step_count": bundle.state.step_count,
+        "metrics": bundle.metrics.snapshot(),
+        # Additive long-running fields (existing keys above unchanged).
+        "planned_subtasks": planned,
+        "executed_subtasks": list(outcome.executed),
+        "replan_attempts": outcome.replan_attempts,
+        "detail": outcome.detail[:500],
+        "progress": runtime.progress(),
+    }
+
+
 # --- tools ---------------------------------------------------------------------------------
 
 
@@ -339,12 +647,21 @@ def start_session(
     allowed_windows: list[str] | None = None,
     allowed_processes: list[str] | None = None,
     limits: dict[str, float] | None = None,
+    resume_from_checkpoint: str | None = None,
 ) -> dict[str, object]:
     """Start a guarded session; dry-run and per-action approval are enabled by default.
 
     ``allowed_processes`` enforces a process allowlist (P0-G); ``limits`` carries any
     :class:`~computer_use_mcp.limits.Limits` field (validated + clamped, fail-closed on
     unknown names). No API key is required to start (the provider is lazy).
+
+    Long-running additive (master-mission 003, trailing optional): pass
+    ``resume_from_checkpoint`` (a checkpoint file path from a previous session) to
+    RESUME it as a CONTINUATION — counters are restored (never reset/zeroed), subtasks,
+    dependencies, and context are restored, the CURRENT environment is re-verified
+    against the checkpoint's expectations (mismatch/invalid checkpoint -> fail-closed
+    typed refusal), and approval is FRESH (never resurrected from data). Existing
+    callers that omit the parameter are byte-identical.
     """
     try:
         # D9 precedence (documented): the legacy ``max_retries_per_action`` parameter and
@@ -436,6 +753,59 @@ def start_session(
         )
     except Exception:
         logger.debug("session_start audit failed", exc_info=True)
+    resume_extra: dict[str, object] = {}
+    if resume_from_checkpoint:
+        # Long-running resume (conflict C4): the live session gets a NEW session id and
+        # carries the checkpoint's original id as continuation identity; counters are
+        # restored (never reset), and the environment is re-verified BEFORE continuing.
+        bundle = _bundles[session_id]
+        resume_bundle: ResumeBundle | None = None
+        try:
+            current_environment = _current_environment_from_backend(backend)
+            resume_bundle = _resume_manager.prepare(
+                resume_from_checkpoint, current_environment=current_environment
+            )
+            runtime = _build_runtime(
+                bundle, goal="", resume_bundle=resume_bundle, resumed=True
+            )
+        except Exception as exc:  # noqa: BLE001 - typed refusal, never a partial restore
+            with _lock:
+                _bundles.pop(session_id, None)
+            _registry.remove(session_id)
+            return _resume_error_response(exc, resume_from_checkpoint)
+        assert resume_bundle is not None
+        bundle.extra["long_running"] = runtime
+        # Continuation doctrine: the checkpoint's OWN (re-clamped) limits stay in force;
+        # the per-run enforcer/executor adopt them too — no budget is ever enlarged.
+        bundle.limits = runtime.limits
+        enforcer.limits = runtime.limits
+        agent.limits = runtime.limits
+        # Adopt the checkpointed session settings (the resumed session IS the old one).
+        state.dry_run = resume_bundle.session.dry_run
+        state.require_approval = resume_bundle.session.require_approval
+        state.max_steps = resume_bundle.session.max_steps
+        state.max_retries_per_action = resume_bundle.session.max_retries_per_action
+        state.min_confidence = resume_bundle.session.min_confidence
+        bundle.context.task.goal = runtime.goal
+        limits_obj = runtime.limits
+        resume_extra = {
+            "resumed": True,
+            "continuation_of": resume_bundle.continuation_identity,
+            "resumed_from_checkpoint": str(resume_from_checkpoint),
+        }
+        try:
+            auditor.emit(
+                "resume",
+                session_id,
+                task_id=context.task.task_id,
+                result="ok",
+                metadata={
+                    "continuation_of": resume_bundle.continuation_identity,
+                    "checkpoint": str(resume_from_checkpoint),
+                },
+            )
+        except Exception:
+            logger.debug("resume audit failed", exc_info=True)
     payload = state.model_dump()
     payload.update(
         {
@@ -444,6 +814,7 @@ def start_session(
             "task_id": context.task.task_id,
         }
     )
+    payload.update(resume_extra)
     return payload
 
 
@@ -468,6 +839,14 @@ def stop_session(session_id: str) -> dict[str, object]:
                 "termination_reason": None,
             }
         return _error_response(_UnknownSession(session_id))
+    # Long-running lifecycle trigger (spec section 7): checkpoint BEFORE the session
+    # ends. Best effort — a checkpoint write failure never blocks the kill path.
+    runtime = bundle.extra.get("long_running")
+    if isinstance(runtime, LongRunningRuntime):
+        try:
+            runtime.checkpoint(CheckpointTrigger.BEFORE_SESSION_END)
+        except Exception:  # durability failure must not block stopping
+            logger.debug("before_session_end checkpoint failed", exc_info=True)
     # D1/F7: shared kill-path cleanup — bundle store and registry stay consistent.
     _close_stopped_bundle(session_id, bundle, source="stop_session")
     return {
@@ -602,12 +981,20 @@ async def run_goal(
     session_id: str,
     goal: str,
     approve_next_action: bool = False,
+    auto_subtasks: bool = False,
 ) -> dict[str, object]:
     """Run the loop; approve_next_action authorizes at most one interactive action in this call.
 
     Recovery retries of the same approved action instance do not re-consume the budget;
     a new distinct action after exhaustion is denied fail-closed with ``requires_approval``.
+
+    Long-running additive (trailing optional): ``auto_subtasks=True`` switches to the
+    Multi-Subtask mode — the goal is decomposed by the LLM planner (validated
+    deterministically, fail-closed) and executed as sequential subtasks through the same
+    closed-loop executor. Callers omitting it get byte-identical single-goal behavior.
     """
+    if auto_subtasks:
+        return await _run_goal_auto_subtasks(session_id, goal, approve_next_action)
     try:
         bundle = _get_live_bundle(session_id)
     except _StoppedSession:
@@ -684,6 +1071,195 @@ async def run_goal(
         "step_count": bundle.state.step_count,
         "metrics": bundle.metrics.snapshot(),
     }
+
+
+# --- long-running session tools (SubtasksProtocol section 9; additive) ----------------------
+
+
+@mcp.tool()
+def create_subtask(
+    session_id: str,
+    description: str,
+    depends_on: list[str] | None = None,
+) -> dict[str, object]:
+    """Create one manual subtask (spec section 9); fail-closed on invalid graphs.
+
+    Validates the session, the description, and the dependency list (every dependency
+    must already exist, no self-dependency, no cycles, hard cap 50 subtasks). Works
+    without any planner/LLM key.
+    """
+    if depends_on is not None and (
+        isinstance(depends_on, (str, bytes)) or not isinstance(depends_on, (list, tuple))
+    ):
+        # Tool-boundary type gate: a non-iterable (or string) depends_on must surface as
+        # the typed fail-closed error code, never as an escaping TypeError from the MCP
+        # tool (the runtime's list() coercion would raise one).
+        return {
+            "ok": False,
+            "error": "invalid_subtask",
+            "message": "depends_on must be a list of subtask ids (or null); "
+            "refusing a non-iterable value at the tool boundary",
+        }
+    try:
+        bundle = _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    runtime = _get_or_create_runtime(bundle)
+    try:
+        subtask = runtime.create_subtask(description, depends_on)
+    except (SubtaskError, LongRunningError) as exc:
+        return _subtask_error_response(exc)
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "subtask": {
+            "subtask_id": subtask.subtask_id,
+            "description": subtask.description,
+            "status": subtask.status.value,
+            "depends_on": list(subtask.depends_on),
+            "created_at": subtask.created_at.isoformat(),
+        },
+        "total_subtasks": len(runtime.subtasks),
+    }
+
+
+@mcp.tool()
+def list_subtasks(session_id: str) -> dict[str, object]:
+    """List all subtasks with statuses as a structured, bounded response.
+
+    Each summary carries bounded scalar fields plus result/recovery COUNTS — never
+    result payloads, never history (spec section 9/19).
+    """
+    try:
+        bundle = _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    runtime = _get_or_create_runtime(bundle)
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "total": len(runtime.subtasks),
+        "counts": runtime.counts(),
+        "subtasks": runtime.list_subtasks(),
+    }
+
+
+@mcp.tool()
+async def run_subtask(
+    session_id: str,
+    subtask_id: str,
+    approve_next_action: bool = False,
+) -> dict[str, object]:
+    """Execute exactly ONE ready subtask through the existing closed-loop executor.
+
+    One bounded subtask per MCP call; state and checkpoints persist server-side between
+    calls, so no MCP connection needs to stay open for hours (spec section 9, conflict
+    C7). The subtask can never bypass safety, approval, grounding, validation, the stop
+    token, verification, recovery, or audit. ``approve_next_action`` authorizes at most
+    one interactive action in this call (run_goal budget semantics).
+    """
+    try:
+        bundle = _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    runtime = _get_or_create_runtime(bundle)
+    try:
+        outcome = await runtime.run_single_subtask(
+            subtask_id, approve_next_action=approve_next_action
+        )
+    except LimitExceeded as exc:
+        return {
+            "ok": False,
+            "error": "limit_exceeded",
+            "limit": exc.limit_name,
+            "message": str(exc),
+        }
+    except (SubtaskError, LongRunningError) as exc:
+        return _subtask_error_response(exc)
+    task = bundle.agent.task
+    results_payload: list[dict[str, object]] = []
+    for item in outcome.results:
+        results_payload.append(_redact_result_payload(item.model_dump()))
+    if task.status.value == "stopped" and session_id in _bundles:
+        # F7: an internally-armed kill path gets the SAME bundle hygiene (stop audited
+        # in-run already).
+        _close_stopped_bundle(
+            session_id, bundle, source="run_subtask_kill_path", audit_stop_events=False
+        )
+    subtask_snapshot = runtime.subtasks.get(subtask_id)
+    subtask_status = subtask_snapshot.status.value if subtask_snapshot is not None else "unknown"
+    return {
+        "ok": bool(outcome.ok),
+        "session_id": session_id,
+        "subtask_id": subtask_id,
+        "status": subtask_status,
+        "termination_reason": outcome.termination_reason,
+        "requires_approval": bool(outcome.requires_approval),
+        "stopped": bool(
+            outcome.stopped or bundle.state.stopped or task.status.value == "stopped"
+        ),
+        "results": results_payload,
+        "executed_subtasks": list(outcome.executed),
+        "approval_budget_remaining": outcome.approval_budget_remaining,
+        "detail": outcome.detail[:500],
+        "progress": runtime.progress(),
+        "metrics": bundle.metrics.snapshot(),
+    }
+
+
+@mcp.tool()
+def get_session_progress(session_id: str) -> dict[str, object]:
+    """Deterministic progress report: status, percent, counts, elapsed, counters, checkpoint.
+
+    The progress percentage is computed from subtask manager state (completed/total) —
+    never invented. The response is structured and bounded (no history dumps).
+    """
+    try:
+        bundle = _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    runtime = bundle.extra.get("long_running")
+    if not isinstance(runtime, LongRunningRuntime):
+        zero_counts = {status.value: 0 for status in SubtaskStatus}
+        budget_like = bundle.metrics.snapshot()["counters"]
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "status": bundle.context.task.status.value,
+            "task_status": bundle.context.task.status.value,
+            "goal": redact_text(str(bundle.context.task.goal or ""))[0][:2_000],
+            "continuation_of": None,
+            "total_subtasks": 0,
+            "completed_subtasks": 0,
+            "progress_percent": 0.0,
+            "counts": zero_counts,
+            "current_subtask_id": None,
+            "elapsed_seconds": round(bundle.enforcer.elapsed_seconds(), 3),
+            "resource_counters": {
+                "actions": int(budget_like.get("action_total", 0)),
+                "model_calls": int(budget_like.get("model_calls", 0)),
+                "steps": int(bundle.state.step_count),
+                "subtasks": 0,
+            },
+            "resource_limits": {
+                "max_session_seconds": bundle.limits.max_session_seconds,
+                "max_session_actions": bundle.limits.max_session_actions,
+                "max_session_model_calls": bundle.limits.max_session_model_calls,
+                "max_session_steps": bundle.limits.max_session_steps,
+                "max_subtasks": bundle.limits.max_subtasks,
+            },
+            "checkpoint": {
+                "has_checkpoint": _checkpoint_manager.has_checkpoint(session_id),
+                "last_trigger": None,
+                "last_checkpoint_at": None,
+            },
+            "replan_attempts_used": 0,
+            "replan_attempts_max": 3,
+        }
+    payload = runtime.progress()
+    payload["ok"] = True
+    payload["task_status"] = bundle.context.task.status.value
+    return payload
 
 
 def main() -> None:

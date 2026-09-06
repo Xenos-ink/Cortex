@@ -6,10 +6,14 @@ F1–F7, plus the DRAG action, the compact-change verification upgrade, and the
 move/hotkey/focus_window actions with the allowlist-gated focus pre-foreground check).
 Every rule
 below is enforced in a named module and exercised by the test suite (standard suite:
-496 passed, 7 skipped — the skips are the gated real-Windows E2E desktop tests;
+857 passed, 7 skipped — the skips are the gated real-Windows E2E desktop tests;
 `ruff check src tests benchmarks` clean at HEAD; observed on the reference machine).
 Companion documents: `README.md` (English capability statement),
 `docs/ARCHITECTURE.md` (module map, contracts, limits, audit, E2E/benchmark layout).
+§11 documents the long-running session surface (approval epochs, the unattended
+modifier, checkpoint redaction and integrity seals, resume re-verification,
+dependency/resource/allowlist enforcement, health checks); sections 1–10 are unchanged
+by that wave.
 
 ## 1. Threat model
 
@@ -372,3 +376,196 @@ lower than a human would. The compensating controls are the approval defaults
     instead of retrying blindly. The previously-focused window is **not** restored on a
     refusal; the caller re-observes actual window state and re-decides. Verification is
     deterministic window state, so a refused focus can never be reported as `verified`.
+
+## 11. Long-running sessions: new surface, same fail-closed doctrine
+
+Long-running sessions add an orchestration layer above the closed-loop executor
+(subtasks, checkpoints, resume, approval epochs, health checks). The doctrine is
+unchanged: the orchestrator executes nothing itself — every action still flows through
+the same grounding, validation (§9 allowlists), risk classification (§3), per-action
+approval, verification, and stop-checked backend — and every new failure path stops
+fail-closed. This section documents the new surface and its fail-closed behavior.
+
+### 11.1 Approval epochs
+
+Every approval in a long-running session lives inside an approval epoch that expires on
+TWO independent axes — wall-clock age (`approval_epoch_seconds`, default 1800 s = 30
+minutes, clamp 60..86400) and the count of interactive actions
+(`approval_epoch_actions`, default 50, clamp 1..1000) — whichever comes first
+(inclusive boundaries).
+
+- **`require_approval=false` is not an unlimited pass.** It is modeled as a full-scope
+  epoch: the standing grant covers interactive actions without the per-action flow, but
+  it STILL expires on both axes and dies on invalidation exactly like any other epoch.
+- **Expiry is fail-closed.** After expiry, every approval-requiring action is refused
+  with `requires_fresh_approval=True` regardless of any per-action approval; a
+  per-action approval can never resurrect a dead epoch. The caller must stop and
+  request fresh approval.
+- **Fresh approval is a NEW epoch**, issued only by an explicit human grant — in the
+  current surface, an MCP call with `approve_next_action=True`. Nothing auto-renews;
+  there is no accumulation of old grants.
+- **Material change invalidates immediately** (typed reasons): application/process
+  changed, risk escalated, goal changed, policy changed, expected environment changed.
+  A health check that turns UNSAFE also invalidates the epoch (the environment changed
+  materially) before stopping execution.
+
+### 11.2 Prolonged unattended execution (raise-only)
+
+Once a session has run without human interaction for at least one hour
+(`PROLONGED_UNATTENDED_SECONDS = 3600`, inclusive boundary), a pure runtime policy
+modifier activates:
+
+- It can only **raise** protection: `LOW` is treated as `MEDIUM`, `MEDIUM` as `HIGH`,
+  `HIGH` stays `HIGH`, `CRITICAL` stays `CRITICAL`. There is **no fifth RiskLevel** —
+  the enum is untouched — and no risk level is ever lowered for any input.
+- While active, non-routine actions (original risk `MEDIUM` and above) require a fresh
+  approval epoch, and a full-scope standing grant may not START new subtasks: the
+  boundary epoch gate holds execution with an explicit `unattended_hold` reason.
+- The only clear path is an explicit human approval call (`approve_next_action=True`),
+  which issues a fresh epoch and restarts the unattended clock. The modifier is
+  consulted at every orchestration boundary.
+
+### 11.3 Checkpoint redaction and integrity seal
+
+- Every string **value** in the checkpoint payload passes `redact_text`; if any value
+  still trips `contains_secret` after redaction, the write is **refused**
+  (`CheckpointRedactionError`) — fail-closed, before any filesystem mutation. The gate
+  runs per value rather than on the serialized JSON, so an inert
+  `[REDACTED:*]` placeholder does not falsely trip while any surviving secret-bearing
+  value blocks the write.
+- Checkpoints therefore store **no secrets**: identity fields carry session ids only;
+  screenshot payloads are never persisted (a persisted result carrying
+  `screenshot_after_base64` is rejected at validation); error text is redacted and
+  bounded; the serialized file is capped at 8 MB.
+
+**Integrity seal (tamper-evidence).** Every checkpoint is sealed with HMAC-SHA256 over a
+canonical serialization of the tamper-sensitive fields — session id, continuation chain
+(`continuation_of`), goal, current subtask id, budget counters, limits, and the subtask
+states — keyed by a per-installation random key stored at
+`<checkpoint-base>/.integrity_key` (created exclusively on first write, `O_CREAT|O_EXCL`,
+mode 0600 where the OS honors it; never inside a session directory, never logged).
+
+- **Load verifies the seal BEFORE anything restores**: a tampered or unsigned checkpoint
+  raises `CheckpointValidationError` (MCP surface: `invalid_checkpoint`) and is never
+  deleted, repaired, or partially loaded.
+- **Key loss is fail-closed, never a re-key**: a missing or replaced key file refuses
+  the load — the load path NEVER recreates the key, so a checkpoint that can no longer
+  be authenticated is refused instead of silently accepted.
+- **Deterministic ceiling cross-checks** (defense in depth behind the seal): at load,
+  `budget.subtasks ≤ limits.max_subtasks` and `budget.steps ≤ limits.max_session_steps`
+  must hold against the checkpoint's own ceilings — counter forgeries past them are
+  refused even when sealed.
+- **Honest threat model**: the seal defends the checkpoint FILE against out-of-band
+  tampering (e.g., zeroing budget counters to refill a session budget on resume). A
+  same-user/full-disk attacker who can also read or replace the key file can re-seal
+  forged state and is OUT OF SCOPE — the OS user boundary, not this mechanism, is the
+  control for that adversary. Checkpoints written before the seal existed are refused
+  by design (fail-closed).
+
+### 11.4 Resume safety
+
+`start_session(resume_from_checkpoint=…)` resumes a session as a continuation only
+after every gate below passes; any failure is a typed refusal (`invalid_checkpoint` /
+`resume_refused`) and the freshly created session is discarded — nothing partially
+restores.
+
+- **Schema/version/integrity validation**: unknown or newer schema versions are
+  rejected; structural, type, and self-consistency checks run on load (counters numeric,
+  limits **canonical** — exactly the current clamping mechanism's output, subtask graph
+  valid with no self/unknown dependencies or cycles, current subtask present in the
+  graph, bounded sizes, no screenshot payloads). A corrupt checkpoint is never deleted,
+  repaired, or partially loaded.
+- **No counter reset**: restored counters are SET to checkpoint values and are
+  monotonic (a counter already higher is never lowered); the elapsed-time anchor is
+  re-based so wall-clock gaps cannot refill the duration budget. The bundle verifies
+  restored counters EQUAL the checkpoint values before continuing.
+- **No limit enlargement**: the resumed session runs under the checkpoint's own
+  (re-clamped) limits, adopted by the enforcer and executor; canonical equality is
+  enforced at load, refusing any checkpoint whose limits the clamp would change.
+- **Environment re-verification**: the checkpoint records the expected foreground
+  process/window and the allowlists; the CURRENT environment is re-read from a real
+  backend observation and compared (casefold) before continuation. Missing current
+  identity is a mismatch, never a pass; a mismatch raises a typed refusal.
+- **Approval is never resurrected**: epoch state has deliberately no restore path —
+  the resumed session must obtain fresh approval via an explicit grant.
+
+### 11.5 Dependency enforcement
+
+- A subtask cannot start until **all** of its dependencies are `completed`:
+  `SubtaskManager.start` re-checks and raises with the unmet dependency ids (MCP surface:
+  `subtask_not_ready` + `unmet_dependencies`); the orchestrator selects work only from
+  the ready set (pending with all dependencies completed), in deterministic creation
+  order.
+- A failed subtask moves its transitive dependents (`pending`/`paused`) to `blocked`
+  automatically. A terminal-failed prerequisite can never complete, so that branch is
+  permanently unrunnable — requeueing cannot revive it. When only dead work remains and
+  the bounded replan (at most 3 planner consultations per session, replacement work
+  never depending on dead ids, deterministically validated) cannot replace it, the
+  session terminates `UNRECOVERABLE` — it never continues when correctness is unknown.
+
+### 11.6 Resource ceilings
+
+- All existing per-task limits still gate every run unchanged; the long-running layer
+  adds shared session ceilings — duration (default 4 h, max configurable 24 h), 2000
+  actions, 500 model calls, 500 steps, 50 subtasks — enforced at every subtask start and
+  orchestration boundary. Exhaustion raises a typed `SessionBudgetExceeded` (a
+  `LimitExceeded` subclass) → the existing audited, fail-closed termination.
+- Counters are **shared and monotonic**: each subtask consumes from its own fresh
+  per-task scope AND mirrors its consumption onto the session tracker, which only ever
+  grows — no subtask can reset, shrink, or refill a session counter. A run's step budget
+  is additionally capped to the REMAINING session steps, so one subtask cannot overspend
+  the shared budget.
+- Ceilings survive resume: counters are restored from the checkpoint (never zeroed or
+  refilled) and limits are the checkpoint's own re-clamped limits (never enlarged).
+- **Dry-run counter semantics (per-phase attribution)**: a completed DRY-RUN subtask
+  records `model_calls ≥ 1` but `steps == 0` and `actions == 0` — the executor's
+  dry-run short-circuit returns a stub result BEFORE `record_action()`/`step_count += 1`,
+  while every decision still consumes a model call. This is per-phase attribution, not
+  an overspend (nothing executed, so there is nothing to count); the run-state step cap
+  (`max_steps` capped to the remaining session steps) still bounds loop iterations.
+
+### 11.7 Allowlist enforcement
+
+- **No new path bypasses the existing validator.** The orchestrator performs no input
+  itself; every action of every subtask flows through the same grounding, staleness
+  validation, process/window allowlist checks (§9), risk classification, approval, and
+  verification as a direct call.
+- **`focus_window` process-binding is preserved**: a target window is resolved and
+  checked against BOTH allowlists before any foregrounding call, exactly as before;
+  the backend never runs on a disallowed target.
+- **Resume re-checks allowlists**: the checkpoint records the session's
+  `allowed_processes`/`allowed_windows`, and the current foreground process/window must
+  satisfy them before continuation (missing current identity = refusal). The resume-side
+  matcher is deliberately conservative (case-insensitive exact or trailing-`*` prefix)
+  and is a re-verification hook only — the live executor keeps its own stricter
+  machinery unchanged.
+
+### 11.8 Health checks
+
+- **Boundary-evaluated only**: no background thread, no scheduler, not a second
+  execution loop. A check runs at an orchestration boundary only when one is due
+  (default every 600 s, clamp 60..3600); the world is read exclusively through injected
+  probes bound to the real session backend, and probe failure is fail-closed data
+  (worst-case reading). A monitor without bound probes can never report `healthy`.
+- **Verdicts are routing data, never actions**: `healthy` → continue; `degraded` → one
+  bounded re-evaluation, then pause; `UNSAFE` (unexpected foreground application, or its
+  identity unavailable) → the approval epoch is invalidated and execution stops
+  (`blocked_safety` termination). The monitor holds no action executor and **never
+  auto-executes** unsafe actions; window-title drift, stale observations, or hung
+  indicators degrade rather than pass.
+
+### 11.9 Fail-closed behavior summary for the new surface
+
+| Condition | Behavior | Where |
+|---|---|---|
+| Approval epoch dead (time / actions / invalidated) | refuses every approval-requiring action with `requires_fresh_approval=True`, regardless of any per-action approval; caller must stop | `approval.authorize_action` |
+| ≥ 1 h unattended + full-scope grant | new subtasks blocked (`unattended_hold`) until a fresh explicit approval epoch | runtime epoch gate (`long_running._epoch_gate`) |
+| Checkpoint value still secret-like after redaction | write REFUSED before any disk touch; previous checkpoint intact | `checkpoint_manager._serialize` |
+| Corrupt / wrong-version / non-canonical-limits checkpoint | typed `CheckpointValidationError`; never loaded, repaired, or deleted | `checkpoint_manager.load` |
+| Checkpoint seal missing/malformed/mismatching, or integrity key missing/replaced | typed `CheckpointValidationError` → `invalid_checkpoint`; refused before any restore; file intact | `checkpoint_manager.load` |
+| Resume environment mismatch or missing current identity | typed `resume_refused`; new session discarded; nothing restored | `resume_manager.prepare`, `server.start_session` |
+| Subtask with unmet dependencies | `subtask_not_ready` (+ unmet list); never started | `subtask_manager.start` |
+| Dead dependency branch, replan exhausted | `UNRECOVERABLE` termination — no continuation with unknown correctness | `long_running.run_pending_subtasks` |
+| Session budget exhausted (duration/actions/model calls/steps/subtasks) | typed `SessionBudgetExceeded` → audited fail-closed termination | `limits.SessionBudgetTracker` |
+| Health check UNSAFE | epoch invalidated + run stops (`blocked_safety`); never auto-executes | `long_running._boundary_health` |
+| Planner unavailable or plan rejected | typed `planner_unavailable` / `plan_rejected` (+ codes); nothing created; session stays usable for manual `create_subtask` | `long_running.plan_from_llm` |

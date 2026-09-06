@@ -126,6 +126,23 @@ async def test_audit_event_types_fields_and_jsonl_conformance(
         all_events.extend(events)
 
     expected = set(get_args(AuditEventType))
+    # Additive master-mission 003 update: the long-running event types below are emitted
+    # by the orchestration layer (long_running.py) and are exercised by the dedicated
+    # long-running/resume test modules, not by this legacy single-goal scenario drive.
+    # All legacy event types remain fully required here.
+    _LONG_RUNNING_EVENT_TYPES = {
+        "subtask_created",
+        "subtask_started",
+        "subtask_completed",
+        "subtask_failed",
+        "subtask_paused",
+        "replan",
+        "checkpoint",
+        "resume",
+        "approval_epoch",
+        "health_check",
+    }
+    expected -= _LONG_RUNNING_EVENT_TYPES
     missing = expected - audit_types(all_events)
     assert not missing, f"audit event types never emitted: {sorted(missing)}"
 

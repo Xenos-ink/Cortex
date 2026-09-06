@@ -221,6 +221,17 @@ class ComputerUseAgent:
         self.suspicious_contents: dict[str, str] = {}
         self._recovery = RecoveryController(self.enforcer)
 
+    def set_enforcer(self, enforcer: LimitEnforcer) -> None:
+        """Swap the per-run limit enforcer (long-running orchestration seam, A5).
+
+        Per-subtask limits (SubtasksProtocol section 3) give each subtask a fresh
+        per-subtask budget scope; the recovery controller shares the enforcer's LIVE
+        counters, so it is rebuilt alongside. No loop phase, ordering, approval, or
+        verification semantics change — this only re-binds which counters gate a run.
+        """
+        self.enforcer = enforcer
+        self._recovery = RecoveryController(enforcer)
+
     # ------------------------------------------------------------------ audit helpers
 
     def _active_app(self, observation: Observation | None) -> str | None:

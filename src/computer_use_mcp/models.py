@@ -13,11 +13,15 @@ Conventions fixed here (binding for later waves):
 - ``VerificationResult.outcome`` is the authoritative result; ``verified`` is a derived,
   serialized property that equals ``outcome == "verified"``. ``uncertain`` is never success.
 - ``GroundedAction.risk`` is filled only by the safety classifier, never by the model.
+- ``Subtask.results`` retains at most ``SUBTASK_RESULTS_CAP`` execution results with heavy
+  payloads (screenshot base64) stripped before storage; ``MAX_SUBTASKS`` is the hard
+  per-session subtask ceiling (50).
 """
 
 from __future__ import annotations
 
 import uuid
+from collections import deque
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -87,6 +91,9 @@ class FailureClass(StrEnum):
     UNRECOVERABLE = "unrecoverable"
     LOW_CONFIDENCE = "low_confidence"
     UNKNOWN = "unknown"
+    # Additive (master-mission 003 conflict C8): a whole subtask exhausted its bounded
+    # in-subtask recovery; the orchestrator may plan a bounded replan of remaining subtasks.
+    SUBTASK_FAILED = "subtask_failed"
 
 
 class TerminationReason(StrEnum):
@@ -336,3 +343,86 @@ class AgentDecision(BaseModel):
     action: GroundedAction | None = None
     summary: str = Field(default="", max_length=1_000)
     expected_change: str | None = Field(default=None, max_length=500)
+
+
+# --- subtask domain (master-mission 003, additive; orchestration wiring is a later wave) ---
+
+#: Hard cap on subtasks per session (SubtasksProtocol section 1: strict maximum of 50).
+MAX_SUBTASKS = 50
+
+#: Bounded per-subtask retention of :class:`ExecutionResult` records (conflict C5: heavy
+#: fields such as screenshot base64 are stripped before storage; oldest records evicted).
+SUBTASK_RESULTS_CAP = 20
+
+
+class SubtaskStatus(StrEnum):
+    """Lifecycle status of one subtask (SubtasksProtocol section 1; ``paused`` included)."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    PAUSED = "paused"
+
+
+class SubtaskFailureInfo(BaseModel):
+    """Failure/recovery info retained on a failed subtask (SubtasksProtocol section 4)."""
+
+    failure_class: FailureClass | None = None
+    error: str = Field(default="", max_length=2_000)
+    recovery_attempts: int = Field(default=0, ge=0)
+    last_known_state: str = Field(default="", max_length=1_000)
+    recorded_at: datetime = Field(default_factory=_utc_now)
+
+
+class Subtask(BaseModel):
+    """One decomposed unit of work with dependencies and bounded results.
+
+    ``subtask_id`` is a stable, serializable identifier: it is preserved verbatim by
+    serialization round-trips and checkpoint restore, so dependency references never dangle.
+    ``results`` keeps at most :data:`SUBTASK_RESULTS_CAP` :class:`ExecutionResult` records
+    (newest retained); heavy payloads (``screenshot_after_base64``) must be stripped by the
+    recorder before storage — the re-wrap validator below guarantees the deque can never
+    grow past the cap, even on a restore path, so no serialization round-trip can unbound it.
+    """
+
+    subtask_id: str = Field(default_factory=_new_id, min_length=1, max_length=128)
+    description: str = Field(min_length=1, max_length=2_000)
+    status: SubtaskStatus = SubtaskStatus.PENDING
+    depends_on: list[str] = Field(default_factory=list, max_length=MAX_SUBTASKS)
+    created_at: datetime = Field(default_factory=_utc_now)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    recovery_attempts: int = Field(default=0, ge=0)
+    results: deque[ExecutionResult] = Field(
+        default_factory=lambda: deque(maxlen=SUBTASK_RESULTS_CAP),
+        max_length=SUBTASK_RESULTS_CAP,
+    )
+    failure: SubtaskFailureInfo | None = None
+
+    @model_validator(mode="after")
+    def _rebound_results(self) -> Subtask:
+        """Re-wrap ``results`` with the retention cap (validated data loses ``maxlen``)."""
+        if self.results.maxlen != SUBTASK_RESULTS_CAP:
+            self.results = deque(self.results, maxlen=SUBTASK_RESULTS_CAP)
+        return self
+
+
+class SubtaskPlanEntry(BaseModel):
+    """One validated (normalized) entry of an LLM-proposed plan.
+
+    Constructed only by the plan validator after its deterministic checks pass; pydantic
+    constraints here are the fail-closed backstop, never the primary rejection mechanism.
+    """
+
+    subtask_id: str = Field(min_length=1, max_length=128)
+    description: str = Field(min_length=1, max_length=2_000)
+    depends_on: list[str] = Field(default_factory=list, max_length=MAX_SUBTASKS)
+    status: SubtaskStatus = SubtaskStatus.PENDING
+
+
+class SubtaskPlan(BaseModel):
+    """A validated plan: at least one, at most :data:`MAX_SUBTASKS`, entries."""
+
+    entries: list[SubtaskPlanEntry] = Field(min_length=1, max_length=MAX_SUBTASKS)
