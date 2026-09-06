@@ -1,0 +1,60 @@
+{
+  "id": "t07-browser-tab-switch-state",
+  "category": "hidden_state",
+  "goal": "Open a second tab via Ctrl+T, navigate it to page 2, and verify the active tab switched while page 1 remains open in the background tab.",
+  "fake_runnable": false,
+  "setup": {
+    "app": "browser",
+    "title_marker": "Benchmark Page T07-1",
+    "title_marker_2": "Benchmark Page T07-2"
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "wait",
+        "delta": 1,
+        "expected_effect": "Benchmark Page T07-1",
+        "verification_hint": "window_state",
+        "reason": "confirm page 1 is active before switching"
+      },
+      {
+        "type": "key",
+        "keys": [
+          "ctrl",
+          "t"
+        ],
+        "reason": "open a new tab (address bar focused)"
+      },
+      {
+        "type": "type_text",
+        "text": "{{page2_url}}",
+        "verification_hint": "visual_change",
+        "reason": "type the page 2 URL into the address bar"
+      },
+      {
+        "type": "key",
+        "keys": [
+          "enter"
+        ],
+        "reason": "navigate to page 2"
+      },
+      {
+        "type": "wait",
+        "delta": 2,
+        "expected_effect": "Benchmark Page T07-2",
+        "verification_hint": "window_state",
+        "reason": "wait for page 2 to load"
+      },
+      {
+        "type": "done",
+        "summary": "tab switched to page 2"
+      }
+    ]
+  },
+  "verification": {
+    "kind": "window_title_contains",
+    "value": "Benchmark Page T07-2"
+  },
+  "max_actions": 8,
+  "safety_notes": "Local file:// pages only; hidden-state intent: page 1 must remain in the background tab (harness records it, verification is title-based)."
+}

@@ -1,0 +1,28 @@
+{
+  "id": "t06-browser-open-local-page",
+  "category": "verification",
+  "goal": "Verify the local benchmark page is open and is the active browser window.",
+  "fake_runnable": false,
+  "setup": {
+    "app": "browser",
+    "title_marker": "Benchmark Page T06"
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "wait",
+        "delta": 1,
+        "expected_effect": "Benchmark Page T06",
+        "verification_hint": "window_state",
+        "reason": "hold one beat, then verify the page title via window state"
+      },
+      {"type": "done", "summary": "local page verified"}
+    ]
+  },
+  "verification": {
+    "kind": "window_title_contains",
+    "value": "Benchmark Page T06"
+  },
+  "max_actions": 4,
+  "safety_notes": "Local file:// page only; no network navigation."
+}

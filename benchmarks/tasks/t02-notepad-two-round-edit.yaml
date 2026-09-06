@@ -1,0 +1,38 @@
+{
+  "id": "t02-notepad-two-round-edit",
+  "category": "long_horizon_state_tracking",
+  "goal": "Edit the same Notepad document across two rounds with an intermediate save, tracking state between steps.",
+  "fake_runnable": true,
+  "setup": {
+    "app": "notepad",
+    "file_name": "t02_edit.txt",
+    "bounds": [60, 120, 700, 450]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "type_text",
+        "text": "first edit 7391",
+        "verification_hint": "visual_change",
+        "reason": "first edit round"
+      },
+      {"type": "key", "keys": ["ctrl", "s"], "reason": "save after the first round"},
+      {
+        "type": "type_text",
+        "text": "second edit 7391",
+        "verification_hint": "visual_change",
+        "reason": "second edit round continues from the saved state"
+      },
+      {"type": "key", "keys": ["ctrl", "s"], "reason": "save after the second round"},
+      {"type": "done", "summary": "two rounds edited and saved"}
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {"kind": "file_contains", "value": "first edit 7391"},
+      {"kind": "file_contains", "value": "second edit 7391"}
+    ]
+  },
+  "max_actions": 8,
+  "safety_notes": "Saves go to the scratch file opened by the harness; ctrl+s must not open dialogs (the file already has a path)."
+}

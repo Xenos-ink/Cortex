@@ -1,0 +1,31 @@
+{
+  "id": "t08-notepad-save-cross-source",
+  "category": "cross_source_reasoning",
+  "goal": "Type a marker into Notepad, save it, and verify from two independent sources: the window title shows the file and the file on disk contains the marker.",
+  "fake_runnable": true,
+  "setup": {
+    "app": "notepad",
+    "file_name": "t08_cross.txt",
+    "bounds": [60, 120, 700, 450]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "type_text",
+        "text": "cross-source-marker-7391",
+        "verification_hint": "visual_change",
+        "reason": "type the marker"
+      },
+      {"type": "key", "keys": ["ctrl", "s"], "reason": "save the document to its scratch path"},
+      {"type": "done", "summary": "typed and saved"}
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {"kind": "file_contains", "value": "cross-source-marker-7391"},
+      {"kind": "window_title_contains", "value": "t08_cross"}
+    ]
+  },
+  "max_actions": 6,
+  "safety_notes": "Save goes to the scratch file opened by the harness; verification combines an on-disk source with a window-state source."
+}

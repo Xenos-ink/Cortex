@@ -1,0 +1,26 @@
+{
+  "id": "t04-calculator-decimal-entry",
+  "category": "visual_spatial_precision",
+  "goal": "Enter 70.5 in Calculator by precisely clicking small digit and decimal-point buttons.",
+  "fake_runnable": true,
+  "allowed_processes": ["win32calc.exe"],
+  "setup": {
+    "app": "calculator",
+    "bounds": [96, 96, 282, 403]
+  },
+  "provider": {
+    "steps": [
+      {"type": "click_button", "label": "7", "expected_effect": "digit 7 appears on the display", "verification_hint": "visual_change"},
+      {"type": "click_button", "label": "0", "expected_effect": "display shows 70", "verification_hint": "visual_change"},
+      {"type": "click_button", "label": ".", "expected_effect": "decimal point appended", "verification_hint": "visual_change"},
+      {"type": "click_button", "label": "5", "expected_effect": "display shows 70.5", "verification_hint": "visual_change"},
+      {"type": "done", "summary": "70.5 entered"}
+    ]
+  },
+  "verification": {
+    "kind": "calc_display_equals",
+    "value": "70.5"
+  },
+  "max_actions": 8,
+  "safety_notes": "Clicks target Calculator buttons only; the decimal point is a deliberately small target."
+}

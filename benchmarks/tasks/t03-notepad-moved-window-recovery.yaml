@@ -1,0 +1,52 @@
+{
+  "id": "t03-notepad-moved-window-recovery",
+  "category": "verification",
+  "goal": "Click into the target Notepad window and type a marker; the window moves after the first click is proposed and the runtime must recover.",
+  "fake_runnable": true,
+  "setup": {
+    "app": "notepad_two",
+    "file_name": "t03_target.txt",
+    "decoy_file": "t03_decoy.txt",
+    "bounds": [60, 120, 700, 450],
+    "decoy_bounds": [300, 200, 700, 450]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "hook_move_window",
+        "window": "target",
+        "to": [1200, 600, 420, 380],
+        "reason": "fault: move the target window after the observation, before execution"
+      },
+      {
+        "type": "click_window_center",
+        "window": "target",
+        "from_observation": true,
+        "expected_effect": "t03_target",
+        "verification_hint": "window_state",
+        "reason": "click grounded on the pre-move observation (stale)"
+      },
+      {
+        "type": "click_window_center",
+        "window": "target",
+        "expected_effect": "t03_target",
+        "verification_hint": "window_state",
+        "reason": "re-grounded click on the moved window"
+      },
+      {
+        "type": "type_text",
+        "text": "moved-window-recovered-7391",
+        "verification_hint": "visual_change",
+        "reason": "type the marker after recovery"
+      },
+      {"type": "done", "summary": "recovered from the moved window and typed"}
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {"kind": "window_text_contains", "value": "moved-window-recovered-7391"}
+    ]
+  },
+  "max_actions": 10,
+  "safety_notes": "Fault injection only moves harness-owned windows; clicks land inside harness-owned windows (never arbitrary desktop content)."
+}

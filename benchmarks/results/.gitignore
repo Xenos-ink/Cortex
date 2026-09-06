@@ -1,0 +1,4 @@
+# Generated benchmark artifacts live here; they are run outputs, not sources.
+# The harness-validation sample is committed under evidence/e2e/ instead.
+*
+!.gitignore
