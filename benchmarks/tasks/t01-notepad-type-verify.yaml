@@ -1,0 +1,28 @@
+{
+  "id": "t01-notepad-type-verify",
+  "category": "verification",
+  "goal": "Type the marker sentence into Notepad so it appears in the edit buffer.",
+  "fake_runnable": true,
+  "setup": {
+    "app": "notepad",
+    "file_name": "t01_type.txt",
+    "bounds": [60, 120, 700, 450]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "type_text",
+        "text": "benchmark-marker-7391 the quick brown fox",
+        "verification_hint": "visual_change",
+        "reason": "type the marker sentence into the focused Notepad"
+      },
+      {"type": "done", "summary": "marker typed"}
+    ]
+  },
+  "verification": {
+    "kind": "window_text_contains",
+    "value": "benchmark-marker-7391"
+  },
+  "max_actions": 4,
+  "safety_notes": "Benign typing into a scratch Notepad file only; no dialogs, no saving."
+}

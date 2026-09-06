@@ -1,0 +1,28 @@
+{
+  "id": "t05-calculator-keyboard-compute",
+  "category": "verification",
+  "goal": "Compute 7*6 in Calculator via keyboard input and verify the display shows 42.",
+  "fake_runnable": true,
+  "allowed_processes": ["win32calc.exe"],
+  "setup": {
+    "app": "calculator",
+    "bounds": [96, 96, 282, 403]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "type_text",
+        "text": "7*6=",
+        "verification_hint": "visual_change",
+        "reason": "Calculator processes keyboard arithmetic; the display changes to the result"
+      },
+      {"type": "done", "summary": "7*6 computed"}
+    ]
+  },
+  "verification": {
+    "kind": "calc_display_equals",
+    "value": "42"
+  },
+  "max_actions": 4,
+  "safety_notes": "Benign arithmetic; classic Calculator accepts keyboard operators (* and =)."
+}
