@@ -79,7 +79,7 @@ window/process identity escalate to `CRITICAL`.
 |---|---|
 | `shell_execution` | powershell, pwsh, cmd.exe, command prompt, `cmd /c`, `bash -c`, `sh -c`, invoke-expression/iex, start-process, wscript, cscript, certutil |
 | `registry_write` | `reg add/delete/import/restore/load/save`, regedit |
-| `disk_destructive` | `format X:`, diskpart, wipe disk/drive, format-volume; Arabic "تهيئة" |
+| `disk_destructive` | `format X:`, diskpart, wipe disk/drive, format-volume; the Arabic word for "format" (exact glyph tokens in safety.py, stored as unicode escapes) |
 | `file_deletion` | del/rd/rmdir/remove-item/rm/erase patterns; delete files/folders/directories |
 | `destructive_sql` | drop database/table/schema/index/view, truncate table, delete from |
 | `credential_change` | change/reset/remove password/pin/credentials; delete account/user |
@@ -106,7 +106,7 @@ window/process identity escalate to `CRITICAL`.
 | `navigation` | URL-like text, navigate to, open website/URL |
 | `file_modification` | save as, save the file, move/copy to, rename, new folder, export, overwrite, replace the file |
 | `window_identity_drift` | controller environment-note reports the active window changed identity since last validation |
-| `suspicious_delete_term` | Arabic destructive terms "حذف"/"مسح" in typed text/reason |
+| `suspicious_delete_term` | Arabic destructive terms (the words for "delete"/"erase" in Arabic script; exact glyph tokens in safety.py as unicode escapes) in typed text/reason |
 | `keyboard_shortcut_state_change` | keypress/hotkey containing delete/backspace/win/alt/ctrl |
 | `window_focus_change` | `focus_window` — the action brings a different window to the foreground (always MEDIUM; the category is assigned before the drift/routine scans so it is stable). Consequence: subsequent input could land in an unintended application |
 | `unverified_target_application` | click/double-click/drag/type when window/process identity is unknown |

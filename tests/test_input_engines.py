@@ -2,7 +2,7 @@
 
 The SendInput engine reads the module-level ``_user32`` binding at call time, so every
 test here monkeypatches ``backend_module._user32`` with a fake that records decoded
-events — the same convention as the window-identity tests. Nothing in this file
+events \u2014 the same convention as the window-identity tests. Nothing in this file
 dispatches real input on the desktop.
 
 Covered:
@@ -270,7 +270,7 @@ def test_type_text_batches_whole_string_as_unicode(fake_user32: _FakeUser32) -> 
 @WINDOWS_ONLY
 def test_type_text_arabic_string_is_layout_proof(fake_user32: _FakeUser32) -> None:
     """Arabic must not pass through any keyboard-layout remapping (Session1 bug)."""
-    arabic = "مرحبا"
+    arabic = "\u0645\u0631\u062d\u0628\u0627"
     _engine().type_text(arabic)
     assert len(fake_user32.batches) == 1
     events = fake_user32.batches[0]

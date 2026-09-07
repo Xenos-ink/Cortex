@@ -14,7 +14,7 @@ Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
 ## Unreleased
 
-(nothing yet — perf-004 shipped as v0.5.0 below.)
+(empty — v0.5.0 is the latest release, listed below.)
 
 ## v0.5.0 (2026-09-07) — RELEASED (performance & effectiveness)
 

@@ -7,9 +7,9 @@ Doctrines implemented here:
 
 - Contextual risk classification (P0-F): every action is classified LOW / MEDIUM / HIGH /
   CRITICAL from the action type + target text/coordinates + active window/process + goal
-  context — not from string matching alone (Goal.md section 11). The Goal.md section 11
+  context \u2014 not from string matching alone (Goal.md section 11). The Goal.md section 11
   list maps to HIGH or CRITICAL. Unknown or insufficient context for a potentially
-  high-risk action escalates to CRITICAL (``risk_unresolvable_fail_closed``) — fail closed.
+  high-risk action escalates to CRITICAL (``risk_unresolvable_fail_closed``) \u2014 fail closed.
 - Policy decision (P0-F): :meth:`SafetyPolicy.evaluate` preserves the legacy gates
   (stopped, step budget, keyword-secret block, approval defaults) verbatim, then merges
   the classification: ``SafetyDecision.risk`` / ``category`` / ``reason`` are filled and
@@ -19,7 +19,7 @@ Doctrines implemented here:
   screen content). ``dry_run`` semantics are untouched: a dry run never executes, and the
   decision still reports risk and approval needs.
 - Approval message quality (Goal.md section 12): every ``requires_approval`` message
-  states the action, the target location (window/process plus coordinates or text —
+  states the action, the target location (window/process plus coordinates or text \u2014
   never bare coordinates), why (risk category), the consequence, and how to approve.
 
 Screen text, model suggestions, and fake "approvals" can never downgrade a decision here:
@@ -284,11 +284,11 @@ _MEDIUM_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 #: Arabic destructive terms (Goal.md section 11 multilingual note): delete/wipe. Their
-#: presence in typed text or reason is suspicious — at least MEDIUM; command patterns
+#: presence in typed text or reason is suspicious \u2014 at least MEDIUM; command patterns
 #: above still escalate to CRITICAL when they also match.
-_SUSPICIOUS_ARABIC_TERMS: tuple[str, ...] = ("حذف", "مسح")
-#: Arabic for "format" (disk formatting) — destructive on its own.
-_CRITICAL_ARABIC_TERMS: tuple[str, ...] = ("تهيئة",)
+_SUSPICIOUS_ARABIC_TERMS: tuple[str, ...] = ("\u062d\u0630\u0641", "\u0645\u0633\u062d")
+#: Arabic for "format" (disk formatting) \u2014 destructive on its own.
+_CRITICAL_ARABIC_TERMS: tuple[str, ...] = ("\u062a\u0647\u064a\u0626\u0629",)
 
 #: Human-readable "why" per category (used verbatim in approval/block messages).
 _CATEGORY_WHY: dict[str, str] = {
@@ -377,7 +377,7 @@ def _clip(text: str, limit: int = _MAX_TEXT_SNIPPET) -> str:
     cleaned = " ".join(text.split())
     if len(cleaned) <= limit:
         return cleaned
-    return cleaned[: limit - 1] + "…"
+    return cleaned[: limit - 1] + "\u2026"
 
 
 class SafetyPolicy:
@@ -590,7 +590,7 @@ class SafetyPolicy:
         return kind
 
     def _describe_target(self, action: GroundedAction, ctx: SafetyContext) -> str:
-        """Target location: application identity plus coordinates/text — never bare coordinates."""
+        """Target location: application identity plus coordinates/text \u2014 never bare coordinates."""
         identity = ctx.describe_identity()
         if action.action in {ActionType.CLICK, ActionType.DOUBLE_CLICK} and action.point is not None:
             return f"{identity}, at screenshot coordinates (x={action.point.x}, y={action.point.y})"
@@ -618,7 +618,7 @@ class SafetyPolicy:
         return (
             f"Action: {self._describe_action(action)}. "
             f"Target: {self._describe_target(action, ctx)}. "
-            f"Why: risk category {category!r} — {why}. "
+            f"Why: risk category {category!r} \u2014 {why}. "
             f"Risk level: {risk.value}. "
             f"Consequence: {self._consequence_for(risk, category)} "
             + _HOW_TO_APPROVE
@@ -628,7 +628,7 @@ class SafetyPolicy:
         risk = RiskLevel.CRITICAL
         return (
             "BLOCKED pending explicit authorization. "
-            f"Action risk category {category!r} — {why}. "
+            f"Action risk category {category!r} \u2014 {why}. "
             f"Target: {ctx.describe_identity()}. "
             f"Risk level: {risk.value}. "
             f"Consequence: {self._consequence_for(risk, category)} "

@@ -1,6 +1,6 @@
 # ROADMAP
 
-هذا الملف هو سجل العمل المخطَّط لمشروع Cortex: ما الذي يُنفَّذ في كل إصدار قادم — للمالك أو لأي وكيل ذكاء اصطناعي سيتابع التنفيذ.
+This file is the planned-work ledger for Cortex: what ships in each upcoming version — written for the owner and for any AI agent continuing the work.
 
 ## Purpose and scope
 
