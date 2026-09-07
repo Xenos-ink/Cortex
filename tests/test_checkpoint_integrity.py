@@ -392,7 +392,12 @@ async def test_dry_run_consumes_model_calls_but_no_step_or_action_counters(
         ]
     )
     session_id, _bundle, _backend, _ = make_session(
-        monkeypatch, provider=provider, limits=FAST_LIMITS, require_approval=False
+        monkeypatch,
+        provider=provider,
+        limits=FAST_LIMITS,
+        require_approval=False,
+        dry_run=True,  # PERF-004 C5: the start_session default flipped to False; this
+        # test deliberately exercises the dry-run short-circuit, so it opts in.
     )
     created = server.create_subtask(session_id=session_id, description="dry-run work")
     outcome = await server.run_subtask(

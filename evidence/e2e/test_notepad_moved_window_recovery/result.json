@@ -1,0 +1,152 @@
+{
+  "test": "test_notepad_moved_window_recovery",
+  "run_id": "20260907-185134",
+  "outcome": "passed",
+  "elapsed_ms": 2179.3,
+  "error": null,
+  "assertions": [
+    "[PASS] window actually moved between propose and execute \u2014 {'hook': 'move_window', 'before': (60, 120, 700, 450), 'after': (1200, 600, 420, 380)}",
+    "[PASS] stale click's verification FAILED (semantic, not pixel)",
+    "[PASS] bounded recovery classified and re-decided \u2014 ['wrong_window']",
+    "[PASS] task completed; marker only in the target window"
+  ],
+  "notes": [
+    "Window-bounds-only moves do NOT trip STALE_OBSERVATION (identity checks are hwnd/pid/process/monitor/dimensions/coordinate-space); the semantic verification layer is what catches the miss \u2014 documented runtime behavior."
+  ],
+  "recorded_events": [
+    {
+      "event": "observe_before",
+      "at": "2026-09-07T18:51:46.756627+00:00",
+      "observation_id": "997c935dcd814ae695b87fe477cd446f",
+      "active_app": "notepad.exe",
+      "window": {
+        "hwnd": 929170656,
+        "pid": 10356,
+        "process_name": "notepad.exe",
+        "exe_path": "C:\\Windows\\System32\\notepad.exe",
+        "window_class": "Notepad",
+        "title": "moved.txt - Notepad",
+        "bounds": [
+          60,
+          120,
+          700,
+          450
+        ]
+      },
+      "coordinate_space": "verified_passthrough"
+    },
+    {
+      "event": "run_goal",
+      "at": "2026-09-07T18:51:47.797630+00:00",
+      "ok": true,
+      "termination": "completed",
+      "steps": 3
+    },
+    {
+      "event": "observe_after",
+      "at": "2026-09-07T18:51:47.917728+00:00",
+      "observation_id": "58e7a83eed8f43e2937867e33a7f4547",
+      "active_app": "notepad.exe",
+      "window": {
+        "hwnd": 929170656,
+        "pid": 10356,
+        "process_name": "notepad.exe",
+        "exe_path": "C:\\Windows\\System32\\notepad.exe",
+        "window_class": "Notepad",
+        "title": "*moved.txt - Notepad",
+        "bounds": [
+          1200,
+          600,
+          420,
+          380
+        ]
+      },
+      "coordinate_space": "verified_passthrough"
+    }
+  ],
+  "extra": {
+    "recovery_classes": [
+      "wrong_window"
+    ],
+    "provider_fault_log": [
+      {
+        "hook": "move_window",
+        "before": [
+          60,
+          120,
+          700,
+          450
+        ],
+        "after": [
+          1200,
+          600,
+          420,
+          380
+        ]
+      }
+    ],
+    "metrics": {
+      "counters": {
+        "task_started": 1,
+        "task_completed": 1,
+        "task_failed": 0,
+        "action_total": 3,
+        "action_success": 3,
+        "action_failure": 0,
+        "verification_verified": 2,
+        "verification_failed": 1,
+        "verification_uncertain": 0,
+        "grounding_failure": 0,
+        "safety_block": 0,
+        "approval_requested": 0,
+        "approval_granted": 0,
+        "approval_denied": 0,
+        "retry_total": 0,
+        "recovery_total": 1,
+        "recovery_success": 0,
+        "model_calls": 4,
+        "screenshot_count": 8,
+        "observation_reuse": 3
+      },
+      "latencies": {
+        "observation_ms": {
+          "count": 7,
+          "avg_ms": 99.95528566651046,
+          "p50_ms": 98.61019998788834,
+          "p95_ms": 133.84574993979186,
+          "max_ms": 140.691899927333
+        },
+        "model_ms": {
+          "count": 4,
+          "avg_ms": 3.554350056219846,
+          "p50_ms": 0.12005004100501537,
+          "p95_ms": 11.886975110974157,
+          "max_ms": 13.957800110802054
+        },
+        "execution_ms": {
+          "count": 3,
+          "avg_ms": 100.28890000345807,
+          "p50_ms": 10.118899866938591,
+          "p95_ms": 254.30699002463368,
+          "max_ms": 281.4390000421554
+        },
+        "verification_ms": {
+          "count": 3,
+          "avg_ms": 0.18480008778472742,
+          "p50_ms": 0.07440010085701942,
+          "p95_ms": 0.3943501273170113,
+          "max_ms": 0.42990013025701046
+        },
+        "task_ms": {
+          "count": 1,
+          "avg_ms": 1038.5098000988364,
+          "p50_ms": 1038.5098000988364,
+          "p95_ms": 1038.5098000988364,
+          "max_ms": 1038.5098000988364
+        }
+      }
+    },
+    "audit_event_count": 35
+  },
+  "finished_at": "2026-09-07T18:51:48.257627+00:00"
+}

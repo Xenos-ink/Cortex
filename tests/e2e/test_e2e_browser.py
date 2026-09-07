@@ -9,8 +9,13 @@ identity verification from observation fields, no OCR, no pixel diff.
 
 Environment notes (probed live): the Edge window carries a profile suffix
 ("... - Work - Microsoft Edge"), so verification uses contains-matching against the unique
-page marker. The launcher PID owns the browser window on this box, so cleanup kills the
-launched process tree only after first trying a polite WM_CLOSE.
+page marker. Window ownership (A8 regression wave): when an Edge instance is ALREADY
+running on the box (host-session browser), the launched process hands the URL off to the
+existing singleton and exits, so the new window is NOT owned by the launcher PID. The
+arrangement therefore waits on the UNIQUE per-run page-title marker (never on the
+launcher PID alone) and identity is asserted against the window's REAL owning pid read
+via Win32. Cleanup closes exactly the hwnd found and kills only the launched tree (a
+handoff launcher is already dead or a childless stub — never the user's browser).
 """
 
 from __future__ import annotations
@@ -63,14 +68,14 @@ def edge_app(deadline: w32.Deadline, page_url: str):
     )
     hwnd: int | None = None
     try:
-        hwnd = w32.wait_for_window(
-            deadline, pid=proc.pid, title_needle=PAGE_TITLE_MARKER, timeout_s=45.0
-        )
+        # Unique per-run page marker, NOT the launcher pid: with an Edge singleton
+        # already running, the launcher hands off and exits before the window opens.
+        hwnd = w32.wait_for_window(deadline, title_needle=PAGE_TITLE_MARKER, timeout_s=45.0)
         yield proc, hwnd
     finally:
         if hwnd is not None:
             w32.close_window(hwnd, wait_s=8.0)
-        if proc.poll() is None:  # launcher still alive: it owns the window we opened
+        if proc.poll() is None:  # launcher still alive (no handoff): our tree, kill it
             w32.kill_process_tree(proc.pid)
 
 
@@ -88,7 +93,7 @@ def test_browser_local_page_window_state_verification(
         encoding="utf-8",
     )
     page_url = "file:///" + str(page_path).replace("\\", "/")
-    with edge_app(deadline, page_url) as (proc, hwnd):
+    with edge_app(deadline, page_url) as (_proc, hwnd):
         provider = rt.E2EScriptedProvider(
             [
                 rt.step(
@@ -109,12 +114,15 @@ def test_browser_local_page_window_state_verification(
             # The hosting console can steal foreground during fixture setup; make the
             # identity observation deterministic by explicitly focusing the browser.
             assert w32.focus_window(hwnd), "could not focus the Edge window"
-            observation = server.computer_observe(session_id)["observation"]
+            observation = w32.observe_tool_metadata(server.computer_observe(session_id))["observation"]
             info = observation["active_window_info"]
             if evidence is not None:
                 evidence.save_observation("before", observation)
             assert info["process_name"] == "msedge.exe", info
-            assert info["pid"] == proc.pid, (info["pid"], proc.pid)
+            # Identity is asserted against the window's REAL owning pid (ground truth by
+            # construction): with a pre-running Edge singleton the owner is the browser
+            # process, not the short-lived launcher.
+            assert info["pid"] == w32.window_pid(hwnd), (info["pid"], w32.window_pid(hwnd))
             assert info["hwnd"] == hwnd, (info["hwnd"], hwnd)
             assert PAGE_TITLE_MARKER in info["title"], info
             assert observation["coordinate_space"] == "verified_passthrough", observation
@@ -148,7 +156,7 @@ def test_browser_local_page_window_state_verification(
                 evidence.add_extra("verification", verification)
                 evidence.save_audit(bundle, session_id)
                 evidence.save_observation(
-                    "after", server.computer_observe(session_id)["observation"]
+                    "after", w32.observe_tool_metadata(server.computer_observe(session_id))["observation"]
                 )
         finally:
             server.stop_session(session_id)

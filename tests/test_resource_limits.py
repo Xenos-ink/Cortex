@@ -213,6 +213,14 @@ async def test_per_task_recovery_budget_exhaustion_terminates_safely(
 async def test_screenshot_rate_gate_trips_after_controller_wait_ceiling(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """PERF-004 C2 refined gate semantics: fresh observations stay protected.
+
+    The in-loop action cycle is gate-free under observe reuse (C1) + intra-step burst
+    exemption (a multi-step task COMPLETES under a 60s interval — previously it tripped
+    at the second capture). The gate still binds fail-closed on host-driven observes:
+    the ``computer_execute`` direct_request capture arrives within the interval, waits
+    past the 2s controller ceiling, and terminates with an audited ``limit_exceeded``.
+    """
     provider = ScriptedProvider([make_click(10, 10), AgentDecision(status="done")])
     session_id, bundle, backend, _ = make_session(
         monkeypatch, provider=provider, dry_run=False, require_approval=False,
@@ -220,10 +228,21 @@ async def test_screenshot_rate_gate_trips_after_controller_wait_ceiling(
     )
     response = await server.run_goal(session_id, "rate limited")
 
-    assert response["termination_reason"] == "limit_exceeded"
-    assert "Screenshot rate budget exhausted" in response["results"][-1]["message"]
-    assert executed_summary(backend) == []  # the gate tripped before any action executed
-    assert bundle.metrics.snapshot()["counters"]["screenshot_count"] == 1
+    # The in-loop cycle paid NO gate wait: one action executed, the task completed.
+    assert response["termination_reason"] == "completed"
+    assert len(executed_summary(backend)) == 1
+    counters = bundle.metrics.snapshot()["counters"]
+    # Step 1: loop_top + validate probe + post_action; step 2: reuse (no capture).
+    assert counters["screenshot_count"] == 3
+    # Intra-step burst-exempt captures: exactly the validate probe + post_action.
+    assert bundle.enforcer.snapshot()["burst_screenshots"] == 2
+
+    # The host-driven observe path is STILL gated: this capture is far inside the
+    # 60s interval, waits past the 2s ceiling, and fails closed.
+    limited = await server.computer_execute(session_id, "wait", delta=1)
+    assert limited["ok"] is False
+    assert limited["error"] == "limit_exceeded"
+    assert limited["limit"] == "min_screenshot_interval_ms"
     events = limit_events(bundle, session_id)
     assert events and events[-1]["metadata"]["limit"] == "min_screenshot_interval_ms"
 

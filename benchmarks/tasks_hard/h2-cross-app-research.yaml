@@ -1,0 +1,86 @@
+{
+  "id": "h2-cross-app-research",
+  "title": "Cross-app research: read facts in Edge, transcribe 3 into Notepad, save .txt",
+  "category": "cross_source_reasoning",
+  "fake_runnable": false,
+  "prompt": "Research task across two applications. 1) Open Microsoft Edge and navigate to the local page file:///C:/Users/localadmin/Desktop/cortex-bench/t2_facts.html. 2) Find these three facts on the page: the asset tag of the primary node, the firmware version deployed on the primary node, and the IP address of the backup node. 3) Open a NEW Notepad document (Notepad must not be pre-opened with the target file) and write exactly three lines, one per fact, in this format:\nasset: <asset tag>\nfirmware: <firmware version>\nbackup_ip: <backup node IP>\n4) Save the Notepad document as a plain text file at exactly C:\\Users\\localadmin\\Desktop\\cortex-bench\\t2_out_facts.txt (Save As, plain text). Leave both Edge and the Notepad window showing the saved file open when you are done.",
+  "goal": "Open a local research page in Edge, extract three specified facts, transcribe them into a new Notepad document in a fixed format, and save it as a given .txt path.",
+  "setup": {
+    "app": "browser+notepad",
+    "real_world_only": true,
+    "fixtures": [
+      "t2_facts.html"
+    ],
+    "outputs": [
+      "~/Desktop/cortex-bench/t2_out_facts.txt"
+    ]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "done",
+        "summary": "real-world task; executed by a driver agent via score_task.py flow, not by the scripted provider"
+      }
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {
+        "kind": "file_contains",
+        "value": "NX-7391-ALPHA"
+      },
+      {
+        "kind": "window_title_contains",
+        "value": "t2_out_facts"
+      }
+    ]
+  },
+  "predicates": [
+    {
+      "name": "output_file_exists",
+      "kind": "file_exists",
+      "path": "~/Desktop/cortex-bench/t2_out_facts.txt"
+    },
+    {
+      "name": "output_written_during_run",
+      "kind": "file_fresh",
+      "path": "~/Desktop/cortex-bench/t2_out_facts.txt"
+    },
+    {
+      "name": "three_facts_present",
+      "kind": "text_contains_normalized",
+      "path": "~/Desktop/cortex-bench/t2_out_facts.txt",
+      "needles": [
+        "asset: NX-7391-ALPHA",
+        "firmware: 4.2.117-RC9",
+        "backup_ip: 10.42.7.19"
+      ]
+    },
+    {
+      "name": "notepad_title_matches",
+      "kind": "window_title_contains",
+      "needle": "t2_out_facts.txt",
+      "class": "Notepad"
+    }
+  ],
+  "human_reference": {
+    "primary": "scripted_cadence",
+    "seconds": 66.28,
+    "calibration": {
+      "fitts_click_s": 0.6,
+      "char_s": 0.22,
+      "dialog_wait_s": 1.0,
+      "cognitive_allowance_s": 20,
+      "actions": "1 browser cold start+navigation, ~120 typed chars, 1 save-as dialog, page-reading allowance"
+    },
+    "method_log": "Replayed live (Edge cold start to the local page + untitled Notepad, facts typed, ctrl+s Save As at calibrated cadence). Self-check: file contains all 3 facts, window title 't2_out_facts.txt - Notepad'. Superseded by real human runs when performed."
+  },
+  "anti_gaming": "The three facts are scattered across different page regions (table, body paragraphs, footer) so single-glance copying is not possible; the normalized-content predicate accepts any punctuation/spacing but rejects wrong or missing values. Window-title predicate is checked against the real window list, not driver claims. output_written_during_run fails files that pre-date the run.",
+  "allowed_processes": [
+    "msedge.exe",
+    "notepad.exe",
+    "explorer.exe"
+  ],
+  "max_actions": 400,
+  "safety_notes": "Local file URL only (no network browsing), new file creation inside the dedicated Desktop\\cortex-bench bench area."
+}

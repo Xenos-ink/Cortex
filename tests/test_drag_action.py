@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 from PIL import Image
 from pydantic import ValidationError
+from recording_engine import RecordingEngine
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp import server
@@ -90,42 +91,6 @@ class _CountingStopToken(StopToken):
     def ensure_live(self) -> None:
         self.checks += 1
         super().ensure_live()
-
-
-class _RecordingPyautogui:
-    """Minimal pyautogui stand-in recording every input call (no real mouse movement)."""
-
-    FailSafeException = type("FailSafeException", (Exception,), {})
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[object, ...]] = []
-        self.down = False
-
-    def _record(self, name: str, *args: object) -> None:
-        self.calls.append((name, *args))
-
-    def moveTo(self, x: int, y: int) -> None:
-        self._record("moveTo", x, y)
-
-    def mouseDown(self, button: str = "left") -> None:
-        self.down = True
-        self._record("mouseDown", button)
-
-    def mouseUp(self, button: str = "left") -> None:
-        self.down = False
-        self._record("mouseUp", button)
-
-    def click(self, *args: object, **kwargs: object) -> None:
-        self._record("click", *args)
-
-    def write(self, *args: object, **kwargs: object) -> None:
-        self._record("write", *args)
-
-    def hotkey(self, *args: object, **kwargs: object) -> None:
-        self._record("hotkey", *args)
-
-    def scroll(self, *args: object, **kwargs: object) -> None:
-        self._record("scroll", *args)
 
 
 def _png(color: str, width: int, height: int) -> str:
@@ -273,58 +238,94 @@ def test_fake_drag_input_blocked_records_nothing() -> None:
     assert backend.drags == []
 
 
-# --- LocalComputerBackend (real path, stubbed pyautogui): stop + release guarantees -------------
+# --- LocalComputerBackend (real path, stubbed input engine): stop + release guarantees ------------
 
 
 @WINDOWS_ONLY
 def test_real_drag_prestopped_token_performs_zero_inputs(
     real_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    recorder = _RecordingPyautogui()
-    monkeypatch.setattr(real_backend, "_pyautogui", recorder)
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
     stop = StopToken()
     stop.stop()
     with pytest.raises(TaskStopped):
         real_backend.execute(drag((10, 10), (110, 60)), stop=stop)
-    assert recorder.calls == []
+    assert engine.calls == []
 
 
 @WINDOWS_ONLY
-def test_real_drag_full_sequence_move_then_down_then_segments_then_up(
+def test_real_drag_minimal_stroke_move_down_move_up(
     real_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    recorder = _RecordingPyautogui()
-    monkeypatch.setattr(real_backend, "_pyautogui", recorder)
+    """Default SendInput policy: move-press-move-release with a single segment."""
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
     monkeypatch.setattr(real_backend, "_active_context", None)  # passthrough transform
     message = real_backend.execute(drag((10, 10), (100, 60)))
     assert message == "Executed drag."
+    assert engine.calls == [
+        ("move", 10, 10),
+        ("mouse_down", "left"),
+        ("move", 100, 60),  # stroke ends exactly at the drag end point
+        ("mouse_up", "left"),
+    ]
+
+
+@WINDOWS_ONLY
+def test_real_drag_interpolated_option_draws_waypoints(
+    real_backend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drag interpolation option restores the ~40 px stroke (legacy parity)."""
+    engine = RecordingEngine(drag_interpolate=True)
+    monkeypatch.setattr(real_backend, "_engine", engine)
+    monkeypatch.setattr(real_backend, "_active_context", None)
+    real_backend.execute(drag((10, 10), (100, 60)))
     waypoints = backend_module._drag_segment_points((10, 10), (100, 60))
     assert len(waypoints) == 4  # ~40 px segments with a floor of 4
-    assert waypoints[-1] == (100, 60)  # stroke ends exactly at the drag end point
-    assert recorder.calls == [
-        ("moveTo", 10, 10),
-        ("mouseDown", "left"),
-        *[("moveTo", x, y) for x, y in waypoints],
-        ("mouseUp", "left"),
+    assert waypoints[-1] == (100, 60)
+    assert engine.calls == [
+        ("move", 10, 10),
+        ("mouse_down", "left"),
+        *[("move", x, y) for x, y in waypoints],
+        ("mouse_up", "left"),
     ]
 
 
 @WINDOWS_ONLY
 def test_real_drag_mid_stroke_stop_releases_button(real_backend, monkeypatch: pytest.MonkeyPatch) -> None:
-    recorder = _RecordingPyautogui()
-    monkeypatch.setattr(real_backend, "_pyautogui", recorder)
-    monkeypatch.setattr(real_backend, "_active_context", None)  # passthrough transform
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
+    monkeypatch.setattr(real_backend, "_active_context", None)
+    stop = _StopOnNthCheck(4)  # header, pre-move, pre-down pass; fires before the segment move
+    with pytest.raises(TaskStopped):
+        real_backend.execute(drag((10, 10), (200, 200)), stop=stop)
+    assert engine.calls == [
+        ("move", 10, 10),
+        ("mouse_down", "left"),
+        ("mouse_up", "left"),  # released by the finally guard despite the stop
+    ]
+    assert engine.down is False
+
+
+@WINDOWS_ONLY
+def test_real_drag_interpolated_mid_stroke_stop_releases_button(
+    real_backend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = RecordingEngine(drag_interpolate=True)
+    monkeypatch.setattr(real_backend, "_engine", engine)
+    monkeypatch.setattr(real_backend, "_active_context", None)
     stop = _StopOnNthCheck(6)  # fires before the third of five stroke segments
     with pytest.raises(TaskStopped):
         real_backend.execute(drag((10, 10), (200, 200)), stop=stop)
     waypoints = backend_module._drag_segment_points((10, 10), (200, 200))
-    assert recorder.calls == [
-        ("moveTo", 10, 10),
-        ("mouseDown", "left"),
-        *[("moveTo", x, y) for x, y in waypoints[:2]],
-        ("mouseUp", "left"),  # released by the finally guard despite the stop
+    assert engine.calls == [
+        ("move", 10, 10),
+        ("mouse_down", "left"),
+        *[("move", x, y) for x, y in waypoints[:2]],
+        ("mouse_up", "left"),  # released by the finally guard despite the stop
     ]
-    assert recorder.down is False
+    assert engine.down is False
 
 
 # --- grounding: drag is a spatial coordinate action (both endpoints) ----------------------------

@@ -1,0 +1,93 @@
+{
+  "width": 1920,
+  "height": 1080,
+  "active_window": "E2E Browser Verification Page 7391 - Work - Microsoft\u200b Edge",
+  "cursor_x": 682,
+  "cursor_y": 934,
+  "input_width": 1920,
+  "input_height": 1080,
+  "coordinate_scale_x": 1.0,
+  "coordinate_scale_y": 1.0,
+  "coordinate_space_verified": true,
+  "redactions_applied": false,
+  "observation_id": "8ee68474402d45c9939dd573ff5242aa",
+  "timestamp": "2026-09-07T18:51:39.124141Z",
+  "coordinate_space": "verified_passthrough",
+  "monitor": {
+    "id": "monitor-0",
+    "index": 0,
+    "bounds": [
+      0,
+      0,
+      1920,
+      1080
+    ],
+    "is_primary": true,
+    "dpi_scale_x": 1.25,
+    "dpi_scale_y": 1.25
+  },
+  "active_window_info": {
+    "hwnd": 268437794,
+    "pid": 20948,
+    "process_name": "msedge.exe",
+    "exe_path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "window_class": "Chrome_WidgetWin_1",
+    "title": "E2E Browser Verification Page 7391 - Work - Microsoft\u200b Edge",
+    "bounds": [
+      -9,
+      -9,
+      1938,
+      1048
+    ]
+  },
+  "ocr_text": [
+    {
+      "text": "E",
+      "x": 0,
+      "y": 0,
+      "width": 1938,
+      "height": 1048,
+      "confidence": null
+    },
+    {
+      "text": "C",
+      "x": 5,
+      "y": 100,
+      "width": 1910,
+      "height": 925,
+      "confidence": null
+    }
+  ],
+  "ui_elements": [
+    {
+      "name": "E",
+      "control_type": "Chrome_WidgetWin_1",
+      "automation_id": null,
+      "value": "E",
+      "offscreen": false,
+      "rect": [
+        -9.0,
+        -9.0,
+        1938.0,
+        1048.0
+      ],
+      "focused": true,
+      "source": "win32"
+    },
+    {
+      "name": "C",
+      "control_type": "Chrome_RenderWidgetHostHWND",
+      "automation_id": null,
+      "value": null,
+      "offscreen": false,
+      "rect": [
+        5.0,
+        100.0,
+        1910.0,
+        925.0
+      ],
+      "focused": false,
+      "source": "win32"
+    }
+  ]
+}

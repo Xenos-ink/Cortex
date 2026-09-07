@@ -1,0 +1,64 @@
+{
+  "id": "h3-precision-drawing",
+  "title": "Precision drawing in mspaint: filled rectangle at exact canvas coordinates",
+  "category": "visual_spatial_precision",
+  "fake_runnable": false,
+  "prompt": "Drawing precision task. 1) Open mspaint and maximize its window (do not zoom the canvas; keep it at 100%). 2) Select the rectangle shape tool. 3) Draw a single rectangle on the canvas whose top-left corner is at canvas coordinate (100, 100) and whose bottom-right corner is at canvas coordinate (300, 220). Canvas coordinates are measured from the top-left corner of the white drawing canvas itself (not the window). 4) Make the rectangle SOLID (filled interior, not an outline): either choose Shape Fill > Solid color before drawing, or fill the interior afterwards with the fill-with-color (bucket) tool using Color 1 (the default black). Do not draw anything else and do not save. Leave mspaint open and the filled rectangle visible when you are done.",
+  "goal": "In mspaint (maximized), use the rectangle tool with solid fill to draw one filled rectangle from canvas coordinate (100,100) to (300,220).",
+  "setup": {
+    "app": "mspaint",
+    "real_world_only": true,
+    "fixtures": [],
+    "outputs": []
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "done",
+        "summary": "real-world task; executed by a driver agent via score_task.py flow, not by the scripted provider"
+      }
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {
+        "kind": "window_title_contains",
+        "value": "Paint"
+      }
+    ]
+  },
+  "predicates": [
+    {
+      "name": "filled_rectangle_at_target",
+      "kind": "paint_rect_analysis",
+      "window_class": "MSPaintApp",
+      "target": [
+        100,
+        100,
+        300,
+        220
+      ],
+      "tolerance_px": 12,
+      "min_fill_fraction": 0.6
+    }
+  ],
+  "human_reference": {
+    "primary": "scripted_cadence",
+    "seconds": 11.87,
+    "calibration": {
+      "fitts_click_s": 0.6,
+      "char_s": 0.22,
+      "dialog_wait_s": 1.0,
+      "cognitive_allowance_s": 0,
+      "actions": "1 cold start, 3 ribbon clicks, 1 drag stroke, maximize"
+    },
+    "method_log": "Replayed live (real backend clicks at live-verified ribbon coordinates + drag stroke; canvas origin measured with the scorer's own detector before drawing; final bbox within +/-2 px, fill 1.0). Includes 5 s perceptual allowance for locating the canvas origin. Superseded by real human runs when performed."
+  },
+  "anti_gaming": "The scorer takes its own screenshot of the real mspaint window, locates the white canvas region, computes the bounding box of the drawn shape, and compares it to the target within a stated +/-12 px tolerance; an outline-only rectangle fails the fill-fraction check. Nothing is taken from driver self-report. The prompt does not reveal how scoring is computed.",
+  "allowed_processes": [
+    "mspaint.exe",
+    "explorer.exe"
+  ],
+  "max_actions": 120,
+  "safety_notes": "Fresh untitled mspaint session; nothing is saved to disk, no existing files touched."
+}

@@ -48,10 +48,13 @@ from computer_use_mcp.verification import (
     ProcessStateStrategy,
     ScreenshotDiffStrategy,
     TextPredicateStrategy,
+    UiControlTextStrategy,
     VerificationEngine,
     VerificationIntent,
     VerificationKind,
     WindowStateStrategy,
+    deterministic_tiers,
+    ocr_text_verification_enabled,
 )
 
 
@@ -730,7 +733,10 @@ def test_engine_first_definitive_outcome_wins() -> None:
     assert result.observation_id == after.observation_id
 
 
-def test_engine_combines_all_uncertain_evidence() -> None:
+def test_engine_combines_all_uncertain_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    # T8 B2: the OCR text-predicate tier is opt-in (CORTEX_OCR_TEXT_VERIFICATION);
+    # this test exercises the full chain INCLUDING that last-resort tier.
+    monkeypatch.setenv("CORTEX_OCR_TEXT_VERIFICATION", "1")
     engine = VerificationEngine()
     before, after = _observation("white"), _observation("white", ocr=None, active_window=None)
     result = engine.verify(
@@ -850,3 +856,134 @@ def test_screenshot_diff_stability_fails_on_compact_change() -> None:
         VerificationIntent(kind=VerificationKind.VISUAL_CHANGE, expected_change=False), before, after
     )
     assert result.outcome == "failed" and result.changed is True
+
+
+# --- T8 anomaly-B2 regression: expected-text ladder without OCR ------------------------------
+# On the measurement machine (Windows Server 2022) the OCR text regions were garbage and
+# every type action false-failed. The B2 fix makes window-title + UI-control text the
+# default expected-text evidence, demotes OCR to an opt-in last resort, and routes a
+# text-uncertain verdict to the reliable pixel-diff tier instead of failing.
+
+
+def test_ui_control_text_strategy_verifies_via_window_title() -> None:
+    strategy = UiControlTextStrategy()
+    after = _observation(window=_window(title="notepad - Notepad"), active_window="notepad - Notepad")
+    result = strategy.verify(
+        VerificationIntent(kind=VerificationKind.EXPECTED_TEXT, expected_text="notepad"),
+        _observation(),
+        after,
+    )
+    assert result.outcome == "verified"
+    assert result.verification_method == "ui_control_text"
+    assert "window title" in result.note
+
+
+def test_ui_control_text_strategy_verifies_via_ui_control_value() -> None:
+    strategy = UiControlTextStrategy()
+    after = _observation(
+        ui_elements=[
+            {"name": "Editor", "control_type": "Edit", "value": "typed line 123", "focused": True},
+        ],
+    )
+    result = strategy.verify(
+        VerificationIntent(kind=VerificationKind.EXPECTED_TEXT, expected_text="line 123"),
+        _observation(),
+        after,
+    )
+    assert result.outcome == "verified"
+    assert "UI control text" in result.note
+
+
+def test_ui_control_text_never_fails_on_absence_b2_contract() -> None:
+    """Typed content invisible to title/controls must be UNCERTAIN — never a false fail."""
+    strategy = UiControlTextStrategy()
+    result = strategy.verify(
+        VerificationIntent(kind=VerificationKind.EXPECTED_TEXT, expected_text="absent text"),
+        _observation(),
+        _observation(ui_elements=[{"name": "Sheet1", "control_type": "Custom"}]),
+    )
+    assert result.outcome == "uncertain"
+    assert result.verified is False
+
+
+def test_ocr_text_predicate_is_disabled_by_default_and_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CORTEX_OCR_TEXT_VERIFICATION", raising=False)
+    assert ocr_text_verification_enabled() is False
+    strategy = TextPredicateStrategy()
+    ocr = [TextRegion(text="Save", x=0, y=0, width=40, height=10, confidence=0.9)]
+    # OCR present and MATCHING: still not consulted while the flag is off.
+    assert strategy.can_verify(
+        VerificationIntent(kind=VerificationKind.EXPECTED_TEXT, expected_text="Save")
+    ) is False
+    monkeypatch.setenv("CORTEX_OCR_TEXT_VERIFICATION", "1")
+    assert ocr_text_verification_enabled() is True
+    assert strategy.can_verify(
+        VerificationIntent(kind=VerificationKind.EXPECTED_TEXT, expected_text="Save")
+    ) is True
+    result = strategy.verify(
+        VerificationIntent(kind=VerificationKind.EXPECTED_TEXT, expected_text="Save"),
+        _observation(),
+        _observation(ocr=ocr),
+    )
+    assert result.outcome == "verified"
+
+
+def test_deterministic_tiers_use_ui_control_text_for_expected_text() -> None:
+    intent = VerificationIntent(kind=VerificationKind.EXPECTED_TEXT, expected_text="hello")
+    tiers = deterministic_tiers(intent)
+    names = [strategy.name for strategy, _ in tiers]
+    assert "ui_control_text" in names
+    assert "text_predicate" not in names  # OCR tier stays out unless opted in
+
+
+def test_engine_expected_text_ladder_skips_ocr_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CORTEX_OCR_TEXT_VERIFICATION", raising=False)
+    engine = VerificationEngine()
+    before, after = _observation(), _observation()
+    result = engine.verify(
+        VerificationIntent(kind=VerificationKind.EXPECTED_TEXT, expected_text="anything"),
+        before,
+        after,
+    )
+    assert result.outcome == "uncertain"
+    assert "text_predicate" not in result.verification_method
+
+
+def test_engine_expected_text_falls_through_to_diff_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Text invisible to title/controls routes to the diff tier via the controller's
+    documented fallback (expected-text uncertain -> visual_change re-verify)."""
+    monkeypatch.delenv("CORTEX_OCR_TEXT_VERIFICATION", raising=False)
+    engine = VerificationEngine()
+    before, after = _observation("white"), _observation("black")
+    text_intent = VerificationIntent(
+        kind=VerificationKind.EXPECTED_TEXT,
+        expected_text="invisible text",
+        expected_change=True,
+    )
+    uncertain = engine.verify(text_intent, before, after)
+    assert uncertain.outcome == "uncertain"  # the text itself is not evidenced
+    # The controller rebuilds the intent as visual_change and re-verifies (B2 fallback).
+    fallback = engine.verify(
+        VerificationIntent(
+            kind=VerificationKind.VISUAL_CHANGE,
+            expected_change=True,
+            expected_effect="invisible text",
+        ),
+        before,
+        after,
+    )
+    assert fallback.outcome == "verified"
+    assert fallback.verification_method == "screenshot_diff"
+    # Pixel-identical screen: the stated change truly did not occur -> honest failure.
+    still = engine.verify(
+        VerificationIntent(
+            kind=VerificationKind.VISUAL_CHANGE,
+            expected_change=True,
+            expected_effect="invisible text",
+        ),
+        before,
+        _observation("white"),
+    )
+    assert still.outcome == "failed"

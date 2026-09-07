@@ -111,6 +111,21 @@ async def _drive_audit_scenarios(
     server.stop_session(sid)
     await server.run_goal(sid, "stop before start")
     scenarios.append((sid, bundle))
+
+    # 6. PERF-004 queued host actions: the per-queue summary ("queue") event; every
+    #    item also emits its own grounding/validation/safety/execution/verification.
+    sid, bundle, _, _ = make_session(
+        monkeypatch, provider=ScriptedProvider([]), dry_run=False,
+        require_approval=False, limits=FAST_LIMITS,
+    )
+    await server.computer_execute(
+        sid,
+        "click",
+        x=10,
+        y=10,
+        follow_ups=[{"action": "click", "x": 20, "y": 20}],
+    )
+    scenarios.append((sid, bundle))
     return scenarios
 
 

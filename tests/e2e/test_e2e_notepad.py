@@ -56,8 +56,7 @@ def notepad_app(deadline: w32.Deadline, file_path: Path):
 
 def observe(evidence: Any, session_id: str, when: str) -> dict[str, Any]:
     """Capture an observation through the MCP tool and save it as evidence."""
-    response = server.computer_observe(session_id)
-    assert response.get("observation_id"), response
+    response = w32.observe_tool_metadata(server.computer_observe(session_id))
     observation = response["observation"]
     if evidence is not None:
         evidence.save_observation(when, observation)

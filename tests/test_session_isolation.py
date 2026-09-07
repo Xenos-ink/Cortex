@@ -300,3 +300,84 @@ async def test_tools_on_a_stopped_session_fail_safe(
     assert executed["ok"] is False
     assert executed["error"] == "session_stopped"
     assert executed_summary(backend) == []  # a stopped session never produces inputs
+
+
+# --- T8 anomaly-B4 regression: session registry lifecycle under repeated calls ----------------
+# The measurement bridge observed `unknown_session` for a session-id still in use while
+# the server process was alive. The only in-process path producing that signature is a
+# teardown that pops the bundle WITHOUT remembering the session as stopped (B4 fix: the
+# snapshot is remembered FIRST, atomically under the lock, with fallible pieces guarded),
+# plus divergence between the registry and the bundle store. These tests pin both.
+
+
+async def test_repeated_session_calls_in_a_loop_never_lose_the_session(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeat session calls in a loop (execute/observe/progress): zero unknown_session."""
+    provider = ScriptedProvider([AgentDecision(status="done", summary="done")])
+    session_id, bundle, _backend, _ = make_session(
+        monkeypatch, provider=provider, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    for _ in range(40):
+        observe = server.computer_observe(session_id)
+        assert not (isinstance(observe, dict) and observe.get("error") == "unknown_session")
+        progress = server.get_session_progress(session_id)
+        assert progress["ok"] is True
+        assert session_id in server._bundles
+        assert server._registry.get(session_id) is bundle.context
+    # 60 distinct tool calls total: the session is exactly as alive as at the start.
+    assert server._bundles.get(session_id) is bundle
+
+
+async def test_stop_session_then_every_tool_says_session_stopped_not_unknown(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = ScriptedProvider([AgentDecision(status="done", summary="done")])
+    session_id, _bundle, _backend, _ = make_session(
+        monkeypatch, provider=provider, dry_run=True, require_approval=False, limits=FAST_LIMITS
+    )
+    stopped = server.stop_session(session_id)
+    assert stopped["ok"] is True
+    for _ in range(10):
+        observe = server.computer_observe(session_id)
+        assert observe["error"] == "session_stopped"  # NEVER unknown_session
+        execute = await server.computer_execute(session_id, "wait", delta=0)
+        assert execute["error"] == "session_stopped"
+
+
+async def test_teardown_snapshot_failure_still_remembers_session_as_stopped(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B4 core regression: a failure inside teardown can NEVER leave a popped-but-
+    unremembered session (the exact state that surfaces as bogus unknown_session)."""
+    provider = ScriptedProvider([AgentDecision(status="done", summary="done")])
+    session_id, bundle, _backend, _ = make_session(
+        monkeypatch, provider=provider, dry_run=True, require_approval=False, limits=FAST_LIMITS
+    )
+
+    def _exploding_snapshot() -> dict[str, Any]:
+        raise RuntimeError("metrics sink exploded during teardown")
+
+    monkeypatch.setattr(bundle.metrics, "snapshot", _exploding_snapshot)
+    stopped = server.stop_session(session_id)
+    assert stopped["ok"] is True  # teardown survived the injected failure
+    # The session is REMEMBERED as stopped: structured session_stopped, never unknown.
+    response = server.computer_observe(session_id)
+    assert response["error"] == "session_stopped"
+    assert session_id not in server._bundles
+    assert session_id in server._stopped_sessions
+
+
+def test_registry_and_bundle_store_stay_consistent_across_start_stop_cycles(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = ScriptedProvider([AgentDecision(status="done", summary="done")])
+    for _ in range(6):
+        session_id, _bundle, _backend, _ = make_session(
+            monkeypatch, provider=provider, dry_run=True, require_approval=False, limits=FAST_LIMITS
+        )
+        assert server._registry.get(session_id) is not None
+        assert server.stop_session(session_id)["ok"] is True
+        assert server._registry.get(session_id) is None
+        assert session_id not in server._bundles
+        assert session_id in server._stopped_sessions

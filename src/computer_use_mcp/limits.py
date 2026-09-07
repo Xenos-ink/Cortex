@@ -120,6 +120,7 @@ class LimitEnforcer:
         self._recovery_current_action = 0
         self._recovery_task = 0
         self._screenshots = 0
+        self._burst_screenshots = 0
         self._last_screenshot_monotonic: float | None = None
 
     # --- task duration -----------------------------------------------------
@@ -212,6 +213,14 @@ class LimitEnforcer:
             )
 
     # --- screenshot rate gate ------------------------------------------------------
+    # Refined semantics (PERF-004 C2, no field removed): ``min_screenshot_interval_ms``
+    # protects FRESH observations — the loop_top capture on a new step, host-driven
+    # observe captures, and recovery re-observes. Intra-step verification capture pairs
+    # (validate re-capture, post-action capture, P0-H revalidate) are BURST-EXEMPT via
+    # :meth:`record_burst_screenshot`: they skip the interval wait but still record into
+    # the counters and refresh the pacing timestamp, so session-wide capture volume
+    # stays enforced and bounded (per-step captures are structurally capped: at most one
+    # staleness re-capture + one post-action capture per action).
     def can_screenshot(self) -> bool:
         with self._lock:
             if self._last_screenshot_monotonic is None:
@@ -223,6 +232,19 @@ class LimitEnforcer:
         with self._lock:
             self._last_screenshot_monotonic = time.monotonic()
             self._screenshots += 1
+
+    def record_burst_screenshot(self) -> None:
+        """Record a burst-exempt intra-step capture (counted, pacing timestamp refreshed).
+
+        Deliberately does NOT consult the interval gate — the caller asserts the
+        intra-step exemption policy (agent.py ``_INTRA_STEP_EXEMPT_PHASES``). The count
+        and the pacing timestamp are still updated so the session-wide protection stays
+        truthful: the next gated capture measures from the latest capture of any kind.
+        """
+        with self._lock:
+            self._last_screenshot_monotonic = time.monotonic()
+            self._screenshots += 1
+            self._burst_screenshots += 1
 
     def check_screenshot(self) -> None:
         """Raise when called sooner than ``min_screenshot_interval_ms`` after the last one."""
@@ -244,6 +266,7 @@ class LimitEnforcer:
                 "recovery_current_action": self._recovery_current_action,
                 "recovery_task": self._recovery_task,
                 "screenshots": self._screenshots,
+                "burst_screenshots": self._burst_screenshots,
             }
 
 

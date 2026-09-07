@@ -125,14 +125,20 @@ def test_start_session_without_new_params_keeps_exact_legacy_shape(
     assert server._bundles[session_id] is bundle
     legacy = server.start_session(limits=FAST_LIMITS)
     assert set(legacy) == _LEGACY_START_SESSION_KEYS
-    assert legacy["dry_run"] is True
+    # PERF-004 C5 (the one sanctioned default change): dry_run now defaults to False;
+    # the response shape and every other key are unchanged.
+    assert legacy["dry_run"] is False
     assert "resumed" not in legacy and "continuation_of" not in legacy
 
 
 def test_start_session_new_param_is_trailing_and_optional(fresh_server: Any) -> None:
+    # T8: ``interference`` is the newest trailing-optional parameter; every earlier
+    # additive parameter (resume_from_checkpoint) stays trailing-optional behind it.
     parameters = list(inspect.signature(server.start_session).parameters.values())
-    assert [p.name for p in parameters][-1] == "resume_from_checkpoint"
+    assert [p.name for p in parameters][-1] == "interference"
     assert parameters[-1].default is None
+    resume = [p for p in parameters if p.name == "resume_from_checkpoint"]
+    assert resume and resume[0].default is None
 
 
 def test_run_goal_signature_gain_is_trailing_optional(fresh_server: Any) -> None:

@@ -49,6 +49,10 @@ class ActionType(StrEnum):
     MOVE = "move"
     HOTKEY = "hotkey"
     FOCUS_WINDOW = "focus_window"
+    # T8 mechanism ii (additive sibling of focus_window): attach-or-launch probe.
+    # Target = ``process[|doc-token]``; focuses an EXISTING instance and never spawns
+    # one by default (REATTACHED / AMBIGUOUS_INSTANCE / NO_INSTANCE payloads).
+    ENSURE_APP = "ensure_app"
 
 
 class RiskLevel(StrEnum):
@@ -234,6 +238,13 @@ class GroundedAction(BaseModel):
             raise ValueError("focus_window actions require a non-empty target window title")
         return self
 
+    @model_validator(mode="after")
+    def _ensure_app_requires_target(self) -> GroundedAction:
+        """An ensure_app needs a non-empty ``process[|doc-token]`` target — fail closed."""
+        if self.action is ActionType.ENSURE_APP and not (self.target or "").strip():
+            raise ValueError("ensure_app actions require a non-empty target (process[|doc-token])")
+        return self
+
 
 class Observation(BaseModel):
     """A captured computer state with identity, timing, and coordinate-space metadata."""
@@ -323,6 +334,52 @@ class ExecutionResult(BaseModel):
     verification: VerificationResult | None = None
     screenshot_after_base64: str | None = None
     retry_count: int = 0
+
+
+# --- host-path action queue + observation summary (PERF-004, additive) -----------------------
+
+#: Hard cap on ``follow_ups`` accepted by one ``computer_execute`` call (PERF-004 C7):
+#: a queued batch is speculative planning (UFO2-style), deliberately small; every entry
+#: still passes the FULL independent pipeline and the queue stops at the first failure.
+MAX_FOLLOW_UPS = 5
+
+
+class ActionSpec(BaseModel):
+    """One queued host action in a ``computer_execute`` ``follow_ups`` list (PERF-004 C7).
+
+    Mirrors the ``computer_execute`` tool surface (same field names/semantics, additive
+    model — existing models are untouched). Each spec is converted to a full
+    :class:`GroundedAction` and passes the complete independent pipeline
+    (ground -> validate -> safety -> approval -> execute -> verify) exactly like a
+    single action; ``approved`` from the enclosing call applies to every queue item
+    (approval semantics are evaluated per item by the safety policy).
+    """
+
+    action: ActionType
+    x: int | None = Field(default=None, ge=-8_192, le=16_384)
+    y: int | None = Field(default=None, ge=-8_192, le=16_384)
+    x2: int | None = Field(default=None, ge=-8_192, le=16_384)
+    y2: int | None = Field(default=None, ge=-8_192, le=16_384)
+    text: str | None = Field(default=None, max_length=2_000)
+    keys: list[str] = Field(default_factory=list, max_length=12)
+    delta: int = Field(default=0, ge=-20, le=20)
+    target: str | None = Field(default=None, max_length=200)
+    expected_effect: str | None = Field(default=None, max_length=500)
+
+    def to_grounded(self, *, reason_prefix: str = "Explicit MCP action") -> GroundedAction:
+        """Build the :class:`GroundedAction` this spec denotes (validation happens there)."""
+        return GroundedAction(
+            action=self.action,
+            point=None if self.x is None or self.y is None else {"x": self.x, "y": self.y},
+            to_point=None if self.x2 is None or self.y2 is None else {"x": self.x2, "y": self.y2},
+            text=self.text,
+            keys=list(self.keys),
+            delta=self.delta,
+            reason=reason_prefix,
+            confidence=1.0,
+            expected_effect=self.expected_effect,
+            target=self.target,
+        )
 
 
 class SessionState(BaseModel):

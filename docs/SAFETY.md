@@ -20,8 +20,9 @@ by that wave.
 The operating assumptions are deliberately pessimistic; every mechanism in this
 document exists because of one of these three lines:
 
-1. **The model controls a desktop.** A proposed action becomes real `pyautogui` input
-   on a live Windows session. A mis-grounded coordinate clicks the wrong thing; a
+1. **The model controls a desktop.** A proposed action becomes real physical input
+   on a live Windows session (raw Win32 `SendInput` by default; `pyautogui` is the
+   selectable fallback — both engines honor the same safety contract). A mis-grounded coordinate clicks the wrong thing; a
    wrong action deletes, sends, or pays. The model is treated as a fallible,
    potentially manipulable proposer — never as an authority.
 2. **Screen content is untrusted.** Screenshots, window titles, dialogs, web pages,
@@ -124,6 +125,17 @@ requirement is **upgraded, never downgraded**, by risk. `HIGH` → `requires_app
 `CRITICAL` → blocked unless `authorized=True` (see §5). `dry_run` semantics are
 untouched — the decision still reports risk and approval needs but nothing executes.
 
+PERF-004 (C5/C7) notes, no safety weakening: `start_session` now DEFAULTS to
+`dry_run=False` — the one sanctioned default change (the old default silently produced
+no-op sessions; the compensating control is the mandatory `DRY-RUN (no input
+dispatched):` banner on every dry-run result message, so a no-op can never be misread
+as execution). Queued `follow_ups` are ZERO-BYPASS: every queue item runs the full
+independent pipeline (ground → validate → safety → approval semantics → execute →
+verify), the queue stops at the first verification failure, safety rejection, approval
+requirement, or post-action digest surprise, the stop token is checked between items,
+and adversarial tests prove an unsafe item is rejected individually, a failure mid-queue
+flushes later items, and `stop_session` halts a running queue.
+
 Limitation (stated honestly): classification is deterministic pattern + context
 matching (English patterns plus a small Arabic set), not semantic understanding. It is
 a coarse, conservative net — novel destructive phrasing in other languages may classify
@@ -212,7 +224,8 @@ lower than a human would. The compensating controls are the approval defaults
   the stop setter is unreachable from provider output.
 - Residual honesty: this is a cooperative, in-process stop. There is no OS-level kill
   switch; if the whole process is compromised or wedged below the Python layer, the
-  only physical backstop is the `pyautogui` failsafe screen corner (mapped to
+  only physical backstop is the failsafe screen corner (replicated by BOTH input
+  engines and mapped to
   `InputBlockedError` → `BLOCKED_UI`).
 
 ## 7. Secrets policy
@@ -261,10 +274,16 @@ lower than a human would. The compensating controls are the approval defaults
   60 model calls, 250 ms screenshot interval, 50 context items, 4 sessions. Trips
   raise `LimitExceeded` → audited clean termination (fail safely).
 - **Unthrottled explicit observation (F5, accepted-by-design)**: the
-  `min_screenshot_interval_ms` rate gate applies to the `run_goal` internal loop only.
-  `computer_observe` / `computer_screenshot` are explicit client tools with NO rate
-  gate — measured ~46 captures/s, and every capture emits an audit row, so a
-  hammering client can generate audit volume and CPU load at its own discretion.
+  `min_screenshot_interval_ms` rate gate applies to the runtime's own capture paths.
+  PERF-004 C2 refined semantics: the gate protects FRESH observations (the loop-top
+  capture on a new step, host-driven `computer_execute` observes, recovery
+  re-observes); intra-step verification captures (staleness probe, post-action,
+  P0-H revalidate) are burst-exempt but still recorded into the enforcer (count +
+  pacing timestamp), so session-wide capture volume stays enforced and bounded
+  (per-step captures are structurally capped at one staleness probe + one post-action
+  capture). `computer_observe` / `computer_screenshot` remain explicit client tools
+  with NO rate gate — measured ~46 captures/s, and every capture emits an audit row,
+  so a hammering client can generate audit volume and CPU load at its own discretion.
   Clients wanting throttling should self-limit; the gate exists to stop the runtime
   from racing itself, not to police explicit calls.
 - **Session registry**: bounded at `max_sessions` (default 4); at capacity a new
@@ -569,3 +588,25 @@ restores.
 | Session budget exhausted (duration/actions/model calls/steps/subtasks) | typed `SessionBudgetExceeded` → audited fail-closed termination | `limits.SessionBudgetTracker` |
 | Health check UNSAFE | epoch invalidated + run stops (`blocked_safety`); never auto-executes | `long_running._boundary_health` |
 | Planner unavailable or plan rejected | typed `planner_unavailable` / `plan_rejected` (+ codes); nothing created; session stays usable for manual `create_subtask` | `long_running.plan_from_llm` |
+
+
+### 11.10 Interference Guard (T8): protection upgrades, same doctrine
+
+The Interference Guard only ADDS fail-closed behavior; no existing gate, allowlist,
+approval, or limit is weakened and no new bypass exists:
+
+| Concern | Behavior |
+|---|---|
+| Foreign foreground at dispatch | REJECTION (`FOCUS_TAKEN_BY`) — the guard cannot click, type, or focus the foreign window; `refocus_then_abort` reuses the verified foreground switch aimed ONLY at the bound title; `observe_only` merely annotates |
+| Foreign process at dispatch | unchanged P0-G allowlist rejection (the guard runs in addition, never instead) |
+| Bound window closed | `TARGET_GONE` + binding cleared (default) — no infinite reject loop against a dead identity; driver doctrine: ensure_app before any launch |
+| Modal dialog after an action | reported with its control list; queued batches HALT (`modal_dialog`); auto-handling ships DISABLED (`auto_handle=[]`) and, when a host explicitly configures it, resolves only the exact configured identity with an audit event per resolution |
+| Keyboard focus outside the target | `FOCUS_DRIFTED` rejection before dispatch; mid-type drift aborts the in-flight type (no text into foreign fields); terminal keys are never auto-resent (double-submit risk) |
+| Stuck modifiers before a chord | `STUCK_MODIFIER` rejection; opt-in `release` mode touches ONLY modifiers this session dispatched (a foreign modifier is never released) |
+| ensure_app launches | server-side launch requires `attach_or_launch.launch="server"` policy AND the process-allowlist gate; the default (`launch="driver"`) NEVER spawns a process |
+| Policy parsing | fail-closed (`invalid_interference` on unknown/invalid fields) — a malformed policy can never silently disable protection |
+
+New pacing policies are protection, not performance tuning: `CORTEX_KEY_DISPATCH_GAP`
+(default 0.05 s) paces terminal-key chords and `CORTEX_FOCUS_SETTLE_SECONDS`
+(default 0.3 s) paces keyboard input behind a recent window activation — both reduce
+dropped/misdelivered-input windows (B3/B5/B8); both accept `0` to disable.

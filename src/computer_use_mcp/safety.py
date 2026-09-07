@@ -433,6 +433,7 @@ class SafetyPolicy:
             ActionType.DRAG,
             ActionType.TYPE,
             ActionType.FOCUS_WINDOW,
+            ActionType.ENSURE_APP,
         }:
             base = (True, state.require_approval, "Interactive action requires approval by default.")
         else:
@@ -483,9 +484,11 @@ class SafetyPolicy:
                     )
                 return RiskLevel.HIGH, category, self._why(category)
 
-        if action.action == ActionType.FOCUS_WINDOW:
+        if action.action in {ActionType.FOCUS_WINDOW, ActionType.ENSURE_APP}:
             # Always MEDIUM with a stable category (placed before the drift/routine
             # scans): foregrounding a different window redirects all subsequent input.
+            # T8: ensure_app is focus-like (attach-or-launch redirects input too) and
+            # additionally never launches without explicit host policy (agent gate).
             return (
                 RiskLevel.MEDIUM,
                 "window_focus_change",
@@ -580,6 +583,8 @@ class SafetyPolicy:
             return f"{kind} {'+'.join(action.keys)}"
         if action.action == ActionType.FOCUS_WINDOW and action.target:
             return f"{kind} window {action.target!r}"
+        if action.action == ActionType.ENSURE_APP and action.target:
+            return f"{kind} app {action.target!r}"
         if action.action == ActionType.SCROLL:
             return f"{kind} by {action.delta}"
         return kind
@@ -603,6 +608,8 @@ class SafetyPolicy:
             return f"{identity}, typed text {_clip(action.text)!r}"
         if action.action == ActionType.FOCUS_WINDOW and action.target:
             return f"{identity}, focusing window {action.target!r}"
+        if action.action == ActionType.ENSURE_APP and action.target:
+            return f"{identity}, ensuring app {action.target!r}"
         return identity
 
     def _approval_message(

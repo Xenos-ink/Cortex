@@ -1,0 +1,110 @@
+{
+  "id": "r2-interruption-recovery",
+  "title": "Notepad edit+save under a scripted mid-task interruption (foreign window steal)",
+  "category": "long_horizon_state_tracking",
+  "fake_runnable": false,
+  "prompt": "Open the file C:\\Users\\localadmin\\Desktop\\cortex-bench\\r2_note.txt in Notepad. At the very end of the document, add exactly one new line that reads: Recovered and saved: R2-FOOTER-OK . Save the file in place (same path, same name). While you work, other windows or dialogs may appear on screen that are not part of your task: they are distractions. Never type into a window that is not the task document, never create a second copy of the task document, and do not launch a replacement Notepad for the task - if the task window loses focus, re-ground on the screen and return to the EXISTING task window (reattach by its title/identity). Deal with any distraction deliberately (ignore it, or close it if it is safely closable without losing data). When you are done, leave exactly the task's Notepad window (titled r2_note.txt) open and in the foreground; any distraction window must be either still open and completely untouched, or cleanly closed.",
+  "goal": "Append a required footer to a note in Notepad, save in place, while recovering from a scripted mid-task interruption (foreign window steals focus) without acting on the distraction or spawning stray task documents.",
+  "setup": {
+    "app": "notepad",
+    "real_world_only": true,
+    "fixtures": [
+      "r2_note.txt"
+    ],
+    "outputs": [
+      "~/Desktop/cortex-bench/r2_note.txt"
+    ]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "done",
+        "summary": "real-world task; executed by a driver agent via score_task.py flow, not by the scripted provider"
+      }
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {
+        "kind": "window_title_contains",
+        "value": "Notepad"
+      }
+    ]
+  },
+  "interrupt": {
+    "at_action": 3,
+    "type": "foreign_window",
+    "spec": {
+      "app": "notepad.exe",
+      "dummy_doc": "r2_foreign_doc.txt",
+      "content": "This is a scripted DISTRACTION window for r2-interruption-recovery. The driver must not type into this window.",
+      "title_token": "r2_foreign_doc"
+    },
+    "note": "Interruption policy event names (FOCUS_TAKEN_BY / MODAL_DIALOG / FOCUS_DRIFTED) are INFORMATIONAL for the driver: this server generation does not emit them; the driver must detect the disturbance from its own observation and follow the T8 handling rules in DRIVER-PROTOCOL.md. The launcher injects the disturbance mid-run via benchmarks/interrupt.py (see DRIVER-PROTOCOL.md)."
+  },
+  "predicates": [
+    {
+      "name": "task_file_exists",
+      "kind": "file_exists",
+      "path": "~/Desktop/cortex-bench/r2_note.txt"
+    },
+    {
+      "name": "task_file_written_during_run",
+      "kind": "file_fresh",
+      "path": "~/Desktop/cortex-bench/r2_note.txt"
+    },
+    {
+      "name": "content_preserved_and_footer_added",
+      "kind": "text_contains_normalized",
+      "path": "~/Desktop/cortex-bench/r2_note.txt",
+      "needles": [
+        "STEADY-4471",
+        "HOLD-FAST-88",
+        "Recovered and saved: R2-FOOTER-OK"
+      ]
+    },
+    {
+      "name": "exactly_one_task_notepad_window",
+      "kind": "process_window_count",
+      "process": "notepad.exe",
+      "title_token": "r2_note.txt",
+      "expected": 1
+    },
+    {
+      "name": "disturbance_window_untouched_or_closed",
+      "kind": "window_state_unchanged",
+      "snapshot_from_run_record": "interrupt_snapshot",
+      "allow_closed": true,
+      "tolerance_px": 4
+    },
+    {
+      "name": "focus_recovered_on_task_window",
+      "kind": "focus_steal_recovered",
+      "process": "notepad.exe",
+      "title_token": "r2_note.txt",
+      "interrupt_log_from_run_record": "interrupt_log",
+      "require_event": true
+    }
+  ],
+  "human_reference": {
+    "primary": "arithmetic_cadence",
+    "seconds": 26.0,
+    "seconds_note": "includes a ~2.0 s 'human notices the interruption and refocuses' segment",
+    "calibration": {
+      "fitts_click_s": 0.6,
+      "char_s": 0.22,
+      "dialog_wait_s": 1.0,
+      "keypress_s": 0.5,
+      "cognitive_allowance_s": 10,
+      "actions": "open file (2 clicks 1.2s) + Ctrl+End (0.5s) + type 33-char footer (7.3s) + Ctrl+S (0.5s + 1.0s) + interruption notice+refocus (~2.0s per T8 doctrine) + final verify/observe (1.0s) + cognitive 10s = ~26s"
+    },
+    "method_log": "ARITHMETIC reference (explicit action list x cadence), not a replay: the mid-task interruption cannot be scripted in the deterministic replay harness. The ~2 s notice-and-refocus segment follows the T8 design proposal (KLM/P from the P1 cadence table). Superseded by a real human run when performed."
+  },
+  "anti_gaming": "All predicates evaluate the REAL filesystem and live window state, never driver self-report. task_file_written_during_run fails a file that was not saved during the run. content_preserved_and_footer_added proves the original lines survived AND the footer was added in the same document. exactly_one_task_notepad_window fails when the driver leaves stray Notepad documents or a second copy of the task doc open (the disturbance window does not match the token). disturbance_window_untouched_or_closed compares live state against the launcher's injection-time snapshot: the disturbance window must be untouched (same class/title/rect/edit-text hash) or cleanly closed - typed-into or moved disturbance windows fail. focus_recovered_on_task_window requires BOTH the launcher's interrupt event log (proving the interruption actually fired, with timestamp) AND the task's window in the OS foreground at scoring time.",
+  "allowed_processes": [
+    "notepad.exe",
+    "explorer.exe"
+  ],
+  "max_actions": 400,
+  "safety_notes": "Single in-place save of a dedicated bench fixture plus one throwaway distraction document in the session temp dir; no existing user files are touched, no network access."
+}

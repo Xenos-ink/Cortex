@@ -27,6 +27,14 @@ bounds in screenshot space and records the verified scale on the grounding resul
 NEVER rewrites the point; no consumer may pre-scale or re-scale a point, or the executed
 position lands at ``origin + screenshot * scale**2``.
 
+Physical input is dispatched by pluggable :class:`InputEngine` implementations
+(:class:`SendInputEngine` — raw Win32 ``SendInput`` via ctypes, the default — and
+:class:`PyAutoGuiInputEngine`, the selectable pyautogui fallback). Both honor the same
+safety contract: failsafe screen-corner checks raise :class:`InputBlockedError`, the
+stop token is checked before every physical input by ``execute``, and a blocked
+injection (``SendInput`` returning 0) fails closed. The engine is selected at backend
+construction from ``CORTEX_INPUT_BACKEND`` (``sendinput`` | ``pyautogui``).
+
 The module imports cleanly on non-Windows: all Win32 calls are guarded by
 ``IS_WINDOWS`` and input libraries are imported lazily inside
 :class:`LocalComputerBackend`. The Win32 entry points read the module-level
@@ -41,14 +49,24 @@ import ctypes
 import io
 import os
 import platform
+import re
+import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from PIL import Image
 
-from .models import CoordinateSpace, GroundedAction, MonitorInfo, Observation, WindowInfo
+from .models import (
+    CoordinateSpace,
+    GroundedAction,
+    MonitorInfo,
+    Observation,
+    TextRegion,
+    WindowInfo,
+)
 from .state import StopToken
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -61,7 +79,7 @@ DEFAULT_DPI = 96
 DPI_AWARENESS_CONTEXT_PER_MONITOR_V2 = -4
 WAIT_MAX_SECONDS = 10.0
 WAIT_SLICE_SECONDS = 0.1
-_TYPE_INTERVAL_SECONDS = 0.01
+_TYPE_INTERVAL_SECONDS = 0.01  # legacy per-char pacing (pyautogui fallback parity)
 _DRAG_SEGMENT_PIXELS = 40  # stroke interpolation granularity (~one segment per 40 px)
 _DRAG_MIN_SEGMENTS = 4  # even tiny drags get a visibly interpolated stroke
 _DRAG_STEP_PAUSE_SECONDS = 0.01  # per-segment pacing (same cadence as type)
@@ -70,6 +88,136 @@ _MOVE_SETTLE_SECONDS = 0.05  # settle after a cursor reposition (not an input pa
 _SW_RESTORE = 9  # ShowWindow(nCmdShow) restore for a minimized window
 _VK_MENU = 0x12  # ALT virtual key (foreground-switch nudge)
 _KEYEVENTF_KEYUP = 0x02  # keybd_event flag: key release
+
+# --- input engine configuration (env-overridable; PERF-004) ---------------------------------
+INPUT_BACKEND_ENV = "CORTEX_INPUT_BACKEND"  # "sendinput" (default) | "pyautogui"
+PYAUTOGUI_PAUSE_ENV = "CORTEX_PYAUTOGUI_PAUSE"  # fallback-path PAUSE (default 0.0)
+TYPE_INTERVAL_ENV = "CORTEX_TYPE_INTERVAL"  # per-chunk typing pacing (default 0.0)
+DRAG_INTERPOLATE_ENV = "CORTEX_DRAG_INTERPOLATE"  # "1" interpolates the drag stroke
+PNG_OPTIMIZE_ENV = "CORTEX_PNG_OPTIMIZE"  # "1" restores optimize=True (default off)
+UIA_READ_ENV = "CORTEX_UIA_READ"  # "0" disables the UIA semantic read (default on)
+SENDINPUT_TYPE_INTERVAL = 0.0  # batched whole-string typing: no per-char cost
+SENDINPUT_DRAG_STEP_PAUSE = 0.0  # minimal-segment drag: no per-segment cost
+_SENDINPUT_CHUNK_EVENTS = 1000  # max events per SendInput call (typing chunks)
+_WHEEL_DELTA = 120
+
+# --- UIA semantic read bounds (PERF-004; research digest Q3) --------------------------------
+UIA_MAX_ELEMENTS = 30  # bounded element list (visible buttons/fields)
+UIA_MAX_DEPTH = 2  # focused element + its direct children
+UIA_READ_BUDGET_SECONDS = 0.05  # hard wall for one semantic read; past it: partial
+
+# --- interference-probe constants (T8; A12 mechanisms i-v) ----------------------------------
+_GW_OWNER = 4  # GetWindow(): retrieves the window's owner (owned-dialog chains)
+_DIALOG_WINDOW_CLASS = "#32770"  # system dialog class (Save As, Confirm Save As, ...)
+
+#: Settle/gap policy between queued final-Enter-ish keystrokes (B3): a terminal-key
+#: chord dispatched within this window of the previous keyboard dispatch waits out the
+#: remainder first, so a fast follow_ups batch cannot drop the final Enter into an
+#: input-stack race. ``CORTEX_KEY_DISPATCH_GAP`` restores/overrides (0 disables).
+TERMINAL_KEYS: frozenset[str] = frozenset({"enter", "return", "numpadenter", "tab"})
+
+#: Generic unsaved-document title conventions for attach-or-launch discovery (T8):
+#: leading tokens apps give brand-new unsaved docs + restore-suffixed file patterns
+#: (``<name>.xlsx1`` windows Excel restores beside a crashed session). Title
+#: heuristics only — DATA, never per-app CODE (A12 mechanism ii).
+UNSAVED_DOC_LEADING_TOKENS: frozenset[str] = frozenset(
+    {"book", "untitled", "document", "presentation", "workbook", "sheet", "drawing", "image"}
+)
+_UNSAVED_RESTORE_SUFFIX = re.compile(
+    r"\.(xlsx|xlsm|xls|docx|doc|pptx|ppt|txt|csv|rtf|png|jpg|jpeg|bmp|one|odt|ods)\d+(\.|$)",
+    re.IGNORECASE,
+)
+
+# Win32 SendInput / virtual-screen constants
+_MOUSEEVENTF_MOVE = 0x0001
+_MOUSEEVENTF_LEFTDOWN = 0x0002
+_MOUSEEVENTF_LEFTUP = 0x0004
+_MOUSEEVENTF_RIGHTDOWN = 0x0008
+_MOUSEEVENTF_RIGHTUP = 0x0010
+_MOUSEEVENTF_MIDDLEDOWN = 0x0020
+_MOUSEEVENTF_MIDDLEUP = 0x0040
+_MOUSEEVENTF_WHEEL = 0x0800
+_MOUSEEVENTF_VIRTUALDESK = 0x4000
+_MOUSEEVENTF_ABSOLUTE = 0x8000
+_KEYEVENTF_UNICODE = 0x0004
+_SM_XVIRTUALSCREEN = 76
+_SM_YVIRTUALSCREEN = 77
+_SM_CXVIRTUALSCREEN = 78
+_SM_CYVIRTUALSCREEN = 79
+_COINIT_APARTMENTTHREADED = 0x2
+_RPC_E_CHANGED_MODE = -2147417850  # HRESULT 0x80010106 as c_int
+_CLSCTX_INPROC_SERVER = 0x1
+_TREE_SCOPE_CHILDREN = 0x2
+_VT_EMPTY = 0
+_VT_I4 = 3
+_VT_BSTR = 8
+_VT_BOOL = 11
+_VT_ARRAY = 0x2000
+_VT_R8 = 5
+
+# UIA property IDs (UIAutomationClient.h)
+_UIA_PROP_BOUNDING_RECTANGLE = 30001
+_UIA_PROP_CONTROL_TYPE = 30003
+_UIA_PROP_NAME = 30005
+_UIA_PROP_AUTOMATION_ID = 30011
+_UIA_PROP_VALUE = 30045
+_UIA_PROP_IS_OFFSCREEN = 30022
+
+# CLSID/IID for the raw-ctypes UIA COM client (UIAutomationClient.dll)
+_CLSID_CUIAUTOMATION = "ff48dba4-60ef-4201-aa87-54103eef594e"
+_IID_IUIAUTOMATION = "30cbe57d-d9d3-4eac-bca0-31ca10efc51e"
+
+# IUIAutomation / IUIAutomationElement / IUIAutomationElementArray vtable slots
+# (IUnknown occupies 0-2; order fixed by UIAutomationClient.h).
+_UIA_GET_FOCUSED_ELEMENT = 7
+_UIA_CREATE_TRUE_CONDITION = 22
+_UIA_ELEMENT_FIND_ALL = 6
+_UIA_ELEMENT_GET_PROPERTY_VALUE = 10
+_UIA_ARRAY_GET_LENGTH = 3
+_UIA_ARRAY_GET_ELEMENT = 4
+_COM_RELEASE = 2
+
+UIA_CONTROLTYPE_NAMES: dict[int, str] = {
+    50000: "Button",
+    50001: "Calendar",
+    50002: "CheckBox",
+    50003: "ComboBox",
+    50004: "Edit",
+    50005: "Hyperlink",
+    50006: "Image",
+    50007: "ListItem",
+    50008: "List",
+    50009: "Menu",
+    50010: "MenuBar",
+    50011: "MenuItem",
+    50012: "ProgressBar",
+    50013: "RadioButton",
+    50014: "ScrollBar",
+    50015: "Slider",
+    50016: "Spinner",
+    50017: "StatusBar",
+    50018: "Tab",
+    50019: "TabItem",
+    50020: "Text",
+    50021: "ToolBar",
+    50022: "ToolTip",
+    50023: "Tree",
+    50024: "TreeItem",
+    50025: "Custom",
+    50026: "Group",
+    50027: "Thumb",
+    50028: "DataGrid",
+    50029: "DataItem",
+    50030: "Document",
+    50031: "SplitButton",
+    50032: "Window",
+    50033: "Pane",
+    50034: "Header",
+    50035: "HeaderItem",
+    50036: "Table",
+    50037: "TitleBar",
+    50038: "Separator",
+}
 
 if IS_WINDOWS:
     import ctypes.wintypes
@@ -141,6 +289,15 @@ if IS_WINDOWS:
     _kernel32.QueryFullProcessImageNameW.restype = ctypes.wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     _kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+    # Interference-probe bindings (T8): stuck-modifier sweep + foreground focus target.
+    _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    _user32.GetAsyncKeyState.restype = ctypes.c_short
+    _user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    _user32.IsWindowVisible.restype = ctypes.wintypes.BOOL
+    _user32.IsWindow.argtypes = [ctypes.c_void_p]
+    _user32.IsWindow.restype = ctypes.wintypes.BOOL
+    _user32.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    _user32.GetWindow.restype = ctypes.c_void_p
     if _shcore is not None:
         _shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
         _shcore.SetProcessDpiAwareness.restype = ctypes.HRESULT
@@ -151,10 +308,112 @@ if IS_WINDOWS:
             ctypes.POINTER(ctypes.c_uint),
         ]
         _shcore.GetDpiForMonitor.restype = ctypes.HRESULT
+    try:
+        _ole32 = ctypes.windll.ole32
+        _oleaut32 = ctypes.windll.oleaut32
+    except (AttributeError, OSError):  # pragma: no cover - ole32 is always present on Windows
+        _ole32 = None
+        _oleaut32 = None
+
+    class _MOUSEINPUT(ctypes.Structure):
+        """``MOUSEINPUT`` layout (x64)."""
+
+        _fields_ = [
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class _KEYBDINPUT(ctypes.Structure):
+        """``KEYBDINPUT`` layout (x64)."""
+
+        _fields_ = [
+            ("wVk", ctypes.c_ushort),
+            ("wScan", ctypes.c_ushort),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class _INPUT_UNION(ctypes.Union):
+        """``INPUT`` union: MOUSEINPUT is the largest member (32 bytes on x64)."""
+
+        _fields_ = [
+            ("mi", _MOUSEINPUT),
+            ("ki", _KEYBDINPUT),
+            ("padding", ctypes.c_ubyte * 32),
+        ]
+
+    class _INPUT(ctypes.Structure):
+        """``INPUT`` layout (x64): 4-byte type + 4-byte alignment pad + 32-byte union."""
+
+        _fields_ = [("type", ctypes.c_ulong), ("union", _INPUT_UNION)]
+
+    _INPUT_MOUSE = 0  # INPUT_MOUSE
+    _INPUT_KEYBOARD = 1  # INPUT_KEYBOARD
+
+    class _VARIANT(ctypes.Structure):
+        """Minimal ``VARIANT`` (16 bytes on x64) for UIA property reads."""
+
+        class _VARIANT_UNION(ctypes.Union):
+            _fields_ = [
+                ("lVal", ctypes.c_long),
+                ("bstrVal", ctypes.c_void_p),
+                ("boolVal", ctypes.wintypes.VARIANT_BOOL),
+                ("parray", ctypes.c_void_p),
+            ]
+
+        _fields_ = [
+            ("vt", ctypes.c_ushort),
+            ("wReserved1", ctypes.c_ushort),
+            ("wReserved2", ctypes.c_ushort),
+            ("wReserved3", ctypes.c_ushort),
+            ("union", _VARIANT_UNION),
+        ]
+
+    class _GUID(ctypes.Structure):
+        """Windows ``GUID`` layout (ctypes.wintypes.GUID is unavailable on this Python)."""
+
+        _fields_ = [
+            ("Data1", ctypes.c_ulong),
+            ("Data2", ctypes.c_ushort),
+            ("Data3", ctypes.c_ushort),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    class _GUITHREADINFO(ctypes.Structure):
+        """``GUITHREADINFO`` layout: the foreground thread's focus/caret state."""
+
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong),
+            ("flags", ctypes.c_ulong),
+            ("hwndActive", ctypes.c_void_p),
+            ("hwndFocus", ctypes.c_void_p),
+            ("hwndCapture", ctypes.c_void_p),
+            ("hwndMenuOwner", ctypes.c_void_p),
+            ("hwndMoveSize", ctypes.c_void_p),
+            ("hwndCaret", ctypes.c_void_p),
+            ("rcCaret", ctypes.wintypes.RECT),
+        ]
+
+    _GW_CHILD = 5
+    _GW_HWNDNEXT = 2
+    _WM_GETTEXT = 0x000D
+    _WM_GETTEXTLENGTH = 0x000E
+    _SMTO_ABORTIFHUNG = 0x0002
+    _SENDMESSAGE_TIMEOUT_MS = 100
+    _user32.GetGUIThreadInfo.argtypes = [ctypes.wintypes.DWORD, ctypes.POINTER(_GUITHREADINFO)]
+    _user32.GetGUIThreadInfo.restype = ctypes.wintypes.BOOL
+
 else:  # non-Windows: bindings stay absent, module stays importable for tests
     _user32 = None
     _kernel32 = None
     _shcore = None
+    _ole32 = None
+    _oleaut32 = None
 
 
 class BackendError(RuntimeError):
@@ -195,6 +454,64 @@ class WindowFocusError(BackendError):
     failure. Documented residual: the previously-focused window is not restored on a
     refusal — the caller re-observes and re-decides from actual state.
     """
+
+
+class FocusDriftError(BackendError):
+    """Keyboard focus moved away from the session target mid-dispatch (T8 mechanism iv).
+
+    Raised by a ``type`` action's per-chunk focus hook when the focused control stops
+    belonging to the bound window: the in-flight ``type`` is aborted immediately (no
+    further chunks are dispatched — text must never land in a foreign field). Carries
+    the FOCUS_DRIFTED event payload for the controller to surface verbatim.
+    """
+
+
+class AppWindowCandidate:
+    """One visible top-level window of a process, for attach-or-launch discovery (T8).
+
+    ``doc_token`` is the leading segment of the title before the ``" - "`` app suffix
+    (``"Book1 - Excel"`` -> ``"Book1"``); ``unsaved_candidate`` flags generic
+    unsaved-document title conventions (leading "Book"/"Untitled"/... tokens or a
+    restore-suffixed ``<file>.xlsx1`` pattern). Title heuristics only — DATA, never
+    per-app code (A12 mechanism ii).
+    """
+
+    __slots__ = ("doc_token", "unsaved_candidate", "window")
+
+    def __init__(self, window: WindowInfo, doc_token: str | None, unsaved_candidate: bool) -> None:
+        self.window = window
+        self.doc_token = doc_token
+        self.unsaved_candidate = unsaved_candidate
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"AppWindowCandidate(title={self.window.title!r}, doc_token={self.doc_token!r}, "
+            f"unsaved_candidate={self.unsaved_candidate!r})"
+        )
+
+
+def doc_token_from_title(title: str) -> str | None:
+    """Leading segment of a window title before the ``" - "`` app suffix, or the title.
+
+    ``"Book1 - Excel"`` -> ``"Book1"``; ``"t1_source.txt - Notepad"`` -> ``"t1_source.txt"``;
+    a title without the suffix is its own doc token. Empty titles yield ``None``.
+    """
+    text = (title or "").strip()
+    if not text:
+        return None
+    return text.split(" - ", 1)[0].strip() or None
+
+
+def is_unsaved_candidate_title(title: str) -> bool:
+    """True when a title matches generic unsaved/restore conventions (heuristic flag)."""
+    token = doc_token_from_title(title)
+    if token is None:
+        return False
+    first_word = token.split(" ", 1)[0].casefold()
+    stripped = first_word.rstrip("0123456789")  # "book1" -> "book", "untitled" -> "untitled"
+    if first_word in UNSAVED_DOC_LEADING_TOKENS or stripped in UNSAVED_DOC_LEADING_TOKENS:
+        return True
+    return bool(_UNSAVED_RESTORE_SUFFIX.search(token))
 
 
 @dataclass(frozen=True)
@@ -352,8 +669,8 @@ def _drag_segment_points(
 
     Segments are ~``_DRAG_SEGMENT_PIXELS`` px long (Chebyshev distance) with a floor of
     ``_DRAG_MIN_SEGMENTS`` so even short drags draw a smooth stroke. The final waypoint
-    is exactly ``end``. Shared by the real backend (pyautogui ``moveTo`` targets) and the
-    fake backend (simulated cursor walk), so both stroke identically.
+    is exactly ``end``. Shared by the real backend's interpolated drag mode (and the
+    fake backend's simulated cursor walk, so both stroke identically).
     """
     distance = max(abs(end[0] - start[0]), abs(end[1] - start[1]))
     segments = max(_DRAG_MIN_SEGMENTS, -(-distance // _DRAG_SEGMENT_PIXELS))
@@ -364,6 +681,1013 @@ def _drag_segment_points(
         )
         for index in range(1, segments + 1)
     ]
+
+
+# --- input engines (PERF-004): raw SendInput default, pyautogui fallback ----------------------
+
+#: Virtual-key codes for the named keys accepted in ``keypress``/``hotkey`` actions
+#: (the provider contract passes keys verbatim in pyautogui vocabulary). Letter/digit
+#: VKs are layout-independent; other printable characters resolve through
+#: ``VkKeyScanW`` exactly like pyautogui's ``VkKeyScanA`` mapping (layout parity).
+_VK_NAMED_KEYS: dict[str, int] = {
+    "ctrl": 0x11, "ctrlleft": 0xA2, "ctrlright": 0xA3,
+    "alt": 0x12, "altleft": 0xA4, "altright": 0xA5,
+    "shift": 0x10, "shiftleft": 0xA0, "shiftright": 0xA1,
+    "win": 0x5B, "winleft": 0x5B, "winright": 0x5C, "cmd": 0x5B,
+    "enter": 0x0D, "return": 0x0D, "numpadenter": 0x0D, "\n": 0x0D, "\r": 0x0D,
+    "tab": 0x09, "\t": 0x09, "space": 0x20, " ": 0x20,
+    "backspace": 0x08, "del": 0x2E, "delete": 0x2E,
+    "insert": 0x2D, "home": 0x24, "end": 0x23,
+    "pgup": 0x21, "pageup": 0x21, "pgdn": 0x22, "pagedown": 0x22,
+    "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+    "esc": 0x1B, "escape": 0x1B, "capslock": 0x14, "numlock": 0x90,
+    "scrolllock": 0x91, "pause": 0x13, "print": 0x2A,
+    "printscreen": 0x2C, "prntscrn": 0x2C, "prtsc": 0x2C, "prtscr": 0x2C,
+    "apps": 0x5D, "help": 0x2F, "execute": 0x2B, "select": 0x29,
+    "sleep": 0x5F, "cancel": 0x03, "clear": 0x0C,
+    "accept": 0x1E, "convert": 0x1C, "nonconvert": 0x1D, "final": 0x18,
+    "modechange": 0x1F, "kana": 0x15, "hanguel": 0x15, "hangul": 0x15,
+    "hanja": 0x19, "kanji": 0x19,
+    "num0": 0x60, "num1": 0x61, "num2": 0x62, "num3": 0x63, "num4": 0x64,
+    "num5": 0x65, "num6": 0x66, "num7": 0x67, "num8": 0x68, "num9": 0x69,
+    "multiply": 0x6A, "add": 0x6B, "sep": 0x6C, "separator": 0x6C,
+    "subtract": 0x6D, "decimal": 0x6E, "divide": 0x6F,
+    "nexttrack": 0xB0, "prevtrack": 0xB1, "stop": 0xB2, "playpause": 0xB3,
+    "volumemute": 0xAD, "volumeup": 0xAF, "volumedown": 0xAE,
+    "launchmail": 0xB4, "launchmediaselect": 0xB5, "launchapp1": 0xB6, "launchapp2": 0xB7,
+    "browserback": 0xA6, "browserforward": 0xA7, "browserrefresh": 0xA8,
+    "browserstop": 0xA9, "browsersearch": 0xAA, "browserfavorites": 0xAB,
+    "browserhome": 0xAC,
+}
+_VK_NAMED_KEYS.update({f"f{index}": 0x70 + index - 1 for index in range(1, 25)})
+_VK_NAMED_KEYS.update({chr(0x61 + index): 0x41 + index for index in range(26)})  # a-z
+_VK_NAMED_KEYS.update({str(digit): 0x30 + digit for digit in range(10)})  # 0-9
+# Uppercase letters are deliberately NOT in the table: 'A' resolves through the
+# lowercase entry with needs_shift=True (pyautogui needsShift parity).
+
+_MOUSE_BUTTON_FLAGS: dict[str, tuple[int, int]] = {
+    "left": (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP),
+    "right": (_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP),
+    "middle": (_MOUSEEVENTF_MIDDLEDOWN, _MOUSEEVENTF_MIDDLEUP),
+}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean env flag; garbage values fall back to the default."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _env_nonnegative_float(name: str, default: float) -> float:
+    """Read a non-negative float env value; garbage/negative falls back to default."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+#: Settle/gap policy between queued final-Enter-ish keystrokes (B3, T8): a terminal-key
+#: chord dispatched within this many seconds of the previous keyboard dispatch waits
+#: out the remainder first, so a fast follow_ups batch cannot drop the final Enter into
+#: an input-stack race. ``CORTEX_KEY_DISPATCH_GAP`` overrides (0 disables).
+KEY_DISPATCH_GAP_SECONDS = _env_nonnegative_float("CORTEX_KEY_DISPATCH_GAP", 0.05)
+
+#: B8 settle policy (T8): keyboard input is paced behind a RECENT focus transition
+#: (focus_window / ensure_app reattach) for this many seconds — the first keys sent
+#: while the activated window's thread input queue is still settling are the ones that
+#: drop or misdeliver (the B5 wedge topology; the A5 residual risk class).
+#: ``CORTEX_FOCUS_SETTLE_SECONDS`` overrides (0 disables). Re-dispatch of the dropped
+#: keys is deliberately NOT automatic (a re-issued Enter can double-submit).
+FOCUS_TRANSITION_SETTLE_SECONDS = _env_nonnegative_float("CORTEX_FOCUS_SETTLE_SECONDS", 0.3)
+
+
+def _virtual_screen_metrics() -> tuple[int, int, int, int]:
+    """Virtual-desktop ``(x, y, width, height)`` via ``GetSystemMetrics`` (fail closed)."""
+    if IS_WINDOWS and _user32 is not None:
+        get_metrics = getattr(_user32, "GetSystemMetrics", None)
+        if get_metrics is not None:
+            try:
+                x = int(get_metrics(_SM_XVIRTUALSCREEN))
+                y = int(get_metrics(_SM_YVIRTUALSCREEN))
+                width = int(get_metrics(_SM_CXVIRTUALSCREEN))
+                height = int(get_metrics(_SM_CYVIRTUALSCREEN))
+            except (OSError, AttributeError, ValueError):
+                x = y = width = height = 0
+            if width > 0 and height > 0:
+                return (x, y, width, height)
+    raise InputBlockedError(
+        "Virtual-desktop metrics are unavailable; refusing physical input (fail closed)."
+    )
+
+
+def _primary_screen_size() -> tuple[int, int]:
+    """Primary-monitor pixel size via ``GetSystemMetrics`` (pyautogui's ``size()`` parity)."""
+    if IS_WINDOWS and _user32 is not None:
+        get_metrics = getattr(_user32, "GetSystemMetrics", None)
+        if get_metrics is not None:
+            try:
+                width = int(get_metrics(0))
+                height = int(get_metrics(1))
+                if width > 0 and height > 0:
+                    return (width, height)
+            except (OSError, AttributeError, ValueError):
+                pass
+    return (1920, 1080)
+
+
+def _to_absolute_65535(value: int, origin: int, extent: int) -> int:
+    """Normalize one physical axis to ``MOUSEEVENTF_ABSOLUTE``'s 0-65535 range.
+
+    Bijection over the axis: ``0 -> 0`` and ``origin + extent - 1 -> 65535`` so the
+    inverse (``_from_absolute_65535``) restores the exact pixel. ``extent <= 1``
+    degenerates to 0.
+    """
+    if extent <= 1:
+        return 0
+    clamped = min(max(value, origin), origin + extent - 1)
+    return round((clamped - origin) * 65535 / (extent - 1))
+
+
+def _from_absolute_65535(normalized: int, origin: int, extent: int) -> int:
+    """Inverse of :func:`_to_absolute_65535` (used by the parity tests)."""
+    if extent <= 1:
+        return origin
+    return origin + round(normalized * (extent - 1) / 65535)
+
+
+def _mouse_move_event(x: int, y: int, metrics: tuple[int, int, int, int]) -> _INPUT:
+    """Absolute ``MOUSEEVENTF_MOVE`` event over the whole virtual desktop.
+
+    ``MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`` maps 0-65535 onto the entire
+    virtual desktop (multi-monitor correct; pyautogui's own normalization uses primary
+    metrics only — a latent bug the SendInput engine deliberately does not copy).
+    """
+    origin_x, origin_y, width, height = metrics
+    return _INPUT(
+        type=_INPUT_MOUSE,
+        union=_INPUT_UNION(
+            mi=_MOUSEINPUT(
+                dx=_to_absolute_65535(x, origin_x, width),
+                dy=_to_absolute_65535(y, origin_y, height),
+                mouseData=0,
+                dwFlags=_MOUSEEVENTF_MOVE | _MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_VIRTUALDESK,
+                time=0,
+                dwExtraInfo=0,
+            )
+        ),
+    )
+
+
+def _mouse_flag_event(dw_flags: int, mouse_data: int = 0) -> _INPUT:
+    """Relative-flag mouse event (button/wheel); dx/dy unused at (0, 0) with no MOVE."""
+    return _INPUT(
+        type=_INPUT_MOUSE,
+        union=_INPUT_UNION(
+            mi=_MOUSEINPUT(
+                dx=0, dy=0, mouseData=mouse_data & 0xFFFFFFFF, dwFlags=dw_flags, time=0, dwExtraInfo=0
+            )
+        ),
+    )
+
+
+def _key_event(vk: int, scan: int, dw_flags: int) -> _INPUT:
+    """One ``KEYBDINPUT`` event (``KEYEVENTF_UNICODE`` uses ``scan`` as the code unit)."""
+    return _INPUT(
+        type=_INPUT_KEYBOARD,
+        union=_INPUT_UNION(
+            ki=_KEYBDINPUT(wVk=vk & 0xFFFF, wScan=scan & 0xFFFF, dwFlags=dw_flags, time=0, dwExtraInfo=0)
+        ),
+    )
+
+
+def _text_to_key_units(text: str) -> list[tuple[int, int, int]]:
+    """Whole-string typing as ``KEYEVENTF_UNICODE`` event triples ``(vk, scan, flags)``.
+
+    Layout-proof: every character is injected as a UTF-16 code unit (VK_PACKET), so
+    keyboard-layout remapping (e.g. Arabic) cannot garble it. ``'\\n'``/``'\\r'`` become
+    ``VK_RETURN`` and ``'\\t'`` becomes ``VK_TAB`` (pyautogui ``write`` parity). Astral
+    characters split into surrogate pairs.
+    """
+    units: list[tuple[int, int, int]] = []
+    for char in text:
+        if char in ("\n", "\r"):
+            units.extend(((0x0D, 0, 0), (0x0D, 0, _KEYEVENTF_KEYUP)))
+            continue
+        if char == "\t":
+            units.extend(((0x09, 0, 0), (0x09, 0, _KEYEVENTF_KEYUP)))
+            continue
+        encoded = char.encode("utf_16_le")
+        for index in range(0, len(encoded), 2):
+            code_unit = int.from_bytes(encoded[index : index + 2], "little")
+            units.append((0, code_unit, _KEYEVENTF_UNICODE))
+            units.append((0, code_unit, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP))
+    return units
+
+
+def _resolve_key_events(key: str) -> tuple[int, bool]:
+    """Resolve one key name to ``(virtual_key, needs_shift)``; unknown -> ValueError.
+
+    Named keys use the static table; other printable characters resolve via
+    ``VkKeyScanW`` (pyautogui parity: layout-dependent, shift flag honored).
+    """
+    named = _VK_NAMED_KEYS.get(key)
+    if named is not None:
+        return (named, False)
+    if len(key) == 1:
+        lowered = _VK_NAMED_KEYS.get(key.lower())
+        if lowered is not None:
+            return (lowered, key.lower() != key)  # uppercase letter: inject shift too
+    if not IS_WINDOWS or _user32 is None:
+        raise ValueError(f"unsupported key: {key!r}")
+    try:
+        result = int(_user32.VkKeyScanW(ctypes.c_wchar(key))) & 0xFFFF
+    except (OSError, AttributeError, ValueError, TypeError):
+        result = 0xFFFF  # VkKeyScanW returns -1 (0xFFFF) for unmappable characters
+    if result == 0xFFFF:
+        raise ValueError(f"unsupported keyboard character or key name: {key!r}")
+    vk = result & 0xFF
+    needs_shift = bool(result & 0x0100)
+    return (vk, needs_shift)
+
+
+def _chord_key_units(keys: list[str]) -> list[tuple[int, int, int]]:
+    """Chord events ``(vk, scan, flags)``: press in order, release in reverse order.
+
+    All events land in ONE SendInput call — injected input is serialized into the input
+    stream (never interleaved with real user input), which makes batched chords safer
+    than four separate ``keybd_event`` calls. Shift that a member requires (via
+    ``VkKeyScanW``) is pressed first and released last (stuck-modifier hygiene).
+    """
+    resolved = [_resolve_key_events(key) for key in keys]
+    units: list[tuple[int, int, int]] = []
+    shift_pressed = False
+    for vk, needs_shift in resolved:
+        if needs_shift and not shift_pressed:
+            units.append((0x10, 0, 0))
+            shift_pressed = True
+        units.append((vk, 0, 0))
+    for vk, needs_shift in reversed(resolved):
+        units.append((vk, 0, _KEYEVENTF_KEYUP))
+        if needs_shift and shift_pressed:
+            units.append((0x10, 0, _KEYEVENTF_KEYUP))
+            shift_pressed = False
+    if shift_pressed:  # unreachable by construction; belt-and-braces release
+        units.append((0x10, 0, _KEYEVENTF_KEYUP))
+    return units
+
+
+class InputEngine(ABC):
+    """Physical-input contract used by :class:`LocalComputerBackend.execute`.
+
+    Implementations must raise :class:`InputBlockedError` when input is blocked
+    (failsafe corner, blocked desktop/UIPI) and must never partially dispatch silently
+    (a zero-event success is a contract violation). Pacing attributes
+    (``click_interval``/``type_interval``/``drag_interpolate``/``drag_step_pause``)
+    are read by the backend to keep stroke/stop-check policy engine-agnostic.
+    """
+
+    click_interval: float = 0.0
+    type_interval: float = 0.0
+    drag_interpolate: bool = False
+    drag_step_pause: float = 0.0
+
+    @abstractmethod
+    def move(self, x: int, y: int) -> None:
+        """Reposition the cursor to physical virtual-screen ``(x, y)``."""
+
+    @abstractmethod
+    def click(self, x: int, y: int, clicks: int = 1) -> None:
+        """Move to ``(x, y)`` and press/release the left button ``clicks`` times."""
+
+    @abstractmethod
+    def mouse_down(self, button: str = "left") -> None:
+        """Press a mouse button (drag start)."""
+
+    @abstractmethod
+    def mouse_up(self, button: str = "left") -> None:
+        """Release a mouse button (drag end; the backend guarantees this runs)."""
+
+    @abstractmethod
+    def type_text(self, text: str, before_chunk: Callable[[], None] | None = None) -> None:
+        """Type a whole string; ``before_chunk`` runs before every dispatch chunk."""
+
+    @abstractmethod
+    def chord(self, keys: list[str]) -> None:
+        """Press and release a chord of key names (pyautogui vocabulary)."""
+
+    @abstractmethod
+    def scroll(self, delta: int) -> None:
+        """Scroll by ``delta`` wheel notches (positive = up, pyautogui parity)."""
+
+    def release_modifiers(self, keys: list[str]) -> None:
+        """Synthetic key-up for the NAMED modifiers only (HotkeyGuard ``release`` mode).
+
+        Concrete engines override this; the base implementation is a deliberate no-op
+        so existing engine implementations keep working unchanged. Callers must only
+        ever name modifiers this session dispatched (the guard matches against its own
+        chord log) — a key-up for a key we did not press is never sent.
+        """
+        return
+
+
+class PyAutoGuiInputEngine(InputEngine):
+    """pyautogui-backed engine: the selectable fallback (same contract, legacy pacing).
+
+    Preserves the pre-SendInput behavior exactly (click interval 0.08 s, per-char
+    write + 0.01 s sleep, interpolated drag stroke) except ``PAUSE``: the mission's
+    PAUSE economics set it to 0 by default (``CORTEX_PYAUTOGUI_PAUSE`` restores 0.1).
+    ``FailSafeException`` maps onto :class:`InputBlockedError` as before.
+    """
+
+    def __init__(
+        self,
+        pyautogui_module: object,
+        *,
+        pause: float = 0.0,
+        click_interval: float = 0.08,
+        type_interval: float = _TYPE_INTERVAL_SECONDS,
+        drag_interpolate: bool = True,
+        drag_step_pause: float = _DRAG_STEP_PAUSE_SECONDS,
+        failsafe: bool = True,
+    ) -> None:
+        self._pa = pyautogui_module
+        self._pa.FAILSAFE = failsafe
+        self._pa.PAUSE = pause
+        self.click_interval = click_interval
+        self.type_interval = type_interval
+        self.drag_interpolate = drag_interpolate
+        self.drag_step_pause = drag_step_pause
+
+    def _perform(self, input_call: Callable[[], None]) -> None:
+        """Run one pyautogui input, mapping FailSafeException onto InputBlockedError."""
+        try:
+            input_call()
+        except self._pa.FailSafeException as exc:
+            raise InputBlockedError(
+                "pyautogui failsafe triggered (mouse in a screen corner); physical input halted."
+            ) from exc
+
+    def move(self, x: int, y: int) -> None:
+        self._perform(lambda: self._pa.moveTo(x, y))
+
+    def click(self, x: int, y: int, clicks: int = 1) -> None:
+        self._perform(lambda: self._pa.click(x, y, clicks=clicks, interval=self.click_interval))
+
+    def mouse_down(self, button: str = "left") -> None:
+        self._perform(lambda: self._pa.mouseDown(button=button))
+
+    def mouse_up(self, button: str = "left") -> None:
+        self._perform(lambda: self._pa.mouseUp(button=button))
+
+    def type_text(self, text: str, before_chunk: Callable[[], None] | None = None) -> None:
+        for char in text:
+            if before_chunk is not None:
+                before_chunk()
+            self._perform(lambda char=char: self._pa.write(char))
+            if self.type_interval > 0:
+                time.sleep(self.type_interval)
+
+    def chord(self, keys: list[str]) -> None:
+        self._perform(lambda: self._pa.hotkey(*keys))
+
+    def release_modifiers(self, keys: list[str]) -> None:
+        """Key-up each named modifier via pyautogui (release mode, T8)."""
+        for key in keys:
+            self._perform(lambda key=key: self._pa.keyUp(key))
+
+    def scroll(self, delta: int) -> None:
+        self._perform(lambda: self._pa.scroll(delta))
+
+
+class SendInputEngine(InputEngine):
+    """Raw Win32 SendInput engine (stdlib ctypes, zero new dependencies).
+
+    - Mouse: absolute ``MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`` events
+      normalized 0-65535 over the WHOLE virtual desktop (multi-monitor correct).
+    - Keyboard: batched ``KEYEVENTF_UNICODE`` (VK_PACKET) for typing — layout-proof,
+      fixes keyboard-layout-dependent garbled input (e.g. Arabic); chords are batched
+      into one call and modifiers are always released in reverse order.
+    - Failsafe parity: the pyautogui screen-corner check is replicated before every
+      dispatch batch and raises the same :class:`InputBlockedError`.
+    - Fail-closed: a ``SendInput`` return of 0 (blocked by UIPI or another thread)
+      raises :class:`InputBlockedError` — strictly stronger than pyautogui, which
+      silently swallows ``PermissionError``/``OSError`` from ``mouse_event``.
+
+    Pacing defaults are zero (batched whole-string typing, minimal drag segments);
+    ``type_interval``/``drag_step_pause``/``click_interval`` restore per-event cadence
+    when a consumer needs the paced profile. ``_dispatch`` is the injectable thunk for
+    tests (mock ``backend_module._user32`` instead — the binding is read at call time).
+    """
+
+    def __init__(
+        self,
+        *,
+        failsafe: bool = True,
+        click_interval: float = 0.0,
+        type_interval: float = SENDINPUT_TYPE_INTERVAL,
+        drag_interpolate: bool = False,
+        drag_step_pause: float = SENDINPUT_DRAG_STEP_PAUSE,
+    ) -> None:
+        if not IS_WINDOWS or _user32 is None:
+            raise RuntimeError("SendInputEngine requires Windows.")
+        self.failsafe = failsafe
+        self.click_interval = click_interval
+        self.type_interval = type_interval
+        self.drag_interpolate = drag_interpolate
+        self.drag_step_pause = drag_step_pause
+
+    # -- dispatch plumbing ---------------------------------------------------------------
+
+    def _dispatch(self, events: list[_INPUT]) -> int:
+        """The injectable SendInput thunk: returns the number of events accepted."""
+        array = (_INPUT * len(events))(*events)
+        return int(_user32.SendInput(len(array), array, ctypes.sizeof(_INPUT)))
+
+    def _cursor_in_failsafe_corner(self) -> bool:
+        position = get_cursor_position()
+        if position is None:
+            return False
+        width, height = _primary_screen_size()
+        corners = {(0, 0), (0, height - 1), (width - 1, 0), (width - 1, height - 1)}
+        return position in corners
+
+    def _send(self, events: list[_INPUT]) -> None:
+        """Failsafe-check, dispatch one batch, and fail closed on a zero result."""
+        if not events:
+            return
+        if not IS_WINDOWS or _user32 is None:
+            raise InputBlockedError("Physical input requires Windows.")
+        if self.failsafe and self._cursor_in_failsafe_corner():
+            raise InputBlockedError(
+                "SendInput failsafe triggered (mouse in a screen corner); physical input halted."
+            )
+        if self._dispatch(events) == 0:
+            raise InputBlockedError(
+                "SendInput was blocked (UIPI or another input source); physical input halted."
+            )
+
+    # -- InputEngine interface -------------------------------------------------------------
+
+    def move(self, x: int, y: int) -> None:
+        self._send([_mouse_move_event(x, y, _virtual_screen_metrics())])
+
+    def click(self, x: int, y: int, clicks: int = 1) -> None:
+        if clicks < 1:
+            raise ValueError("clicks must be >= 1")
+        metrics = _virtual_screen_metrics()
+        if clicks == 1 or self.click_interval <= 0:
+            events = [_mouse_move_event(x, y, metrics)]
+            for _ in range(clicks):
+                events.append(_mouse_flag_event(_MOUSEEVENTF_LEFTDOWN))
+                events.append(_mouse_flag_event(_MOUSEEVENTF_LEFTUP))
+            self._send(events)
+            return
+        self._send([_mouse_move_event(x, y, metrics),
+                    _mouse_flag_event(_MOUSEEVENTF_LEFTDOWN),
+                    _mouse_flag_event(_MOUSEEVENTF_LEFTUP)])
+        for _ in range(clicks - 1):
+            time.sleep(self.click_interval)
+            self._send([_mouse_flag_event(_MOUSEEVENTF_LEFTDOWN),
+                        _mouse_flag_event(_MOUSEEVENTF_LEFTUP)])
+
+    def mouse_down(self, button: str = "left") -> None:
+        try:
+            down_flag, _up_flag = _MOUSE_BUTTON_FLAGS[button]
+        except KeyError as exc:
+            raise ValueError(f"unsupported mouse button: {button!r}") from exc
+        self._send([_mouse_flag_event(down_flag)])
+
+    def mouse_up(self, button: str = "left") -> None:
+        try:
+            _down_flag, up_flag = _MOUSE_BUTTON_FLAGS[button]
+        except KeyError as exc:
+            raise ValueError(f"unsupported mouse button: {button!r}") from exc
+        self._send([_mouse_flag_event(up_flag)])
+
+    def type_text(self, text: str, before_chunk: Callable[[], None] | None = None) -> None:
+        if not text:
+            return
+        units = _text_to_key_units(text)
+        if self.type_interval > 0:
+            chunk_size = 2  # one character (down+up) per paced chunk
+        else:
+            chunk_size = _SENDINPUT_CHUNK_EVENTS - (_SENDINPUT_CHUNK_EVENTS % 2)
+        events = [_key_event(vk, scan, flags) for vk, scan, flags in units]
+        for start in range(0, len(events), chunk_size):
+            if before_chunk is not None:
+                before_chunk()
+            self._send(events[start : start + chunk_size])
+            if self.type_interval > 0:
+                time.sleep(self.type_interval)
+
+    def chord(self, keys: list[str]) -> None:
+        self._send([_key_event(vk, scan, flags) for vk, scan, flags in _chord_key_units(keys)])
+
+    def release_modifiers(self, keys: list[str]) -> None:
+        """Key-up each named modifier in ONE SendInput batch (release mode, T8)."""
+        events: list[_INPUT] = []
+        for key in keys:
+            vk, _needs_shift = _resolve_key_events(key)
+            events.append(_key_event(vk, 0, _KEYEVENTF_KEYUP))
+        self._send(events)
+
+    def scroll(self, delta: int) -> None:
+        self._send([_mouse_flag_event(_MOUSEEVENTF_WHEEL, (delta * _WHEEL_DELTA) & 0xFFFFFFFF)])
+
+
+# --- UIA semantic read (PERF-004): raw ctypes COM, zero dependencies --------------------------
+
+
+def _guid_from_string(value: str) -> _GUID:
+    """Windows ``GUID`` struct from its canonical string form (little-endian layout)."""
+    return _GUID.from_buffer_copy(uuid.UUID(value).bytes_le)
+
+
+def _com_call(pointer: int, index: int, argtypes: tuple[type, ...], *args: object) -> int:
+    """Call method ``index`` on a COM interface pointer (stdcall; returns HRESULT).
+
+    Failed HRESULTs (negative) are RETURNED, not raised: property getters legitimately
+    fail per-property (unsupported value patterns) and the snapshot degrades per field.
+    Unrecoverable plumbing failures (bad vtable access) raise and are caught by callers.
+    """
+    vtable_ptr = ctypes.cast(ctypes.c_void_p(pointer), ctypes.POINTER(ctypes.c_void_p)).contents
+    function_addr = ctypes.cast(ctypes.c_void_p(vtable_ptr.value), ctypes.POINTER(ctypes.c_void_p))[index]
+    prototype = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, *argtypes)
+    function = prototype(function_addr)
+    try:
+        return int(function(ctypes.c_void_p(pointer), *args))
+    except OSError as exc:  # WINFUNCTYPE auto-raises on a failed HRESULT
+        return int(exc.winerror) if exc.winerror else -1
+
+
+def _com_release(pointer: int | None) -> None:
+    """Release a COM interface pointer (IUnknown::Release, slot 2); never raises."""
+    if not pointer:
+        return
+    try:
+        _com_call(pointer, _COM_RELEASE, ())
+    except Exception:  # noqa: BLE001,S110 - a failed release must never break an observation
+        pass
+
+
+class UiaSemanticReader:
+    """Warm UIA snapshot reader: focused element + bounded children (raw ctypes COM).
+
+    - ``warm()`` at backend init pays the one-time COM/class-object cost (~200 ms) so
+      per-observation reads stay in the ~1-10 ms range (research digest Q3).
+    - ``read()`` returns ``{"focused": {...}, "elements": [...]}`` bounded by
+      ``UIA_MAX_ELEMENTS`` / ``UIA_MAX_DEPTH`` and a hard wall-clock budget; every
+      failure degrades to ``None`` — an observation must never fail because of UIA.
+    - All calls go through :func:`_com_call` on fixed UIAutomationClient.h vtable
+      slots (IUnknown 0-2; IUIAutomation::GetFocusedElement=7,
+      CreateTrueCondition=22; IUIAutomationElement::FindAll=6,
+      GetCurrentPropertyValue=10; IUIAutomationElementArray::get_Length=3,
+      GetElement=4). Property reads use ``GetCurrentPropertyValue`` exclusively so
+      only five vtable slots are load-bearing.
+    """
+
+    def __init__(self) -> None:
+        self._automation: int | None = None
+        self._available = False
+        self._lock = threading.Lock()
+        self._com_initialized_threads: set[int] = set()
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def _ensure_com(self) -> bool:
+        """CoInitializeEx on the calling thread (idempotent; mode-change tolerated)."""
+        if not IS_WINDOWS or _ole32 is None:
+            return False
+        thread_id = threading.get_ident()
+        if thread_id in self._com_initialized_threads:
+            return True
+        try:
+            result = int(_ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED))
+        except (OSError, AttributeError):
+            return False
+        if result not in (0, _RPC_E_CHANGED_MODE):
+            return False
+        self._com_initialized_threads.add(thread_id)
+        return True
+
+    def _ensure_automation(self) -> int | None:
+        """CoCreateInstance(CLSID_CUIAutomation) once; returns the cached interface pointer."""
+        with self._lock:
+            if self._automation:
+                return self._automation
+            if not self._ensure_com() or _ole32 is None:
+                return None
+            clsid = _guid_from_string(_CLSID_CUIAUTOMATION)
+            iid = _guid_from_string(_IID_IUIAUTOMATION)
+            out = ctypes.c_void_p()
+            try:
+                result = int(
+                    _ole32.CoCreateInstance(
+                        ctypes.byref(clsid), None, _CLSCTX_INPROC_SERVER, ctypes.byref(iid), ctypes.byref(out)
+                    )
+                )
+            except (OSError, AttributeError):
+                return None
+            if result != 0 or not out.value:
+                return None
+            self._automation = int(out.value)
+            self._available = True
+            return self._automation
+
+    def warm(self) -> bool:
+        """Warm the COM apartment + automation object; one throwaway focused read.
+
+        Never raises: any failure leaves the reader permanently unavailable and the
+        observation's semantic fields stay ``None`` (silent degradation).
+        """
+        try:
+            automation = self._ensure_automation()
+            if not automation:
+                return False
+            self.read()  # one throwaway read; warms focused-element + property paths
+            return self._available
+        except Exception:  # noqa: BLE001 - warm must never break backend construction
+            return False
+
+    # -- property reads ------------------------------------------------------------------
+
+    def _read_property(self, element: int, property_id: int) -> tuple[int, object]:
+        """Raw ``GetCurrentPropertyValue`` result as ``(variant_type, python_value)``."""
+        variant = _VARIANT()
+        result = _com_call(
+            element, _UIA_ELEMENT_GET_PROPERTY_VALUE, (ctypes.c_long, ctypes.POINTER(_VARIANT)),
+            property_id, ctypes.byref(variant),
+        )
+        if result != 0 or variant.vt == _VT_EMPTY:
+            return (_VT_EMPTY, None)
+        variant_type = int(variant.vt)  # captured before VariantClear resets it
+        if variant_type == _VT_BSTR:
+            value = ctypes.c_wchar_p(variant.union.bstrVal).value if variant.union.bstrVal else None
+        elif variant_type == _VT_I4:
+            value = int(variant.union.lVal)
+        elif variant_type == _VT_BOOL:
+            value = bool(variant.union.boolVal)
+        elif variant_type == (_VT_ARRAY | _VT_R8):
+            value = _safe_array_doubles(variant.union.parray)
+        else:
+            value = None
+        try:
+            _oleaut32.VariantClear(ctypes.byref(variant))
+        except (OSError, AttributeError, ValueError):
+            pass
+        return (variant_type, value)
+
+    def _element_summary(
+        self, element: int, deadline: float, *, focused: bool = False
+    ) -> dict[str, object]:
+        """Bounded summary dict for one element (property reads + rect)."""
+        _vtype, name = self._read_property(element, _UIA_PROP_NAME)
+        if time.perf_counter() > deadline:
+            name = None  # budget exceeded: still return the partial summary
+        _vtype, control_type = self._read_property(element, _UIA_PROP_CONTROL_TYPE)
+        _vtype, automation_id = self._read_property(element, _UIA_PROP_AUTOMATION_ID)
+        _vtype, value = self._read_property(element, _UIA_PROP_VALUE)
+        _vtype, offscreen = self._read_property(element, _UIA_PROP_IS_OFFSCREEN)
+        _vtype, rect = self._read_property(element, _UIA_PROP_BOUNDING_RECTANGLE)
+        rect_tuple = (
+            tuple(float(item) for item in rect[:4]) if isinstance(rect, tuple) and len(rect) >= 4 else None
+        )
+        return {
+            "name": name if isinstance(name, str) else None,
+            "control_type": UIA_CONTROLTYPE_NAMES.get(int(control_type)) if isinstance(control_type, int) else None,
+            "automation_id": automation_id if isinstance(automation_id, str) else None,
+            "value": value if isinstance(value, str) else None,
+            "offscreen": bool(offscreen) if isinstance(offscreen, bool) else None,
+            "rect": rect_tuple,
+            "focused": focused,
+        }
+
+    def read(self) -> dict[str, object] | None:
+        """One bounded semantic snapshot; ``None`` on any failure (silent degradation)."""
+        if not IS_WINDOWS or _ole32 is None or _oleaut32 is None:
+            return None
+        deadline = time.perf_counter() + UIA_READ_BUDGET_SECONDS
+        try:
+            automation = self._ensure_automation()
+            if not automation:
+                return None
+            focused_ptr = ctypes.c_void_p()
+            if _com_call(automation, _UIA_GET_FOCUSED_ELEMENT, (ctypes.POINTER(ctypes.c_void_p),), ctypes.byref(focused_ptr)) != 0:
+                return None
+            if not focused_ptr.value:
+                return None
+            snapshot: dict[str, object] = {
+                "focused": self._element_summary(int(focused_ptr.value), deadline, focused=True),
+                "elements": [],
+            }
+            condition_ptr = ctypes.c_void_p()
+            if _com_call(automation, _UIA_CREATE_TRUE_CONDITION, (ctypes.POINTER(ctypes.c_void_p),), ctypes.byref(condition_ptr)) == 0 and condition_ptr.value:
+                array_ptr = ctypes.c_void_p()
+                found = _com_call(
+                    int(focused_ptr.value),
+                    _UIA_ELEMENT_FIND_ALL,
+                    (ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+                    _TREE_SCOPE_CHILDREN,
+                    ctypes.c_void_p(condition_ptr.value),
+                    ctypes.byref(array_ptr),
+                )
+                if found == 0 and array_ptr.value:
+                    elements: list[dict[str, object]] = []
+                    length = ctypes.c_long(0)
+                    if _com_call(int(array_ptr.value), _UIA_ARRAY_GET_LENGTH, (ctypes.POINTER(ctypes.c_long),), ctypes.byref(length)) == 0:
+                        for index in range(min(int(length.value), UIA_MAX_ELEMENTS)):
+                            if time.perf_counter() > deadline:
+                                break
+                            child_ptr = ctypes.c_void_p()
+                            if _com_call(int(array_ptr.value), _UIA_ARRAY_GET_ELEMENT, (ctypes.c_long, ctypes.POINTER(ctypes.c_void_p)), index, ctypes.byref(child_ptr)) == 0 and child_ptr.value:
+                                summary = self._element_summary(int(child_ptr.value), deadline)
+                                if summary.get("offscreen") is not True:
+                                    elements.append(summary)
+                                _com_release(int(child_ptr.value))
+                    snapshot["elements"] = elements
+                    _com_release(int(array_ptr.value))
+                _com_release(int(condition_ptr.value))
+            _com_release(int(focused_ptr.value))
+            return snapshot
+        except Exception:  # noqa: BLE001 - observation must never fail because of UIA
+            return None
+
+
+#: Window-class -> UIA-like control-type name (Win32 fallback; best-effort mapping).
+_WIN32_CLASS_CONTROL_TYPES: dict[str, str] = {
+    "EDIT": "Edit",
+    "RICHEDIT": "Edit",
+    "RICHEDIT50W": "Edit",
+    "BUTTON": "Button",
+    "STATIC": "Text",
+    "COMBOBOX": "ComboBox",
+    "LISTBOX": "List",
+    "SYSLISTVIEW32": "List",
+    "SYSHEADER32": "Header",
+    "TOOLBARWINDOW32": "ToolBar",
+    "STATUSCLASSNAME": "StatusBar",
+    "MSCOMCTL.SLIDER": "Slider",
+    "MSCTLS_TRACKBAR32": "Slider",
+    "MSCTLS_UPDOWN32": "Spinner",
+    "MSCTLS_PROGRESS32": "ProgressBar",
+    "PROGRESSCLASS": "ProgressBar",
+    "TABCONTROL": "Tab",
+    "SYSTABCONTROL32": "Tab",
+    "SYSDATAGRID": "DataGrid",
+    "SCROLLBAR": "ScrollBar",
+    "TREEVIEW": "Tree",
+    "SYSTREEVIEW32": "Tree",
+    "DATETIMEPICK": "Calendar",
+    "SYSMONTHCAL32": "Calendar",
+}
+
+
+class Win32TextReader:
+    """Win32-window-text semantic reader: the sanctioned fallback when raw UIA COM is
+    unavailable (see the module-level rationale on :class:`UiaSemanticReader`).
+
+    Emits the SAME snapshot shape as the UIA reader (``focused`` + bounded ``elements``
+    list, every element carrying ``name``/``control_type``/``automation_id``/``value``/
+    ``offscreen``/``rect``/``focused``/``source``), sourced from:
+
+    - ``GetGUIThreadInfo`` — the foreground thread's focused control (``hwndFocus``);
+    - ``WM_GETTEXT``/``WM_GETTEXTLENGTH`` via ``SendMessageTimeoutW`` (aborts on a hung
+      target) — control text becomes ``name`` (buttons/menus) and ``value`` (edits);
+    - a BOUNDED child walk (``GetWindow(GW_CHILD)``/``GW_HWNDNEXT``): direct children of
+      the foreground root, then the children of the first few of those — at most
+      ``UIA_MAX_DEPTH`` levels, ``UIA_MAX_ELEMENTS`` elements, and one wall-clock budget,
+      same as the UIA reader.
+
+    Honest limitations (documented in the change-log): ``automation_id`` is always None
+    (no Win32 equivalent), ``control_type`` is derived from the window class name, and
+    names are limited to text the app exposes as window text.
+    """
+
+    def __init__(self) -> None:
+        self._available = IS_WINDOWS and _user32 is not None
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def warm(self) -> bool:
+        """No COM apartment to warm; availability is the Win32 binding check."""
+        return self._available
+
+    def read(self) -> dict[str, object] | None:
+        """One bounded snapshot of the foreground window's focused control + children."""
+        if not IS_WINDOWS or _user32 is None:
+            return None
+        deadline = time.perf_counter() + UIA_READ_BUDGET_SECONDS
+        try:
+            root = int(_user32.GetForegroundWindow() or 0)
+            if not root:
+                return None
+            focused_summary = self._focused_control_summary(root)
+            return {
+                "focused": focused_summary,
+                "elements": self._bounded_children(root, deadline),
+                "source": "win32",
+            }
+        except Exception:  # noqa: BLE001 - observation must never fail because of UIA
+            return None
+
+    def _focused_control_summary(self, root: int) -> dict[str, object] | None:
+        """The foreground thread's focused control via ``GetGUIThreadInfo``."""
+        try:
+            thread_id = _user32.GetWindowThreadProcessId(ctypes.c_void_p(root), None)
+            info = _GUITHREADINFO()
+            info.cbSize = ctypes.sizeof(_GUITHREADINFO)
+            if not thread_id or not _user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)):
+                return None
+            hwnd_focus = int(info.hwndFocus or 0)
+            if not hwnd_focus:
+                return None
+            return self._control_summary(hwnd_focus, focused=True)
+        except (OSError, AttributeError, ValueError):
+            return None
+
+    def _bounded_children(self, root: int, deadline: float) -> list[dict[str, object]]:
+        """Two-level, count- and budget-bounded walk of the foreground window's children."""
+        elements: list[dict[str, object]] = []
+        try:
+            level1 = _window_child_chain(root, limit=UIA_MAX_ELEMENTS)
+            for index, child in enumerate(level1):
+                if len(elements) >= UIA_MAX_ELEMENTS or time.perf_counter() > deadline:
+                    break
+                summary = self._control_summary(child)
+                if summary is not None:
+                    elements.append(summary)
+                if index < 3:  # budget guard: only the first few hosts get a second level
+                    level2 = _window_child_chain(child, limit=UIA_MAX_ELEMENTS - len(elements))
+                    for grandchild in level2:
+                        if len(elements) >= UIA_MAX_ELEMENTS or time.perf_counter() > deadline:
+                            break
+                        summary = self._control_summary(grandchild)
+                        if summary is not None:
+                            elements.append(summary)
+        except (OSError, AttributeError, ValueError):
+            return elements
+        return elements
+
+    def _control_summary(self, hwnd: int, *, focused: bool = False) -> dict[str, object] | None:
+        """One control's summary dict; None when the window is gone or inaccessible."""
+        try:
+            if not _user32.IsWindow(ctypes.c_void_p(hwnd)):
+                return None
+            class_name = _window_class_name(hwnd)
+            text = _window_text_via_message(hwnd)
+            visible = bool(_user32.IsWindowVisible(ctypes.c_void_p(hwnd)))
+            rect = _window_rect(hwnd)
+            control_type = _WIN32_CLASS_CONTROL_TYPES.get((class_name or "").upper(), class_name)
+            value = text if (focused or (class_name or "").upper() in {"EDIT", "RICHEDIT", "RICHEDIT50W"}) else None
+            return {
+                "name": text or None,
+                "control_type": control_type,
+                "automation_id": None,
+                "value": value or None,
+                "offscreen": not visible,
+                "rect": tuple(float(item) for item in rect) if rect else None,
+                "focused": focused,
+                "source": "win32",
+            }
+        except (OSError, AttributeError, ValueError):
+            return None
+
+
+def _window_child_chain(parent: int, *, limit: int) -> list[int]:
+    """Sibling chain of ``parent``'s direct children via GetWindow (bounded, read-only)."""
+    chain: list[int] = []
+    if not IS_WINDOWS or _user32 is None or limit <= 0:
+        return chain
+    try:
+        handle = int(_user32.GetWindow(ctypes.c_void_p(parent), _GW_CHILD) or 0)
+        while handle and len(chain) < limit:
+            chain.append(handle)
+            handle = int(_user32.GetWindow(ctypes.c_void_p(handle), _GW_HWNDNEXT) or 0)
+    except (OSError, AttributeError, ValueError):
+        return chain
+    return chain
+
+
+def _window_text_via_message(hwnd: int, max_chars: int = 256) -> str:
+    """Control text via WM_GETTEXT (SendMessageTimeoutW, abort-if-hung); '' on failure."""
+    if not IS_WINDOWS or _user32 is None or not hwnd:
+        return ""
+    try:
+        length = int(_user32.SendMessageTimeoutW(ctypes.c_void_p(hwnd), _WM_GETTEXTLENGTH, 0, 0, _SMTO_ABORTIFHUNG, _SENDMESSAGE_TIMEOUT_MS, None) or 0)
+        if length <= 0:
+            return ""
+        size = min(length, max_chars) + 1
+        buffer = ctypes.create_unicode_buffer(size)
+        result = ctypes.c_size_t(0)
+        copied = int(_user32.SendMessageTimeoutW(
+            ctypes.c_void_p(hwnd), _WM_GETTEXT, size, buffer, _SMTO_ABORTIFHUNG, _SENDMESSAGE_TIMEOUT_MS, ctypes.byref(result)
+        ) or 0)
+        if not copied:
+            return ""
+        return buffer.value[:max_chars]
+    except (OSError, AttributeError, ValueError):
+        return ""
+
+
+def _safe_array_doubles(pointer: int | None) -> tuple[float, ...] | None:
+    """Read a 1-D SAFEARRAY of doubles (UIA BoundingRectangle); None on any failure."""
+    if not pointer or _oleaut32 is None:
+        return None
+    access = ctypes.c_void_p()
+    try:
+        if int(_oleaut32.SafeArrayAccessData(ctypes.c_void_p(pointer), ctypes.byref(access))) != 0:
+            return None
+        if not access.value:
+            return None
+        values = tuple(float(ctypes.cast(ctypes.c_void_p(access.value), ctypes.POINTER(ctypes.c_double))[index]) for index in range(4))
+        return values
+    except (OSError, AttributeError, ValueError, IndexError):
+        return None
+    finally:
+        try:
+            _oleaut32.SafeArrayUnaccessData(ctypes.c_void_p(pointer))
+        except (OSError, AttributeError, ValueError):
+            pass
+
+
+def _uia_rect_to_screenshot(
+    rect: tuple[float, float, float, float] | None,
+    origin: tuple[int, int],
+    scale: tuple[float, float],
+) -> tuple[int, int, int, int] | None:
+    """Convert a physical UIA rect to screenshot-local ``(x, y, w, h)`` (None if empty)."""
+    if rect is None:
+        return None
+    left, top, width, height = rect
+    if width <= 0 or height <= 0:
+        return None
+    scale_x = scale[0] if scale[0] > 0 else 1.0
+    scale_y = scale[1] if scale[1] > 0 else 1.0
+    x = max(0, round((left - origin[0]) / scale_x))
+    y = max(0, round((top - origin[1]) / scale_y))
+    return (x, y, max(1, round(width / scale_x)), max(1, round(height / scale_y)))
+
+
+def _uia_snapshot_to_ui_elements(snapshot: dict[str, object]) -> list[dict[str, object]]:
+    """Snapshot -> ``Observation.ui_elements`` payload (focused element first)."""
+    elements: list[dict[str, object]] = []
+    focused = snapshot.get("focused")
+    if isinstance(focused, dict):
+        elements.append(focused)
+    children = snapshot.get("elements")
+    if isinstance(children, list):
+        for element in children:
+            if isinstance(element, dict):
+                elements.append(element)
+    return elements[: UIA_MAX_ELEMENTS + 1]
+
+
+def _uia_snapshot_to_text_regions(
+    snapshot: dict[str, object],
+    origin: tuple[int, int],
+    scale: tuple[float, float],
+) -> list[TextRegion]:
+    """Snapshot -> ``Observation.ocr_text`` regions (screenshot-local, bounded)."""
+    regions: list[TextRegion] = []
+    candidates: list[object] = []
+    focused = snapshot.get("focused")
+    if isinstance(focused, dict):
+        candidates.append(focused)
+    children = snapshot.get("elements")
+    if isinstance(children, list):
+        candidates.extend(item for item in children if isinstance(item, dict))
+    for element in candidates:
+        if len(regions) >= UIA_MAX_ELEMENTS:
+            break
+        rect = element.get("rect")
+        if not isinstance(rect, tuple) or len(rect) != 4:
+            continue
+        converted = _uia_rect_to_screenshot(
+            (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])), origin, scale
+        )
+        if converted is None:
+            continue
+        text = element.get("name") or element.get("control_type") or ""
+        if not text:
+            continue
+        x, y, width, height = converted
+        regions.append(TextRegion(text=text[:200], x=x, y=y, width=width, height=height))
+    return regions
 
 
 def _set_process_dpi_awareness() -> str:
@@ -597,6 +1921,244 @@ def get_cursor_position() -> tuple[int, int] | None:
         return None
 
 
+# --- interference probes (T8; A12 mechanisms i-v, read-only, sub-ms) -------------------------
+
+
+def query_focus_target() -> dict[str, object] | None:
+    """Who would receive keyboard input RIGHT NOW: ``GetGUIThreadInfo`` focus target.
+
+    Returns ``{"hwnd_focus", "root_hwnd", "window_class", "text", "pid",
+    "root_window_class", "process_name"}`` for the foreground thread's focused control
+    (mechanism iv's cheap, exact probe), or ``None`` when unavailable (non-Windows, no
+    foreground, or a failed query — callers treat ``None`` as "cannot verify" and leave
+    the check inert rather than guessing). ``window_class`` is the FOCUSED CONTROL's
+    class (e.g. "Edit" inside a dialog); ``root_window_class`` is the focus ROOT
+    window's class (e.g. "#32770" for the hosting Run dialog) and ``process_name`` the
+    root's process — the B10 anchoring semantics key on the ROOT surface, not the
+    focused control.
+    """
+    if not IS_WINDOWS or _user32 is None:
+        return None
+    try:
+        foreground = int(_user32.GetForegroundWindow() or 0)
+        if not foreground:
+            return None
+        thread_id = int(_user32.GetWindowThreadProcessId(ctypes.c_void_p(foreground), None) or 0)
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        # idThread=0 asks for the foreground thread; an explicit id is equally valid.
+        if not _user32.GetGUIThreadInfo(ctypes.wintypes.DWORD(thread_id), ctypes.byref(info)):
+            return None
+        hwnd_focus = int(info.hwndFocus or info.hwndActive or 0)
+        if not hwnd_focus:
+            return None
+        root = int(_user32.GetAncestor(ctypes.c_void_p(hwnd_focus), GA_ROOT) or hwnd_focus)
+        pid = _window_pid(root)
+        exe_path = _process_image_path(pid) if pid else None
+        return {
+            "hwnd_focus": hwnd_focus,
+            "root_hwnd": root,
+            "window_class": _window_class_name(hwnd_focus),
+            "text": _window_text_via_message(hwnd_focus),
+            "pid": pid,
+            "root_window_class": _window_class_name(root),
+            "process_name": os.path.basename(exe_path) if exe_path else None,
+        }
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def is_window_owned_by(hwnd: int | None, ancestor_hwnd: int | None) -> bool:
+    """Whether ``hwnd``'s GW_OWNER chain roots at ``ancestor_hwnd`` (SHARED ownership rule).
+
+    The ONE ownership computation for the whole guard: DialogSentinel classifies a
+    foreground window as an owned dialog with it, and the pre-dispatch FocusGuard
+    exempts owner-chained same-target windows with it — the two can never diverge
+    again (B11/A7b: the sentinel matched an Excel `bosa_sdm_XL9` owned modal as
+    `owner_chain` while the guard's class-keyed check rejected the same window).
+    Read-only, bounded, never raises (False on any failure).
+    """
+    if hwnd is None or ancestor_hwnd is None or not IS_WINDOWS or _user32 is None:
+        return False
+    try:
+        if not _user32.IsWindow(ctypes.c_void_p(int(hwnd))) or not _user32.IsWindow(
+            ctypes.c_void_p(int(ancestor_hwnd))
+        ):
+            return False
+        return int(ancestor_hwnd) in _owner_chain_roots(int(hwnd))
+    except (OSError, AttributeError, TypeError, ValueError):
+        return False
+
+
+def _owner_chain_roots(hwnd: int, limit: int = 8) -> list[int]:
+    """Root hwnds of the owner chain of ``hwnd`` (GetWindow(GW_OWNER), bounded)."""
+    chain: list[int] = []
+    current = hwnd
+    for _ in range(limit):
+        try:
+            owner = int(_user32.GetWindow(ctypes.c_void_p(current), _GW_OWNER) or 0)  # type: ignore[union-attr]
+        except (OSError, AttributeError, TypeError, ValueError):
+            break
+        if not owner:
+            break
+        try:
+            root = int(_user32.GetAncestor(ctypes.c_void_p(owner), GA_ROOT) or owner)  # type: ignore[union-attr]
+        except (OSError, AttributeError, TypeError, ValueError):
+            root = owner
+        chain.append(root)
+        current = owner
+    return chain
+
+
+def detect_system_dialog(
+    bound_hwnd: int | None, title_table: Sequence[str] | None = None
+) -> dict[str, object] | None:
+    """Detect a modal/system dialog holding the foreground (T8 mechanism iii).
+
+    Cheap class/owner/title query — NO UIA, NO screenshots. A dialog is reported when
+    the foreground root window differs from ``bound_hwnd`` (when provided) AND any of:
+
+    - its window class is the system dialog class ``#32770``;
+    - its owner chain reaches ``bound_hwnd`` (an owned popup of the session target);
+    - its title matches one of the configured dialog-title conventions.
+
+    Returns ``{"hwnd", "owner_hwnd", "title", "window_class", "pid", "matched"}`` or
+    ``None`` (no dialog / nothing detectable).
+    """
+    if not IS_WINDOWS or _user32 is None:
+        return None
+    try:
+        foreground = int(_user32.GetForegroundWindow() or 0)
+        if not foreground:
+            return None
+        root = int(_user32.GetAncestor(ctypes.c_void_p(foreground), GA_ROOT) or foreground)
+        if bound_hwnd is not None and root == int(bound_hwnd):
+            return None  # the session target itself is foreground: no interloper
+        window_class = _window_class_name(root) or ""
+        title = _window_text(root)
+        matched: str | None = None
+        if window_class == _DIALOG_WINDOW_CLASS:
+            matched = "class"
+        else:
+            if bound_hwnd is not None and is_window_owned_by(root, int(bound_hwnd)):
+                # B11: the SAME shared ownership helper the pre-dispatch guard uses —
+                # sentinel and guard can never diverge on ownership again.
+                matched = "owner_chain"
+            if matched is None:
+                folded = title.casefold()
+                for needle in title_table or ():
+                    text = str(needle).strip().casefold()
+                    if text and text in folded:
+                        matched = "title"
+                        break
+        if matched is None:
+            return None
+        return {
+            "hwnd": root,
+            "owner_hwnd": (_owner_chain_roots(root, limit=1) or [0])[0],
+            "title": title,
+            "window_class": window_class,
+            "pid": _window_pid(root),
+            "matched": matched,
+        }
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def enumerate_app_windows(process_name: str) -> list[AppWindowCandidate]:
+    """Visible top-level windows of ``process_name`` for attach-or-launch (mechanism ii).
+
+    EnumWindows (Z-order), filtered to visible top-level windows whose pid resolves to
+    the given process basename (case-insensitive, ``.exe``-tolerant). Each candidate
+    carries its derived doc token and the generic unsaved-candidate flag. Non-Windows
+    or an empty needle returns ``[]``.
+    """
+    if not IS_WINDOWS or _user32 is None:
+        return []
+    needle = (process_name or "").strip().casefold().removesuffix(".exe")
+    if not needle:
+        return []
+    candidates: list[AppWindowCandidate] = []
+
+    def _on_window(hwnd: object, _lparam: object) -> bool:
+        try:
+            handle = int(hwnd)  # type: ignore[arg-type]
+            if not _user32.IsWindow(ctypes.c_void_p(handle)) or not _user32.IsWindowVisible(
+                ctypes.c_void_p(handle)
+            ):
+                return True
+            root = int(_user32.GetAncestor(ctypes.c_void_p(handle), GA_ROOT) or handle)
+            pid = _window_pid(root)
+            if not pid:
+                return True
+            exe_path = _process_image_path(pid)
+            base = os.path.basename(exe_path) if exe_path else ""
+            if base.casefold().removesuffix(".exe") != needle:
+                return True
+            title = _window_text(root)
+            window = WindowInfo(
+                hwnd=root,
+                pid=pid,
+                process_name=base or None,
+                exe_path=exe_path,
+                window_class=_window_class_name(root),
+                title=title,
+                bounds=_window_rect(root),
+            )
+            candidates.append(
+                AppWindowCandidate(
+                    window=window,
+                    doc_token=doc_token_from_title(title),
+                    unsaved_candidate=is_unsaved_candidate_title(title),
+                )
+            )
+        except (OSError, AttributeError, TypeError, ValueError):
+            return True  # an unreadable window is simply not a candidate
+        return True
+
+    enum_proc = ctypes.WINFUNCTYPE(
+        ctypes.wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p
+    )(_on_window)
+    try:
+        _user32.EnumWindows(enum_proc, 0)
+    except (OSError, AttributeError):
+        return []
+    return candidates
+
+
+#: Modifier key names swept before a chord dispatch (HotkeyGuard, mechanism v).
+_MODIFIER_KEY_NAMES: dict[str, int] = {
+    "ctrl": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B,
+}
+
+
+def query_stuck_modifiers(keys: Sequence[str]) -> list[str]:
+    """Modifiers currently HELD DOWN (GetAsyncKeyState high bit) among ``keys`` + base set.
+
+    The sweep covers the chord's own modifiers plus ctrl/alt/shift/win (A12 mechanism
+    v): an untracked held modifier rewrites the chord's meaning (ctrl down + "s" is
+    save; plain "s" is a letter into a cell). Returns canonical key NAMES; empty when
+    nothing is stuck or the probe is unavailable.
+    """
+    sweep: set[str] = set()
+    for key in keys:
+        name = str(key).strip().casefold()
+        if name in _MODIFIER_KEY_NAMES:
+            sweep.add(name)
+    sweep.update(_MODIFIER_KEY_NAMES)
+    if not IS_WINDOWS or _user32 is None:
+        return []
+    stuck: list[str] = []
+    for name in sorted(sweep):
+        try:
+            state = int(_user32.GetAsyncKeyState(int(_MODIFIER_KEY_NAMES[name])))
+        except (OSError, AttributeError, TypeError, ValueError):
+            continue
+        if state & 0x8000:
+            stuck.append(name)
+    return stuck
+
+
 def _system_dpi_scale() -> float:
     """System DPI scale via ``GetDpiForSystem``; 1.0 when it cannot be queried."""
     try:
@@ -774,7 +2336,13 @@ class ComputerBackend(ABC):
         """Capture a full Observation of the current computer state."""
 
     @abstractmethod
-    def execute(self, action: GroundedAction, stop: StopToken | None = None) -> str:
+    def execute(
+        self,
+        action: GroundedAction,
+        stop: StopToken | None = None,
+        focus_hook: Callable[[], None] | None = None,
+        allow_launch: bool = False,
+    ) -> str:
         """Execute one grounded action and return a human-readable result message.
 
         ``stop`` is optional for backward compatibility: when None no cancellation checks
@@ -782,7 +2350,72 @@ class ComputerBackend(ABC):
         ``StopToken.ensure_live()`` immediately before every physical input call.
         Raises ``TaskStopped`` when a provided stop token has fired (zero inputs are
         performed in that case).
+
+        ``focus_hook`` (T8, trailing optional): for ``type`` actions, a zero-arg callable
+        invoked before every dispatch chunk AFTER the stop-token check (the FocusGuard's
+        per-chunk focus-continuity probe piggybacks this cadence). Implementations
+        without chunking invoke it once before dispatching; the hook may raise
+        :class:`FocusDriftError` to abort the in-flight type. Omitted (legacy callers)
+        keeps behavior byte-identical.
+
+        ``allow_launch`` (T8, trailing optional): the ONLY path through which
+        ``ensure_app`` may spawn a process (host-authorized server-side launch policy);
+        the default False keeps ensure_app a pure attach-probe.
         """
+
+    def query_foreground_window(self) -> WindowInfo | None:
+        """Strong identity of the current foreground window; ``None`` when unavailable."""
+        return None
+
+    def is_window_alive(self, hwnd: int | None) -> bool:
+        """Whether a previously bound window still exists (B6 TARGET_GONE probe).
+
+        Default ``True``: backends that cannot track liveness keep the conservative
+        rejection semantics (TARGET_GONE never fires on a guess).
+        """
+        return True
+
+    def is_window_owned_by(self, hwnd: int | None, ancestor_hwnd: int | None) -> bool:
+        """GW_OWNER-chain ownership probe (B11 shared rule); default ``False``.
+
+        Backends that cannot compute ownership keep the conservative semantics (the
+        guard then relies on the same-process rule only).
+        """
+        return False
+
+    def query_focus_target(self) -> dict[str, object] | None:
+        """Keyboard-focus target probe (T8 mechanism iv); ``None`` = cannot verify."""
+        return None
+
+    def detect_system_dialog(
+        self, bound_hwnd: int | None, title_table: Sequence[str] | None = None
+    ) -> dict[str, object] | None:
+        """Modal-dialog foreground probe (T8 mechanism iii); ``None`` = no dialog found."""
+        return None
+
+    def enumerate_app_windows(self, process_name: str) -> list[AppWindowCandidate]:
+        """Process-filtered window enumeration for attach-or-launch (T8 mechanism ii)."""
+        return []
+
+    def query_stuck_modifiers(self, keys: Sequence[str]) -> list[str]:
+        """Modifiers currently held down before a chord (T8 mechanism v); empty = clear."""
+        return []
+
+    def release_modifiers(self, keys: list[str]) -> None:
+        """Synthetic key-up for NAMED session-dispatched modifiers (release mode, T8)."""
+        return
+
+    def focus_window_title(self, title: str) -> str:
+        """Refocus primitive for the guard's ``refocus_then_abort`` policy (T8).
+
+        Reuses the verified foreground-switch sequence; raises
+        :class:`WindowFocusError` on refusal (never a silent failure).
+        """
+        raise UnsupportedActionError("This backend cannot focus windows by title.")
+
+    def ensure_app(self, target: str, allow_launch: bool = False) -> str:
+        """Attach-or-launch probe (T8 mechanism ii); REATTACHED/AMBIGUOUS_INSTANCE/NO_INSTANCE."""
+        raise UnsupportedActionError("This backend cannot ensure applications.")
 
     def wait(self, seconds: float, stop: StopToken | None = None) -> float:
         """Interruptible sleep; returns the seconds actually waited.
@@ -831,9 +2464,31 @@ class ComputerBackend(ABC):
 
 
 class LocalComputerBackend(ComputerBackend):
-    """Real Windows backend: Win32 identity/DPI/monitors + stop-checked pyautogui input."""
+    """Real Windows backend: Win32 identity/DPI/monitors + stop-checked engine input.
 
-    def __init__(self) -> None:
+    The physical-input hot path is a pluggable :class:`InputEngine`:
+
+    - ``sendinput`` (default): raw Win32 ``SendInput`` via ctypes — batched absolute
+      mouse moves/clicks, layout-proof ``KEYEVENTF_UNICODE`` typing, minimal-segment
+      drags; no per-call pacing cost (PERF-004).
+    - ``pyautogui`` (selectable fallback, ``CORTEX_INPUT_BACKEND=pyautogui``): the
+      legacy path with ``PAUSE=0`` by default (``CORTEX_PYAUTOGUI_PAUSE`` restores it).
+
+    Both engines honor the same contract: failsafe screen-corner checks raise
+    :class:`InputBlockedError`, and ``execute`` checks the stop token before every
+    physical input.
+    """
+
+    def __init__(
+        self,
+        *,
+        input_engine: str | None = None,
+        png_optimize: bool | None = None,
+        uia_read: bool | None = None,
+        type_interval: float | None = None,
+        pyautogui_pause: float | None = None,
+        drag_interpolate: bool | None = None,
+    ) -> None:
         self._system = platform.system()
         if self._system != "Windows":
             raise RuntimeError(
@@ -852,7 +2507,64 @@ class LocalComputerBackend(ComputerBackend):
 
         self._pyautogui = pyautogui
         pyautogui.FAILSAFE = True
+        self._engine = self._build_input_engine(
+            input_engine, type_interval, pyautogui_pause, drag_interpolate
+        )
+        self.png_optimize: bool = (
+            _env_bool(PNG_OPTIMIZE_ENV, False) if png_optimize is None else png_optimize
+        )
+        self._uia_enabled: bool = _env_bool(UIA_READ_ENV, True) if uia_read is None else uia_read
+        self._semantic_reader: UiaSemanticReader | Win32TextReader | None = None
+        if self._uia_enabled:
+            uia_reader = UiaSemanticReader()
+            # Raw UIA COM first; the Win32 window-text reader is the sanctioned fallback
+            # (PERF-004: this hardening-affected box refuses IUIAutomation from
+            # CUIActivation via raw COM in every process — see change-log).
+            self._semantic_reader = uia_reader if uia_reader.warm() else Win32TextReader()
+        if self._semantic_reader is not None:
+            self._semantic_reader.warm()  # one-time warm-up; never raises
         self._refresh_monitors()
+        # B3 settle/gap policy: monotonic timestamp of the last keyboard dispatch
+        # (0.0 = epoch; the first dispatch of a session never waits).
+        self._last_key_dispatch: float = 0.0
+        # B8 settle policy: monotonic timestamp of the last focus transition.
+        self._last_focus_transition: float = 0.0
+
+    def _build_input_engine(
+        self,
+        input_engine: str | None,
+        type_interval: float | None,
+        pyautogui_pause: float | None,
+        drag_interpolate: bool | None,
+    ) -> InputEngine:
+        """Resolve the input engine from the argument/env/default precedence."""
+        name = (input_engine or os.getenv(INPUT_BACKEND_ENV) or "sendinput").strip().lower()
+        if name not in {"sendinput", "pyautogui"}:
+            raise ValueError(
+                f"unknown input engine {name!r}: expected 'sendinput' or 'pyautogui'"
+            )
+        interval = (
+            _env_nonnegative_float(TYPE_INTERVAL_ENV, SENDINPUT_TYPE_INTERVAL)
+            if type_interval is None
+            else max(0.0, type_interval)
+        )
+        engine: InputEngine
+        if name == "pyautogui":
+            pause = (
+                _env_nonnegative_float(PYAUTOGUI_PAUSE_ENV, 0.0)
+                if pyautogui_pause is None
+                else max(0.0, pyautogui_pause)
+            )
+            engine = PyAutoGuiInputEngine(self._pyautogui, pause=pause, type_interval=interval)
+        else:
+            engine = SendInputEngine(type_interval=interval)
+        if drag_interpolate is not None:
+            engine.drag_interpolate = drag_interpolate
+        else:
+            env_flag = os.getenv(DRAG_INTERPOLATE_ENV)
+            if env_flag is not None and env_flag.strip():
+                engine.drag_interpolate = _env_bool(DRAG_INTERPOLATE_ENV, engine.drag_interpolate)
+        return engine
 
     @staticmethod
     def _neutralize_mss_dpi_awareness(mss_module: object) -> bool:
@@ -896,7 +2608,8 @@ class LocalComputerBackend(ComputerBackend):
 
         Targets the monitor containing the cursor (fallback: primary monitor), or
         ``monitor_index`` when provided. Raises ``DisplayUnavailableError`` when capture
-        fails; window/cursor identity degrades to None instead of failing.
+        fails; window/cursor identity and the UIA semantic read degrade to None instead
+        of failing.
         """
         if self._system != "Windows":
             raise DisplayUnavailableError("Screen capture requires Windows.")
@@ -917,6 +2630,7 @@ class LocalComputerBackend(ComputerBackend):
                 origin_x=left, origin_y=top, scale_x=verdict.scale_x, scale_y=verdict.scale_y
             ).to_screenshot(*cursor_physical)
         self._active_context = _CaptureContext(monitor=monitor, verdict=verdict)
+        ocr_text, ui_elements = self._uia_semantic_fields(monitor, verdict)
         return Observation(
             image_base64=encoded,
             width=image_width,
@@ -931,11 +2645,45 @@ class LocalComputerBackend(ComputerBackend):
             coordinate_space=verdict.space,
             monitor=monitor,
             active_window_info=window_info,
+            ocr_text=ocr_text,
+            ui_elements=ui_elements,
             redactions_applied=False,
         )
 
+    def _uia_semantic_fields(
+        self, monitor: MonitorInfo, verdict: CoordinateVerdict
+    ) -> tuple[list[TextRegion] | None, list[dict[str, object]] | None]:
+        """Semantic snapshot -> the optional ``ocr_text``/``ui_elements`` fields.
+
+        Silent degradation everywhere: an unavailable reader, a failed COM call, or an
+        exceeded read budget leaves both fields ``None`` (or returns the partial data
+        already gathered) and never raises into the observation loop.
+        """
+        reader = self._semantic_reader
+        if reader is None or not reader.available:
+            return (None, None)
+        try:
+            snapshot = reader.read()
+        except Exception:  # noqa: BLE001 - a broken reader must never break an observation
+            return (None, None)
+        if snapshot is None:
+            return (None, None)
+        origin = (monitor.bounds[0], monitor.bounds[1])
+        scale = (verdict.scale_x, verdict.scale_y)
+        try:
+            ui_elements = _uia_snapshot_to_ui_elements(snapshot)
+            ocr_text = _uia_snapshot_to_text_regions(snapshot, origin, scale)
+        except Exception:  # noqa: BLE001 - conversion must never break an observation
+            return (None, None)
+        return (ocr_text or None, ui_elements or None)
+
     def _grab_png(self, left: int, top: int, width: int, height: int) -> tuple[str, int, int]:
-        """Capture a monitor region and return ``(base64_png, width, height)``."""
+        """Capture a monitor region and return ``(base64_png, width, height)``.
+
+        PNG encoding defaults to ``optimize=False`` (PERF-004: −201 ms/frame measured,
+        and a slightly SMALLER payload on real UI content); ``CORTEX_PNG_OPTIMIZE=1``
+        (or the ``png_optimize`` constructor argument) restores the old behavior.
+        """
         try:
             with self._mss_factory() as capture:
                 raw = capture.grab({"left": left, "top": top, "width": width, "height": height})
@@ -943,13 +2691,28 @@ class LocalComputerBackend(ComputerBackend):
         except Exception as exc:
             raise DisplayUnavailableError(f"Screen capture failed: {exc}") from exc
         output = io.BytesIO()
-        image.save(output, format="PNG", optimize=True)
+        image.save(output, format="PNG", optimize=self.png_optimize)
         return base64.b64encode(output.getvalue()).decode("ascii"), image.width, image.height
 
-    def execute(self, action: GroundedAction, stop: StopToken | None = None) -> str:
-        """Execute one action; the stop token is checked before every physical input."""
+    def execute(
+        self,
+        action: GroundedAction,
+        stop: StopToken | None = None,
+        focus_hook: Callable[[], None] | None = None,
+        allow_launch: bool = False,
+    ) -> str:
+        """Execute one action; the stop token is checked before every physical input.
+
+        The physical input itself is dispatched by the selected :class:`InputEngine`
+        (SendInput by default, pyautogui fallback). Every engine dispatch is preceded by
+        a stop-token check (per typing chunk / drag segment, exactly like per pyautogui
+        call before), and engines raise :class:`InputBlockedError` on failsafe/blocked
+        input, preserving the pre-SendInput error semantics. ``focus_hook`` (T8) runs
+        before every ``type`` dispatch chunk after the stop check (focus continuity).
+        """
         if stop is not None:
             stop.ensure_live()
+        engine = self._engine
         if action.action == "wait":
             total = min(max(action.delta, 0), WAIT_MAX_SECONDS)
             if stop is None:
@@ -964,29 +2727,28 @@ class LocalComputerBackend(ComputerBackend):
             if stop is not None:
                 stop.ensure_live()
             clicks = 2 if action.action == "double_click" else 1
-            self._perform(
-                lambda: self._pyautogui.click(physical[0], physical[1], clicks=clicks, interval=0.08)
-            )
+            engine.click(physical[0], physical[1], clicks=clicks)
         elif action.action == "drag":
             if action.point is None or action.to_point is None:
                 raise ValueError("Both a start point and an end point are required for drag actions")
             start = self._map_to_physical(action.point.x, action.point.y)
             end = self._map_to_physical(action.to_point.x, action.to_point.y)
             if stop is not None:
-                stop.ensure_live()  # before moveTo(start)
-            self._perform(lambda: self._pyautogui.moveTo(start[0], start[1]))
+                stop.ensure_live()  # before move(start)
+            engine.move(start[0], start[1])
             if stop is not None:
                 stop.ensure_live()  # before mouseDown
             button_down = False
             drag_error: BaseException | None = None
             try:
-                self._perform(lambda: self._pyautogui.mouseDown(button="left"))
+                engine.mouse_down("left")
                 button_down = True
-                for segment_x, segment_y in _drag_segment_points(start, end):
+                for segment_x, segment_y in self._drag_waypoints(start, end):
                     if stop is not None:
                         stop.ensure_live()  # before every stroke segment
-                    self._perform(lambda sx=segment_x, sy=segment_y: self._pyautogui.moveTo(sx, sy))
-                    time.sleep(_DRAG_STEP_PAUSE_SECONDS)
+                    engine.move(segment_x, segment_y)
+                    if engine.drag_step_pause > 0:
+                        time.sleep(engine.drag_step_pause)
                 if stop is not None:
                     stop.ensure_live()  # before mouseUp
             except BaseException as error:
@@ -998,7 +2760,7 @@ class LocalComputerBackend(ComputerBackend):
                 # failing release never masks an in-flight error such as TaskStopped.
                 if button_down:
                     try:
-                        self._perform(lambda: self._pyautogui.mouseUp(button="left"))
+                        engine.mouse_up("left")
                     except Exception:
                         if drag_error is None:
                             raise
@@ -1008,22 +2770,35 @@ class LocalComputerBackend(ComputerBackend):
             physical = self._map_to_physical(action.point.x, action.point.y)
             if stop is not None:
                 stop.ensure_live()  # before the single cursor reposition
-            self._perform(lambda: self._pyautogui.moveTo(*physical))
+            engine.move(physical[0], physical[1])
             time.sleep(_MOVE_SETTLE_SECONDS)  # settle only; a move is not an input press
         elif action.action == "type":
             if action.text is None:
                 raise ValueError("Text is required for type actions")
-            for char in action.text:
-                if stop is not None:
-                    stop.ensure_live()
-                self._perform(lambda char=char: self._pyautogui.write(char))
-                time.sleep(_TYPE_INTERVAL_SECONDS)
+            if stop is not None:
+                stop.ensure_live()
+            self._apply_focus_settle()  # B8 settle after a recent focus transition
+            before_chunk: Callable[[], None] | None = stop.ensure_live if stop is not None else None
+            if focus_hook is not None:
+                # T8 mechanism iv: the focus-continuity probe piggybacks the per-chunk
+                # cadence AFTER the stop-token hook (stop discipline keeps precedence).
+                def _chained() -> None:
+                    if stop is not None:
+                        stop.ensure_live()
+                    focus_hook()
+
+                before_chunk = _chained
+            engine.type_text(action.text, before_chunk=before_chunk)
+            self._last_key_dispatch = time.monotonic()
         elif action.action == "keypress":
             if not action.keys:
                 raise ValueError("At least one key is required")
             if stop is not None:
                 stop.ensure_live()
-            self._perform(lambda: self._pyautogui.hotkey(*action.keys))
+            self._apply_focus_settle()  # B8 settle after a recent focus transition
+            self._apply_key_dispatch_gap(action.keys)  # B3 settle/gap policy
+            engine.chord(list(action.keys))
+            self._last_key_dispatch = time.monotonic()
         elif action.action == "hotkey":
             # Sibling of keypress for COMPOUND chords (2..12 keys, passed verbatim in
             # pyautogui vocabulary); single-key presses deliberately stay on keypress.
@@ -1032,27 +2807,182 @@ class LocalComputerBackend(ComputerBackend):
                 raise ValueError("Hotkey actions require 2 to 12 non-empty key names")
             if stop is not None:
                 stop.ensure_live()  # immediately before the single chord input
-            self._perform(lambda: self._pyautogui.hotkey(*action.keys))
+            self._apply_focus_settle()  # B8 settle after a recent focus transition
+            self._apply_key_dispatch_gap(guard_keys)  # B3 settle/gap policy
+            engine.chord(list(action.keys))
+            self._last_key_dispatch = time.monotonic()
         elif action.action == "scroll":
             if stop is not None:
                 stop.ensure_live()
-            self._perform(lambda: self._pyautogui.scroll(action.delta))
+            engine.scroll(action.delta)
         elif action.action == "focus_window":
             return self._execute_focus_window(action)
+        elif action.action == "ensure_app":
+            # T8 mechanism ii: attach-or-launch probe. Target format
+            # ``process[|doc-token]``; NEVER launches unless the host explicitly
+            # authorized server-side launches (policy + allow_launch) — the default
+            # outcome set is REATTACHED / AMBIGUOUS_INSTANCE / NO_INSTANCE.
+            target = (action.target or "").strip()
+            if not target:
+                raise ValueError("A target is required for ensure_app actions")
+            return self.ensure_app(target, allow_launch=allow_launch)
         elif action.action == "done":
             return "No computer action requested."
         else:
             raise UnsupportedActionError(f"Unsupported action: {action.action}")
         return f"Executed {action.action}."
 
-    def _perform(self, input_call: Callable[[], None]) -> None:
-        """Run one pyautogui input, mapping FailSafeException onto InputBlockedError."""
+    def _drag_waypoints(self, start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
+        """Stroke waypoints for one drag (engine-selected policy).
+
+        Minimal by default on the SendInput engine (move-press-move-release in three
+        dispatch batches); ``CORTEX_DRAG_INTERPOLATE=1`` (or ``drag_interpolate``)
+        restores the ~40 px interpolated stroke (the pyautogui fallback engine keeps it
+        by default for legacy parity). Either way the stop token is checked before every
+        segment and the button is always released.
+        """
+        if self._engine.drag_interpolate:
+            return _drag_segment_points(start, end)
+        return [end]
+
+    def find_window_by_title(self, target: str) -> WindowInfo | None:
+        """Strong identity of the best-matching top-level window (delegates to the resolver).
+
+        PERF-004 P0 bug fix: this method previously never overrode the
+        :class:`ComputerBackend` stub and therefore ALWAYS returned ``None`` — the
+        working module-level :func:`find_window_by_title` resolver existed but was only
+        reachable through ``focus_window``'s internal call. Any consumer probing via the
+        backend got false negatives.
+        """
+        return find_window_by_title(target)
+
+    # --- interference probes + attach-or-launch (T8) -----------------------------------------
+
+    def query_foreground_window(self) -> WindowInfo | None:
+        """Strong identity of the current foreground window (the guard's per-dispatch probe)."""
+        return query_foreground_window()
+
+    def is_window_alive(self, hwnd: int | None) -> bool:
+        """B6: ``IsWindow`` liveness probe for the FocusGuard's bound target."""
+        if hwnd is None:
+            return False
         try:
-            input_call()
-        except self._pyautogui.FailSafeException as exc:
-            raise InputBlockedError(
-                "pyautogui failsafe triggered (mouse in a screen corner); physical input halted."
-            ) from exc
+            if IS_WINDOWS and _user32 is not None and _user32.IsWindow(ctypes.c_void_p(int(hwnd))):
+                return True
+        except (OSError, AttributeError, TypeError, ValueError):
+            return False
+        return False
+
+    def is_window_owned_by(self, hwnd: int | None, ancestor_hwnd: int | None) -> bool:
+        """B11: the shared GW_OWNER-chain ownership probe (guard + sentinel aligned)."""
+        return is_window_owned_by(hwnd, ancestor_hwnd)
+
+    def query_focus_target(self) -> dict[str, object] | None:
+        """Keyboard-focus target via ``GetGUIThreadInfo`` (T8 mechanism iv)."""
+        return query_focus_target()
+
+    def detect_system_dialog(
+        self, bound_hwnd: int | None, title_table: Sequence[str] | None = None
+    ) -> dict[str, object] | None:
+        """Modal-dialog foreground probe (T8 mechanism iii); class/owner/title only."""
+        return detect_system_dialog(bound_hwnd, title_table)
+
+    def enumerate_app_windows(self, process_name: str) -> list[AppWindowCandidate]:
+        """Process-filtered visible-window enumeration for attach-or-launch (T8)."""
+        return enumerate_app_windows(process_name)
+
+    def query_stuck_modifiers(self, keys: Sequence[str]) -> list[str]:
+        """Pre-chord stuck-modifier sweep via ``GetAsyncKeyState`` (T8 mechanism v)."""
+        return query_stuck_modifiers(keys)
+
+    def release_modifiers(self, keys: list[str]) -> None:
+        """Synthetic key-up for the named (session-dispatched) modifiers (release mode)."""
+        self._engine.release_modifiers(list(keys))
+
+    def focus_window_title(self, title: str) -> str:
+        """Refocus primitive reused by the guard's ``refocus_then_abort`` policy."""
+        action = GroundedAction(
+            action="focus_window", target=title, reason="InterferenceGuard refocus", confidence=1.0
+        )
+        return self._execute_focus_window(action)
+
+    def ensure_app(self, target: str, allow_launch: bool = False) -> str:
+        """Attach-or-launch probe (T8 mechanism ii) — bind to an EXISTING instance.
+
+        Target format: ``process[|doc-token]`` (case-insensitive; the doc token is the
+        leading title segment, e.g. ``excel|book1``). Resolution order:
+
+        1. doc-identity match (when a doc token is given) or any visible window of the
+           process (when not) -> focus it via the verified foreground switch ->
+           ``REATTACHED title=... hwnd=...`` — never launches.
+        2. No identity match but unsaved-candidate windows exist -> the structured
+           ``AMBIGUOUS_INSTANCE`` payload (unsaved-work risk; the driver decides) —
+           never launches, never closes anything.
+        3. Nothing matches -> ``NO_INSTANCE target=... launch=...``. Only when the host
+           explicitly authorized server-side launches (``allow_launch=True`` AND the
+           session policy ``attach_or_launch.launch == "server"`` — enforced by the
+           caller) AND the process is resolvable is ``os.startfile`` used; the DEFAULT
+           path never spawns a process.
+        """
+        from .interference import format_ambiguous_instance, format_no_instance, format_reattached
+
+        process_needle, _, doc_needle = target.partition("|")
+        process_needle = process_needle.strip()
+        doc_needle = doc_needle.strip().casefold()
+        candidates = self.enumerate_app_windows(process_needle)
+        if not candidates:
+            payload = format_no_instance(target, "server" if allow_launch else "driver")
+            if allow_launch:
+                launched = self._launch_process(process_needle)
+                if launched:
+                    payload = f"{payload} launched={launched}"
+            return payload
+
+        def _doc_matches(candidate: AppWindowCandidate) -> bool:
+            if not doc_needle:
+                return True
+            token = (candidate.doc_token or "").casefold()
+            title = (candidate.window.title or "").casefold()
+            return doc_needle in token or doc_needle in title
+
+        matches = [item for item in candidates if _doc_matches(item)]
+        if matches:
+            window = matches[0].window
+            self.focus_window_title(window.title)
+            return format_reattached(window.title or target, window.hwnd)
+        unsaved = [item for item in candidates if item.unsaved_candidate]
+        if unsaved:
+            return format_ambiguous_instance(unsaved)
+        return format_ambiguous_instance(candidates)
+
+    def _launch_process(self, process_needle: str) -> str | None:
+        """Best-effort shell launch of an explicitly-authorized process; never raises."""
+        try:
+            import subprocess
+
+            subprocess.Popen([process_needle], shell=True)
+            return process_needle
+        except Exception:  # noqa: BLE001 - a launch failure degrades to the payload
+            return None
+
+    def _apply_key_dispatch_gap(self, keys: list[str]) -> None:
+        """B3 settle/gap policy: pace terminal-key chords behind the previous dispatch.
+
+        When ``keys`` contains a terminal key (enter/return/tab) and the previous
+        keyboard dispatch happened less than ``KEY_DISPATCH_GAP_SECONDS`` ago, sleep out
+        the remainder first. A dropped final Enter in a fast batch (anomaly B3) is an
+        input-stack race; the gap is the deliberate, configurable exception to the
+        zero-pacing doctrine (default 0.05 s; ``CORTEX_KEY_DISPATCH_GAP=0`` disables).
+        """
+        if KEY_DISPATCH_GAP_SECONDS <= 0:
+            return
+        folded = {str(key).strip().casefold() for key in keys}
+        if not (folded & TERMINAL_KEYS):
+            return
+        elapsed = time.monotonic() - self._last_key_dispatch
+        remaining = KEY_DISPATCH_GAP_SECONDS - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
     def _execute_focus_window(self, action: GroundedAction) -> str:
         """Bring the window matching ``action.target`` to the foreground (Win32 sequence).
@@ -1063,6 +2993,10 @@ class LocalComputerBackend(ComputerBackend):
         refusal raises :class:`WindowFocusError` (documented residual: the previously
         focused window is not restored; the caller re-observes). The stop token is
         checked once by the ``execute`` header; this path performs no pyautogui input.
+
+        B7 (T8): focusing the ALREADY-foreground window is an idempotent no-op success —
+        running the AttachThreadInput/ALT-nudge sequence against the current foreground
+        can refuse and turn a legitimate re-bind into a spurious WindowFocusError.
         """
         target = (action.target or "").strip()
         if not target:
@@ -1076,6 +3010,9 @@ class LocalComputerBackend(ComputerBackend):
         try:
             if _user32.IsIconic(hwnd):
                 _user32.ShowWindow(hwnd, _SW_RESTORE)
+            elif int(_user32.GetForegroundWindow() or 0) == hwnd:
+                self._note_focus_transition()
+                return f"Focused window '{candidate.title or target}'."
             foreground = _user32.GetForegroundWindow()
             fg_thread = _user32.GetWindowThreadProcessId(int(foreground or 0), None)
             me = _kernel32.GetCurrentThreadId()
@@ -1094,7 +3031,27 @@ class LocalComputerBackend(ComputerBackend):
                 f"SetForegroundWindow refused focus for '{candidate.title or target}'; "
                 "the foreground window did not change."
             )
+        self._note_focus_transition()
         return f"Focused window '{candidate.title or target}'."
+
+    def _note_focus_transition(self) -> None:
+        """B8: record a focus-transition instant for the post-activation settle policy.
+
+        The first keyboard dispatch following a window activation races the freshly
+        activated thread's input queue (the A5 residual risk class: dropped/misdelivered
+        first keys, the B5 wedge topology). Keyboard actions pace themselves behind
+        ``FOCUS_TRANSITION_SETTLE_SECONDS`` (``CORTEX_FOCUS_SETTLE_SECONDS``).
+        """
+        self._last_focus_transition = time.monotonic()
+
+    def _apply_focus_settle(self) -> None:
+        """B8: pace keyboard input behind a recent focus transition (configurable)."""
+        if FOCUS_TRANSITION_SETTLE_SECONDS <= 0:
+            return
+        elapsed = time.monotonic() - self._last_focus_transition
+        remaining = FOCUS_TRANSITION_SETTLE_SECONDS - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
     def _build_default_context(self) -> _CaptureContext:
         """Passthrough-by-measurement context when executing before any observation."""
@@ -1135,8 +3092,9 @@ class FakeComputerBackend(ComputerBackend):
     input-blocked, or coordinate-refused execute records nothing, and neither does a wait
     interrupted by the stop token), ``observed`` (every observation produced),
     ``width``/``height`` (current screenshot dims). For drag actions the stroke is
-    simulated as a stop-checked cursor walk (identical waypoint policy to the real
-    backend): ``drags`` records the mapped physical ``(start, end)`` pairs of completed
+    simulated as a stop-checked cursor walk (the real backend's INTERPOLATED waypoint
+    policy — the SendInput default dispatches a minimal stroke instead, but the
+    stop-per-segment and always-release contract is identical): ``drags`` records the mapped physical ``(start, end)`` pairs of completed
     drags, the cursor ends at the drag end point, and ``_drag_button_down`` mirrors the
     held mouse button (always ``False`` after execute, including on a mid-stroke stop —
     the release guarantee is part of the contract). Drawing pixels in the fake canvas is
@@ -1186,6 +3144,18 @@ class FakeComputerBackend(ComputerBackend):
         self._drag_button_down = False
         self.observed: list[Observation] = []
         self._active_context: _CaptureContext | None = None
+        # --- T8 interference-probe surface (inert by default; tests inject state) ---
+        self.focus_target: dict[str, object] | None = None
+        self.system_dialog: dict[str, object] | None = None
+        self.app_windows: list[AppWindowCandidate] = []
+        self.stuck_modifiers: list[str] = []
+        self.released_modifiers: list[str] = []
+        # (child_hwnd, ancestor_hwnd) pairs the fake reports as GW_OWNER-owned.
+        self.owned_windows: set[tuple[int, int]] = set()
+        self.ensure_app_calls: list[str] = []
+        self.launched_processes: list[str] = []
+        self._last_key_dispatch: float = 0.0
+        self._last_focus_transition: float = 0.0
 
     def set_windows(self, windows: list[WindowInfo]) -> None:
         """Replace the fake top-level window list (first entry = top of Z-order)."""
@@ -1204,6 +3174,119 @@ class FakeComputerBackend(ComputerBackend):
             if best is None or rank > best[0]:  # first-in-Z-order wins ties
                 best = (rank, z_index, window)
         return best[2] if best is not None else None
+
+    # --- T8 interference-probe surface (mirrors LocalComputerBackend's contract) -----
+
+    def query_foreground_window(self) -> WindowInfo | None:
+        """The fake foreground window (``active_window``), like the real identity probe."""
+        return self.active_window.model_copy() if self.active_window else None
+
+    def is_window_alive(self, hwnd: int | None) -> bool:
+        """A fake window is alive while it is active or listed in ``windows``."""
+        if hwnd is None:
+            return False
+        if self.active_window is not None and self.active_window.hwnd == hwnd:
+            return True
+        for window in self.windows:
+            if isinstance(window, WindowInfo) and window.hwnd == hwnd:
+                return True
+        return False
+
+    def is_window_owned_by(self, hwnd: int | None, ancestor_hwnd: int | None) -> bool:
+        """Injected ownership probe (set ``owned_windows`` pairs to simulate modals)."""
+        if hwnd is None or ancestor_hwnd is None:
+            return False
+        return (int(hwnd), int(ancestor_hwnd)) in self.owned_windows
+
+    def _note_focus_transition(self) -> None:
+        """Same B8 transition record as :class:`LocalComputerBackend`."""
+        self._last_focus_transition = time.monotonic()
+
+    def _apply_focus_settle(self) -> None:
+        """Same B8 settle contract as :class:`LocalComputerBackend`."""
+        if FOCUS_TRANSITION_SETTLE_SECONDS <= 0:
+            return
+        elapsed = time.monotonic() - self._last_focus_transition
+        remaining = FOCUS_TRANSITION_SETTLE_SECONDS - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def query_focus_target(self) -> dict[str, object] | None:
+        """Injected focus-target probe (set ``focus_target`` to simulate keyboard focus)."""
+        return dict(self.focus_target) if self.focus_target is not None else None
+
+    def detect_system_dialog(
+        self, bound_hwnd: int | None, title_table: Sequence[str] | None = None
+    ) -> dict[str, object] | None:
+        """Injected modal-dialog probe (set ``system_dialog`` to simulate a dialog)."""
+        return dict(self.system_dialog) if self.system_dialog is not None else None
+
+    def enumerate_app_windows(self, process_name: str) -> list[AppWindowCandidate]:
+        """Injected app-window population (set ``app_windows`` to simulate instances)."""
+        return list(self.app_windows)
+
+    def query_stuck_modifiers(self, keys: Sequence[str]) -> list[str]:
+        """Injected stuck-modifier sweep (set ``stuck_modifiers`` to simulate sticks)."""
+        return list(self.stuck_modifiers)
+
+    def release_modifiers(self, keys: list[str]) -> None:
+        """Record a release-mode key-up sweep and CLEAR the simulated sticks (T8)."""
+        self.released_modifiers.extend(keys)
+        self.stuck_modifiers = [name for name in self.stuck_modifiers if name not in set(keys)]
+
+    def _apply_key_dispatch_gap(self, keys: list[str]) -> None:
+        """Same B3 settle/gap contract as :class:`LocalComputerBackend`."""
+        if KEY_DISPATCH_GAP_SECONDS <= 0:
+            return
+        folded = {str(key).strip().casefold() for key in keys}
+        if not (folded & TERMINAL_KEYS):
+            return
+        elapsed = time.monotonic() - self._last_key_dispatch
+        remaining = KEY_DISPATCH_GAP_SECONDS - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def focus_window_title(self, title: str) -> str:
+        """Same verified-refocus contract: a miss raises ``WindowFocusError``."""
+        candidate = self.find_window_by_title(title)
+        if candidate is None:
+            raise WindowFocusError(f"no window matching '{title}'")
+        self.active_window = candidate.model_copy()
+        self.focused.append(title)
+        return f"Focused window '{candidate.title or title}'."
+
+    def ensure_app(self, target: str, allow_launch: bool = False) -> str:
+        """Simulated attach-or-launch over the injected ``app_windows`` population."""
+        from .interference import format_ambiguous_instance, format_no_instance, format_reattached
+
+        self.ensure_app_calls.append(target)
+        process_needle, _, doc_needle = target.partition("|")
+        process_needle = process_needle.strip()
+        doc_needle = doc_needle.strip().casefold()
+        candidates = self.enumerate_app_windows(process_needle)
+        if not candidates:
+            payload = format_no_instance(target, "server" if allow_launch else "driver")
+            if allow_launch:
+                self.launched_processes.append(process_needle)
+                payload = f"{payload} launched={process_needle}"
+            return payload
+
+        def _doc_matches(candidate: AppWindowCandidate) -> bool:
+            if not doc_needle:
+                return True
+            token = (candidate.doc_token or "").casefold()
+            title = (candidate.window.title or "").casefold()
+            return doc_needle in token or doc_needle in title
+
+        matches = [item for item in candidates if _doc_matches(item)]
+        if matches:
+            window = matches[0].window
+            self.focus_window_title(window.title)
+            return format_reattached(window.title or target, window.hwnd)
+        unsaved = [item for item in candidates if item.unsaved_candidate]
+        if unsaved:
+            return format_ambiguous_instance(unsaved)
+        return format_ambiguous_instance(candidates)
 
     def set_active_window(self, window: WindowInfo | None) -> None:
         """Swap the fake foreground window (simulates focus change between observations)."""
@@ -1270,7 +3353,13 @@ class FakeComputerBackend(ComputerBackend):
         self.observed.append(observation)
         return observation
 
-    def execute(self, action: GroundedAction, stop: StopToken | None = None) -> str:
+    def execute(
+        self,
+        action: GroundedAction,
+        stop: StopToken | None = None,
+        focus_hook: Callable[[], None] | None = None,
+        allow_launch: bool = False,
+    ) -> str:
         """Record and simulate one action; the stop token gates every simulated input."""
         if stop is not None:
             stop.ensure_live()
@@ -1301,6 +3390,27 @@ class FakeComputerBackend(ComputerBackend):
                 raise WindowFocusError(f"no window matching '{target}'")
             self.active_window = candidate.model_copy()
             self.focused.append(target)
+            self._note_focus_transition()  # B8 parity: a fake focus switch is a transition
+        elif action.action == "ensure_app":
+            target = (action.target or "").strip()
+            if not target:
+                raise ValueError("A target is required for ensure_app actions")
+            return self.ensure_app(target, allow_launch=allow_launch)
+        elif action.action in {"keypress", "hotkey"}:
+            # B3/B8 settle parity: the fake models both pacing contracts.
+            keys = list(action.keys)
+            if stop is not None:
+                stop.ensure_live()
+            self._apply_focus_settle()
+            self._apply_key_dispatch_gap(keys)
+            self._last_key_dispatch = time.monotonic()
+        elif action.action == "type":
+            if action.text is None:
+                raise ValueError("Text is required for type actions")
+            if stop is not None:
+                stop.ensure_live()
+            self._apply_focus_settle()
+            self._last_key_dispatch = time.monotonic()  # B3 clock parity
         elif action.action == "drag":
             if action.point is None or action.to_point is None:
                 raise ValueError("Both a start point and an end point are required for drag actions")

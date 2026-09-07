@@ -1,0 +1,1 @@
+Meeting notes 2024-05-14: asset register reconciliation agreed; firmware certification owner: infra-ops; failover drill scheduled June.

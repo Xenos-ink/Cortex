@@ -30,17 +30,20 @@ from .models import Observation, VerificationResult
 
 __all__ = [
     "DEFAULT_STRATEGY_CHAIN",
+    "OCR_TEXT_VERIFICATION_ENV",
     "DeterministicPredicateStrategy",
     "ModelJudge",
     "ModelVisualStrategy",
     "ProcessStateStrategy",
     "ScreenshotDiffStrategy",
     "TextPredicateStrategy",
+    "UiControlTextStrategy",
     "VerificationEngine",
     "VerificationIntent",
     "VerificationKind",
     "VerificationStrategy",
     "WindowStateStrategy",
+    "ocr_text_verification_enabled",
 ]
 
 #: Pixel mean-difference at or above this value counts as a visual change (legacy threshold).
@@ -636,8 +639,14 @@ class DeterministicPredicateStrategy:
 class TextPredicateStrategy:
     """Verifies that expected text appears in the ``after`` observation's OCR regions.
 
-    Works only when OCR data is present (P1 perception fills ``Observation.ocr_text``);
-    without OCR data it degrades to ``uncertain`` — never to success.
+    T8 anomaly-B2 demotion: OCR-derived text regions proved UNRELIABLE on the
+    measurement machine (Windows Server 2022 returns garbage regions even on plain
+    text), so this strategy is a LAST RESORT, disabled by default and gated behind the
+    ``CORTEX_OCR_TEXT_VERIFICATION=1`` config flag. The default expected-text ladder is
+    :class:`UiControlTextStrategy` (window title + ``ui_elements`` control text —
+    deterministic window/UIA signals). When enabled, the strategy keeps its exact
+    semantics: only OCR data decides, and without OCR data it degrades to ``uncertain``
+    — never to success.
     """
 
     @property
@@ -645,7 +654,7 @@ class TextPredicateStrategy:
         return "text_predicate"
 
     def can_verify(self, intent: VerificationIntent) -> bool:
-        return intent.kind == VerificationKind.EXPECTED_TEXT
+        return intent.kind == VerificationKind.EXPECTED_TEXT and ocr_text_verification_enabled()
 
     def verify(self, intent: VerificationIntent, before: Observation, after: Observation) -> VerificationResult:
         expected = intent.expected_text
@@ -694,6 +703,101 @@ class TextPredicateStrategy:
             f"Expected text {expected!r} not found in OCR output.",
             [f"OCR regions seen: {sample}"],
             0.85,
+            changed=False,
+        )
+
+
+#: T8 anomaly-B2 config flag: OCR text-predicate participation (last-resort tier).
+#: Default OFF — the OCR path returned garbage on the measurement machine and
+#: false-failed every type action; window-title + ui-control text evidence is the
+#: default expected-text ladder instead.
+OCR_TEXT_VERIFICATION_ENV = "CORTEX_OCR_TEXT_VERIFICATION"
+
+
+def ocr_text_verification_enabled() -> bool:
+    """Whether the OCR text-predicate tier may run (env-flag gated; default False)."""
+    import os
+
+    raw = os.getenv(OCR_TEXT_VERIFICATION_ENV)
+    if raw is None or not raw.strip():
+        return False
+    return raw.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+class UiControlTextStrategy:
+    """Verifies expected text through deterministic window/UI-control evidence (B2 fix).
+
+    The default expected-text ladder, replacing OCR as the primary signal:
+
+    1. **Window title**: the ``after`` observation's active window title containing the
+       expected text is definitive evidence (e.g. a document retitled after a save).
+    2. **UI control text**: ``after.ui_elements`` (the backend's focused-control +
+       children read — Win32 ``WM_GETTEXT`` or UIA, whichever the backend supplies)
+       carrying the expected text in a control's ``name`` or ``value`` (an edit field's
+       content) is definitive evidence.
+
+    When neither channel shows the text the strategy degrades to ``uncertain`` — NEVER
+    to ``failed``: typed content is often invisible to Win32/UIA (spreadsheet cells,
+    canvases), and on the B2 machine the OCR fallback is garbage, so an absent match
+    must not become a false failure. Callers (the controller) then route an
+    expected-text ``uncertain`` to the reliable pixel-diff tier.
+    """
+
+    @property
+    def name(self) -> str:
+        return "ui_control_text"
+
+    def can_verify(self, intent: VerificationIntent) -> bool:
+        return intent.kind == VerificationKind.EXPECTED_TEXT
+
+    def verify(self, intent: VerificationIntent, before: Observation, after: Observation) -> VerificationResult:
+        expected = intent.expected_text
+        if not expected:
+            return _uncertain(self.name, "No expected text stated; nothing to verify.", [], 0.0, changed=False)
+        needle = expected.casefold()
+
+        info = after.active_window_info
+        title = (info.title if info is not None else None) or after.active_window
+        if title and needle in title.casefold():
+            return _definitive(
+                self.name,
+                "verified",
+                f"Expected text {expected!r} found in the active window title.",
+                [f"Active window title {title!r} contains {expected!r}."],
+                _IDENTITY_MATCH_CONFIDENCE,
+                changed=False,
+            )
+
+        elements = after.ui_elements or []
+        for index, element in enumerate(elements[:50]):
+            if not isinstance(element, dict):
+                continue
+            for field_name in ("value", "name"):
+                text = element.get(field_name)
+                if isinstance(text, str) and needle in text.casefold():
+                    control = element.get("control_type") or element.get("type") or "control"
+                    return _definitive(
+                        self.name,
+                        "verified",
+                        f"Expected text {expected!r} found in UI control text.",
+                        [
+                            (
+                                f"Control #{index} ({control}) {field_name} contains "
+                                f"{expected!r}."
+                            )
+                        ],
+                        0.85,
+                        changed=False,
+                    )
+
+        return _uncertain(
+            self.name,
+            (
+                "Typed text is not visible to window-title or UI-control evidence; "
+                "text presence cannot be determined (never treated as absence)."
+            ),
+            [f"expected_text={expected!r}", f"title={title!r}", f"ui_elements={len(elements)}"],
+            0.2,
             changed=False,
         )
 
@@ -772,11 +876,18 @@ class ModelVisualStrategy:
 
 
 def default_strategy_chain(judge: ModelJudge | None = None) -> list[VerificationStrategy]:
-    """Built-in strategy order: cheap deterministic checks first, model judgment last."""
+    """Built-in strategy order: cheap deterministic checks first, model judgment last.
+
+    T8 B2 ordering: :class:`UiControlTextStrategy` (window title + UI control text)
+    runs as the default expected-text ladder; :class:`TextPredicateStrategy` (OCR)
+    stays in the chain as the LAST-RESORT tier and self-disables unless the
+    ``CORTEX_OCR_TEXT_VERIFICATION`` config flag is set.
+    """
     return [
         DeterministicPredicateStrategy(),
         WindowStateStrategy(),
         ProcessStateStrategy(),
+        UiControlTextStrategy(),
         TextPredicateStrategy(),
         ScreenshotDiffStrategy(),
         ModelVisualStrategy(judge=judge),
@@ -784,6 +895,90 @@ def default_strategy_chain(judge: ModelJudge | None = None) -> list[Verification
 
 
 DEFAULT_STRATEGY_CHAIN: list[VerificationStrategy] = default_strategy_chain()
+
+
+def deterministic_tiers(
+    intent: VerificationIntent,
+) -> list[tuple[VerificationStrategy, VerificationIntent]]:
+    """Deterministic (cheap-first) verification tiers derivable from ``intent`` (PERF-004 C3).
+
+    For a :class:`VerificationKind.MODEL_JUDGE` intent, each STATED criterion (window
+    title, process name/pid, expected text, predicate) yields a deterministic strategy
+    plus a narrowly-scoped sub-intent carrying exactly that criterion. Running these
+    tiers BEFORE the model judge implements the research-adopted cheap-first ladder:
+    the expensive judge tier runs only when every deterministic tier and the pixel-diff
+    tier are inconclusive. Non-judge intents never need this helper (the engine chain
+    already orders deterministic strategies first).
+    """
+    tiers: list[tuple[VerificationStrategy, VerificationIntent]] = []
+    metadata = dict(intent.metadata)
+    if intent.expected_window_title:
+        tiers.append(
+            (
+                WindowStateStrategy(),
+                VerificationIntent(
+                    kind=VerificationKind.WINDOW_STATE,
+                    expected_window_title=intent.expected_window_title,
+                    window_title_match=intent.window_title_match,
+                    require_bounds_change=intent.require_bounds_change,
+                    expected_effect=intent.expected_effect,
+                    metadata=metadata,
+                ),
+            )
+        )
+    if intent.expected_process_name or intent.expected_pid is not None:
+        tiers.append(
+            (
+                ProcessStateStrategy(),
+                VerificationIntent(
+                    kind=VerificationKind.PROCESS_STATE,
+                    expected_process_name=intent.expected_process_name,
+                    expected_pid=intent.expected_pid,
+                    expected_effect=intent.expected_effect,
+                    metadata=metadata,
+                ),
+            )
+        )
+    if intent.expected_text:
+        # B2: the deterministic text tier is the UI-control strategy (title + control
+        # text); the OCR text-predicate joins ONLY when the config flag enables it.
+        tiers.append(
+            (
+                UiControlTextStrategy(),
+                VerificationIntent(
+                    kind=VerificationKind.EXPECTED_TEXT,
+                    expected_text=intent.expected_text,
+                    expected_effect=intent.expected_effect,
+                    metadata=metadata,
+                ),
+            )
+        )
+        if ocr_text_verification_enabled():
+            tiers.append(
+                (
+                    TextPredicateStrategy(),
+                    VerificationIntent(
+                        kind=VerificationKind.EXPECTED_TEXT,
+                        expected_text=intent.expected_text,
+                        expected_effect=intent.expected_effect,
+                        metadata=metadata,
+                    ),
+                )
+            )
+    if intent.predicate is not None:
+        tiers.append(
+            (
+                DeterministicPredicateStrategy(),
+                VerificationIntent(
+                    kind=VerificationKind.PREDICATE,
+                    predicate=intent.predicate,
+                    predicate_name=intent.predicate_name,
+                    expected_effect=intent.expected_effect,
+                    metadata=metadata,
+                ),
+            )
+        )
+    return tiers
 
 
 class VerificationEngine:

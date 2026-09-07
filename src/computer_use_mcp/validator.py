@@ -347,6 +347,14 @@ class GroundingValidator:
                 "missing_target",
                 "focus_window actions require a non-empty target window title.",
             )
+        if action.action == ActionType.ENSURE_APP and not (action.target or "").strip():
+            # T8 mechanism ii: the identity string gates the attach decision, so a bare
+            # ensure_app is malformed (fail closed like a target-less focus_window).
+            reject(
+                "missing_target",
+                "ensure_app actions require a non-empty target: 'process' or "
+                "'process|doc-token' (e.g. 'excel|book1').",
+            )
 
         outcome = ValidationOutcome(valid=not reasons, reasons=reasons, codes=codes)
         outcome._error = first_error

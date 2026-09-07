@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from PIL import Image
 from pydantic import ValidationError
+from recording_engine import RecordingEngine
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp import server
@@ -37,40 +38,8 @@ def hotkey(keys: list[str], **kwargs: Any) -> GroundedAction:
     return GroundedAction(action="hotkey", keys=keys, **kwargs)
 
 
-class _RecordingPyautogui:
-    """Minimal pyautogui stand-in recording every input call (no real keyboard input)."""
-
-    FailSafeException = type("FailSafeException", (Exception,), {})
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[object, ...]] = []
-
-    def _record(self, name: str, *args: object) -> None:
-        self.calls.append((name, *args))
-
-    def moveTo(self, x: int, y: int) -> None:
-        self._record("moveTo", x, y)
-
-    def mouseDown(self, button: str = "left") -> None:
-        self._record("mouseDown", button)
-
-    def mouseUp(self, button: str = "left") -> None:
-        self._record("mouseUp", button)
-
-    def click(self, *args: object, **kwargs: object) -> None:
-        self._record("click", *args)
-
-    def write(self, *args: object, **kwargs: object) -> None:
-        self._record("write", *args)
-
-    def hotkey(self, *args: object, **kwargs: object) -> None:
-        self._record("hotkey", *args)
-
-    def scroll(self, *args: object, **kwargs: object) -> None:
-        self._record("scroll", *args)
-
-
-# The session-scoped ``real_backend`` fixture comes from tests/conftest.py.
+# The session-scoped ``real_backend`` fixture comes from tests/conftest.py, which also
+# provides the RecordingEngine stub (no real input dispatch).
 
 
 # --- models: hotkey is a compound chord -----------------------------------------------------------
@@ -131,31 +100,31 @@ def test_fake_hotkey_input_blocked_records_nothing() -> None:
     assert backend.executed == []
 
 
-# --- LocalComputerBackend (real path, stubbed pyautogui) -------------------------------------------
+# --- LocalComputerBackend (real path, stubbed input engine) -----------------------------------------
 
 
 @WINDOWS_ONLY
-def test_real_hotkey_calls_hotkey_with_key_names_verbatim(
+def test_real_hotkey_calls_chord_with_key_names_verbatim(
     real_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    recorder = _RecordingPyautogui()
-    monkeypatch.setattr(real_backend, "_pyautogui", recorder)
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
     message = real_backend.execute(hotkey(["ctrl", "s"]))
     assert message == "Executed hotkey."
-    assert recorder.calls == [("hotkey", "ctrl", "s")]
+    assert engine.calls == [("chord", "ctrl", "s")]
 
 
 @WINDOWS_ONLY
 def test_real_hotkey_prestopped_token_performs_zero_inputs(
     real_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    recorder = _RecordingPyautogui()
-    monkeypatch.setattr(real_backend, "_pyautogui", recorder)
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
     stop = StopToken()
     stop.stop()
     with pytest.raises(TaskStopped):
         real_backend.execute(hotkey(["ctrl", "s"]), stop=stop)
-    assert recorder.calls == []
+    assert engine.calls == []
 
 
 @WINDOWS_ONLY
@@ -163,15 +132,15 @@ def test_real_hotkey_bad_chord_value_error_at_backend(
     real_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A caller bug that bypasses model validation still fails closed at the backend."""
-    recorder = _RecordingPyautogui()
-    monkeypatch.setattr(real_backend, "_pyautogui", recorder)
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
     single = GroundedAction.model_construct(action=ActionType.HOTKEY, keys=["ctrl"])
     with pytest.raises(ValueError, match="2 to 12"):
         real_backend.execute(single)
     blank = GroundedAction.model_construct(action=ActionType.HOTKEY, keys=["ctrl", "  "])
     with pytest.raises(ValueError, match="2 to 12"):
         real_backend.execute(blank)
-    assert recorder.calls == []
+    assert engine.calls == []
 
 
 # --- grounding: hotkey is non-spatial (trivial "none") ----------------------------------------------

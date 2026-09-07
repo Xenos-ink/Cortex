@@ -51,9 +51,10 @@ __all__ = [
 ]
 
 #: Actions that never require a spatial target; the router grounds them trivially.
-#: HOTKEY (compound chord) and FOCUS_WINDOW (window-title selector) are non-spatial too:
-#: they carry ``keys`` / ``target`` instead of coordinates. MOVE is deliberately NOT
-#: listed — point-bearing actions already route to the coordinate strategy automatically.
+#: HOTKEY (compound chord), FOCUS_WINDOW (window-title selector), and ENSURE_APP
+#: (T8 process/doc identity selector) are non-spatial too: they carry ``keys`` /
+#: ``target`` instead of coordinates. MOVE is deliberately NOT listed — point-bearing
+#: actions already route to the coordinate strategy automatically.
 NON_SPATIAL_ACTIONS: frozenset[ActionType] = frozenset(
     {
         ActionType.TYPE,
@@ -63,6 +64,7 @@ NON_SPATIAL_ACTIONS: frozenset[ActionType] = frozenset(
         ActionType.WAIT,
         ActionType.DONE,
         ActionType.FOCUS_WINDOW,
+        ActionType.ENSURE_APP,
     }
 )
 
@@ -514,7 +516,7 @@ class GroundingRouter:
        its accurate fail-closed refusal (coordinate-space reason) propagates instead of the
        generic router fallback message.
     3. Coordinate default / trivial grounding — non-spatial actions (type, keypress,
-       hotkey, scroll, wait, done, focus_window) without a target are grounded trivially
+       hotkey, scroll, wait, done, focus_window, ensure_app) without a target are grounded trivially
        with strategy ``"none"``; anything else that no strategy can ground raises
        :class:`UnsupportedGroundingError` (fail-closed).
     """

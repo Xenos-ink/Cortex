@@ -1,0 +1,90 @@
+{
+  "id": "h4-composite-thinking",
+  "title": "Composite thinking: compute per-region totals from a source file, enter in Excel",
+  "category": "long_horizon_state_tracking",
+  "fake_runnable": false,
+  "prompt": "Data aggregation task that requires real computation. 1) Read the numeric records in C:\\Users\\localadmin\\Desktop\\cortex-bench\\t4_source.txt (lines of the form region,amount - 24 records across three regions: north, south, east). 2) Compute the total amount for each region yourself (calculator or mental arithmetic; the totals must be correct to within 0.01). 3) In Excel, create a small summary table: cell A1 = Region, cell B1 = Total; then row 2 = north with its total in B2, row 3 = south with its total in B3, row 4 = east with its total in B4 (enter the computed numbers, in that row order). 4) Save the workbook as an Excel .xlsx file at exactly C:\\Users\\localadmin\\Desktop\\cortex-bench\\t4_out_summary.xlsx. Leave Excel open when you are done.",
+  "goal": "Read 24 region/amount records from a text file, compute per-region totals, build a Region/Total summary table in Excel in a fixed row order, and save as .xlsx to the given path.",
+  "setup": {
+    "app": "excel+notepad",
+    "real_world_only": true,
+    "fixtures": [
+      "t4_source.txt"
+    ],
+    "outputs": [
+      "~/Desktop/cortex-bench/t4_out_summary.xlsx"
+    ]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "done",
+        "summary": "real-world task; executed by a driver agent via score_task.py flow, not by the scripted provider"
+      }
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {
+        "kind": "window_title_contains",
+        "value": "Excel"
+      }
+    ]
+  },
+  "predicates": [
+    {
+      "name": "output_file_exists",
+      "kind": "file_exists",
+      "path": "~/Desktop/cortex-bench/t4_out_summary.xlsx"
+    },
+    {
+      "name": "output_written_during_run",
+      "kind": "file_fresh",
+      "path": "~/Desktop/cortex-bench/t4_out_summary.xlsx"
+    },
+    {
+      "name": "headers_present",
+      "kind": "xlsx_contains_strings",
+      "path": "~/Desktop/cortex-bench/t4_out_summary.xlsx",
+      "needles": [
+        "Region",
+        "Total"
+      ]
+    },
+    {
+      "name": "computed_totals_correct",
+      "kind": "xlsx_computed_totals",
+      "path": "~/Desktop/cortex-bench/t4_out_summary.xlsx",
+      "fixture": "t4_source.txt",
+      "order": [
+        "north",
+        "south",
+        "east"
+      ],
+      "start_row": 2,
+      "category_col": "A",
+      "total_col": "B",
+      "tolerance": 0.01
+    }
+  ],
+  "human_reference": {
+    "primary": "scripted_cadence",
+    "seconds": 93.85,
+    "calibration": {
+      "fitts_click_s": 0.6,
+      "char_s": 0.22,
+      "dialog_wait_s": 1.0,
+      "cognitive_allowance_s": 45,
+      "actions": "1 source open+read dwell, 1 Excel cold start, ~80 typed chars, 1 save-as dialog, computation allowance"
+    },
+    "method_log": "Replayed live (source read in Notepad, per-region totals computed from the fixture by the replay 'human', entered at calibrated cadence; 45 s computation allowance documented). Self-check: all 4 predicates verified. Superseded by real human runs when performed."
+  },
+  "anti_gaming": "The scorer independently recomputes the three expected totals from the canonical fixture in benchmarks/tasks_hard/fixtures/ (never from the Desktop copy, which a driver could edit) and matches them against the saved sheet cells in the required order. Formulas typed by the driver are fine (the cached <v> value is checked). output_written_during_run fails files that pre-date the run.",
+  "allowed_processes": [
+    "EXCEL.EXE",
+    "notepad.exe",
+    "explorer.exe"
+  ],
+  "max_actions": 400,
+  "safety_notes": "Read-only source file plus new file creation inside the dedicated Desktop\\cortex-bench bench area; no existing user files touched."
+}

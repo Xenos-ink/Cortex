@@ -349,6 +349,10 @@ async def test_happy_path_click_verified_with_phase_audit_and_metrics(
 async def test_type_action_verified_via_expected_text(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # T8 B2: the OCR text-predicate tier is opt-in (CORTEX_OCR_TEXT_VERIFICATION=1);
+    # without the flag, type actions verify via UI-control/diff evidence instead
+    # (see test_t8_interference.py / test_focus_guard.py regression coverage).
+    monkeypatch.setenv("CORTEX_OCR_TEXT_VERIFICATION", "1")
     provider = ScriptedProvider(
         [
             AgentDecision(
@@ -706,8 +710,16 @@ async def test_task_duration_limit_trips_cleanly(
 async def test_screenshot_rate_limit_trips_cleanly(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """PERF-004 C2 refined semantics: the gate protects FRESH observations.
+
+    Observe reuse + intra-step burst exemption mean the in-loop action cycle no longer
+    pays the gate (a multi-step task completes under a 60s interval), but the gate
+    still trips fail-closed on the host-driven observe path: a queued second action
+    arriving within the interval waits past the 2s controller ceiling -> audited
+    ``limit_exceeded`` termination, nothing further executed.
+    """
     provider = ScriptedProvider([click(10, 10), AgentDecision(status="done")])
-    session_id, bundle, _backend, _ = make_session(
+    session_id, bundle, backend, _ = make_session(
         monkeypatch,
         provider=provider,
         dry_run=False,
@@ -716,11 +728,21 @@ async def test_screenshot_rate_limit_trips_cleanly(
     )
     response = await server.run_goal(session_id, "rate limited")
 
-    assert response["termination_reason"] == "limit_exceeded"
-    assert "Screenshot rate budget exhausted" in response["results"][-1]["message"]
+    # The in-loop cycle is gate-free under the refined semantics: reuse covers the
+    # loop_top captures and validate/post_action are burst-exempt.
+    assert response["termination_reason"] == "completed"
+    assert len(executed_summary(backend)) == 1
+    # But the host-driven observe path (computer_execute -> direct_request capture)
+    # is still gated: this second capture arrives within the 60s interval and trips.
+    stopped = await server.computer_execute(session_id, "wait", delta=1)
+    assert stopped["ok"] is False
+    assert stopped["error"] == "limit_exceeded"
+    assert stopped["limit"] == "min_screenshot_interval_ms"
     events = audit_events(bundle, session_id)
     limit_events = [event for event in events if event["event_type"] == "limit_exceeded"]
-    assert any(event["metadata"].get("limit") == "min_screenshot_interval_ms" for event in limit_events)
+    assert any(
+        event["metadata"].get("limit") == "min_screenshot_interval_ms" for event in limit_events
+    )
 
 # --- approval budget semantics -------------------------------------------------------------------
 
@@ -862,7 +884,9 @@ async def test_computer_execute_dry_run_never_executes(
     )
     dry = await server.computer_execute(session_id, "wait", delta=1)
     assert dry["ok"] is True
-    assert "Dry run" in dry["message"]
+    # PERF-004 C5: dry-run results are UNMISTAKABLE — the message must start with the
+    # banner so no host can misread a no-op as execution.
+    assert dry["message"].startswith("DRY-RUN (no input dispatched):")
     assert dry["verification"]["verified"] is False
     assert backend.executed == []
 

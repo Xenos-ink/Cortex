@@ -15,6 +15,7 @@ import ctypes
 import threading
 import time
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -535,6 +536,69 @@ def test_real_backend_records_dpi_awareness(real_backend: LocalComputerBackend) 
     assert real_backend.dpi_estimated is False  # Server 2022 box: shcore per-monitor works
 
 
+# --- find_window_by_title: backend override (PERF-004 bug fix) --------------------------------
+#
+# P0 finding 5: LocalComputerBackend never overrode the ABC stub, so
+# ``backend.find_window_by_title(...)`` returned None even though the module-level
+# resolver worked (only focus_window's internal call reached it). These tests pin the
+# fix: the backend method MUST delegate to the resolver.
+
+
+@WINDOWS_ONLY
+def test_real_backend_find_window_by_title_delegates_to_resolver(
+    real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = WindowInfo(hwnd=7, pid=1, process_name="sentinel.exe", title="Sentinel")
+    monkeypatch.setattr(
+        backend_module, "find_window_by_title", lambda target: sentinel if target == "sentinel" else None
+    )
+    assert real_backend.find_window_by_title("sentinel") is sentinel
+    assert real_backend.find_window_by_title("missing") is None
+
+
+@WINDOWS_ONLY
+def test_real_backend_find_window_by_title_populates_identity(
+    real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Full path through the backend with mocked EnumWindows (no real app needed)."""
+    windows = {2: ("Calculator", "Calc", (100, 100, 400, 300))}
+    def fake_enum_windows(callback: Any, _lparam: Any) -> int:
+        for hwnd in (2,):  # top of Z-order first
+            callback(ctypes.c_void_p(hwnd), None)
+        return 1
+
+    user32 = SimpleNamespace(
+        EnumWindows=fake_enum_windows,
+        GetAncestor=lambda hwnd, _flag: hwnd,
+        GetWindowTextLengthW=lambda hwnd: len(windows.get(hwnd, ("",))[0]),
+        GetWindowTextW=lambda hwnd, buffer, size: (
+            buffer.__setattr__("value", windows[hwnd][0]) or len(windows[hwnd][0])
+        ) if hwnd in windows else 0,
+        GetClassNameW=lambda hwnd, buffer, size: (
+            buffer.__setattr__("value", windows[hwnd][1]) or 1
+        ) if hwnd in windows else 0,
+        GetWindowThreadProcessId=lambda hwnd, pid_ref: (
+            pid_ref._obj.__setattr__("value", 4321) if pid_ref else 1
+        ),
+        GetWindowRect=lambda hwnd, rect_ref: (
+            rect_ref._obj.__setattr__("left", 100),
+            rect_ref._obj.__setattr__("top", 100),
+            rect_ref._obj.__setattr__("right", 500),
+            rect_ref._obj.__setattr__("bottom", 400),
+        ) and 1,
+        GetDpiForSystem=lambda: 96,
+    )
+    monkeypatch.setattr(backend_module, "_user32", user32)
+    window = real_backend.find_window_by_title("calculator")  # case-insensitive
+    assert window is not None  # the regression: the ABC stub returned None ALWAYS
+    assert window.hwnd == 2
+    assert window.title == "Calculator"
+    assert window.window_class == "Calc"
+    assert window.pid == 4321
+    assert window.bounds == (100, 100, 400, 300)
+    assert real_backend.find_window_by_title("Ghost Window") is None
+
+
 # --- real-desktop read-only smoke (this box: 1920x1080 @ 125%) -------------------------------
 
 
@@ -621,3 +685,31 @@ def test_coordinate_verdict_dataclass_shape() -> None:
         space=CoordinateSpace.VERIFIED_PASSTHROUGH, scale_x=1.0, scale_y=1.0, input_width=1, input_height=1
     )
     assert verdict.space == "verified_passthrough"
+
+
+# --- T8 coordinator findings: B7 idempotent focus_window + B6 liveness probe -----------------
+
+
+@pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="Real Win32 backend requires Windows.")
+def test_focus_window_on_already_foreground_window_is_idempotent_success(
+    real_backend: LocalComputerBackend,
+) -> None:
+    """B7: focusing the CURRENT foreground window succeeds as a no-op, never errors."""
+    info = query_foreground_window()
+    if info is None or not (info.title or "").strip():
+        pytest.skip("No foreground window with a title available.")
+    message = real_backend._execute_focus_window(
+        GroundedAction(action="focus_window", target=info.title, confidence=1.0)
+    )
+    assert message.startswith("Focused window")
+
+
+@pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="Real Win32 backend requires Windows.")
+def test_is_window_alive_reflects_real_windows(real_backend: LocalComputerBackend) -> None:
+    """B6 probe contract: a real hwnd is alive; a bogus hwnd is not."""
+    info = query_foreground_window()
+    if info is None or info.hwnd is None:
+        pytest.skip("No foreground window identity available.")
+    assert real_backend.is_window_alive(int(info.hwnd)) is True
+    assert real_backend.is_window_alive(0xDEADBEEF) is False
+    assert real_backend.is_window_alive(None) is False

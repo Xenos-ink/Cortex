@@ -193,8 +193,14 @@ class FakeWorldBackend(FakeComputerBackend):
         image.save(buffer, format="PNG")
         return base64.b64encode(buffer.getvalue()).decode("ascii")
 
-    def execute(self, action: GroundedAction, stop: Any = None) -> str:
-        message = super().execute(action, stop)
+    def execute(
+        self,
+        action: GroundedAction,
+        stop: Any = None,
+        focus_hook: Any = None,
+        allow_launch: bool = False,
+    ) -> str:
+        message = super().execute(action, stop, focus_hook=focus_hook, allow_launch=allow_launch)
         self._executes += 1
         self._model_effect(action)
         return message

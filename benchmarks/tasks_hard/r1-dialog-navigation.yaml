@@ -1,0 +1,93 @@
+{
+  "id": "r1-dialog-navigation",
+  "title": "Notepad Save As through dialog UI: navigate + create nested folder under r1_target",
+  "category": "verification",
+  "fake_runnable": false,
+  "prompt": "Open the file C:\\Users\\localadmin\\Desktop\\cortex-bench\\r1_note.txt in Notepad. At the very end of the document, add exactly one new line that reads: Appended via Save As dialog: R1-APPEND-OK . Then save a COPY of the edited note as a plain-text file named r1_out_note.txt into a NEW folder named r1_archive that you create INSIDE C:\\Users\\localadmin\\Desktop\\cortex-bench\\r1_target\\ (this folder starts empty). The nested folder must be created and reached with the Save As dialog's own on-screen controls: use the dialog's New Folder button and/or navigate the folder tree, breadcrumb/address-bar dropdown or Browse controls inside the dialog. The original r1_note.txt must remain in place with its original name. Leave the Notepad window showing r1_out_note.txt open when you are done.",
+  "goal": "Open a note in Notepad, append a required line, then route the save through the GUI Save As dialog: navigate into Desktop\\cortex-bench\\r1_target, create a nested folder r1_archive via the dialog's own controls, and save r1_out_note.txt there.",
+  "setup": {
+    "app": "notepad",
+    "real_world_only": true,
+    "fixtures": [
+      "r1_note.txt"
+    ],
+    "outputs": [
+      "~/Desktop/cortex-bench/r1_target/r1_archive/r1_out_note.txt"
+    ]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "done",
+        "summary": "real-world task; executed by a driver agent via score_task.py flow, not by the scripted provider"
+      }
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {
+        "kind": "window_title_contains",
+        "value": "Notepad"
+      }
+    ]
+  },
+  "predicates": [
+    {
+      "name": "nested_output_file_exists",
+      "kind": "file_exists",
+      "path": "~/Desktop/cortex-bench/r1_target/r1_archive/r1_out_note.txt"
+    },
+    {
+      "name": "output_written_during_run",
+      "kind": "file_fresh",
+      "path": "~/Desktop/cortex-bench/r1_target/r1_archive/r1_out_note.txt"
+    },
+    {
+      "name": "content_carried_over_and_appended",
+      "kind": "text_contains_normalized",
+      "path": "~/Desktop/cortex-bench/r1_target/r1_archive/r1_out_note.txt",
+      "needles": [
+        "DIALOG-NAV-7391",
+        "KEEP-TOKEN-R1",
+        "Appended via Save As dialog: R1-APPEND-OK"
+      ]
+    },
+    {
+      "name": "source_note_still_in_place",
+      "kind": "file_exists",
+      "path": "~/Desktop/cortex-bench/r1_note.txt"
+    },
+    {
+      "name": "exactly_one_task_notepad_window",
+      "kind": "process_window_count",
+      "process": "notepad.exe",
+      "title_token": "r1_out_note.txt",
+      "expected": 1
+    },
+    {
+      "name": "saved_doc_window_title",
+      "kind": "window_title_contains",
+      "needle": "r1_out_note.txt"
+    }
+  ],
+  "human_reference": {
+    "primary": "arithmetic_cadence",
+    "seconds": 36.0,
+    "calibration": {
+      "fitts_click_s": 0.6,
+      "char_s": 0.22,
+      "dialog_wait_s": 1.0,
+      "keypress_s": 0.5,
+      "cognitive_allowance_s": 12,
+      "actions": "open file (2 clicks 1.2s) + Ctrl+End (0.5s) + type 37-char appended line (8.1s) + open Save As (0.6s + 1.0s dialog) + navigate into r1_target (2 clicks 1.2s) + New Folder + type r1_archive + Enter (0.6+2.2+0.5s) + type filename 15 chars (3.3s) + Save (0.6s + 1.0s dialog) + cognitive 12s = ~36s"
+    },
+    "method_log": "ARITHMETIC reference (explicit action list x cadence), not a replay: Notepad's common Save As dialog navigation (tree/breadcrumb + New Folder + rename) is too state-dependent to replay deterministically on this box; the h6 precedent applies. Superseded by a real human run when performed."
+  },
+  "anti_gaming": "All predicates evaluate the REAL filesystem and window state, never driver self-report. output_written_during_run fails files that pre-date the run. content_carried_over_and_appended proves the source lines and the appended marker both reached the copy, so hand-creating a bare file cannot pass. exactly_one_task_notepad_window fails when the driver leaves stray Notepad documents (or a second copy of the task doc) open. The scorer records nothing about HOW the dialog was driven; the dialog-UI requirement (folder reached/created with the dialog's own controls, full-path typing at most as one step of the flow) is a prompt-level discipline verified by run review, not by the scorer.",
+  "allowed_processes": [
+    "notepad.exe",
+    "explorer.exe"
+  ],
+  "max_actions": 400,
+  "safety_notes": "Read-only source file plus one new file created inside the dedicated Desktop\\cortex-bench\\r1_target bench area; no existing user files are touched, no network access."
+}

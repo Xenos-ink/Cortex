@@ -55,6 +55,10 @@ AuditEventType = Literal[
     "resume",
     "approval_epoch",
     "health_check",
+    # PERF-004 (A4, additive): queued host-action batches (computer_execute
+    # follow_ups) emit one per-queue summary event; every item still emits its
+    # own per-phase events.
+    "queue",
 ]
 
 _REDACTED_STR_FIELDS = (

@@ -1,0 +1,185 @@
+{
+  "width": 1920,
+  "height": 1080,
+  "active_window": "Calculator",
+  "cursor_x": 495,
+  "cursor_y": 594,
+  "input_width": 1920,
+  "input_height": 1080,
+  "coordinate_scale_x": 1.0,
+  "coordinate_scale_y": 1.0,
+  "coordinate_space_verified": true,
+  "redactions_applied": false,
+  "observation_id": "7be3c6c4aeeb486898e64e0aa258a4a7",
+  "timestamp": "2026-09-07T18:51:44.216205Z",
+  "coordinate_space": "verified_passthrough",
+  "monitor": {
+    "id": "monitor-0",
+    "index": 0,
+    "bounds": [
+      0,
+      0,
+      1920,
+      1080
+    ],
+    "is_primary": true,
+    "dpi_scale_x": 1.25,
+    "dpi_scale_y": 1.25
+  },
+  "active_window_info": {
+    "hwnd": 103614888,
+    "pid": 3984,
+    "process_name": "win32calc.exe",
+    "exe_path": "C:\\Windows\\System32\\win32calc.exe",
+    "window_class": "CalcFrame",
+    "title": "Calculator",
+    "bounds": [
+      256,
+      256,
+      282,
+      403
+    ]
+  },
+  "ocr_text": [
+    {
+      "text": "0",
+      "x": 300,
+      "y": 352,
+      "width": 211,
+      "height": 36,
+      "confidence": null
+    },
+    {
+      "text": "CalcFrame",
+      "x": 265,
+      "y": 319,
+      "width": 264,
+      "height": 331,
+      "confidence": null
+    },
+    {
+      "text": "Text",
+      "x": 278,
+      "y": 332,
+      "width": 238,
+      "height": 63,
+      "confidence": null
+    },
+    {
+      "text": "#32770",
+      "x": 278,
+      "y": 332,
+      "width": 238,
+      "height": 63,
+      "confidence": null
+    },
+    {
+      "text": "#32770",
+      "x": 278,
+      "y": 401,
+      "width": 238,
+      "height": 239,
+      "confidence": null
+    },
+    {
+      "text": "#32770",
+      "x": 265,
+      "y": 319,
+      "width": 750,
+      "height": 600,
+      "confidence": null
+    }
+  ],
+  "ui_elements": [
+    {
+      "name": "0",
+      "control_type": "Text",
+      "automation_id": null,
+      "value": "0",
+      "offscreen": false,
+      "rect": [
+        300.0,
+        352.0,
+        211.0,
+        36.0
+      ],
+      "focused": true,
+      "source": "win32"
+    },
+    {
+      "name": null,
+      "control_type": "CalcFrame",
+      "automation_id": null,
+      "value": null,
+      "offscreen": false,
+      "rect": [
+        265.0,
+        319.0,
+        264.0,
+        331.0
+      ],
+      "focused": false,
+      "source": "win32"
+    },
+    {
+      "name": null,
+      "control_type": "Text",
+      "automation_id": null,
+      "value": null,
+      "offscreen": false,
+      "rect": [
+        278.0,
+        332.0,
+        238.0,
+        63.0
+      ],
+      "focused": false,
+      "source": "win32"
+    },
+    {
+      "name": null,
+      "control_type": "#32770",
+      "automation_id": null,
+      "value": null,
+      "offscreen": false,
+      "rect": [
+        278.0,
+        332.0,
+        238.0,
+        63.0
+      ],
+      "focused": false,
+      "source": "win32"
+    },
+    {
+      "name": null,
+      "control_type": "#32770",
+      "automation_id": null,
+      "value": null,
+      "offscreen": false,
+      "rect": [
+        278.0,
+        401.0,
+        238.0,
+        239.0
+      ],
+      "focused": false,
+      "source": "win32"
+    },
+    {
+      "name": null,
+      "control_type": "#32770",
+      "automation_id": null,
+      "value": null,
+      "offscreen": true,
+      "rect": [
+        265.0,
+        319.0,
+        750.0,
+        600.0
+      ],
+      "focused": false,
+      "source": "win32"
+    }
+  ]
+}

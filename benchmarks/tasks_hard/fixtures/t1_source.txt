@@ -1,0 +1,11 @@
+name,position,salary
+Alice Norton,Engineer,52400
+Bruno Keller,Analyst,47800
+Chen Wei,Manager,63150
+Diana Osei,Clerk,39200
+Elias Brandt,Engineer,55875
+Farah Aziz,Director,72400
+Guru Menon,Analyst,49325
+Hana Suzuki,Clerk,40100
+Ivan Petrov,Engineer,58210
+Julia Reyes,Manager,66800

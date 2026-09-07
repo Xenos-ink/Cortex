@@ -872,3 +872,66 @@ def test_context_without_approval_flag_reports_risk_but_keeps_defaults() -> None
     assert decision.allowed is True
     assert decision.requires_approval is False
     assert decision.risk is RiskLevel.LOW
+
+
+# --- PERF-004: trimmed retry backoff ----------------------------------------------------------
+
+
+def test_default_retry_backoff_is_trimmed() -> None:
+    """PERF-004: (0.5, 1.0) -> (0.2, 0.4); still bounded at MAX_RETRIES=2."""
+    assert provider_module.DEFAULT_RETRY_BACKOFF == (0.2, 0.4)
+
+
+async def test_async_retries_sleep_the_trimmed_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(provider_module.asyncio, "sleep", fake_sleep)
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return httpx.Response(429, json={"error": "rate limited"})
+        return chat_response(decision_payload())
+
+    provider = OpenAICompatibleVisionProvider(
+        api_key="k", transport=httpx.MockTransport(handler)
+    )
+    decision = await provider.decide("goal", make_observation(), [])
+    assert decision.status == "action"
+    assert sleeps == [0.2, 0.4]
+
+
+def test_sync_retries_sleep_the_trimmed_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(provider_module.time, "sleep", lambda delay: sleeps.append(delay))
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 2:
+            return httpx.Response(503, json={"error": "unavailable"})
+        return chat_response(decision_payload())
+
+    provider = OpenAICompatibleVisionProvider(
+        api_key="k", transport=httpx.MockTransport(handler)
+    )
+    verdict = provider.judge_change("before", "after", "effect appears")
+    assert verdict["outcome"] in {"verified", "failed", "uncertain"}
+    assert sleeps == [0.2]
+
+
+async def test_retry_backoff_still_exhausts_to_typed_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(provider_module.asyncio, "sleep", fake_sleep)
+    provider = OpenAICompatibleVisionProvider(
+        api_key="k",
+        transport=httpx.MockTransport(lambda _req: httpx.Response(503, json={})),
+    )
+    with pytest.raises(ProviderHTTPError, match="503"):
+        await provider.decide("goal", make_observation(), [])

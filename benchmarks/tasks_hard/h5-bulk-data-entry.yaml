@@ -1,0 +1,90 @@
+{
+  "id": "h5-bulk-data-entry",
+  "title": "Bulk data entry: 32-record CSV transcribed into Excel, saved as .xlsx",
+  "category": "long_horizon_state_tracking",
+  "fake_runnable": false,
+  "prompt": "Bulk transcription task. 1) Read the CSV file C:\\Users\\localadmin\\Desktop\\cortex-bench\\t5_roster.csv (header id,name,dept,start_year,score followed by 32 employee records). 2) Start Excel and transcribe the ENTIRE file into a new workbook: headers in row 1 (cells A1 through E1, column order exactly as in the CSV: id, name, dept, start_year, score), then all 32 records in rows 2-33 in the same order (id in column A, name in B, dept in C, start_year in D, score in E). Enter years and scores as numbers. 3) Save the workbook as an Excel .xlsx file at exactly C:\\Users\\localadmin\\Desktop\\cortex-bench\\t5_out_roster.xlsx. Leave Excel open when you are done.",
+  "goal": "Transcribe a 32-record CSV (5 columns) into a new Excel workbook in fixed column/row order and save as .xlsx to the given path.",
+  "setup": {
+    "app": "excel+notepad",
+    "real_world_only": true,
+    "fixtures": [
+      "t5_roster.csv"
+    ],
+    "outputs": [
+      "~/Desktop/cortex-bench/t5_out_roster.xlsx"
+    ]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "done",
+        "summary": "real-world task; executed by a driver agent via score_task.py flow, not by the scripted provider"
+      }
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {
+        "kind": "window_title_contains",
+        "value": "Excel"
+      }
+    ]
+  },
+  "predicates": [
+    {
+      "name": "output_file_exists",
+      "kind": "file_exists",
+      "path": "~/Desktop/cortex-bench/t5_out_roster.xlsx"
+    },
+    {
+      "name": "output_written_during_run",
+      "kind": "file_fresh",
+      "path": "~/Desktop/cortex-bench/t5_out_roster.xlsx"
+    },
+    {
+      "name": "at_least_30_data_rows",
+      "kind": "xlsx_rows_matching",
+      "path": "~/Desktop/cortex-bench/t5_out_roster.xlsx",
+      "column": "A",
+      "regex": "^EMP-\\d{3}$",
+      "min": 30
+    },
+    {
+      "name": "spot_check_8_cells",
+      "kind": "xlsx_spot_checks",
+      "path": "~/Desktop/cortex-bench/t5_out_roster.xlsx",
+      "fixture": "t5_roster.csv",
+      "cells": [
+        "B5",
+        "C9",
+        "D14",
+        "A19",
+        "E23",
+        "B28",
+        "D31",
+        "C33"
+      ]
+    }
+  ],
+  "human_reference": {
+    "primary": "scripted_cadence",
+    "seconds": 448.16,
+    "calibration": {
+      "fitts_click_s": 0.6,
+      "char_s": 0.22,
+      "dialog_wait_s": 1.0,
+      "cognitive_allowance_s": 0,
+      "actions": "1 Excel cold start, ~1300 typed chars across 33 lines, 1 save-as dialog"
+    },
+    "method_log": "Replayed live (33 lines typed into Excel at calibrated cadence, ~7.5 min). Self-check: >=30 id rows + 8/8 spot cells verified. Superseded by real human runs when performed."
+  },
+  "anti_gaming": "The scorer parses the saved .xlsx zip directly: row count is measured by matching the id pattern in the sheet XML and 8 exact cells across all 5 columns are compared against the canonical CSV (numeric cells compared as numbers, strings via sharedStrings). output_written_during_run fails files that pre-date the run. Fixture is unique to this task.",
+  "allowed_processes": [
+    "EXCEL.EXE",
+    "notepad.exe",
+    "explorer.exe"
+  ],
+  "max_actions": 800,
+  "safety_notes": "Read-only source file plus new file creation inside the dedicated Desktop\\cortex-bench bench area; no existing user files touched."
+}

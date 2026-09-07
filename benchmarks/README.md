@@ -99,3 +99,59 @@ summaries (observation/model/execution/verification/task) from the session metri
 | t07-browser-tab-switch-state | hidden_state | no | yes | background-tab state tracking |
 | t08-notepad-save-cross-source | cross_source_reasoning | yes | yes | file + title sources |
 | t09-notepad-block-destructive-text | safety_compliance | yes | yes | runtime must block; zero executions |
+
+## Harsh tasks (`tasks_hard/`) — host-driven mode
+
+`tasks_hard/` holds six harsh benchmark tasks (h1–h6: Excel multi-step entry, cross-app
+research, mspaint precision drawing, computed aggregation, bulk entry, Explorer file
+triage). They are **real-world-only** (`fake_runnable: false`): the scripted runner
+reports them as `requires_env` (that is the expected fake-mode outcome — it proves the
+loader accepts them; see the internal QA evidence, local only). Because there
+is no vision API key on this box, the primary scoring instrument is **host-driven
+mode**: a driver LLM agent performs the task through the real `mcp__cortex__*` tools
+and an independent scorer evaluates the final machine state.
+
+- `tasks_hard/DRIVER-PROTOCOL.md` — launcher/driver/scorer contract (driver gets only
+  the YAML `prompt`; wall time is measured externally; driver self-report is never used).
+- `tasks_hard/*.yaml` — runner-schema-compatible (id/category/setup/provider/verification/
+  max_actions/allowed_processes) plus task-specific `predicates` (authoritative, interpreted
+  by `score_task.py`), `human_reference` and `anti_gaming` blocks.
+- `tasks_hard/fixtures/` + `tasks_hard/setup_fixtures.py` — canonical task data and the
+  deterministic Desktop `cortex-bench` seeder (inputs only; outputs are never seeded).
+- `score_task.py` — stdlib-only scorer (zip+XML for .xlsx, ctypes Win32 for windows,
+  PIL only for the mspaint canvas analysis); CLI:
+  `python benchmarks/score_task.py --seed --task <yaml>` then
+  `python benchmarks/score_task.py --task <yaml> --run-record run.json --out scoring.json`
+  (optional: `--model "LABEL"` records the driver/model in the run log, `--no-log` opts
+  out of the log append; see below).
+- `make_references.py` — calibrated reference timings: real UI replays at scripted
+  cadence (h1–h5) or an auditable arithmetic action list (h6) -> written to the
+  internal QA evidence tree (local only, not published).
+  Calibrated references only — superseded by measured reference runs when performed.
+
+Warning: `make_references.py` drives the real desktop (real mouse/keyboard).
+
+### Automatic run log (`RUNS.md` + `runs-log.jsonl`)
+
+Every successful scoring invocation leaves an automatic, visible trace (default ON;
+`--no-log` is the only opt-out). After scoring, `score_task.py` appends one record —
+UTC timestamp, task, run id, driver/model label, wall time, reference timing, ratio,
+completed, precision, actions, retries, guard events (from the run record when it
+carries them), anomaly count, notes — to two files written by the same code path:
+
+- `benchmarks/runs-log.jsonl` — append-only, one JSON line per run, never capped (machine-readable).
+- `benchmarks/RUNS.md` — human-readable markdown table, newest first; regenerated on
+  each append and capped at the last 200 entries (the full history stays in the JSONL).
+
+Scorer flags:
+
+- `--model "LABEL"` — free-text driver/model label stored in the log (e.g. `"glm-flash"`,
+  `"gpt-4o"`, or any free-form agent label); omitted records `null`.
+- `--no-log` — skip the append; scoring behavior and exit codes are unchanged either way.
+
+The flags are purely additive: existing invocations (`--seed`, or
+`--task --run-record --out`) keep working unchanged. `RUNS.md` is auto-generated — do
+not edit it by hand. The log is pre-seeded with the maintainer's internal QA campaign
+rows (failed/invalidated/aborted runs keep their honest labels); deep per-run
+evidence for every row stays local and is not published. The log files themselves are
+local-only (`benchmarks/RUNS.md` and `benchmarks/runs-log.jsonl` are gitignored).

@@ -29,7 +29,8 @@ from computer_use_mcp.models import (
 
 def test_action_type_members_unchanged() -> None:
     # "drag" was added additively (press-move-release); "move", "hotkey", and
-    # "focus_window" were added additively the same way — the legacy members are unchanged.
+    # "focus_window" were added additively the same way; T8 added "ensure_app"
+    # (attach-or-launch probe) the same additive way — the legacy members are unchanged.
     assert {member.value for member in ActionType} == {
         "click",
         "double_click",
@@ -42,6 +43,7 @@ def test_action_type_members_unchanged() -> None:
         "move",
         "hotkey",
         "focus_window",
+        "ensure_app",
     }
 
 

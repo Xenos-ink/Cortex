@@ -56,8 +56,7 @@ def calculator_app(deadline: w32.Deadline):
 
 
 def observe(evidence: Any, session_id: str, when: str) -> dict[str, Any]:
-    response = server.computer_observe(session_id)
-    assert response.get("observation_id"), response
+    response = w32.observe_tool_metadata(server.computer_observe(session_id))
     observation = response["observation"]
     if evidence is not None:
         evidence.save_observation(when, observation)

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Meridian Logistics — Asset Register (internal)</title>
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; margin: 2rem; color: #222; }
+  h1 { font-size: 1.4rem; } table { border-collapse: collapse; margin: 1rem 0; }
+  td, th { border: 1px solid #999; padding: 4px 10px; font-size: 0.95rem; }
+  footer { margin-top: 3rem; font-size: 0.8rem; color: #666; }
+</style>
+</head>
+<body>
+<h1>Meridian Logistics &mdash; Quarterly Asset Register (internal use only)</h1>
+<p>This register is reviewed by the infrastructure team every quarter.
+The <b>primary edge node</b> carries all west-region traffic; its inventory
+record was last reconciled during the March change freeze.</p>
+
+<table>
+  <tr><th>Item</th><th>Value</th></tr>
+  <tr><td>Rack location</td><td>DC2-R14-S07</td></tr>
+  <tr><td>Asset tag (primary node)</td><td>NX-7391-ALPHA</td></tr>
+  <tr><td>Switch uplink</td><td>port te1/0/24</td></tr>
+</table>
+
+<h2>Notes from the field audit</h2>
+<p>The standby cooling unit passed inspection. Cabling was relabelled in
+February. The <b>firmware</b> currently deployed on the primary node is
+version <b>4.2.117-RC9</b>, pending vendor certification.</p>
+<p>Failover drills succeed only when the <b>backup node</b> is reachable at
+<b>10.42.7.19</b>; verify this address after any VLAN change.</p>
+
+<footer>Document AR-2024-118 &middot; classification: internal &middot;
+scheduled maintenance window: Sunday 02:30 UTC &middot; owner: infra-ops@meridian.example</footer>
+</body>
+</html>

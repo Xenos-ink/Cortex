@@ -1,0 +1,124 @@
+{
+  "id": "h1-excel-employee-sheet",
+  "title": "Excel employee sheet: cold start, 10-row entry, SUM, bold header, save .xlsx",
+  "category": "long_horizon_state_tracking",
+  "fake_runnable": false,
+  "prompt": "Create an Excel workbook of employees. 1) Start Excel from the Start menu (cold start - it is not running). 2) Read the employee data from the file C:\\Users\\localadmin\\Desktop\\cortex-bench\\t1_source.txt (comma-separated: name,position,salary - 10 records plus a header line). 3) In a new blank workbook enter the headers Name, Position, Salary in cells A1, B1, C1, then all 10 employee records in rows 2-11 (name in column A, position in column B, salary in column C). 4) In cell C12 enter a SUM formula that adds all 10 salaries (C2 through C11). 5) Make the header row (A1:C1) bold. 6) Save the workbook as an Excel .xlsx file at exactly C:\\Users\\localadmin\\Desktop\\cortex-bench\\t1_out_employees.xlsx. Leave Excel open when you are done.",
+  "goal": "Cold-start Excel, transcribe 10 employees from a desktop source file, add a SUM formula under Salary, bold the header row, and save as .xlsx to the given path.",
+  "setup": {
+    "app": "excel",
+    "real_world_only": true,
+    "fixtures": [
+      "t1_source.txt"
+    ],
+    "outputs": [
+      "~/Desktop/cortex-bench/t1_out_employees.xlsx"
+    ]
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "done",
+        "summary": "real-world task; executed by a driver agent via score_task.py flow, not by the scripted provider"
+      }
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {
+        "kind": "window_title_contains",
+        "value": "Excel"
+      }
+    ]
+  },
+  "predicates": [
+    {
+      "name": "output_file_exists",
+      "kind": "file_exists",
+      "path": "~/Desktop/cortex-bench/t1_out_employees.xlsx"
+    },
+    {
+      "name": "output_written_during_run",
+      "kind": "file_fresh",
+      "path": "~/Desktop/cortex-bench/t1_out_employees.xlsx"
+    },
+    {
+      "name": "headers_present",
+      "kind": "xlsx_contains_strings",
+      "path": "~/Desktop/cortex-bench/t1_out_employees.xlsx",
+      "needles": [
+        "Name",
+        "Position",
+        "Salary"
+      ]
+    },
+    {
+      "name": "employee_names_transcribed",
+      "kind": "xlsx_min_string_hits",
+      "path": "~/Desktop/cortex-bench/t1_out_employees.xlsx",
+      "needles": [
+        "Alice Norton",
+        "Bruno Keller",
+        "Chen Wei",
+        "Diana Osei",
+        "Elias Brandt",
+        "Farah Aziz",
+        "Guru Menon",
+        "Hana Suzuki",
+        "Ivan Petrov",
+        "Julia Reyes"
+      ],
+      "min": 6
+    },
+    {
+      "name": "sum_formula_present",
+      "kind": "xlsx_formula",
+      "path": "~/Desktop/cortex-bench/t1_out_employees.xlsx",
+      "pattern": "SUM\\("
+    },
+    {
+      "name": "sum_value_correct",
+      "kind": "xlsx_cell_value",
+      "path": "~/Desktop/cortex-bench/t1_out_employees.xlsx",
+      "ref": "C12",
+      "type": "number",
+      "expected_from_fixture": {
+        "file": "t1_source.txt",
+        "column": 3,
+        "operation": "sum",
+        "skip_header": true
+      },
+      "tolerance": 0.01
+    },
+    {
+      "name": "header_row_bold",
+      "kind": "xlsx_bold_cells",
+      "path": "~/Desktop/cortex-bench/t1_out_employees.xlsx",
+      "cells": [
+        "A1",
+        "B1",
+        "C1"
+      ]
+    }
+  ],
+  "human_reference": {
+    "primary": "scripted_cadence",
+    "seconds": 131.42,
+    "calibration": {
+      "fitts_click_s": 0.6,
+      "char_s": 0.22,
+      "dialog_wait_s": 1.0,
+      "cognitive_allowance_s": 0,
+      "actions": "1 cold start (+ctrl+n blank workbook), ~140 typed chars across 11 lines, ~10 keypresses (navigation/bold), 1 save-as dialog"
+    },
+    "method_log": "Replayed live on the machine via make_references.py (keyboard-driven Excel at calibrated cadence; Excel launched with /e + ctrl+n to bypass the flaky Start screen - documented deviation). Self-check: all 7 predicates verified on the produced file. Superseded by real human runs when performed."
+  },
+  "anti_gaming": "All predicates evaluate the saved .xlsx on disk (zip/XML parsed by the scorer), never driver self-report. The expected SUM is recomputed by the scorer from the canonical fixture, not from the Desktop copy. output_written_during_run fails files that pre-date the run. Fixture data is unique to this task.",
+  "allowed_processes": [
+    "EXCEL.EXE",
+    "explorer.exe",
+    "notepad.exe"
+  ],
+  "max_actions": 600,
+  "safety_notes": "Read-only source file plus new file creation inside the dedicated Desktop\\cortex-bench bench area; no existing user files are touched, no network access."
+}

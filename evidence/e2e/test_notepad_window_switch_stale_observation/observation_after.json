@@ -1,0 +1,116 @@
+{
+  "width": 1920,
+  "height": 1080,
+  "active_window": "*target_a.txt - Notepad",
+  "cursor_x": 560,
+  "cursor_y": 445,
+  "input_width": 1920,
+  "input_height": 1080,
+  "coordinate_scale_x": 1.0,
+  "coordinate_scale_y": 1.0,
+  "coordinate_space_verified": true,
+  "redactions_applied": false,
+  "observation_id": "51a2855fc5e4436c8c4b2b140d6b3a2c",
+  "timestamp": "2026-09-07T18:51:51.096087Z",
+  "coordinate_space": "verified_passthrough",
+  "monitor": {
+    "id": "monitor-0",
+    "index": 0,
+    "bounds": [
+      0,
+      0,
+      1920,
+      1080
+    ],
+    "is_primary": true,
+    "dpi_scale_x": 1.25,
+    "dpi_scale_y": 1.25
+  },
+  "active_window_info": {
+    "hwnd": 90769574,
+    "pid": 21472,
+    "process_name": "notepad.exe",
+    "exe_path": "C:\\Windows\\System32\\notepad.exe",
+    "window_class": "Notepad",
+    "title": "*target_a.txt - Notepad",
+    "bounds": [
+      210,
+      220,
+      700,
+      450
+    ]
+  },
+  "ocr_text": [
+    {
+      "text": "s",
+      "x": 219,
+      "y": 283,
+      "width": 682,
+      "height": 349,
+      "confidence": null
+    },
+    {
+      "text": "s",
+      "x": 219,
+      "y": 283,
+      "width": 682,
+      "height": 349,
+      "confidence": null
+    },
+    {
+      "text": "msctls_statusbar32",
+      "x": 219,
+      "y": 632,
+      "width": 682,
+      "height": 29,
+      "confidence": null
+    }
+  ],
+  "ui_elements": [
+    {
+      "name": "s",
+      "control_type": "Edit",
+      "automation_id": null,
+      "value": "s",
+      "offscreen": false,
+      "rect": [
+        219.0,
+        283.0,
+        682.0,
+        349.0
+      ],
+      "focused": true,
+      "source": "win32"
+    },
+    {
+      "name": "s",
+      "control_type": "Edit",
+      "automation_id": null,
+      "value": "s",
+      "offscreen": false,
+      "rect": [
+        219.0,
+        283.0,
+        682.0,
+        349.0
+      ],
+      "focused": false,
+      "source": "win32"
+    },
+    {
+      "name": null,
+      "control_type": "msctls_statusbar32",
+      "automation_id": null,
+      "value": null,
+      "offscreen": false,
+      "rect": [
+        219.0,
+        632.0,
+        682.0,
+        29.0
+      ],
+      "focused": false,
+      "source": "win32"
+    }
+  ]
+}

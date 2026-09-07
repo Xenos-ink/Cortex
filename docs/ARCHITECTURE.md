@@ -26,9 +26,10 @@ types — include the wave's additive members).
   pointing at the same entry point (`computer_use_mcp.server:main`).
 - Windows-first execution (`LocalComputerBackend`); a faithful in-memory
   `FakeComputerBackend` implements the same contracts for tests and non-Windows import.
-- Python >= 3.11; runtime deps: `mcp`, `pydantic`, `Pillow`, `mss`, `pyautogui`
+- Python >= 3.11; runtime deps: `mcp`, `pydantic`, `Pillow`, `mss`, `pyautogui` (pyautogui is now the SELECTABLE FALLBACK input engine; the default physical-input path is raw Win32 `SendInput` via stdlib ctypes — PERF-004)
   (win32), `httpx`. No OCR/UIA engines are installed (deliberate non-goal; see §12).
-- Version: `0.2.0` (`__init__.py`; `pyproject.toml` aligned to the same value, F6).
+- Version: `0.5.0` (`__init__.py`; `pyproject.toml` aligned to the same value).
+- PERF-004 release: interference guards, SendInput engine, verification ladder, run-log — see VERSIONS.md and ROADMAP.md.
 - Test/benchmark layout: `tests/` unit+integration (fakes); `tests/e2e/` real-Windows
   E2E gated behind `CUMCP_RUN_E2E=1` (10 tests: 7 desktop + 3 benchmark-harness that
   run unconditionally); `benchmarks/` harness with `--mode fake` / `--mode env`
@@ -87,9 +88,9 @@ above is measured from the actual imports.
 | Perception/Grounding | `grounding.py` | `GroundingRouter` over `GroundingStrategy` implementations: coordinate (real), region descriptor (real), text-anchor (P1 stub), accessibility (P1 stub); fail-closed `UnsupportedGroundingError`. `NON_SPATIAL_ACTIONS` covers type, keypress, **hotkey** (carries `keys`), scroll, wait, done, **focus_window** (carries `target`) — grounded trivially with strategy `none`; point-bearing actions (click/double_click/drag/**move**) route to the coordinate strategy |
 | Action validation | `validator.py` | bounds, confidence floor, coordinate-space refusal, window/process allowlists, staleness + `source_observation_id` binding (`COORDINATE_ACTIONS` = click/double_click/drag/**move** — `move` binds its point like click); `missing_text`/`missing_keys`/`missing_target` (focus_window requires a non-empty `target`) |
 | Risk classification + policy + approval | `safety.py` | contextual LOW/MEDIUM/HIGH/CRITICAL; approval upgrade never downgraded; CRITICAL blocked pending explicit authorization; structured approval messages |
-| Execution | `backend.py` | `execute(action, stop)` — `StopToken.ensure_live()` before every physical input and between typed characters; interruptible 100 ms-sliced waits |
-| Post-action observation | `observation.py` | fresh capture, new `observation_id`; rate-gated by `min_screenshot_interval_ms` |
-| Semantic verification | `verification.py` | `VerificationStrategy` chain; outcome ∈ {verified, failed, uncertain}; first definitive wins; all-uncertain combines into `uncertain` |
+| Execution | `backend.py` | `execute(action, stop)` — `StopToken.ensure_live()` before every physical input (per typing chunk / drag segment; the chunk size is engine-selected); interruptible 100 ms-sliced waits |
+| Post-action observation | `observation.py` | fresh capture, new `observation_id`; burst-exempt intra-step capture (PERF-004 C2) that is REUSED as the next loop-top observation (C1) |
+| Semantic verification | `verification.py` | `VerificationStrategy` chain; outcome ∈ {verified, failed, uncertain}; first definitive wins; all-uncertain combines into `uncertain`; model-judge intents run the cheap-first ladder `deterministic_tiers` → pixel diff → judge (PERF-004 C3) |
 | Recovery/Replanning | `recovery.py` + `agent.py` | FailureClass → bounded plan; re-observe + re-ground; never blind same-coordinate retry |
 | Audit/Telemetry | `audit.py` | per-session JSONL with write-time redaction; `Metrics` counters + latency percentiles |
 | Limits | `limits.py` | 9 limit classes enforced centrally in `agent.py` (+ session cap in `server.py`/`state.py`) |
@@ -181,8 +182,7 @@ Loop exhaustion without termination → `LIMIT_EXCEEDED`.
 (`verified_passthrough` | `scaled` | `unverifiable` — synced with the legacy boolean by
 a model validator, enum wins when provided), `monitor: MonitorInfo|None` (id, index,
 bounds `(left,top,w,h)` virtual-screen, is_primary, dpi_scale_x/y),
-`active_window_info: WindowInfo|None`, plus P1 stubs `ocr_text: list[TextRegion]|None`
-and `ui_elements: list|None` (always `None` in P0).
+`active_window_info: WindowInfo|None`, plus the semantic fields `ocr_text: list[TextRegion]|None` and `ui_elements: list|None` — populated since PERF-004 by a bounded semantic read of the foreground window (raw-UIA COM when the box allows it, otherwise a Win32 `GetGUIThreadInfo`+`WM_GETTEXT` fallback): focused element name/control type/automation id/value plus a depth-bounded (2 levels), count-bounded (30) and time-budgeted (50 ms) list of visible child controls; every failure degrades silently to `None`.
 
 **GroundedAction lineage**: every action instance carries `action_id` (uuid, default)
 for auditing and approval binding. Coordinate actions carry
@@ -321,7 +321,7 @@ fields total (the 9 session-level additions are listed below the table).
 | `max_recovery_per_action` | 2 | 0..10 | recovery budget check |
 | `max_recovery_per_task` | 6 | 0..50 | recovery budget check |
 | `max_model_calls` | 60 | 1..1000 | `check_model_call` before DECIDE |
-| `min_screenshot_interval_ms` | 250 | 0..60000 | rate gate in `_observe` (wait ≤ 2 s then fail) |
+| `min_screenshot_interval_ms` | 250 | 0..60000 | rate gate in `_observe` (wait ≤ 2 s then fail); PERF-004 C2: protects FRESH observations only (`loop_top`/`direct_request`); intra-step captures (`validate`, `post_action`, `revalidate`) are burst-exempt via `record_burst_screenshot` (still counted + pace-stamped) |
 | `max_context_items` | 50 | 1..1000 | `check_context_items` before provider call |
 | `max_sessions` | 4 | 1..64 | `SessionRegistry` (fail-closed refusal, no eviction) + `check_session_count` |
 
@@ -414,11 +414,15 @@ stop: `stop_session` and an internally-armed kill path both route through the sh
 bounded snapshot retained in `_stopped_sessions`, capped at 1024 entries), and every
 subsequent tool call on that session id returns `session_stopped`.
 
-**`start_session(dry_run=True, require_approval=True, max_steps=30,
+**`start_session(dry_run=False, require_approval=True, max_steps=30,
 max_retries_per_action=1, min_confidence=0.70, allowed_windows=None,
 allowed_processes=None, limits=None)`**
 → `SessionState` dump plus `allowed_processes`, `limits` (string), `task_id`.
-Creates the registry entry, per-session audit dir, metrics, agent.
+Creates the registry entry, per-session audit dir, metrics, agent. PERF-004 C5
+intentional default change: `dry_run` now defaults to False (live session); the
+Session-1 forensics showed the old `dry_run=True` default silently wasted a full
+agent turn, and every dry-run result message now starts with the unmistakable banner
+`DRY-RUN (no input dispatched):`.
 
 **`stop_session(session_id)`**
 → `{ok, session_id, message, task_id, termination_reason}`; arms the kill path via the
@@ -427,14 +431,21 @@ shared cleanup. Idempotent: a second call on an already-stopped session returns
 
 **`computer_observe(session_id)`** (alias `computer_screenshot`)
 → `{observation: <Observation model dump incl. identity/monitor/coordinate fields>,
-digest: sha256 of the screenshot payload, observation_id, active_app}`.
+digest: sha256 of the screenshot payload, observation_id, active_app, text_summary}`.
+The additive PERF-004 C8 `text_summary` is a bounded one-line grounding digest for
+weak models: window title/process, cursor, a focused-control hint when the backend
+populates `ui_elements` (omitted gracefully when absent), and changed/unchanged versus
+the session's previous observation.
 **No rate gate on this explicit client tool** (measured ~46 captures/s; every capture
 emits an audit row). The `run_goal` internal loop is the rate-gated path
-(`min_screenshot_interval_ms`); accepted-by-design for explicit client calls — clients
-wanting throttling should self-limit (F5).
+(`min_screenshot_interval_ms`, PERF-004 C2 refined semantics: fresh observations
+only — intra-step verification captures are burst-exempt but recorded);
+accepted-by-design for explicit client calls — clients wanting throttling should
+self-limit (F5).
 
 **`computer_execute(session_id, action, x=None, y=None, text=None, keys=None,
-delta=0, approved=False, expected_effect=None, x2=None, y2=None, target=None)`**
+delta=0, approved=False, expected_effect=None, x2=None, y2=None, target=None,
+include_screenshot_after=None, follow_ups=None)`**
 → executed: `ExecutionResult` dump + the three confidence fields, with the response
 path redacted (F2: `message`, `action.text`, `action.reason`, `verification.note`,
 `verification.evidence` pass `redact_text` before leaving the server — the audit sink
@@ -443,7 +454,20 @@ unredacted surface);
 `rejected`: `{ok:false, message:"Grounding rejected.", reasons:[…]}`
 (one automatic re-observe + re-validate happens first on `STALE_OBSERVATION`);
 `safety_denied`: `{ok:false, message}` (includes all CRITICAL blocks);
-`approval_required`: `{ok:false, requires_approval:true, message}`.
+`approval_required`: `{ok:false, requires_approval:true, message}`;
+`digest_surprise`: `{ok:false, error:"digest_surprise", message}` (queued items only).
+An invalid action name/payload returns `{ok:false, error:"invalid_action", message, reasons}`
+whose message TEACHES the exact `ActionType` vocabulary and the closest valid shape
+(PERF-004 C6: `key` → `keypress`, `triple_click` → `double_click`/repeated clicks,
+word hotkey payloads → key names on `keypress`/`hotkey`).
+PERF-004 C4 (trailing optional): `include_screenshot_after=false` OMITS the heavy
+`screenshot_after_base64` from the response; omitted/None keeps the legacy payload.
+PERF-004 C7 (trailing optional): `follow_ups` (max 5 `ActionSpec` dicts) queues
+actions that each pass the FULL independent pipeline — the queue stops at the first
+verification failure, safety rejection, approval requirement, or post-action digest
+surprise; per-item results arrive in additive `follow_up_results` +
+`follow_ups_stopped_reason`, and a `queue` audit event summarizes the batch (every
+item still emits its own per-phase events).
 For `action="drag"`, `x`/`y` are the drag start and `x2`/`y2` the drag end (both
 required, screenshot coordinates); grounding and validation bounds-check both
 endpoints, and the backend interpolates the stroke in segments with the button always
@@ -459,8 +483,10 @@ The three newer actions:
   predicate (±2 px).
 - **`hotkey`** (`keys` required, 2–12 non-empty key names — enforced at construction
   and again in the backend; the validator rejects an empty list with `missing_keys`):
-  a compound chord executed through pyautogui `hotkey`, stop-checked immediately
-  before the single input. Single-key presses stay on `keypress`. Risk: `LOW` without
+  a compound chord executed through the selected input engine (`SendInputEngine.chord`
+  batches all key events into ONE SendInput call with modifiers released in reverse
+  order; the pyautogui fallback uses `hotkey`), stop-checked immediately before the
+  single input. Single-key presses stay on `keypress`. Risk: `LOW` without
   state-changing keys, `MEDIUM` (`keyboard_shortcut_state_change`) when any key is
   `ctrl`/`alt`/`win`/`delete`/`backspace`.
 - **`focus_window`** (`target` required, max 200 chars): the target title is resolved
@@ -627,8 +653,12 @@ numbers, not performance claims; scores require a real vision-provider run.
   state (edit text, calculator display) currently requires injected strategies rather
   than shipping in the default chain.
 - Benchmark output is harness validation only; no score exists.
-- No OS-level sandbox or VM isolation; `pyautogui` failsafe corner is the only
-  physical backstop.
+- No OS-level sandbox or VM isolation; the failsafe screen corner is the only
+  physical backstop. It is enforced on BOTH input engines: the pyautogui fallback
+  raises `FailSafeException` (mapped to `InputBlockedError`) and the default SendInput
+  path replicates the same corner check before every dispatch (same
+  `InputBlockedError` semantics) and additionally fails closed when `SendInput`
+  returns 0 (blocked by UIPI or another input source).
 
 ## 15. Long-Running Runtime (orchestration layer)
 
@@ -996,3 +1026,73 @@ there is no second executor.
   degradation — the session stays fully usable for manual `create_subtask` (no planner
   key needed); the context summarizer similarly falls back to its deterministic bounded
   summary.
+
+
+## 16. Interference Guard (T8: window binding, reattach, dialogs, focus, hotkeys)
+
+The Interference Guard (`interference.py` policy + `focus_guard.py` runtime) is a
+protection UPGRADE layered between the existing gates: it can only ADD rejections or
+annotations — grounding -> validation -> allowlists -> focus gate -> safety -> approval
+-> dry-run -> guard pre-dispatch -> stop-token -> limits -> execution -> sentinel ->
+verification all still run, in that order (the guard sits after the dry-run check and
+before `LimitEnforcer.check_action`).
+
+- **Policy surface**: `start_session(interference={...})` (trailing-optional) parsed
+  fail-closed by `parse_interference` (`extra="forbid"`, typed error
+  `invalid_interference`): five sections — `focus_guard`
+  (abort | refocus_then_abort | observe_only; `allow_owned_dialogs`;
+  `transient_launch_processes=["explorer.exe"]`; `on_identity_unknown="abort"`;
+  `on_target_gone="unbind_and_report"`), `attach_or_launch` (`launch="driver"`),
+  `dialog_sentinel` (halt | report; `auto_handle=[]` — NO auto-clicks ship enabled;
+  configurable `title_table`), `focus_continuity` (abort | warn;
+  `resend_terminal_key=false`), `hotkey_guard` (abort | release). Omitting the param
+  yields the same protective defaults.
+- **Mechanism (i) FocusGuard**: the session binds a target window identity from the
+  first ALLOWLISTED observation (or an explicit `focus_window` / `ensure_app` rebind);
+  sessions without an allowlist stay DORMANT (never binds the user's console). Before
+  every input dispatch the foreground is compared against the binding: MATCH (hwnd, or
+  pid+class+title overlap after a hwnd recycle), MATCH-ADJACENT (owned `#32770` of the
+  bound pid; configured transient launcher) dispatch; FOREIGN aborts with
+  `FOCUS_TAKEN_BY ...`. A dead bound window reports `TARGET_GONE` and (default policy)
+  clears the binding instead of deadlocking. Identity-unavailable fails closed.
+- **Mechanism (ii) AttachOrLaunch**: additive `ActionType.ENSURE_APP`
+  (`target="process[|doc-token]"`) — enumerate -> identity match ->
+  `REATTACHED title=... hwnd=...` (focused via the verified foreground switch, guard
+  re-bound); unsaved-candidate windows (generic title heuristics) ->
+  `AMBIGUOUS_INSTANCE` (discovery only); nothing matches -> `NO_INSTANCE`. The server
+  launches ONLY with `launch="server"` policy + process-allowlist match +
+  `allow_launch=True` threading; the default NEVER spawns a process.
+- **Mechanism (iii) DialogSentinel**: after every executed action a cheap probe
+  (class `#32770` / owner chain / title table) reports
+  `MODAL_DIALOG title=... controls=[...]` (the control list comes from the post-action
+  observation's `ui_elements` — no extra round-trip). Queue policy `halt` stops batches
+  with `follow_ups_stopped_reason="modal_dialog"`; the sentinel NEVER dispatches input.
+- **Mechanism (iv) FocusContinuity**: before/after keyboard dispatches the backend's
+  `query_focus_target()` (GetGUIThreadInfo) must belong to the bound window (or an
+  owned dialog); drift aborts (`FOCUS_DRIFTED`, mapped WRONG_WINDOW) or annotates
+  (`warn`). Long types carry a per-chunk hook (after the stop-token hook) that aborts
+  the in-flight type on mid-string drift — no same-instance retype (duplicates).
+  Terminal keys are NEVER auto-resent.
+- **Mechanism (v) HotkeyGuard**: pre-chord GetAsyncKeyState sweep (chord modifiers +
+  ctrl/alt/shift/win); stuck -> `STUCK_MODIFIER` rejection; opt-in `release` clears
+  ONLY session-dispatched modifiers via synthetic key-ups, then re-checks.
+- **B3/B8 pacing**: terminal-key chords (enter/return/tab) wait out
+  `CORTEX_KEY_DISPATCH_GAP` (default 0.05 s) behind a prior keyboard dispatch, and ALL
+  keyboard input waits out `CORTEX_FOCUS_SETTLE_SECONDS` (default 0.3 s) behind a
+  recent focus transition — the dropped-final-Enter (B3) and dropped/misdelivered
+  first-keys-after-activation (B5/B8) windows.
+- **B-fixes in the pipeline**: expected-text verification runs window-title +
+  `ui_elements` control text FIRST (`UiControlTextStrategy`); the OCR text-predicate is
+  demoted to an opt-in last resort (`CORTEX_OCR_TEXT_VERIFICATION=1`), and an
+  expected-text uncertain routes to the reliable pixel-diff tier instead of failing
+  (anomaly B2). Verification always captures its own fresh post-action observation; a
+  starved ladder (after-capture == grounding capture) routes PAST the pixel-diff tier
+  instead of false-failing on a self-comparison 0.0 diff (anomaly B1); the response
+  opt-out `include_screenshot_after=false` strips the payload only AFTER verification.
+  Session teardown is atomic and remembers the stopped-session snapshot FIRST
+  (anomaly B4: no popped-but-unremembered session can surface as `unknown_session`).
+- **Events**: `FOCUS_TAKEN_BY`, `FOCUS_IDENTITY_UNKNOWN`, `FOCUS_DRIFTED`,
+  `MODAL_DIALOG`, `REATTACHED`, `AMBIGUOUS_INSTANCE`, `NO_INSTANCE`, `STUCK_MODIFIER`,
+  `TARGET_GONE` — in `reasons` (rejections), `interference_events` + verification note
+  (post-action), and audit events (`interference` type); driver doctrine lives in
+  `benchmarks/tasks_hard/DRIVER-PROTOCOL.md`.

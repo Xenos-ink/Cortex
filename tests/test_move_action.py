@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from PIL import Image
 from pydantic import ValidationError
+from recording_engine import RecordingEngine
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp import server
@@ -68,40 +69,8 @@ class _StopOnNthCheck(StopToken):
         super().ensure_live()
 
 
-class _RecordingPyautogui:
-    """Minimal pyautogui stand-in recording every input call (no real mouse movement)."""
-
-    FailSafeException = type("FailSafeException", (Exception,), {})
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[object, ...]] = []
-
-    def _record(self, name: str, *args: object) -> None:
-        self.calls.append((name, *args))
-
-    def moveTo(self, x: int, y: int) -> None:
-        self._record("moveTo", x, y)
-
-    def mouseDown(self, button: str = "left") -> None:
-        self._record("mouseDown", button)
-
-    def mouseUp(self, button: str = "left") -> None:
-        self._record("mouseUp", button)
-
-    def click(self, *args: object, **kwargs: object) -> None:
-        self._record("click", *args)
-
-    def write(self, *args: object, **kwargs: object) -> None:
-        self._record("write", *args)
-
-    def hotkey(self, *args: object, **kwargs: object) -> None:
-        self._record("hotkey", *args)
-
-    def scroll(self, *args: object, **kwargs: object) -> None:
-        self._record("scroll", *args)
-
-
-# The session-scoped ``real_backend`` fixture comes from tests/conftest.py.
+# The session-scoped ``real_backend`` fixture comes from tests/conftest.py, which also
+# provides the RecordingEngine stub (no real input dispatch).
 
 
 # --- models: move requires a point --------------------------------------------------------------
@@ -183,32 +152,32 @@ def test_fake_move_missing_point_value_error() -> None:
     assert backend.executed == []
 
 
-# --- LocalComputerBackend (real path, stubbed pyautogui) ------------------------------------------
+# --- LocalComputerBackend (real path, stubbed input engine) ---------------------------------------
 
 
 @WINDOWS_ONLY
 def test_real_move_calls_move_to_once_with_mapped_coords(
     real_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    recorder = _RecordingPyautogui()
-    monkeypatch.setattr(real_backend, "_pyautogui", recorder)
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
     monkeypatch.setattr(real_backend, "_active_context", None)  # passthrough transform
     message = real_backend.execute(move((30, 45)))
     assert message == "Executed move."
-    assert recorder.calls == [("moveTo", 30, 45)]
+    assert engine.calls == [("move", 30, 45)]
 
 
 @WINDOWS_ONLY
 def test_real_move_prestopped_token_performs_zero_inputs(
     real_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    recorder = _RecordingPyautogui()
-    monkeypatch.setattr(real_backend, "_pyautogui", recorder)
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
     stop = StopToken()
     stop.stop()
     with pytest.raises(TaskStopped):
         real_backend.execute(move((30, 45)), stop=stop)
-    assert recorder.calls == []
+    assert engine.calls == []
 
 
 # --- grounding: move is a spatial coordinate action (single point) -------------------------------

@@ -55,9 +55,9 @@ The design principle: the goal is not to click the right pixel — it is to reac
 
 **Execution.** The backend performs the physical input through PyAutoGUI. The stop token is checked before every input and between typed characters; waits are sliced at 100 ms so a stop lands within one slice; drags interpolate the stroke in segments and always release the mouse button, including on a mid-stroke stop. `focus_window` is the deliberate exception to PyAutoGUI: it drives the Win32 foreground switch directly (restore when minimized, then the standard `AttachThreadInput` foreground switch with an ALT-key nudge) and verifies that the foreground actually moved — a refusal is a typed `WindowFocusError`, never a silent success. Dry-run sessions validate the full pipeline but short-circuit before any input.
 
-**Re-observe.** A fresh post-action capture is taken, rate-gated inside the loop by `min_screenshot_interval_ms` (default 250 ms).
+**Re-observe.** A fresh post-action capture is taken. PERF-004 loop economics: that capture becomes the next step's loop-top observation (observe reuse: 3 full captures per action step instead of 4 — loop-top, staleness probe, post-action — measured before/after), and the `min_screenshot_interval_ms` rate gate (default 250 ms) now protects only FRESH observations — the loop-top capture on a new step and host-driven observes — while intra-step verification captures (the staleness probe, the post-action capture) are burst-exempt but still recorded, so session-wide capture volume stays enforced and bounded. The staleness check itself is digest-first: the grounding source's pixel digest is compared with the fresh pre-execution capture's digest (a pixel-identical capture proves identity drift impossible), and the full identity validation still decides — a digest mismatch is a hint, never a verdict.
 
-**Semantic verification.** A chain of six strategies answers "did the intended transition happen?" with `verified` / `failed` / `uncertain`. The first definitive outcome wins; an all-uncertain chain combines into `uncertain`; no code path upgrades `uncertain` to success (asserted by a dedicated test). The comparison baseline is always the observation the action was grounded from.
+**Semantic verification.** A chain of six strategies answers "did the intended transition happen?" with `verified` / `failed` / `uncertain`. The first definitive outcome wins; an all-uncertain chain combines into `uncertain`; no code path upgrades `uncertain` to success (asserted by a dedicated test). The comparison baseline is always the observation the action was grounded from. For model-judge intents a cheap-first ladder applies: deterministic window/process/text/predicate strategies derived from the action intent run first, the pixel-diff supporting check second, and the provider model judge ONLY when both cheap tiers are inconclusive — a deterministic verdict always skips the judge.
 
 **Recovery / replanning.** Failures classify into a 12-value taxonomy. Recovery is bounded at 2 attempts per action and 6 per task; the same coordinates are never retried blindly — the loop re-observes, re-grounds, and re-decides. Authentication prompts always terminate safely; credentials are never auto-typed.
 
@@ -125,6 +125,100 @@ or, from a clone:
 git pull && python -m pip install -e ".[dev]"
 ```
 
+### Install and update via an AI agent
+
+You do not have to do any of this by hand. Paste one of the two prompts below into any AI coding agent (ZCode, Claude, Cursor, Kimi, Codex, …) and it will install or update Cortex for you end to end: prerequisites, venv, editable install, MCP wiring for the target host, verification, and a smoke test. Both prompts are self-contained — the agent asks you only for the two things it cannot know (where the repo comes from and which host to wire it into). Both prompts are written entirely in English so any agent can follow them verbatim.
+
+#### Install prompt
+
+````text
+Your task: install the Cortex MCP server on this machine and wire it into the host application, from start to final verification. Do everything yourself; never ask the user to run any command manually. Ask the user at the start about two things only, if you do not already know them: (1) the repository source — download from GitHub (the default) or an existing local copy at a specific path? (2) which host application to wire the server into (ZCode, Claude Desktop, Cursor, or other). Everything else is fully specified in these instructions; you need no other context.
+
+Step 1 — Check prerequisites:
+- OS: Windows 10, Windows 11, or Windows Server with an active, interactive display session (there is no headless mode — capture and input go through the real desktop).
+- Python 3.11 or newer: check with `py -3.11 --version` or `python --version`. If missing, install the latest 3.11+ from python.org before continuing.
+- git is optional: needed only for the clone method; if it is absent, use the ZIP download.
+
+Step 2 — Obtain the repository:
+```bash
+git clone https://github.com/Xenos-ink/Cortex.git
+cd Cortex
+```
+If git is unavailable: download the ZIP from the repository page (Code → Download ZIP) and extract it. If the user gave you a local path to a copy, use it as is. Treat the full folder path as the reference value C:\path\to\Cortex and substitute it everywhere below (always use absolute paths in configuration files).
+
+Step 3 — Virtual environment and installation:
+```bash
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+- pyproject.toml at the repository root is the reference: the entry point is `computer_use_mcp.server:main`, the install creates the two console scripts `cortex` and `computer-use-mcp`, and the server also runs as a module via `python -m computer_use_mcp.server` — invent no other commands or flags.
+- No optional extras are needed. Only if the user later asks for the development/test tooling: `.\.venv\Scripts\python.exe -m pip install -e ".[dev]"`.
+- Verify the install succeeded:
+```bash
+.\.venv\Scripts\python.exe -c "import computer_use_mcp; print(computer_use_mcp.__version__)"
+```
+
+Step 4 — Wire the MCP server into the host application (both ways):
+The standard server object is the same in every case (replace C:\path\to\Cortex with the real path, and use only the venv's python.exe):
+```json
+{
+  "mcpServers": {
+    "cortex": {
+      "command": "C:\\path\\to\\Cortex\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "computer_use_mcp.server"],
+      "cwd": "C:\\path\\to\\Cortex",
+      "env": {
+        "VISION_BASE_URL": "https://api.openai.com/v1",
+        "VISION_MODEL": "your-vision-model",
+        "VISION_API_KEY": "YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
+Note: the whole `env` block applies to the autonomous `run_goal` mode only; deterministic direct control via `computer_observe` + `computer_execute` needs no API key. If the user did not ask for autonomous mode, drop `env` or leave it empty.
+
+a) Global configuration (user level — applies to every project):
+- ZCode: the file `%USERPROFILE%\.zcode\cli\config.json`, and the key there is `mcp.servers` (i.e. put the "cortex" object under `mcp.servers`, NOT under `mcpServers`; compatible fallback: `~\.agents\mcp.json` in the `mcpServers` shape above).
+- Claude Desktop: the file `%APPDATA%\Claude\claude_desktop_config.json`, in the `mcpServers` shape as-is.
+- Cursor: the file `%USERPROFILE%\.cursor\mcp.json`, in the `mcpServers` shape as-is.
+
+b) Per-project / agent-level configuration (inside the target project folder):
+- ZCode: `<project>\.zcode\config.json` with the key `mcp.servers` (compatible fallback: `<project>\.agents\mcp.json` in the `mcpServers` shape).
+- Cursor: `<project>\.cursor\mcp.json` in the `mcpServers` shape.
+- Claude Code: `<project>\.mcp.json` in the `mcpServers` shape.
+
+Apply at least the method the user asked for; applying both (global + project) is recommended. If a config file already exists, merge the new "cortex" object into the existing `mcpServers`/`mcp.servers` without deleting any existing server. Respect JSON syntax strictly (double quotes, and doubled backslashes `\\` in Windows paths).
+
+Step 5 — Verification:
+- Restart the host application or reload its MCP connections, then confirm the tools list (tools/list) returns the nine Cortex tools: `start_session`, `computer_observe`, `computer_execute`, `run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`, `stop_session` (`computer_screenshot` also exists as a compatibility alias of `computer_observe`).
+- A secondary command-line boot check: run `.\.venv\Scripts\python.exe -m computer_use_mcp.server` — a stdio server stays waiting on stdin, which is normal; end it once it starts with no import errors, and treat tools/list from the host as the final proof.
+
+Step 6 — Smoke test and notes:
+- With the user's consent, run a short session: `start_session`, then `computer_observe`, then `stop_session`. As of the PERF-004 release the `dry_run` default is `false` (a live session that performs real input) — pass `dry_run: true` explicitly for a validation-only session with no input (its results carry the `DRY-RUN (no input dispatched):` banner). The `require_approval` default remains `true`.
+- A missing `VISION_API_KEY` blocks nothing in `start_session` or the host-driven tools (`computer_observe`/`computer_execute`); the key is needed only when `run_goal` makes its first model call (it raises a clear, typed error at that point).
+- Multi-monitor and DPI: coordinates are always given in screenshot space; the server measures per-monitor DPI and classifies the coordinate space; an unverifiable space refuses coordinate input fail-closed. Multi-monitor logic is unit-tested only — on a multi-monitor machine, start with a `dry_run: true` session to check the classification before any live input.
+- If the tools do not appear: check the absolute path to `.venv\Scripts\python.exe` in the config and that the host was restarted after editing it; server logs go to stderr and per-session audit logs live under `%TEMP%\cortex\logs` (default level `LOG_LEVEL=INFO`).
+
+When done: give the user a summary of the repository path, the config file(s) you edited, and the list of Cortex tools that appeared in the host.
+````
+
+#### Update prompt
+
+````text
+Your task: update an existing Cortex MCP server installation on this machine to the latest version with zero loss of data or settings. Ask the user only for the path of the current repository folder if you do not know it (the folder containing pyproject.toml for the computer-use-mcp package).
+
+Step 1 — Check before anything: inside the repository folder run `git status --porcelain`. If local changes exist, destroy nothing and use no force `git reset`/`git checkout`: stash them safely with `git stash push -m "pre-update local changes"` and tell the user they can be restored later with `git stash pop`.
+Step 2 — Fetch the new version: `git pull`. If the original install was not via git (a ZIP copy), re-download the latest ZIP and extract it over the copy while keeping the existing `.venv` folder.
+Step 3 — Refresh dependencies: `.\.venv\Scripts\python.exe -m pip install -e .` (the same command as the original install; it re-resolves dependencies from the updated pyproject.toml).
+Step 4 — Restart: restart the MCP connection in the host application (restart the app or reload the MCP servers) so the connection picks up the new version.
+Step 5 — Re-verify: repeat the full verification — tools/list returns the nine Cortex tools (`start_session`, `computer_observe`, `computer_execute`, `run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`, `stop_session`), then a short smoke test (`start_session` → `computer_observe` → `stop_session`).
+Step 6 — Version ledger: read VERSIONS.md at the repository root and tell the user what changed in the new version and any Compatibility notes — pay special attention to default-value changes, such as `dry_run` now defaulting to `false` (a live session) as of the PERF-004 release.
+Rollback if needed: if something breaks after the update, return to the previous version listed in VERSIONS.md with `git checkout <tag-or-commit>` then `.\.venv\Scripts\python.exe -m pip install -e .`, then restart the host.
+
+When done: summarize the old and new versions (from pyproject.toml and VERSIONS.md), any local changes you stashed, and the final verification result.
+````
+
 ## Running the server
 
 ```bash
@@ -180,9 +274,9 @@ The `env` block is only needed if you plan to use `run_goal`; deterministic dire
 
 Cortex exposes six core MCP tools; the four long-running session tools are documented under [Long-Running Sessions](#long-running-sessions).
 
-**`start_session(dry_run=True, require_approval=True, max_steps=30, max_retries_per_action=1, min_confidence=0.70, allowed_windows=None, allowed_processes=None, limits=None, resume_from_checkpoint=None)`**
+**`start_session(dry_run=False, require_approval=True, max_steps=30, max_retries_per_action=1, min_confidence=0.70, allowed_windows=None, allowed_processes=None, limits=None, resume_from_checkpoint=None, interference=None)`**
 
-Creates a guarded session and returns the session state plus `allowed_processes`, the effective `limits`, and `task_id`. Dry-run and per-action approval are on by default — flip them deliberately. `allowed_windows` is a window-title allowlist, `allowed_processes` a process allowlist (authoritative when the OS reports process identity; fail-closed when it does not; `focus_window` targets are checked against both allowlists before any foregrounding call). `limits` accepts any `Limits` field as a dict; unknown field names or non-numeric values are rejected. No API key is required. The trailing optional `resume_from_checkpoint` resumes a previous long-running session from a checkpoint file as a continuation — see [Resume](#resume).
+Creates a guarded session and returns the session state plus `allowed_processes`, the effective `limits`, and `task_id`. PERF-004 intentional default change: `dry_run` now defaults to **False** (live session) — the old `dry_run=True` default silently produced no-op sessions that cost a full agent turn to discover; pass `dry_run=True` explicitly for a validation-only session, and every dry-run result message starts with the unmistakable banner `DRY-RUN (no input dispatched):`. `require_approval` still defaults to True. `allowed_windows` is a window-title allowlist, `allowed_processes` a process allowlist (authoritative when the OS reports process identity; fail-closed when it does not; `focus_window` targets are checked against both allowlists before any foregrounding call). `limits` accepts any `Limits` field as a dict; unknown field names or non-numeric values are rejected. No API key is required. The trailing optional `resume_from_checkpoint` resumes a previous long-running session from a checkpoint file as a continuation — see [Resume](#resume).
 
 ```json
 {
@@ -198,11 +292,11 @@ Creates a guarded session and returns the session state plus `allowed_processes`
 
 **`computer_observe(session_id)`**
 
-Captures the current screen and returns MCP content blocks: one `ImageContent` block carrying the screenshot itself (`image/png`) — so vision-capable client models receive a real image, not text — plus one `TextContent` block with the JSON metadata `{ "observation": ..., "digest": <sha256 of the screenshot payload>, "observation_id": ..., "active_app": ..., "image_format": "image/png" }`. The `observation` object carries dimensions, cursor position, coordinate-space classification, monitor identity (bounds, primary flag, DPI scales), and the full window/process identity; the raw base64 never travels as text. Error paths still return the structured error dict. This explicit tool is not rate-gated — every capture writes an audit row, so hammering clients generate audit volume at their own discretion; the `run_goal` loop is the rate-gated path. `computer_screenshot(session_id)` is a compatibility alias returning the same blocks.
+Captures the current screen and returns MCP content blocks: one `ImageContent` block carrying the screenshot itself (`image/png`) — so vision-capable client models receive a real image, not text — plus one `TextContent` block with the JSON metadata `{ "observation": ..., "digest": <sha256 of the screenshot payload>, "observation_id": ..., "active_app": ..., "image_format": "image/png", "text_summary": <PERF-004 additive one-line summary> }`. The additive `text_summary` line carries the active window title/process, cursor position, a focused-control hint when the backend supplies `ui_elements` (omitted gracefully when absent), and a changed/unchanged note versus the previous observation of this session. The `observation` object carries dimensions, cursor position, coordinate-space classification, monitor identity (bounds, primary flag, DPI scales), and the full window/process identity; the raw base64 never travels as text. Error paths still return the structured error dict. This explicit tool is not rate-gated — every capture writes an audit row, so hammering clients generate audit volume at their own discretion; the `run_goal` loop is the rate-gated path. `computer_screenshot(session_id)` is a compatibility alias returning the same blocks.
 
-**`computer_execute(session_id, action, x=None, y=None, text=None, keys=None, delta=0, approved=False, expected_effect=None, x2=None, y2=None, target=None)`**
+**`computer_execute(session_id, action, x=None, y=None, text=None, keys=None, delta=0, approved=False, expected_effect=None, x2=None, y2=None, target=None, include_screenshot_after=None, follow_ups=None)`**
 
-Validates and executes one action through the full pipeline. Supported actions:
+Validates and executes one action through the full pipeline. Supported actions (there is deliberately no `key` and no `triple_click` action):
 
 | Action | Parameters | Notes |
 |---|---|---|
@@ -222,7 +316,13 @@ When either allowlist is configured (`start_session(allowed_processes=…)` / `a
 
 Approval semantics: `approved=true` authorizes this one call when the policy requires approval (always for `HIGH` risk; for interactive actions when the session was started with `require_approval=true`). It never clears a `CRITICAL` block. `expected_effect` opts into semantic verification: the stated effect must be observed, or the result reports `failed`/`uncertain` — a stated effect turns "the screen changed somehow" into "the screen changed the way I claimed it would".
 
-Possible outcomes: an executed result (`ok`, `action`, `message`, `verification`, plus `model_confidence`, `grounding_confidence`, `verification_confidence`), a grounding rejection (`ok: false` with `reasons`), a safety denial (`ok: false` with the policy message), or an approval request (`ok: false`, `requires_approval: true`, with the full approval message).
+Possible outcomes: an executed result (`ok`, `action`, `message`, `verification`, plus `model_confidence`, `grounding_confidence`, `verification_confidence`), a grounding rejection (`ok: false` with `reasons`), a safety denial (`ok: false` with the policy message), or an approval request (`ok: false`, `requires_approval: true`, with the full approval message). An invalid action name or malformed payload returns `ok: false, error: "invalid_action"` whose message TEACHES the exact valid vocabulary and the closest valid shape for what was sent.
+
+Interference Guard (T8, trailing optional): `interference` is a dict of policy sections for the session's Interference Guard — `focus_guard` (bound-target foreground verification; abort | refocus_then_abort | observe_only), `attach_or_launch` (`ensure_app` attach-before-launch doctrine; the server never launches by default), `dialog_sentinel` (modal-dialog interception with a control list; queued batches halt; `auto_handle` ships EMPTY — no automatic clicks), `focus_continuity` (keyboard-focus verification before/after dispatch; drift aborts or warns), `hotkey_guard` (pre-chord stuck-modifier sweep; abort or opt-in release). Every field is optional with protective defaults; unknown sections/fields are rejected fail-closed (`invalid_interference`). Events (`FOCUS_TAKEN_BY`, `MODAL_DIALOG`, `FOCUS_DRIFTED`, `TARGET_GONE`, `STUCK_MODIFIER`, ...) appear in `reasons` / `interference_events` / verification notes; see docs/ARCHITECTURE.md §16 and docs/SAFETY.md §11.10.
+
+Host-payload opt-out (PERF-004, trailing optional): pass `include_screenshot_after=false` to omit the heavy `screenshot_after_base64` (~1-2 MB) from the response — recommended when you check the outcome via the verification verdict instead of the image (the full image stays available via `computer_observe`). Omitted or `null` keeps the legacy payload unchanged.
+
+Queued actions (PERF-004, trailing optional): `follow_ups` accepts up to 5 action specs (same fields as the tool's action parameters). Each follow-up passes the FULL independent pipeline — grounding, validation, safety, approval semantics, execution, verification — exactly like a single action; the queue stops at the first verification failure, safety rejection, approval requirement, or post-action digest surprise (the screen changed since the queued premise was captured). Per-item results arrive in the additive `follow_up_results` field (bounded, no per-item screenshots) with `follow_ups_stopped_reason` (`null` = every item executed and verified). Batch small related groups and observe after the batch.
 
 **`run_goal(session_id, goal, approve_next_action=False, auto_subtasks=False)`**
 
@@ -601,11 +701,30 @@ python -m ruff check src tests benchmarks
 CUMCP_RUN_E2E=1 pytest tests/e2e/
 ```
 
-Measured at HEAD on the development machine (Windows Server 2022, Python 3.12): **857 passed, 7 skipped** for the standard suite, and ruff reports **all checks passed**. The 7 skips are the gated real-Windows E2E desktop tests. `tests/e2e/` collects 10 tests: the 7 gated desktop tests (window identity, semantic typing verification, moved-window recovery, staleness on window switch, grounded Calculator clicks, display-value verification, browser window-state verification) plus 3 benchmark-harness tests that run unconditionally in the standard suite. The desktop tests use deterministic scripted providers — no vision model, no network — and cross-check runtime assertions against real Win32 state so the runtime cannot self-certify.
+Measured at HEAD on the development machine (Windows Server 2022, Python 3.12): **1105 passed, 7 skipped** for the standard suite, and ruff reports **all checks passed**. The 7 skips are the gated real-Windows E2E desktop tests. `tests/e2e/` collects 10 tests: the 7 gated desktop tests (window identity, semantic typing verification, moved-window recovery, staleness on window switch, grounded Calculator clicks, display-value verification, browser window-state verification) plus 3 benchmark-harness tests that run unconditionally in the standard suite. The desktop tests use deterministic scripted providers — no vision model, no network — and cross-check runtime assertions against real Win32 state so the runtime cannot self-certify.
 
 ## Benchmarks
 
 `benchmarks/` contains measurement scaffolding only: 9 task definitions in an OSWorld-2.0-aligned task format (`benchmarks/tasks/*.yaml`) and a runner (`python -m benchmarks.runner`) with `--mode fake` (default; an in-memory desktop, no GUI needed) and `--mode env` (real applications on the local machine). **No scores are published.** Every harness artifact carries the disclaimer "Harness validation output — NOT benchmark scores.", and no benchmark number should be inferred from anything in the repository until a measured run with a real vision provider exists.
+
+### Test run log
+
+Nothing about a test goes unrecorded: after every scoring invocation, the harsh-task
+scorer (`benchmarks/score_task.py`) **automatically** appends one record — UTC timestamp,
+task, run id, driver/model label, wall time, reference timing, ratio, completed, precision,
+actions, retries, guard events, anomaly count, notes — to two log files it owns:
+
+- `benchmarks/runs-log.jsonl` — append-only, one JSON line per run (full history, never capped).
+- `benchmarks/RUNS.md` — human-readable table, newest first (auto-generated; capped at the last 200 entries).
+
+Label the driver/model with the free-text `--model` flag, e.g.
+`python benchmarks/score_task.py --task <yaml> --run-record run.json --out scoring.json --model "glm-flash"`.
+Pass `--no-log` to opt out; existing invocations keep working unchanged. The log is
+pre-seeded with the maintainer's internal QA campaign rows (failed and invalidated
+runs keep their honest labels). Deep per-run evidence for every row — run records,
+scoring JSONs, bridge transcripts, screenshots — stays local to the maintainer's
+machine and is not published; `benchmarks/RUNS.md` and `benchmarks/runs-log.jsonl`
+are local-only (gitignored).
 
 ## Safety model
 
@@ -616,6 +735,8 @@ Full details — risk taxonomy with all pattern categories, fail-closed rules ta
 ## Architecture
 
 The module map with verified import graph, the pipeline-to-module mapping, the pinned data contracts (`Observation`, `GroundedAction` lineage, `VerificationResult`), the coordinate-transform invariant, the recovery taxonomy table, the stop-token enforcement story, the limits table, and the audit schema: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
+Planned work per upcoming version — the prioritized improvement backlog (P0/P1/P2, items R-01 … R-20): **[ROADMAP.md](ROADMAP.md)**.
 
 ## Limitations
 

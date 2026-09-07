@@ -11,3 +11,5 @@ build/
 *.egg-info/
 evidence/
 .orvex/
+benchmarks/RUNS.md
+benchmarks/runs-log.jsonl

@@ -74,7 +74,9 @@ DEFAULT_MODEL = "gpt-4.1-mini"
 REQUEST_TIMEOUT_SECONDS = 90.0
 CONNECT_TIMEOUT_SECONDS = 10.0
 MAX_RETRIES = 2
-DEFAULT_RETRY_BACKOFF: tuple[float, ...] = (0.5, 1.0)
+# PERF-004: trimmed from (0.5, 1.0) — worst-case retry sleep across 2 retries drops from
+# 1.5 s to 0.6 s while remaining bounded; retryable windows stay conservative.
+DEFAULT_RETRY_BACKOFF: tuple[float, ...] = (0.2, 0.4)
 RETRYABLE_STATUS: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 MAX_RAW_DECISION_CHARS = 200_000
@@ -737,7 +739,7 @@ class OpenAICompatibleVisionProvider(VisionProvider):
 
     ``transport`` accepts an ``httpx.AsyncBaseTransport``/``httpx.BaseTransport`` (used
     by tests with ``httpx.MockTransport``); ``timeout`` an ``httpx.Timeout``; and
-    ``retry_backoff`` the per-retry sleep schedule (default ``(0.5, 1.0)`` after the
+    ``retry_backoff`` the per-retry sleep schedule (default ``(0.2, 0.4)`` after the
     initial attempt, i.e. at most 2 retries on 429/5xx/timeouts).
     """
 

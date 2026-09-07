@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.wintypes as wt
+import json
 import subprocess
 import time
 from collections.abc import Callable
@@ -41,6 +42,29 @@ WM_GETTEXTLENGTH = 0x000E
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 _DPI_AWARENESS_DONE = False
+
+
+def observe_tool_metadata(response: Any) -> dict[str, Any]:
+    """Parse a ``computer_observe``/``computer_screenshot`` response into its metadata dict.
+
+    Test-side compat adaptation (A8 regression wave): committed fix b1d873e (v0.4.1
+    vision fix, part of the release-candidate base) changed the tool contract from a
+    bare metadata dict to MCP content blocks — ``[TextContent(metadata JSON),
+    ImageContent(png)]`` — and the desktop E2E helpers predate that change (they were
+    written against the pre-0.4.1 dict shape). The production contract change is
+    intentional and documented (README/ARCHITECTURE); this helper only re-parses the
+    TextContent metadata block (observation / observation_id / active_app / digest /
+    text_summary) so the desktop tests keep driving the REAL tool surface. A legacy
+    dict response (defensive) passes through unchanged.
+    """
+    if isinstance(response, dict):
+        return response
+    for block in response:
+        if getattr(block, "type", None) == "text":
+            metadata = json.loads(block.text)
+            assert metadata.get("observation_id"), metadata
+            return metadata
+    raise AssertionError(f"observation response carried no TextContent metadata: {response!r}")
 
 
 def ensure_dpi_awareness() -> None:

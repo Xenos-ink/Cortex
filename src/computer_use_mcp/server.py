@@ -4,11 +4,21 @@ Compatibility contract (master-mission section 6, binding):
 
 - The 6 tool names, stdio transport, and parameter positions are preserved; signatures
   gain TRAILING OPTIONAL params only (``start_session(..., allowed_processes=None,
-  limits=None)``, ``computer_execute(..., expected_effect=None)``).
+  limits=None)``, ``computer_execute(..., expected_effect=None, include_screenshot_after=None,
+  follow_ups=None)``).
 - Existing return shapes keep their top-level keys; new fields are additive only.
+- SANCTIONED DEFAULT CHANGE (PERF-004 C5, documented intentional policy change):
+  ``start_session`` now defaults to ``dry_run=False`` (Session 1 forensics: the old
+  ``dry_run=True`` default silently produced no-op sessions that cost a full agent
+  turn). ``require_approval`` still defaults to True. Every dry-run result message
+  starts with the unmistakable banner ``DRY-RUN (no input dispatched):``.
 - ``computer_execute`` keeps the hardcoded ``confidence=1.0`` — redefined as the
   client-asserted MODEL confidence for a direct caller action; grounding confidence,
   staleness, risk classification, approval, and verification apply independently.
+  ``include_screenshot_after=False`` (additive) omits the heavy
+  ``screenshot_after_base64`` from the response; omitted/None keeps the legacy payload.
+  ``follow_ups`` (additive, max 5) queues actions that each pass the FULL independent
+  pipeline; the queue stops at the first failure — zero bypass.
 - ``run_goal`` keeps exactly ``approval_budget = 1`` per call when
   ``approve_next_action=True``; bounded recovery retries of the same approved action
   instance do not re-consume budget; a new distinct action after exhaustion is denied
@@ -53,6 +63,7 @@ from .checkpoint_manager import (
     CheckpointValidationError,
 )
 from .context_manager import ContextManager
+from .interference import parse_interference
 from .limits import LimitEnforcer, LimitExceeded, Limits
 from .long_running import (
     LongRunningError,
@@ -61,7 +72,15 @@ from .long_running import (
     RuntimeBusyError,
     SubtaskNotRunnableError,
 )
-from .models import ExecutionResult, GroundedAction, SessionState, SubtaskStatus
+from .models import (
+    MAX_FOLLOW_UPS,
+    ActionSpec,
+    ExecutionResult,
+    GroundedAction,
+    SessionState,
+    SubtaskStatus,
+)
+from .observation import observation_text_summary
 from .plan_validator import PlanRejectedError
 from .provider import OpenAICompatibleVisionProvider
 from .redaction import redact_text
@@ -282,6 +301,12 @@ def _close_stopped_bundle(
     the stop, removes the bundle from the store AND the registry, and records the
     bounded stopped-session snapshot. ``audit_stop_events=False`` is used when the stop
     was already audited by another path (in-run emergency_stop, detection event).
+
+    B4 (T8): teardown is ATOMIC under the lock and the stopped-session snapshot is
+    remembered FIRST, with every fallible piece guarded — a failure inside the audit
+    or the metrics snapshot can never again leave the registry/bundle store popped
+    WITHOUT the stopped memory (the exact state that surfaces to clients as a
+    bogus ``unknown_session`` for a session that was already stopped).
     """
     bundle.context.stop.stop()
     bundle.state.stopped = True
@@ -299,16 +324,19 @@ def _close_stopped_bundle(
             except Exception:
                 logger.debug("stop audit failed", exc_info=True)
     with _lock:
-        _bundles.pop(session_id, None)
-        _registry.remove(session_id)
-        _remember_stopped(
-            session_id,
-            {
+        snapshot: dict[str, Any] = {}
+        try:
+            snapshot = {
                 "task_id": bundle.context.task.task_id,
                 "step_count": bundle.state.step_count,
                 "metrics": bundle.metrics.snapshot(),
-            },
-        )
+            }
+        except Exception:
+            logger.debug("stopped-session snapshot failed", exc_info=True)
+            snapshot = {"task_id": bundle.context.task.task_id}
+        _remember_stopped(session_id, snapshot)
+        _bundles.pop(session_id, None)
+        _registry.remove(session_id)
 
 
 def _error_response(exc: Exception) -> dict[str, object]:
@@ -364,6 +392,20 @@ def _redact_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _redact_queue_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """F2 defense-in-depth for PERF-004 C7 queue entries: redact text at the sink."""
+    redacted = dict(entry)
+    if redacted.get("message"):
+        redacted["message"] = redact_text(str(redacted["message"]))[0]
+    reasons = redacted.get("reasons")
+    if isinstance(reasons, list):
+        redacted["reasons"] = [redact_text(str(reason))[0] for reason in reasons]
+    result = redacted.get("result")
+    if isinstance(result, dict):
+        redacted["result"] = _redact_result_payload(result)
+    return redacted
+
+
 def _parse_limits(limits: dict[str, Any] | None) -> Limits:
     """Validate a client-supplied limits dict via ``Limits.validate`` (fail-closed)."""
     if not limits:
@@ -380,6 +422,60 @@ def _parse_limits(limits: dict[str, Any] | None) -> Limits:
             raise TypeError(f"Limit {key!r} must be a number, got {type(value).__name__}.")
         kwargs[str(key)] = float(value)
     return Limits(**kwargs).validate()  # type: ignore[arg-type]
+
+
+# --- teach-in-text action vocabulary (PERF-004 C6) ------------------------------------------
+# The EXACT ActionType vocabulary from models.py (verbatim enum values):
+# click, double_click, drag, type, keypress, scroll, wait, done, move, hotkey,
+# focus_window. There is deliberately NO 'key' and NO 'triple_click' action.
+
+#: The precise valid action list, taught in tool descriptions and error messages.
+ACTION_VOCABULARY = (
+    "Valid actions (exact names): "
+    "click (x,y required), double_click (x,y), drag (x,y start + x2,y2 end, both required), "
+    "move (x,y), type (text required), keypress (keys=[\"<one key name>\"]), "
+    "hotkey (keys=[2-12 key names], e.g. [\"ctrl\",\"a\"]), scroll (delta -20..20), "
+    "wait (delta 0..20 seconds), focus_window (target = window title), "
+    "ensure_app (target = \"process\" or \"process|doc-token\"; attaches to an EXISTING "
+    "instance — REATTACHED/AMBIGUOUS_INSTANCE/NO_INSTANCE — never launches by default), done."
+)
+
+#: Key-name rule taught alongside the vocabulary (Session 1 failure class: text sent
+#: as hotkey keys).
+KEY_NAME_RULE = (
+    "keys must be KEY NAMES (e.g. \"ctrl\", \"a\", \"enter\", \"esc\") — never text, "
+    "words, or sentences; to type text use action=\"type\" with text=\"...\". "
+    "Single-key presses belong on keypress (a hotkey needs 2-12 keys)."
+)
+
+
+def _teaching_invalid_action(exc: Exception, action: str | None) -> dict[str, object]:
+    """Fail-closed ``invalid_action`` response that TEACHES the valid vocabulary.
+
+    Session 1 lost full agent turns to schema rejections (``key``, 1-key ``hotkey``
+    with a word payload, ``triple_click``). The rejection now always carries the exact
+    valid values and, when recognizable, the closest valid shape for what was tried.
+    """
+    hints = [KEY_NAME_RULE]
+    tried = (action or "").strip().casefold()
+    if tried == "key":
+        hints.append(
+            "You sent action=\"key\", which does not exist. For a single key press use "
+            "action=\"keypress\" with keys=[\"<key name>\"] (e.g. {\"action\": \"keypress\", "
+            "\"keys\": [\"ctrl\"]}); for a chord use action=\"hotkey\" with 2-12 key names."
+        )
+    elif tried == "triple_click":
+        hints.append(
+            "You sent action=\"triple_click\", which does not exist. Use action=\"double_click\", "
+            "or queue repeated clicks via follow_ups."
+        )
+    elif tried in {"keypress", "hotkey"}:
+        hints.append(
+            "Closest valid shape for a hotkey chord: {\"action\": \"hotkey\", \"keys\": [\"ctrl\", \"a\"]} "
+            "(2-12 key names). Closest valid shape for one key: {\"action\": \"keypress\", \"keys\": [\"a\"]}."
+        )
+    message = f"{exc} {ACTION_VOCABULARY}"
+    return {"ok": False, "error": "invalid_action", "message": message, "reasons": hints}
 
 
 # --- long-running session wiring (master-mission 003, additive) -----------------------------
@@ -641,7 +737,7 @@ async def _run_goal_auto_subtasks(
 
 @mcp.tool()
 def start_session(
-    dry_run: bool = True,
+    dry_run: bool = False,
     require_approval: bool = True,
     max_steps: int = 30,
     max_retries_per_action: int = 1,
@@ -650,12 +746,27 @@ def start_session(
     allowed_processes: list[str] | None = None,
     limits: dict[str, float] | None = None,
     resume_from_checkpoint: str | None = None,
+    interference: dict[str, Any] | None = None,
 ) -> dict[str, object]:
-    """Start a guarded session; dry-run and per-action approval are enabled by default.
+    """Start a guarded session; per-action approval is enabled by default.
+
+    INTENTIONAL POLICY CHANGE (PERF-004 C5): ``dry_run`` now defaults to False. The
+    Session 1 forensics showed the old ``dry_run=True`` default silently produced
+    no-op sessions (a full agent turn wasted re-starting). Pass ``dry_run=True``
+    explicitly for a no-input validation session; every dry-run result message starts
+    with the unmistakable banner ``DRY-RUN (no input dispatched):`` so no client can
+    misread a no-op as execution. ``require_approval`` still defaults to True.
 
     ``allowed_processes`` enforces a process allowlist (P0-G); ``limits`` carries any
     :class:`~computer_use_mcp.limits.Limits` field (validated + clamped, fail-closed on
     unknown names). No API key is required to start (the provider is lazy).
+
+    Interference policy (T8, trailing optional): ``interference`` is a dict of policy
+    sections for the Interference Guard (``focus_guard`` / ``attach_or_launch`` /
+    ``dialog_sentinel`` / ``focus_continuity`` / ``hotkey_guard``). Every field is
+    optional with A12's fail-safe defaults (protective); unknown sections/fields/values
+    are REJECTED fail-closed (``invalid_interference``), exactly like ``limits``.
+    Callers omitting the parameter get the same protective defaults.
 
     Long-running additive (master-mission 003, trailing optional): pass
     ``resume_from_checkpoint`` (a checkpoint file path from a previous session) to
@@ -685,6 +796,12 @@ def start_session(
             ).validate()
     except (TypeError, ValueError) as exc:
         return {"ok": False, "error": "invalid_limits", "message": str(exc)}
+    try:
+        interference_policy = parse_interference(interference)
+    except (TypeError, ValueError) as exc:
+        # Fail-closed policy parsing (mirrors ``invalid_limits``): a malformed policy
+        # can never silently weaken the protective defaults.
+        return {"ok": False, "error": "invalid_interference", "message": str(exc)}
     try:
         context = _registry.create()
     except SessionLimitExceeded as exc:
@@ -721,6 +838,7 @@ def start_session(
             auditor=auditor,
             metrics=metrics,
             allowed_processes=allowed_processes or [],
+            interference=interference_policy,
         )
     except Exception as exc:  # noqa: BLE001 - never leak a traceback; release the slot
         _registry.remove(session_id)
@@ -738,6 +856,7 @@ def start_session(
             extra={
                 "allowed_processes": list(allowed_processes or []),
                 "max_retries_per_action": max_retries_per_action,
+                "interference_policy": interference_policy,
             },
         )
     try:
@@ -751,6 +870,7 @@ def start_session(
                 "require_approval": require_approval,
                 "allowed_processes": list(allowed_processes or []),
                 "limits": str(limits_obj),
+                "interference": str(interference_policy),
             },
         )
     except Exception:
@@ -867,8 +987,11 @@ def computer_observe(session_id: str) -> Any:
     """Return the current observation state used for grounding: screenshot, dimensions, window, and cursor.
 
     On success this returns MCP content blocks: one TextContent carrying the
-    observation metadata (dimensions, active window, digest, coordinate scale —
-    never the raw base64) and one ImageContent carrying the screenshot itself, so
+    observation metadata (dimensions, active window, digest, coordinate scale,
+    plus an additive ``text_summary`` one-liner: window title/process, cursor,
+    focused-control hint when the backend supplies ui_elements, and
+    changed/unchanged versus the previous observation of this session — never the
+    raw base64) and one ImageContent carrying the screenshot itself, so
     vision-capable clients receive it as a real image rather than as text.
     Error paths still return the structured error dict.
     """
@@ -881,6 +1004,11 @@ def computer_observe(session_id: str) -> Any:
     except Exception as exc:  # noqa: BLE001 - structured error, no traceback
         return _error_response(exc)
     info = observation.active_window_info
+    # PERF-004 C8: additive structured summary line (previous digest tracked per
+    # session; the FIRST observation reports "first observation" — never invented).
+    previous_digest = bundle.extra.get("last_observation_digest")
+    text_summary = observation_text_summary(observation, previous_digest=previous_digest)
+    bundle.extra["last_observation_digest"] = digest
     try:
         bundle.auditor.emit(
             "observation",
@@ -900,6 +1028,8 @@ def computer_observe(session_id: str) -> Any:
         "observation_id": observation.observation_id,
         "active_app": info.process_name if info is not None else observation.active_window,
         "image_format": "image/png",
+        # PERF-004 C8 (additive): bounded one-line grounding text for weak models.
+        "text_summary": text_summary,
     }
     return [
         TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
@@ -927,8 +1057,19 @@ async def computer_execute(
     x2: int | None = None,
     y2: int | None = None,
     target: str | None = None,
+    include_screenshot_after: bool | None = None,
+    follow_ups: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
     """Validate and execute one grounded action; approval applies only to this action call.
+
+    ACTION VOCABULARY (exact names, from the models enum): click, double_click, drag,
+    type, keypress, scroll, wait, done, move, hotkey, focus_window, ensure_app. There is
+    NO "key" action (single keys use "keypress": {"action": "keypress", "keys": ["ctrl"]})
+    and NO "triple_click" (use "double_click" or repeated clicks). "keys" must be KEY
+    NAMES ("ctrl", "a", "enter", "esc") — never text or sentences; to type text use
+    {"action": "type", "text": "..."}. "ensure_app" takes target="process" or
+    "process|doc-token" (e.g. "excel|book1") and attaches to an EXISTING instance
+    (REATTACHED / AMBIGUOUS_INSTANCE / NO_INSTANCE payloads; never launches by default).
 
     The hardcoded ``confidence=1.0`` is the client-asserted MODEL confidence; grounding,
     staleness, risk, approval, and verification run independently. ``expected_effect``
@@ -936,13 +1077,45 @@ async def computer_execute(
     reports verification failed/uncertain — never silently successful). For
     ``action="drag"``, ``x``/``y`` are the drag start and the trailing ``x2``/``y2`` the
     drag end (both required, screenshot coordinates). ``action="move"`` requires
-    ``x``/``y``; ``action="hotkey"`` requires ``keys`` (2-12 names);
+    ``x``/``y``; ``action="hotkey"`` requires ``keys`` (2-12 key names);
     ``action="focus_window"`` requires ``target`` (a window title).
+
+    Host-payload opt-out (PERF-004, trailing optional): pass
+    ``include_screenshot_after=false`` to OMIT the heavy ``screenshot_after_base64``
+    (~1-2 MB) from this response — recommended for actions whose outcome you check via
+    the verification verdict + digest instead of the image (the full image stays
+    available via computer_observe). Omitted or None keeps the legacy payload unchanged.
+
+    Queued actions (PERF-004, trailing optional): ``follow_ups`` is a list of at most 5
+    action specs (same fields as this tool's action parameters, e.g.
+    {"action": "click", "x": 10, "y": 20, "expected_effect": "..."}). Each follow-up
+    passes the FULL independent pipeline (validate -> safety -> approval semantics ->
+    execute -> verify) exactly like a single action — zero bypass; the queue stops at
+    the first verification failure, safety rejection, approval requirement, or
+    post-action digest surprise (the screen changed since the queued premise was
+    captured). Batch small related groups and end the batch with an observation.
+    Per-item results arrive in the additive ``follow_up_results`` field (bounded, no
+    per-item screenshots) with ``follow_ups_stopped_reason`` (None = all verified).
     """
     try:
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
+    if follow_ups is not None:
+        if not isinstance(follow_ups, list) or any(
+            not isinstance(item, dict) for item in follow_ups
+        ):
+            return _teaching_invalid_action(
+                ValueError("follow_ups must be a list of action-spec objects."), action
+            )
+        if len(follow_ups) > MAX_FOLLOW_UPS:
+            return _teaching_invalid_action(
+                ValueError(
+                    f"follow_ups supports at most {MAX_FOLLOW_UPS} entries "
+                    f"(got {len(follow_ups)}); batch smaller groups."
+                ),
+                action,
+            )
     try:
         grounded = GroundedAction(
             action=action,  # type: ignore[arg-type]
@@ -957,37 +1130,73 @@ async def computer_execute(
             target=target,
         )
     except Exception as exc:  # noqa: BLE001 - unknown action type: fail closed, no crash
-        return {"ok": False, "error": "invalid_action", "message": str(exc)}
+        return _teaching_invalid_action(exc, action)
+    specs: list[ActionSpec] = []
+    if follow_ups:
+        for item in follow_ups:
+            try:
+                specs.append(ActionSpec.model_validate(item))
+            except Exception as exc:  # noqa: BLE001 - malformed queue item: fail closed
+                return _teaching_invalid_action(exc, str(item.get("action", "")))
     try:
         outcome = await bundle.agent.run_single(
-            bundle.state, grounded, approved=approved, expected_effect=expected_effect
+            bundle.state,
+            grounded,
+            approved=approved,
+            expected_effect=expected_effect,
+            follow_ups=specs or None,
         )
     except TaskStopped as exc:
         return {"ok": False, "stopped": True, "message": str(exc)}
     except LimitExceeded as exc:
         return {"ok": False, "error": "limit_exceeded", "limit": exc.limit_name, "message": str(exc)}
     if outcome.kind == "rejected":
-        return {"ok": False, "message": "Grounding rejected.", "reasons": outcome.reasons}
-    if outcome.kind == "safety_denied":
-        return {"ok": False, "message": outcome.message}
-    if outcome.kind == "approval_required":
-        return {"ok": False, "requires_approval": True, "message": outcome.message}
-    if outcome.kind == "error":
-        return {"ok": False, "error": "action_error", "message": outcome.message}
-    result = outcome.result
-    if result is None:  # defensive: executed outcomes always carry a result
-        return {"ok": False, "error": "action_error", "message": "Execution produced no result."}
-    payload = result.model_dump()
-    # F2: the response path is redacted too (defense in depth).
-    payload = _redact_result_payload(payload)
-    payload.update(
-        {
-            "model_confidence": outcome.model_confidence,
-            "grounding_confidence": outcome.grounding_confidence,
-            "verification_confidence": outcome.verification_confidence,
+        response: dict[str, object] = {
+            "ok": False,
+            # T8: rejections carry their SPECIFIC message (e.g. "Focus interference: the
+            # OS-focused window is not the session target.") instead of the generic
+            # grounding text; the structured event payloads ride in ``reasons``.
+            "message": outcome.message or "Grounding rejected.",
+            "reasons": outcome.reasons,
         }
-    )
-    return payload
+    elif outcome.kind == "safety_denied":
+        response = {"ok": False, "message": outcome.message}
+    elif outcome.kind == "approval_required":
+        response = {"ok": False, "requires_approval": True, "message": outcome.message}
+    elif outcome.kind == "digest_surprise":
+        response = {"ok": False, "error": "digest_surprise", "message": outcome.message}
+    elif outcome.kind == "error":
+        response = {"ok": False, "error": "action_error", "message": outcome.message}
+    else:
+        result = outcome.result
+        if result is None:  # defensive: executed outcomes always carry a result
+            return {"ok": False, "error": "action_error", "message": "Execution produced no result."}
+        payload = result.model_dump()
+        # F2: the response path is redacted too (defense in depth).
+        payload = _redact_result_payload(payload)
+        payload.update(
+            {
+                "model_confidence": outcome.model_confidence,
+                "grounding_confidence": outcome.grounding_confidence,
+                "verification_confidence": outcome.verification_confidence,
+            }
+        )
+        response = payload
+    # PERF-004 C4: host-payload opt-out (additive, off by default) — omit the heavy
+    # image from the response entirely when the caller asked for it.
+    if include_screenshot_after is False:
+        response.pop("screenshot_after_base64", None)
+    # PERF-004 C7: additive queue bookkeeping on every response shape.
+    if outcome.follow_up_results is not None:
+        response["follow_up_results"] = [
+            _redact_queue_entry(entry) for entry in outcome.follow_up_results
+        ]
+        response["follow_ups_stopped_reason"] = outcome.follow_ups_stopped_reason
+    # T8: additive Interference Guard events on every response shape (structured event
+    # payloads the driver parses per DRIVER-PROTOCOL.md).
+    if outcome.interference_events:
+        response["interference_events"] = list(outcome.interference_events)
+    return response
 
 
 @mcp.tool()

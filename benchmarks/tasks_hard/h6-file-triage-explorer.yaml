@@ -1,0 +1,71 @@
+{
+  "id": "h6-file-triage-explorer",
+  "title": "File triage in Explorer: sort 12 inbox files into 3 folders with rename pattern",
+  "category": "verification",
+  "fake_runnable": false,
+  "prompt": "File triage task. The folder C:\\Users\\localadmin\\Desktop\\cortex-bench\\t6_inbox contains 12 loose files (.txt, .png, .csv). 1) Inside t6_inbox create exactly three subfolders named Reports, Images and Data. 2) Move every file by type: all .txt files into Reports, all .png files into Images, all .csv files into Data. 3) While moving, rename each file by prefixing its original name with 'archived_' (for example report_2024_q1.txt becomes archived_report_2024_q1.txt inside Reports). 4) When finished, the t6_inbox root must contain ONLY the three folders (no loose files, no other items), each folder must contain exactly its 4 archived files, and file contents must be unchanged. Use File Explorer to do the work. Leave the Explorer window open when you are done.",
+  "goal": "In File Explorer, create Reports/Images/Data inside t6_inbox, move 12 files by type into them with an 'archived_' rename prefix, leaving the root clean and contents unchanged.",
+  "setup": {
+    "app": "explorer",
+    "real_world_only": true,
+    "fixtures": [
+      "t6_seed"
+    ],
+    "outputs": [],
+    "state_root": "~/Desktop/cortex-bench/t6_inbox"
+  },
+  "provider": {
+    "steps": [
+      {
+        "type": "done",
+        "summary": "real-world task; executed by a driver agent via score_task.py flow, not by the scripted provider"
+      }
+    ]
+  },
+  "verification": {
+    "all_of": [
+      {
+        "kind": "window_title_contains",
+        "value": "t6_inbox"
+      }
+    ]
+  },
+  "predicates": [
+    {
+      "name": "final_layout_exact",
+      "kind": "folder_layout",
+      "root": "~/Desktop/cortex-bench/t6_inbox",
+      "rule": {
+        ".txt": "Reports",
+        ".png": "Images",
+        ".csv": "Data"
+      },
+      "rename_prefix": "archived_",
+      "canonical_dir": "fixtures://t6_seed",
+      "allow_root": [
+        "Reports",
+        "Images",
+        "Data"
+      ]
+    }
+  ],
+  "human_reference": {
+    "primary": "scripted_cadence",
+    "seconds": 123.74,
+    "calibration": {
+      "fitts_click_s": 0.6,
+      "char_s": 0.22,
+      "dialog_wait_s": 1.0,
+      "cognitive_allowance_s": 15,
+      "actions": "arithmetic action list: 1 window open, 3 folder creations (right-click/new/type/enter), 12 x (select, cut, open folder, paste, F2, type prefix, enter, navigate back), verification scan allowance"
+    },
+    "method_log": "Arithmetic reference: an Explorer UI replay of 12 multi-step move+rename operations is too position-dependent to be deterministic; the auditable action list x Fitts cadence is in benchmarks/make_references.py (h6_seconds), plus a 15 s verification-scan allowance. Superseded by real human runs when performed."
+  },
+  "anti_gaming": "The scorer hashes every final file against the canonical copies in benchmarks/tasks_hard/fixtures/t6_seed/ (sha256), so moved-but-truncated or recreated files fail; it also asserts the exact root layout (only the three folders) and that no source file was left behind or duplicated. Driver self-report is never consulted.",
+  "allowed_processes": [
+    "explorer.exe",
+    "notepad.exe"
+  ],
+  "max_actions": 400,
+  "safety_notes": "File operations restricted to the dedicated Desktop\\cortex-bench\\t6_inbox bench tree (moved, not deleted; contents hash-verified). No system paths involved."
+}
