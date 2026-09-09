@@ -12,10 +12,10 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
-## Unreleased
+## v0.5.5 (2026-09-09) — RELEASED (three live-usage defect classes + live-host hardening)
 
-In flight toward v0.5.5 (mission ORVEX-CORTEX-055, 2026-09-08/09 — three live-usage
-defect classes from FailedLog.txt, plus live-Kimi hardening).
+Mission ORVEX-CORTEX-055: root-caused from FailedLog.txt (967-line live session),
+fixed, red-teamed, and validated live on Kimi Code + GLM-5V driving MS Paint.
 
 ### Fixed
 
@@ -55,7 +55,8 @@ defect classes from FailedLog.txt, plus live-Kimi hardening).
 
 - Measured live (Kimi Code + GLM-5V driving Paint, session metrics): observation p50
   120–164 ms, execution p50 11.6–119 ms, verification p50 94–110 ms per action;
-  ensure_app + observe + click round-trips 0.14–1.4 s per tool call.
+  ensure_app + observe + click round-trips 0.14–1.4 s per tool call. Loop mechanics are no
+  longer the bottleneck; model inference time dominates end-to-end step latency.
 
 ### Compatibility notes
 

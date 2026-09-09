@@ -28,7 +28,7 @@ types — include the wave's additive members).
   `FakeComputerBackend` implements the same contracts for tests and non-Windows import.
 - Python >= 3.11; runtime deps: `mcp`, `pydantic`, `Pillow`, `mss`, `pyautogui` (pyautogui is now the SELECTABLE FALLBACK input engine; the default physical-input path is raw Win32 `SendInput` via stdlib ctypes — PERF-004)
   (win32), `httpx`. No OCR/UIA engines are installed (deliberate non-goal; see §12).
-- Version: `0.5.0` (`__init__.py`; `pyproject.toml` aligned to the same value).
+- Version: `0.5.5` (`__init__.py`; `pyproject.toml` aligned to the same value).
 - PERF-004 release: interference guards, SendInput engine, verification ladder, run-log — see VERSIONS.md and ROADMAP.md.
 - Test/benchmark layout: `tests/` unit+integration (fakes); `tests/e2e/` real-Windows
   E2E gated behind `CUMCP_RUN_E2E=1` (10 tests: 7 desktop + 3 benchmark-harness that
