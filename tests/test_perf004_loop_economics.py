@@ -36,6 +36,7 @@ from test_controller_integration import (
     ScriptedProvider,
     _png,
     audit_events,
+    execute_payload,
     executed_summary,
     make_session,
 )
@@ -186,6 +187,7 @@ async def test_run_single_audits_staleness_proof(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     response = await server.computer_execute(session_id, "click", x=15, y=15)
+    response = execute_payload(response)
     assert response["ok"] is True
     bundle = server._get_bundle(session_id)
     events = audit_events(bundle, session_id)
@@ -319,11 +321,19 @@ async def test_include_screenshot_after_false_omits_image_keeps_legacy_default(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     legacy = await server.computer_execute(session_id, "click", x=15, y=15)
-    assert legacy["ok"] is True
-    assert isinstance(legacy.get("screenshot_after_base64"), str)  # legacy payload intact
+    # REM-A H3: executed responses are content blocks (TextContent + ImageContent)
+    # in parity with computer_observe — the image never rides the text channel.
+    assert isinstance(legacy, list) and len(legacy) == 2
+    assert legacy[0].type == "text" and legacy[1].type == "image"
+    legacy_payload = json.loads(legacy[0].text)
+    assert legacy_payload["ok"] is True
+    assert "screenshot_after_base64" not in legacy_payload  # blob never rides text
+    assert base64.b64decode(legacy[1].data, validate=True)[:8] == b"\x89PNG\r\n\x1a\n"
     trimmed = await server.computer_execute(
         session_id, "click", x=25, y=25, include_screenshot_after=False
     )
+    # Opt-out keeps the plain-dict legacy shape minus the blob (no image at all).
+    assert isinstance(trimmed, dict)
     assert trimmed["ok"] is True
     assert "screenshot_after_base64" not in trimmed  # omitted entirely
     # Everything else survives the opt-out.
@@ -360,6 +370,7 @@ async def test_dry_run_results_carry_unmistakable_banner(
         monkeypatch, provider=provider, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
     execute_response = await server.computer_execute(session_id, "wait", delta=1)
+    execute_response = execute_payload(execute_response)
     assert execute_response["message"].startswith("DRY-RUN (no input dispatched):")
     goal_response = await server.run_goal(session_id, "banner check")
     results = goal_response["results"]
@@ -428,6 +439,7 @@ async def test_follow_ups_run_full_pipeline_and_verify_each_item(
             {"action": "wait", "delta": 1},
         ],
     )
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["ok"] is True
     assert response["follow_ups_stopped_reason"] is None
     assert len(response["follow_up_results"]) == 3
@@ -456,6 +468,7 @@ async def test_unsafe_follow_up_rejected_individually_and_stops_queue(
             {"action": "click", "x": 30, "y": 30},
         ],
     )
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["ok"] is True  # the FIRST action is the legacy payload and succeeded
     assert response["follow_ups_stopped_reason"] == "safety_denied"
     unsafe_entry = response["follow_up_results"][1]
@@ -495,6 +508,7 @@ async def test_verification_failure_stops_queue_before_later_items(
             {"action": "click", "x": 30, "y": 30},
         ],
     )
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["follow_ups_stopped_reason"] == "verification_failed"
     assert response["follow_up_results"][1]["verification_outcome"] == "failed"
     assert len(executed_summary(backend)) == 2  # items 1-2 ran; item 3 was flushed
@@ -516,6 +530,7 @@ async def test_post_action_digest_surprise_stops_queue(
         y=10,
         follow_ups=[{"action": "click", "x": 20, "y": 20}],
     )
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     # Item 2's staleness probe no longer matches its premise (every capture differs) ->
     # DIGEST SURPRISE: the speculative item is never executed against an unseen screen.
     assert response["follow_ups_stopped_reason"] == "digest_surprise"
@@ -544,6 +559,7 @@ async def test_approval_required_mid_queue_stops_queue(
             {"action": "click", "x": 30, "y": 30},
         ],
     )
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["follow_ups_stopped_reason"] == "approval_required"
     entry = response["follow_up_results"][1]
     assert entry["kind"] == "approval_required" and entry["requires_approval"] is True

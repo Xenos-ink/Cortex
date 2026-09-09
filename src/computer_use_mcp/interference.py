@@ -14,8 +14,9 @@ Design contract (A12 ``evidence/perf-004/t8/interference-immunity-design.md``):
   =====================  =========================================================
   focus_guard            session target-window binding + pre-dispatch foreground
                          check (``abort`` | ``refocus_then_abort`` | ``observe_only``)
-  attach_or_launch       pre-launch reattachment doctrine (``ensure_app``); the
-                         server NEVER launches by default (``launch="driver"``)
+  attach_or_launch       pre-launch reattachment doctrine (``ensure_app``); the server
+                         may launch an allowlisted target by default
+                         (``launch="server"``; ``"driver"`` never launches)
   dialog_sentinel        modal-dialog interception post-action (``halt`` |
                          ``report``); ``auto_handle`` ships EMPTY — no auto-clicks
   focus_continuity       typing focus continuity (``on_drift`` abort|warn);
@@ -36,9 +37,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
+    "ATTACH_OR_LAUNCH_ENV",
     "DEFAULT_DIALOG_TITLE_TABLE",
     "DEFAULT_TRANSIENT_LAUNCH_PROCESSES",
     "REFOCUS_HINT",
@@ -120,13 +122,65 @@ class FocusGuardPolicy(BaseModel):
         return cleaned
 
 
+#: REM-B env knob: restore the pre-REM-B default of never launching server-side.
+#: Only the value ``driver`` (case-insensitive, whitespace-trimmed) selects the old
+#: behavior; any other value (unset, empty, bogus) fails safe to the new ``server``
+#: default. Read at POLICY-PARSE time (``parse_interference``/model validation), so
+#: runtime env changes take effect for the NEXT session without a process restart.
+ATTACH_OR_LAUNCH_ENV = "CORTEX_ATTACH_OR_LAUNCH"
+
+
+def _default_launch_policy() -> str:
+    """Resolve the default ``attach_or_launch.launch`` value from the environment.
+
+    Fail-safe (H2a): only the value ``driver`` (case-insensitive, whitespace-trimmed)
+    restores the old default; anything else — unset, empty, whitespace,
+    unrecognized — yields ``server`` so a typo can never silently disable Cortex's
+    ability to take over.
+    """
+    import os
+
+    raw = os.getenv(ATTACH_OR_LAUNCH_ENV)
+    if raw is not None and raw.strip().casefold() == "driver":
+        return "driver"
+    return "server"
+
+
 class AttachOrLaunchPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    """Mechanism (ii): pre-launch reattachment (``ensure_app``) doctrine."""
+    """Mechanism (ii): pre-launch reattachment (``ensure_app``) doctrine.
+
+    REM-B (H2a takeover): the ``launch`` DEFAULT is ``"server"`` — ``ensure_app``
+    may spawn the target process server-side when no existing instance matches.
+    Cortex can then bootstrap control of an app that is not already foreground
+    (the logged failure mode: the driving model had to use another tool to launch
+    Paint, which failed twice). Every other safety property is unchanged: the
+    agent gate still requires the TARGET process to be allowlisted whenever an
+    allowlist is configured, safety/approval semantics still apply to the launch
+    action, and StopToken/limits are untouched. ``launch="driver"`` keeps the
+    pre-REM-B never-launch behavior and is also selectable as the DEFAULT via the
+    ``CORTEX_ATTACH_OR_LAUNCH=driver`` environment knob (fail-safe parsing:
+    unrecognized values fall back to the ``"server"`` default). An omitted
+    ``launch`` resolves from the environment AT VALIDATION TIME (not import time),
+    so runtime env changes apply to the next parsed policy.
+    """
 
     enabled: bool = True
-    launch: Literal["driver", "server"] = "driver"
+    #: ``None`` means "not stated by the host" — resolved from the env knob by the
+    #: model validator below; the stored value is always concrete (never None).
+    launch: Literal["driver", "server"] | None = None
+
+    @model_validator(mode="after")
+    def _resolve_launch_default(self) -> "AttachOrLaunchPolicy":
+        """Omitted/unstated ``launch`` resolves from the env at validation time.
+
+        Only ``CORTEX_ATTACH_OR_LAUNCH=driver`` restores the pre-REM-B never-launch
+        default; anything else fails safe to ``server`` (REM-B H2a takeover fix).
+        """
+        if self.launch is None:
+            object.__setattr__(self, "launch", _default_launch_policy())
+        return self
 
 
 class AutoHandleSpec(BaseModel):

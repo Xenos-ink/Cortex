@@ -25,6 +25,12 @@ violation even when the window title matches. The legacy title substring allowli
 verbatim as a fallback for observations without window identity; when
 ``WindowInfo`` is available, exact-title and process matching are preferred (the substring
 check is retained additively for compatibility).
+
+REM-D bootstrap exemption: an ``ensure_app`` whose TARGET process is allowlisted skips the
+ACTIVE-process check (fresh-session takeover: the foreground is by definition not yet the
+target). The security property is preserved — the agent's target-side launch gate
+(attached/launched only for allowlisted targets) remains the real gate; every other action
+keeps the foreground check fail-closed.
 """
 
 from __future__ import annotations
@@ -263,7 +269,23 @@ class GroundingValidator:
         if effective_windows and not self._window_allowed(observation, effective_windows):
             reject("window_not_allowed", "Active window is not in the configured allowlist.")
         if allowed_processes:
-            violation = self._process_allowlist_violation(observation, allowed_processes)
+            # REM-D: ensure_app makes no screen claim (its outcome is a probe —
+            # REATTACHED/AMBIGUOUS_INSTANCE/NO_INSTANCE), so on a FRESH session the
+            # foreground is by definition not yet the target (chicken-and-egg). Skip
+            # the ACTIVE-process check when the ensure_app TARGET itself is
+            # allowlisted (same matcher semantics as the agent's launch gate: the
+            # process part of 'process|doc-token', case-insensitive, .exe-tolerant).
+            # The agent's target-side gate (``_ensure_app_allow_launch`` — launch
+            # allowed only for allowlisted targets) remains the real security gate.
+            ensure_app_exempt = (
+                action.action is ActionType.ENSURE_APP
+                and self._ensure_app_target_allowed(action, allowed_processes)
+            )
+            violation = (
+                None
+                if ensure_app_exempt
+                else self._process_allowlist_violation(observation, allowed_processes)
+            )
             if violation is not None:
                 error: GroundingRejection
                 if violation == "process_identity_unavailable":
@@ -276,14 +298,31 @@ class GroundingValidator:
                         error,
                     )
                 else:
+                    # REM-B (H2a messaging) / REM-D (truthful after the bootstrap
+                    # exemption): the rejection still fails closed (P0-G
+                    # untouched), but now NAMES the active process, states that the
+                    # gate checks the FOREGROUND (not the action's target), and
+                    # teaches the concrete remedies: bring/focus an allowlisted app
+                    # (ensure_app on an ALLOWLISTED target now works even from a
+                    # fresh session with a foreign foreground — it can also launch
+                    # the target server-side under the default launch="server"
+                    # policy) or extend allowed_processes at session start
+                    # (start_session(allowed_processes=[...])).
+                    reason = (
+                        f"Active (foreground) process {violation!r} is not in the "
+                        "configured process allowlist. This gate checks the CURRENT "
+                        "foreground process, not the action's intended target. "
+                        "Remedy: bring/focus an allowlisted app into the foreground "
+                        "first — e.g. ensure_app on an allowlisted target process "
+                        "(allowed from a fresh session, and able to launch it "
+                        "server-side under the default launch=\"server\" policy) — "
+                        "or extend allowed_processes at session start "
+                        "(start_session(allowed_processes=[...]))."
+                    )
                     error = ProcessNotAllowedError(
                         f"Active process {violation!r} is not in the configured process allowlist."
                     )
-                    reject(
-                        "process_not_allowed",
-                        f"Active process {violation!r} is not in the configured process allowlist.",
-                        error,
-                    )
+                    reject("process_not_allowed", reason, error)
 
         # --- staleness / observation binding (P0-H) ----------------------------------------
         enforce_binding = enforce_observation_binding if enforce_observation_binding is not None else (
@@ -389,6 +428,22 @@ class GroundingValidator:
                 return True
         active = observation.active_window or (info.title if info is not None else "") or ""
         return any(pattern.casefold() in active.casefold() for pattern in allowed_windows)
+
+    @staticmethod
+    def _ensure_app_target_allowed(
+        action: GroundedAction, allowed_processes: list[str]
+    ) -> bool:
+        """REM-D: whether an ``ensure_app`` action's TARGET process is allowlisted.
+
+        Same semantics as the agent's launch gate (``_process_matches_pattern``):
+        the process part of the ``process|doc-token`` identity is matched against
+        each allowlist entry case-insensitively with ``.exe`` tolerance (via
+        :func:`_process_matches`, which also tolerates executable paths).
+        """
+        process = (action.target or "").split("|", 1)[0].strip()
+        if not process:
+            return False
+        return any(_process_matches(process, pattern) for pattern in allowed_processes)
 
     @staticmethod
     def _process_allowlist_violation(

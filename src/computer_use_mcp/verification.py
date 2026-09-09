@@ -30,8 +30,10 @@ from .models import Observation, VerificationResult
 
 __all__ = [
     "DEFAULT_STRATEGY_CHAIN",
+    "FOCUS_CHANGE_INTENT_FLAG",
     "OCR_TEXT_VERIFICATION_ENV",
     "DeterministicPredicateStrategy",
+    "FocusChangeStrategy",
     "ModelJudge",
     "ModelVisualStrategy",
     "ProcessStateStrategy",
@@ -68,6 +70,14 @@ _STABILITY_VERIFIED_CONFIDENCE = 0.95
 
 #: Confidence for identity matches (window/process) backed by real observation fields.
 _IDENTITY_MATCH_CONFIDENCE = 0.9
+
+#: REM-B (H2c): confidence for a deterministic focus/window/digest change signal.
+_DETERMINISTIC_CHANGE_CONFIDENCE = 0.85
+
+#: REM-B (H2c): intent metadata key marking a focus-type click expectation (set by
+#: ``ComputerUseAgent._build_intent``; the strategy only claims marked intents so
+#: every other visual-change consumer keeps its exact existing semantics).
+FOCUS_CHANGE_INTENT_FLAG = "focus_change_click"
 
 
 class VerificationKind(StrEnum):
@@ -802,6 +812,286 @@ class UiControlTextStrategy:
         )
 
 
+class FocusChangeStrategy:
+    """Deterministic focus/window/digest change verification (REM-B, H2c).
+
+    A click whose stated ``expected_effect`` describes a FOCUS-type transition
+    ("Hex input focused", "Edit colors dialog opens") is often INVISIBLE to the
+    pixel-diff tier: focusing a text field or opening a dialog moves either no
+    measurable pixels (mean 0.013, strongly-changed 0) or opens after the capture.
+    The logged Paint session false-failed three such clicks, killing the task at
+    the first drawing step.
+
+    Cheap deterministic signals, in order, using OBSERVATION FIELDS ONLY (never
+    pixels, never a model):
+
+    (a) UIA focused-element change: the focused control (``ui_elements`` entries
+        carrying ``focused`` truthy, falling back to the first element) changed
+        between before/after on ``name`` / ``automation_id`` / ``control_type``
+        (REM-C F2: the fallback is only trusted when at least ONE side carries a
+        real focus marker — with no focus claim anywhere, a UIA re-enumeration
+        order change of unfocused controls is NOT a focus change and the signal
+        abstains);
+    (b) active-window identity change: the active window title OR process changed
+        between the two observations (dialog-open signature);
+    (c) observation digest change: the screenshots are not pixel-identical
+        (REM-C F1: evidence only by default — it may VERIFY solely when
+        corroborated by real changed-pixel magnitude, at least
+        ``STRONG_CHANGE_MIN_PIXELS`` strongly-changed pixels as the pixel tier
+        defines them; an uncorroborated digest change — a caret blink, a clock
+        tick, another app's toast — degrades to ``uncertain`` so the
+        screenshot-diff tier decides, preserving that tier's deliberate
+        flicker exclusion instead of bypassing it).
+
+    Any one of (a)/(b) showing change, or a CORROBORATED (c), is DEFINITIVE ``verified`` with a note naming
+    the signal that fired. NO signal showing change leaves the verdict to the
+    next tiers — the screenshot-diff strategy keeps its exact existing failure
+    semantics (honesty preserved: this strategy NEVER emits ``failed`` and never
+    upgrades a pixel-proven non-change).
+
+    Scope gate: only intents flagged ``{FOCUS_CHANGE_INTENT_FLAG}`` in
+    ``intent.metadata`` (set by the controller's ``_build_intent`` for CLICK /
+    DOUBLE_CLICK actions carrying a stated expected effect). Every other
+    visual-change intent — drag, scroll, type, unstated expectations — keeps its
+    exact pre-REM-B tier semantics.
+    """
+
+    @property
+    def name(self) -> str:
+        return "focus_change"
+
+    def can_verify(self, intent: VerificationIntent) -> bool:
+        return (
+            intent.kind == VerificationKind.VISUAL_CHANGE
+            and bool(intent.metadata.get(FOCUS_CHANGE_INTENT_FLAG))
+            and intent.expected_change is True
+            and bool(intent.expected_effect)
+        )
+
+    def verify(self, intent: VerificationIntent, before: Observation, after: Observation) -> VerificationResult:
+        expected = intent.expected_effect or ""
+        # (a) UIA focused-element change.
+        focus_signal = self._focused_element_change(before, after)
+        if focus_signal is not None:
+            return _definitive(
+                self.name,
+                "verified",
+                (
+                    f"Expected focus-type change observed: {expected}. "
+                    f"Deterministic signal: focused UI element changed ({focus_signal})."
+                ),
+                [focus_signal, f"expected_effect={expected!r}"],
+                _DETERMINISTIC_CHANGE_CONFIDENCE,
+                changed=True,
+            )
+        # (b) Active-window identity change (title or process).
+        window_signal = self._active_window_change(before, after)
+        if window_signal is not None:
+            return _definitive(
+                self.name,
+                "verified",
+                (
+                    f"Expected focus-type change observed: {expected}. "
+                    f"Deterministic signal: active window identity changed ({window_signal})."
+                ),
+                [window_signal, f"expected_effect={expected!r}"],
+                _DETERMINISTIC_CHANGE_CONFIDENCE,
+                changed=True,
+            )
+        # (c) Observation digest change — REM-C (V-2 F1): the base64 diff is EVIDENCE,
+        # not proof: a 1-pixel caret blink also changes the digest, and the pixel tier
+        # deliberately distrusts exactly that flicker class (STRONG_CHANGE_MIN_PIXELS
+        # exists so "ambiguous flicker (caret, clock tick) [is] never proof of a
+        # transition"). The digest change may VERIFY only when corroborated by real
+        # changed-pixel magnitude at the floor the pixel tier itself trusts; otherwise
+        # it defers to the pixel tier (uncertain, never a free verified).
+        if before.image_base64 and after.image_base64 and before.image_base64 != after.image_base64:
+            magnitude = self._digest_change_magnitude(before, after)
+            threshold = max(intent.diff_threshold, 0.0)
+            if magnitude is not None and (
+                magnitude[0] >= threshold or magnitude[1] >= STRONG_CHANGE_MIN_PIXELS
+            ):
+                return _definitive(
+                    self.name,
+                    "verified",
+                    (
+                        f"Expected focus-type change observed: {expected}. "
+                        "Deterministic signal: observation digest changed and the pixel "
+                        f"change is corroborated (mean {magnitude[0]:.6f} >= {threshold:.6g} "
+                        f"or strongly-changed pixels {magnitude[1]} >= {STRONG_CHANGE_MIN_PIXELS})."
+                    ),
+                    [
+                        "observation digest changed between before and after",
+                        (
+                            f"corroborated pixel magnitude: mean {magnitude[0]:.6f}, "
+                            f"strongly-changed pixels {magnitude[1]} "
+                            f"(floor {STRONG_CHANGE_MIN_PIXELS})"
+                        ),
+                        f"expected_effect={expected!r}",
+                    ],
+                    _DETERMINISTIC_CHANGE_CONFIDENCE,
+                    changed=True,
+                )
+            # Uncorroborated digest change: ambiguous flicker (caret blink, clock
+            # tick, foreign toast) — carry the evidence, defer the verdict. The
+            # strategy still never emits ``failed``; the pixel tier decides.
+            uncorroborated_note = (
+                "Observation digest changed but the pixel change is BELOW the "
+                "corroboration floor (strongly-changed "
+                f"{magnitude[1] if magnitude is not None else 'uncomputable'} < "
+                f"{STRONG_CHANGE_MIN_PIXELS}, mean "
+                f"{magnitude[0]:.6f} < {threshold:.6g}); ambiguous flicker is never "
+                "proof of a transition — deferring to the pixel-diff tier."
+                if magnitude is not None
+                else "Observation digest changed but the pixel magnitude could not be "
+                "computed for corroboration; deferring to the pixel-diff tier."
+            )
+            return _uncertain(
+                self.name,
+                uncorroborated_note,
+                [
+                    "observation digest changed between before and after (sub-threshold)",
+                    f"expected_effect={expected!r}",
+                ],
+                0.3,
+                changed=False,
+            )
+        # No deterministic signal: never failed, never a free success — the next
+        # tiers (screenshot_diff, judge) keep their exact existing semantics.
+        return _uncertain(
+            self.name,
+            "No deterministic focus/window/digest change signal; deferring to the pixel-diff tier.",
+            [f"expected_effect={expected!r}"],
+            0.2,
+            changed=False,
+        )
+
+    # --- signal extractors (observation fields only; never raise) ----------------------
+
+    @staticmethod
+    def _digest_change_magnitude(before: Observation, after: Observation) -> tuple[float, int] | None:
+        """(mean difference, strongly-changed pixel count) between the two captures.
+
+        Mirrors :class:`ScreenshotDiffStrategy`'s diff math exactly (same
+        ``STRONG_PIXEL_DELTA`` semantics), so the corroboration floor applied by
+        signal (c) is the same floor the pixel tier trusts. Returns ``None`` on ANY
+        decode/shape failure — fail-closed: an uncomputable magnitude never
+        corroborates (the signal then abstains to ``uncertain``).
+        """
+        try:
+            if before.width != after.width or before.height != after.height:
+                return None
+            before_image = ScreenshotDiffStrategy._decode(before.image_base64)
+            after_image = ScreenshotDiffStrategy._decode(after.image_base64)
+            if before_image.size != after_image.size:
+                return None
+            diff = ImageChops.difference(before_image, after_image)
+            mean_difference = sum(ImageStat.Stat(diff).mean) / 3.0
+            bands = diff.split()
+            if len(bands) == 1:
+                max_band = bands[0]
+            else:
+                max_band = ImageChops.lighter(ImageChops.lighter(bands[0], bands[1]), bands[2])
+            strongly_changed = sum(max_band.histogram()[STRONG_PIXEL_DELTA:])
+        except Exception:  # noqa: BLE001 - no magnitude -> no corroboration
+            return None
+        return mean_difference / 255.0, strongly_changed
+
+    @staticmethod
+    def _focus_marked_element(observation: Observation) -> dict[str, Any] | None:
+        """The element EXPLICITLY marked focused (``focused``/``is_focused``/``has_focus``)."""
+        for element in (observation.ui_elements or [])[:50]:
+            if isinstance(element, dict) and (
+                element.get("focused") or element.get("is_focused") or element.get("has_focus")
+            ):
+                return element
+        return None
+
+    @staticmethod
+    def _element_label(element: dict[str, Any]) -> str:
+        parts = [
+            str(element.get(field_key) or "") for field_key in ("control_type", "name", "automation_id")
+        ]
+        return "/".join(part for part in parts if part) or "unnamed control"
+
+    @classmethod
+    def _focused_element_change(cls, before: Observation, after: Observation) -> str | None:
+        """Evidence line naming the focused-control delta, or None when unavailable.
+
+        REM-C (V-2 F2): grounded in REAL focus claims only. The pre-REM-C positional
+        fallback (``elements[0]`` when NOTHING was focused) let a UIA re-enumeration
+        ORDER change of unfocused controls masquerade as a focus change; with no
+        focus marker on either side the signal now ABSTAINS (never verifies). A
+        marker APPEARING where none was reported — or DISAPPEARING — is itself a
+        deterministic focused-element transition and is named as such.
+        """
+        before_marked = cls._focus_marked_element(before)
+        after_marked = cls._focus_marked_element(after)
+        if before_marked is None and after_marked is None:
+            # No focus claim anywhere: positional coincidence is not focus evidence.
+            return None
+        if before_marked is not None and after_marked is not None:
+            before_key = (
+                str(before_marked.get("name") or ""),
+                str(before_marked.get("automation_id") or ""),
+                str(before_marked.get("control_type") or ""),
+            )
+            after_key = (
+                str(after_marked.get("name") or ""),
+                str(after_marked.get("automation_id") or ""),
+                str(after_marked.get("control_type") or ""),
+            )
+            if before_key == after_key:
+                return None
+            field = (
+                "name"
+                if before_key[0] != after_key[0]
+                else ("automation_id" if before_key[1] != after_key[1] else "control_type")
+            )
+            return (
+                f"focused element {field}: "
+                f"{cls._element_label(before_marked)!r} -> {cls._element_label(after_marked)!r}"
+            )
+        if before_marked is None:  # focus identity APPEARED (the control received focus)
+            return f"focused element identity appeared: (unfocused) -> {cls._element_label(after_marked)!r}"
+        # Focus identity DISAPPEARED (the control lost focus).
+        return f"focused element identity disappeared: {cls._element_label(before_marked)!r} -> (unfocused)"
+
+    @staticmethod
+    def _active_window_change(before: Observation, after: Observation) -> str | None:
+        """Evidence line naming the active-window title/process delta, or None.
+
+        A side that carries NO window identity at all never matches as a "change"
+        (fail-closed against None -> title), but identity APPEARING where it was
+        absent is a real deterministic transition (a dialog opening onto a desktop
+        with no foreground window reported).
+        """
+        before_info = before.active_window_info
+        after_info = after.active_window_info
+        before_title = (before_info.title if before_info is not None else None) or before.active_window or ""
+        after_title = (after_info.title if after_info is not None else None) or after.active_window or ""
+        before_process = (
+            (before_info.process_name if before_info is not None else None)
+            or (before_info.exe_path if before_info is not None else None)
+            or ""
+        )
+        after_process = (
+            (after_info.process_name if after_info is not None else None)
+            or (after_info.exe_path if after_info is not None else None)
+            or ""
+        )
+        if before_title and after_title and before_title != after_title:
+            return f"active window title: {before_title!r} -> {after_title!r}"
+        if before_process and after_process and before_process != after_process:
+            return f"active window process: {before_process!r} -> {after_process!r}"
+        if not before_title and not before_process and (after_title or after_process):
+            return (
+                f"active window identity appeared: none -> title {after_title!r}"
+                + (f" process {after_process!r}" if after_process else "")
+            )
+        return None
+
+
 @runtime_checkable
 class ModelJudge(Protocol):
     """Callback interface for model-based visual verification (injected by the controller).
@@ -889,6 +1179,7 @@ def default_strategy_chain(judge: ModelJudge | None = None) -> list[Verification
         ProcessStateStrategy(),
         UiControlTextStrategy(),
         TextPredicateStrategy(),
+        FocusChangeStrategy(),  # REM-B H2c: deterministic focus tier before pixel diff
         ScreenshotDiffStrategy(),
         ModelVisualStrategy(judge=judge),
     ]

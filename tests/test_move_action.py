@@ -412,6 +412,13 @@ def _make_session(monkeypatch: pytest.MonkeyPatch, backend: Any, **start_kwargs:
     return str(response["session_id"])
 
 
+def _execute_payload(result: Any) -> dict[str, Any]:
+    """REM-A: unwrap an executed computer_execute response (blocks) to its dict."""
+    if isinstance(result, list):
+        return json.loads(result[0].text)
+    return result
+
+
 async def test_computer_execute_move_executes_and_moves_cursor(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -420,6 +427,7 @@ async def test_computer_execute_move_executes_and_moves_cursor(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     result = await server.computer_execute(session_id, "move", x=40, y=50)
+    result = _execute_payload(result)  # REM-A: executed -> content blocks
     assert result["ok"] is True, result
     assert result["message"] == "Simulated move."
     assert result["verification"]["outcome"] == "verified"  # deterministic cursor predicate

@@ -7,7 +7,8 @@ Covers the mechanism-(ii) contract:
 - doc-token match preferred over a bare process match;
 - unsaved-candidate windows with no identity match -> AMBIGUOUS_INSTANCE payload
   (discovery only — nothing focused, closed, or launched);
-- no match -> NO_INSTANCE with launch=driver (the DEFAULT policy never spawns);
+- no match -> NO_INSTANCE (server-side launching is now the REM-B default; the
+  agent gate still requires the allowlisted target — see test_rem_b_takeover.py);
 - server-side launch requires BOTH the ``launch="server"`` policy AND the allowlist
   gate on the agent;
 - doc-token/unsaved title heuristics are generic (no per-app tables in code);
@@ -132,6 +133,8 @@ def test_no_instance_payload_with_driver_launch_default() -> None:
     backend = _backend_with()
     payload = _ensure(backend, "excel.exe")
     assert payload.startswith(NO_INSTANCE)
+    # REM-B: allow_launch=False still reports the driver channel and never spawns;
+    # the default POLICY flip lives in the agent gate (launch="server" now).
     assert "launch=driver" in payload
     assert backend.launched_processes == []
 
@@ -157,7 +160,11 @@ def test_agent_launch_gate_requires_server_policy_and_allowlist() -> None:
         backend, provider=None, safety=SafetyPolicy(), task=TaskState(), stop=StopToken(),
         limits=Limits().validate(),
     )
-    assert default_agent._ensure_app_allow_launch(action) is False  # launch="driver" default
+    # REM-B (H2a): the DEFAULT policy is launch="server" — the default agent MAY
+    # launch an allowlisted target (Cortex bootstraps control itself). The old
+    # never-launch default is restored explicitly (launch="driver") or via the
+    # CORTEX_ATTACH_OR_LAUNCH=driver env knob (pinned in test_rem_b_takeover.py).
+    assert default_agent._ensure_app_allow_launch(action) is True  # launch="server" default
 
     server_policy_agent = ComputerUseAgent(
         backend, provider=None, safety=SafetyPolicy(), task=TaskState(), stop=StopToken(),

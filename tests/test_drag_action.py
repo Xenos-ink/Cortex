@@ -534,6 +534,13 @@ def _make_session(
     return str(response["session_id"])
 
 
+def _execute_payload(result: Any) -> dict[str, Any]:
+    """REM-A: unwrap an executed computer_execute response (blocks) to its dict."""
+    if isinstance(result, list):
+        return json.loads(result[0].text)
+    return result
+
+
 async def test_computer_execute_drag_via_x2_y2_executes_and_fake_records(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -542,6 +549,7 @@ async def test_computer_execute_drag_via_x2_y2_executes_and_fake_records(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     result = await server.computer_execute(session_id, "drag", x=10, y=20, x2=110, y2=70)
+    result = _execute_payload(result)  # REM-A: executed -> content blocks
     assert result["ok"] is True, result
     assert result["message"] == "Simulated drag."
     assert result["verification"]["outcome"] == "verified"  # flip: visual change detected
@@ -595,5 +603,6 @@ async def test_computer_execute_drag_requires_approval_by_default(
     approved = await server.computer_execute(
         session_id, "drag", x=10, y=20, x2=110, y2=70, approved=True
     )
+    approved = _execute_payload(approved)  # REM-A: executed -> content blocks
     assert approved["ok"] is True
     assert len(backend.executed) == 1

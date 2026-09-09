@@ -417,8 +417,63 @@ async def test_resolution_change_mid_task_detected_as_stale(
 async def test_unexpected_dialog_classified_with_bounded_recovery(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """UNEXPECTED_DIALOG classification + bounded recovery still fire when a
+    verification DOES fail while the active window became a dialog.
+
+    REM-B Fix 4 note: a CLICK with a stated expected effect that opens a dialog now
+    VERIFIES via the deterministic window-identity tier (the old failed verdict was
+    the H2c false negative — see test_rem_b_takeover.py). The recovery path is
+    therefore exercised here with a TYPE action: the typed effect is stated, the
+    pixels never change (flip=False), the dialog spawns on execute — the failed
+    verification classifies UNEXPECTED_DIALOG and the recovery stays bounded.
+    """
     backend = ScriptedBackend(
         flip=False,  # screenshots never change -> verification of the stated effect fails
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="Main"),
+    )
+    dialog = WindowInfo(hwnd=2, pid=99, process_name="app.exe", title="Confirm Delete?")
+
+    def spawn_dialog(action: GroundedAction) -> None:
+        backend.set_active_window(dialog)
+
+    backend.execute_hooks.append(spawn_dialog)
+    typed = AgentDecision(
+        status="action",
+        action=GroundedAction(
+            action="type",
+            text="record name",
+            confidence=1.0,
+            expected_effect="the record is deleted",
+        ),
+    )
+    provider = ScriptedProvider([typed, AgentDecision(status="done")])
+    session_id, bundle, _backend, _ = make_session(
+        monkeypatch, backend=backend, provider=provider, dry_run=False, require_approval=False,
+        limits=FAST_LIMITS,
+    )
+    response = await server.run_goal(session_id, "rename the record")
+
+    assert response["termination_reason"] == "completed"  # recovered once, then done
+    assert executed_summary(backend) == [("type", None, "record name")]  # no destructive retry loop
+    counters = bundle.metrics.snapshot()["counters"]
+    assert counters["recovery_total"] == 1
+    events = audit_events(bundle, session_id)
+    assert any(
+        event.get("metadata", {}).get("failure_class") == "unexpected_dialog"
+        for event in events
+        if event["event_type"] == "recovery"
+    )
+
+
+async def test_dialog_opening_click_verifies_via_window_identity(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REM-B Fix 4 companion: the OLD shape of the test above (click + dialog opens +
+    unchanged pixels) now verifies honestly — the dialog opening IS the deterministic
+    window-identity change (pre-REM-B this false-failed exactly like the logged Paint
+    "Edit colors" click)."""
+    backend = ScriptedBackend(
+        flip=False,  # pixels never change — only the window identity moves
         active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="Main"),
     )
     dialog = WindowInfo(hwnd=2, pid=99, process_name="app.exe", title="Confirm Delete?")
@@ -436,16 +491,14 @@ async def test_unexpected_dialog_classified_with_bounded_recovery(
     )
     response = await server.run_goal(session_id, "delete the record")
 
-    assert response["termination_reason"] == "completed"  # recovered once, then done
-    assert executed_summary(backend) == [("click", (50, 50), None)]  # no destructive retry loop
+    assert response["termination_reason"] == "completed"
+    assert executed_summary(backend) == [("click", (50, 50), None)]
     counters = bundle.metrics.snapshot()["counters"]
-    assert counters["recovery_total"] == 1
+    assert counters["recovery_total"] == 0  # verified — no recovery needed
     events = audit_events(bundle, session_id)
-    assert any(
-        event.get("metadata", {}).get("failure_class") == "unexpected_dialog"
-        for event in events
-        if event["event_type"] == "recovery"
-    )
+    verification = [e for e in events if e["event_type"] == "verification"]
+    assert verification and verification[0]["result"] == "verified"
+    assert verification[0]["metadata"]["method"] == "focus_change"
 
 
 # --- application crash / display unavailable --------------------------------------------------------

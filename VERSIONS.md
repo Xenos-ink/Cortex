@@ -14,7 +14,60 @@ Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
 ## Unreleased
 
-(empty — v0.5.0 is the latest release, listed below.)
+In flight toward v0.5.5 (mission ORVEX-CORTEX-055, 2026-09-08/09 — three live-usage
+defect classes from FailedLog.txt, plus live-Kimi hardening).
+
+### Fixed
+
+- **Computer-use slowness drivers** — false "Expected change was not observed" verdicts
+  for focus-type clicks (a new deterministic `FocusChangeStrategy` verifies via UIA
+  focused-element / active-window identity / digest corroboration before the pixel tier);
+  `follow_ups` queues no longer abort on UNCERTAIN verdicts (stop only on definitive
+  failure), so batches actually batch; provider-judge image re-encoding eliminated
+  (base64 reused verbatim).
+- **Failed full takeover** — `ensure_app` now LAUNCHES allowlisted targets server-side by
+  default (`attach_or_launch.launch` default `driver`→`server`; `CORTEX_ATTACH_OR_LAUNCH`
+  env knob restores the old never-launch default), resolves Windows Store execution
+  aliases (`%LOCALAPPDATA%\Microsoft\WindowsApps\<needle>`) so Store apps like Paint
+  actually spawn, and an allowlisted `ensure_app` target is exempt from the
+  foreground-process gate that previously made bootstrap impossible from a fresh session;
+  the `process_not_allowed` rejection now names the active process and teaches the remedy.
+  Launch hardening: typed `LaunchTargetError` charset validation before any spawn,
+  `shell=True` removed (list argv via `shutil.which` → alias → raw name).
+- **Screenshots truncated / delivered as base64 text** — `computer_execute` now returns
+  MCP content blocks in parity with `computer_observe` (slim TextContent + real
+  ImageContent); `include_screenshot_after=false` honored on the follow_ups path too;
+  follow-up entries are slim (double serialization eliminated); outbound images on BOTH
+  observe and execute bounded by `CORTEX_RESULT_IMAGE_MAX_KB` (default 180 KB, JPEG q85 +
+  downscale ladder, internal PNG pipeline untouched); observe metadata `ocr_text` /
+  `ui_elements` capped at 20 entries with `<field>_omitted_count`.
+- **Weak-model tool-call tolerance (live GLM-5V on Kimi Code)** — integral floats, numeric
+  strings, and fractional coordinates accepted for x/y/x2/y2 (rounded, clean typed errors
+  otherwise); `keys` accepts a bare string or JSON-encoded array; `follow_ups` accepts a
+  single dict / JSON string; `allowed_processes`/`allowed_windows` accept comma- or
+  space-separated strings; **all Optional parameters advertise plain type-array JSON
+  schemas (`{"type":["integer","null"]}`) instead of `anyOf` unions**, which a live vision
+  host rejected wholesale; `computer_execute`'s FastMCP return annotation relaxed to `Any`
+  (the `dict[str, object]` annotation crashed block-list responses with a Pydantic
+  DictModel error through real hosts).
+
+### Performance
+
+- Measured live (Kimi Code + GLM-5V driving Paint, session metrics): observation p50
+  120–164 ms, execution p50 11.6–119 ms, verification p50 94–110 ms per action;
+  ensure_app + observe + click round-trips 0.14–1.4 s per tool call.
+
+### Compatibility notes
+
+- **Default behavior change:** a session with an allowlist can now server-LAUNCH an
+  allowlisted `ensure_app` target (`launch="driver"` or `CORTEX_ATTACH_OR_LAUNCH=driver`
+  restores never-launch). Non-allowlisted targets never launch — fail-closed unchanged.
+- **Tool output shape:** executed `computer_execute` calls return `[TextContent,
+  ImageContent]` blocks (was: dict with `screenshot_after_base64`); error/rejection shapes
+  stay plain dicts. The image rides as a real image block under the 180 KB outbound budget.
+- **Wire schemas:** Optional parameters advertise type-array forms instead of `anyOf`
+  (runtime validation semantics unchanged; `limits` still fail-closed strict).
+
 
 ## v0.5.0 (2026-09-07) — RELEASED (performance & effectiveness)
 

@@ -20,6 +20,7 @@ import pytest
 from test_checkpoint_manager import build_state as build_checkpoint_state
 from test_controller_integration import (
     FAST_LIMITS,
+    execute_payload,
     ScriptedBackend,
     ScriptedProvider,
     audit_events,
@@ -107,6 +108,7 @@ async def test_rt1_smuggled_privilege_fields_in_follow_up_spec_are_ignored(
             {"action": "click", "x": 30, "y": 30},
         ],
     )
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["ok"] is True  # item 0 (the legacy payload) executed
     assert response["follow_ups_stopped_reason"] == "safety_denied"
     smuggled = response["follow_up_results"][1]
@@ -136,6 +138,7 @@ async def test_rt1_critical_follow_up_never_authorized_by_call_level_approved(
             {"action": "type", "text": "del C:\\Windows\\System32 /s /q", "expected_effect": "x"},
         ],
     )
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["follow_ups_stopped_reason"] == "safety_denied"
     assert response["follow_up_results"][1]["ok"] is False
     assert len(executed_summary(backend)) == 1
@@ -212,6 +215,7 @@ async def test_rt1_finding_spec_valid_grounded_invalid_items_crash_unstructured(
     # fail-closed in effect: nothing was dispatched, and the session is still usable
     assert backend.executed == []
     response = await server.computer_execute(session_id, "click", x=10, y=10)
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["ok"] is True
 
 
@@ -224,6 +228,7 @@ async def test_rt1_queue_cap_enforced_pre_dispatch_with_boundary_exact(
     )
     five = [{"action": "wait", "delta": 1} for _ in range(MAX_FOLLOW_UPS)]
     response = await server.computer_execute(session_id, "click", x=10, y=10, follow_ups=five)
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["ok"] is True and response["follow_ups_stopped_reason"] is None
     assert len(executed_summary(backend)) == 6  # primary + 5
     backend.executed.clear()
@@ -283,6 +288,7 @@ async def test_rt1_dry_run_session_queue_stubs_without_dispatch(
         y=10,
         follow_ups=[{"action": "click", "x": 20, "y": 20}],
     )
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     assert backend.executed == []
     assert response["message"].startswith("DRY-RUN (no input dispatched):")
     assert response["follow_ups_stopped_reason"] == "no_post_action_observation"
@@ -305,10 +311,16 @@ async def test_rt1_queue_entries_never_carry_image_payloads(
         y=10,
         follow_ups=[{"action": "wait", "delta": 1}],
     )
-    assert "screenshot_after_base64" in response  # legacy payload intact
-    for entry in response["follow_up_results"][1:]:
+    # REM-A H3: executed responses are content blocks — the image rides ONLY the
+    # ImageContent block; the text payload and every queue entry carry no image bytes.
+    assert isinstance(response, list) and len(response) == 2
+    assert response[1].type == "image"  # the ONE image slot
+    payload = json.loads(response[0].text)
+    assert "screenshot_after_base64" not in payload
+    for entry in payload["follow_up_results"]:
         assert "screenshot_after_base64" not in entry
-        assert "image" not in json.dumps(entry.get("result", {}), default=str)
+        assert "result" not in entry  # H6: slim per-item entries, no duplicated blobs
+        assert "image" not in json.dumps(entry, default=str)
 
 
 def test_rt1_spec_cannot_override_policy_relevant_grounded_fields() -> None:
@@ -773,6 +785,7 @@ async def test_rt6_dry_run_fuzz_never_dispatches_and_always_banners(
     ]
     for action_name, kwargs in attempts:
         response = await server.computer_execute(session_id, action_name, **kwargs)
+        response = execute_payload(response)  # REM-A: unwrap blocks when executed
         assert isinstance(response, dict), (action_name, response)
         if response.get("ok") is True:
             message = str(response.get("message", ""))
@@ -784,6 +797,7 @@ async def test_rt6_dry_run_fuzz_never_dispatches_and_always_banners(
         session_id, "click", x=10, y=10,
         follow_ups=[{"action": "type", "text": "format C: /fs:ntfs /y"}],
     )
+    response = execute_payload(response)  # REM-A: executed -> content blocks
     assert backend.executed == []  # NOTHING dispatched across the whole fuzz
     assert (
         response.get("stopped") is True
@@ -834,8 +848,13 @@ async def test_rt7_old_client_shapes_accepted_on_the_tool_surface(
     assert observe_response and observe_response[0].type == "text"
     assert server.computer_screenshot(session_id)[0].type == "text"
     response = await server.computer_execute(session_id, "click", x=10, y=10)
-    assert response["ok"] is True
-    assert "screenshot_after_base64" in response  # legacy payload byte-compatible
+    # REM-A H3: executed responses are content blocks — legacy call shapes still work
+    # end-to-end; the image rides the ImageContent block (never the text channel).
+    assert isinstance(response, list) and len(response) == 2
+    assert response[1].type == "image"
+    payload = json.loads(response[0].text)
+    assert payload["ok"] is True
+    assert "screenshot_after_base64" not in payload
     bundle = server._get_bundle(session_id)
     bundle.agent.provider = ScriptedProvider([AgentDecision(status="done", summary="done")])
     goal = await server.run_goal(session_id, "legacy goal")

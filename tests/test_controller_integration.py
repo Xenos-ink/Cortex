@@ -151,6 +151,7 @@ class ScriptedBackend(FakeComputerBackend):
         self.execute_hooks: list[Any] = []
         self.observe_faults: list[Exception | None] = []  # popped per observe call (D4)
         self.typed_text: str | None = None
+        self.observe_override_png: str | None = None  # REM-A H7: oversized-image hook
 
     def observe(self) -> Any:
         if self.observe_faults:
@@ -161,7 +162,7 @@ class ScriptedBackend(FakeComputerBackend):
         color = "white"
         if self.flip and self.executes % 2 == 1:
             color = "black"
-        observation.image_base64 = _png(color)
+        observation.image_base64 = self.observe_override_png or _png(color)
         if self.typed_text:
             observation.ocr_text = [
                 TextRegion(text=self.typed_text, x=8, y=8, width=120, height=16, confidence=0.95)
@@ -257,6 +258,26 @@ def make_session(
     session_id = str(response["session_id"])
     bundle = server._get_bundle(session_id)
     return session_id, bundle, backend, provider
+
+
+def execute_payload(result: Any) -> dict[str, Any]:
+    """REM-A: unwrap an executed ``computer_execute`` response to its dict payload.
+
+    Executed responses are MCP content blocks (TextContent result JSON + ImageContent
+    post-action screenshot — parity with computer_observe). Error/rejection/approval
+    shapes stay plain dicts. This helper returns the payload dict for BOTH forms so
+    legacy-shape assertions keep working; use ``execute_blocks`` when the block form
+    itself matters.
+    """
+    if isinstance(result, list):
+        return json.loads(result[0].text)
+    return result
+
+
+def execute_blocks(result: Any) -> tuple[Any, ...]:
+    """REM-A: return the content blocks of an executed response (asserts block form)."""
+    assert isinstance(result, list) and result, result
+    return tuple(result)
 
 
 def executed_summary(backend: Any) -> list[tuple[str, tuple[int, int] | None, str | None]]:
@@ -839,6 +860,7 @@ async def test_computer_execute_confidence_semantics_and_expected_effect(
     assert backend.executed == []
 
     approved = await server.computer_execute(session_id, "click", x=10, y=10, approved=True)
+    approved = execute_payload(approved)  # REM-A: executed -> content blocks
     assert approved["ok"] is True
     assert approved["verification"]["outcome"] == "verified"
     assert approved["model_confidence"] == 1.0  # client-asserted model confidence
@@ -856,6 +878,7 @@ async def test_computer_execute_expected_effect_and_failure_shapes(
     effect = await server.computer_execute(
         session_id, "click", x=15, y=15, approved=False, expected_effect="the screen changes"
     )
+    effect = execute_payload(effect)  # REM-A: executed -> content blocks
     # A stated expected effect that did not occur is reported failed — never silently OK.
     assert effect["ok"] is False
     assert effect["verification"]["outcome"] == "failed"
@@ -883,6 +906,7 @@ async def test_computer_execute_dry_run_never_executes(
         monkeypatch, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
     dry = await server.computer_execute(session_id, "wait", delta=1)
+    dry = execute_payload(dry)  # REM-A: executed (dry-run stub) -> content blocks
     assert dry["ok"] is True
     # PERF-004 C5: dry-run results are UNMISTAKABLE — the message must start with the
     # banner so no host can misread a no-op as execution.

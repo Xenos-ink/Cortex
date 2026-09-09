@@ -27,6 +27,14 @@ Compatibility contract (master-mission section 6, binding):
   StopToken kill path and audits stop + emergency_stop.
 - ``start_session`` succeeds with no API key (provider construction is lazy at the first
   model call — compat decision 5; dry-run usable).
+- REM-F weak-model boundary tolerance (ORVEX-CORTEX-055, live-test hardening):
+  ``x``/``y``/``x2``/``y2`` accept integral floats and numeric strings and ROUND
+  non-integral values; ``follow_ups`` accepts a JSON-encoded string / single dict /
+  JSON-string entries; ``allowed_processes``/``allowed_windows`` accept
+  comma/space-separated or bare strings. All via Annotated BeforeValidator
+  coercions PRE-validation — the advertised schemas stay "integer"/"array", the
+  downstream internal models stay strict, and garbage still fails typed.
+  ``limits`` is deliberately NOT made tolerant (fail-closed numeric contract).
 
 Test/extension seam (for E6/E7): the module-level ``_backend_factory`` and
 ``_provider_factory`` callables are invoked once per ``start_session``; tests monkeypatch
@@ -37,9 +45,12 @@ them to inject ``FakeComputerBackend``/scripted providers, and read session wiri
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
+import io
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -48,10 +59,12 @@ from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
+from PIL import Image
+from pydantic import BeforeValidator
 
 from .agent import ComputerUseAgent
 from .audit import AuditLogger, Metrics
@@ -400,10 +413,123 @@ def _redact_queue_entry(entry: dict[str, Any]) -> dict[str, Any]:
     reasons = redacted.get("reasons")
     if isinstance(reasons, list):
         redacted["reasons"] = [redact_text(str(reason))[0] for reason in reasons]
-    result = redacted.get("result")
-    if isinstance(result, dict):
-        redacted["result"] = _redact_result_payload(result)
+    verification_note = redacted.get("verification_note")
+    if verification_note:
+        redacted["verification_note"] = redact_text(str(verification_note))[0]
     return redacted
+
+
+# --- REM-A outbound image budget + content-block parity (master-mission Phase 2) ---------------
+
+#: Default budget for ONE outbound image block, in KB (H7). The host inline limit is
+#: ~200KB; the default keeps the encoded image comfortably under it.
+RESULT_IMAGE_MAX_KB_DEFAULT = 180
+
+#: Env knob name: ``CORTEX_RESULT_IMAGE_MAX_KB`` bounds the OUTBOUND image only —
+#: observe and execute paths share the same budget; internal captures,
+#: verification pixel-diff, and checkpoints keep PNG exactly as today.
+RESULT_IMAGE_MAX_KB_ENV = "CORTEX_RESULT_IMAGE_MAX_KB"
+
+#: Cap on ``ocr_text``/``ui_elements`` entries serialized into the observe metadata
+#: text (H8): the internal Observation model keeps the full lists.
+OBSERVE_METADATA_ELEMENT_CAP = 20
+
+
+def _result_image_max_bytes() -> int:
+    """Resolve the outbound image budget in BYTES; invalid values fall back to default."""
+    raw = os.environ.get(RESULT_IMAGE_MAX_KB_ENV, "").strip()
+    try:
+        kb = float(raw) if raw else RESULT_IMAGE_MAX_KB_DEFAULT
+    except (TypeError, ValueError):
+        kb = RESULT_IMAGE_MAX_KB_DEFAULT
+    if kb <= 0 or kb != kb:  # non-positive or NaN -> fail-safe default
+        kb = RESULT_IMAGE_MAX_KB_DEFAULT
+    kb = min(kb, 100_000.0)
+    return int(kb * 1024)
+
+
+def _bound_outbound_image(data_b64: str) -> tuple[str, str]:
+    """Return ``(base64, mimeType)`` for the OUTBOUND copy, under the size budget.
+
+    H7: the outbound PNG travels as-is while it fits the budget; an oversized PNG is
+    re-encoded as JPEG (quality 85, no alpha channel) and, if still over budget,
+    progressively downscaled by 0.85 steps until it fits. INTERNAL pipeline bytes are
+    never touched: captures, verification pixel-diff, and checkpoints keep PNG exactly
+    as today. Degradation (PIL failure) returns the original — an oversized real image
+    beats none.
+    """
+    try:
+        decoded = base64.b64decode(data_b64, validate=True)
+    except Exception:  # noqa: BLE001 - unusable environment is fail-closed data
+        return data_b64, "image/png"
+    if len(decoded) <= _result_image_max_bytes():
+        return data_b64, "image/png"
+    try:
+        image = Image.open(io.BytesIO(decoded))
+        image.load()
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        # Ladder: JPEG q85, then progressive 0.85 downscale; after exhausting the
+        # scale steps, quality descent (85 -> 70 -> 55 -> 40 -> 25) on the smallest
+        # frame. The ladder terminates well before pixel collapse; the floor path
+        # only exists so a pathological image still yields SOMETHING legible.
+        qualities = (85, 70, 55, 40, 25)
+        last_bytes = b""
+        for step in range(17):  # 12 scale steps (0.85^12 ≈ 0.14x area) + quality descent
+            quality = qualities[0] if step < 12 else qualities[min(step - 11, len(qualities) - 1)]
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=quality)
+            last_bytes = buffer.getvalue()
+            if len(last_bytes) <= _result_image_max_bytes():
+                break
+            if step < 12:
+                image = image.resize(  # progressive 0.85 downscale until it fits
+                    (max(1, int(image.width * 0.85)), max(1, int(image.height * 0.85))),
+                    Image.LANCZOS,
+                )
+        return base64.b64encode(last_bytes).decode("ascii"), "image/jpeg"
+    except Exception:  # noqa: BLE001 - degradation: deliver the original image
+        logger.debug("outbound image re-encode failed; delivering original PNG", exc_info=True)
+        return data_b64, "image/png"
+
+
+def _execute_response_blocks(response: dict[str, object]) -> list[Any]:
+    """REM-A H3/H5: executed ``computer_execute`` results as MCP content blocks.
+
+    Returns one TextContent (the result JSON with the image blob stripped and the
+    outbound format noted) plus one ImageContent carrying the post-action screenshot
+    as a real image block (bounded by :func:`_bound_outbound_image`) — parity with
+    ``computer_observe``. When the caller opted out
+    (``include_screenshot_after=False``, honored BEFORE this point) the response
+    carries no blob and this yields the text block only — never an empty image.
+    """
+    payload = dict(response)
+    data_b64 = payload.pop("screenshot_after_base64", None)
+    blocks: list[Any] = []
+    if data_b64 is not None:
+        bounded_b64, mime = _bound_outbound_image(str(data_b64))
+        payload["image_format"] = mime
+        blocks.append(ImageContent(type="image", data=bounded_b64, mimeType=mime))
+    return [
+        TextContent(type="text", text=json.dumps(payload, ensure_ascii=False)),
+        *blocks,
+    ]
+
+
+def _bound_observe_lists(dump: dict[str, Any]) -> dict[str, Any]:
+    """H8: cap ``ocr_text``/``ui_elements`` in the SERIALIZED observe metadata only.
+
+    The internal :class:`~computer_use_mcp.models.Observation` keeps its full lists;
+    only the host-facing metadata text is capped, with an additive
+    ``<field>_omitted_count`` marker so nothing is silently lost.
+    """
+    for field in ("ocr_text", "ui_elements"):
+        value = dump.get(field)
+        if isinstance(value, list) and len(value) > OBSERVE_METADATA_ELEMENT_CAP:
+            omitted = len(value) - OBSERVE_METADATA_ELEMENT_CAP
+            dump[field] = value[:OBSERVE_METADATA_ELEMENT_CAP]
+            dump[f"{field}_omitted_count"] = omitted
+    return dump
 
 
 def _parse_limits(limits: dict[str, Any] | None) -> Limits:
@@ -424,6 +550,270 @@ def _parse_limits(limits: dict[str, Any] | None) -> Limits:
     return Limits(**kwargs).validate()  # type: ignore[arg-type]
 
 
+# --- REM-F weak-model tolerant argument coercion (ORVEX-CORTEX-055, boundary only) --------------
+# The live Kimi Code / GLM-5V run proved the pipeline works but the DRIVING MODEL
+# could not pass the strict pydantic schema four times (float coordinates, a
+# follow_ups array shape, an allowed_processes array) and gave up on clicking.
+# These helpers add BOUNDARY tolerance on exactly that class — the advertised tool
+# schemas stay self-describing ("integer" / "array"), the coercion runs
+# PRE-validation, and every downstream internal model (GroundedAction, Limits,
+# ActionSpec bounds) stays strict and unchanged. Non-numeric garbage still fails
+# with a clean pydantic-style typed error — this is tolerance, not semantics change.
+
+
+#: Names of the action-spec fields that carry integer coordinates (used to coerce
+#: follow_ups entries with the same policy as the tool parameters).
+_SPEC_COORDINATE_FIELDS = ("x", "y", "x2", "y2")
+
+
+def _coerce_tolerant_int(value: Any, *, field: str = "value") -> int:
+    """Boundary coercion for one integer tool argument (weak-model tolerance).
+
+    Accepts ints as-is; integral floats (1343.0) and numeric strings ("1343") pass
+    through; NON-INTEGRAL floats/strings ROUND to the nearest int — a vision model
+    aiming at pixel 1343.7 must not hard-fail at the schema boundary. Booleans,
+    NaN/infinity, non-numeric strings, and non-number types raise a clean
+    pydantic-style ValueError instead of crashing.
+    """
+    if isinstance(value, bool):
+        # ValueError (not TypeError): pydantic only converts ValueError/AssertionError
+        # inside BeforeValidator into a typed ValidationError — a raw TypeError would
+        # escape the validation boundary as a crash (verified against pydantic 2.13).
+        raise ValueError(  # noqa: TRY004 - deliberate: see the comment above
+            f"{field}: boolean is not a valid integer coordinate."
+        )
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field}: non-finite number is not a valid integer coordinate.")
+        return round(value)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            number = float(text)
+        except ValueError:
+            raise ValueError(
+                f"{field}: cannot interpret {value!r} as an integer coordinate."
+            ) from None
+        if not math.isfinite(number):
+            raise ValueError(f"{field}: non-finite number is not a valid integer coordinate.")
+        return round(number)
+    raise ValueError(
+        f"{field}: cannot interpret a {type(value).__name__} as an integer coordinate."
+    )
+
+
+#: ``x``/``y``/``x2``/``y2`` tool type — schema still says "integer" (Annotated
+#: int), coercion runs before validation. Covers int, integral float, fractional
+#: float (rounded), and numeric string inputs.
+TolerantInt = Annotated[int, BeforeValidator(_coerce_tolerant_int)]
+
+
+def _coerce_tolerant_str_list(value: Any) -> list[str] | None:
+    """Boundary coercion for allowlist parameters (``allowed_processes``/windows).
+
+    Accepts list[str] as today, PLUS weak-model serializations: a comma- or
+    space-separated STRING ("mspaint.exe, notepad.exe" -> two entries) and a single
+    bare string ("mspaint.exe" -> one entry). Empty/whitespace-only string yields
+    [] (same as an omitted value). Anything else raises a typed error.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        return [item for item in stripped.replace(",", " ").split() if item]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    # ValueError (not TypeError): pydantic converts only ValueError/AssertionError
+    # inside BeforeValidator into a typed ValidationError — a raw TypeError would
+    # escape the validation boundary as a crash.
+    raise ValueError(
+        f"must be a list of strings (or a comma/space-separated string), "
+        f"got {type(value).__name__}."
+    )
+
+
+#: Allowlist parameter type — schema still says array-of-string.
+TolerantStrList = Annotated[list[str], BeforeValidator(_coerce_tolerant_str_list)]
+
+
+def _coerce_tolerant_follow_ups(value: Any) -> list[dict[str, Any]] | None:
+    """Boundary coercion for the ``follow_ups`` queue (weak-model tolerance).
+
+    Accepts list[dict] as today, PLUS: a JSON-encoded STRING containing the list
+    (parsed), a single dict (wrapped into [dict]), and per-entry JSON strings (each
+    parsed). Entries keep ``dict[str, Any]`` (unknown keys already tolerated);
+    non-JSON strings and non-object entries raise a typed error — the queue is
+    never silently truncated or guessed at.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"follow_ups string is not valid JSON: {exc}") from None
+    if isinstance(value, dict):
+        value = [value]
+    if isinstance(value, (list, tuple)):
+        coerced: list[dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, str):
+                try:
+                    item = json.loads(item)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"follow_ups entry is not valid JSON: {exc}") from None
+            if not isinstance(item, dict):
+                # ValueError (not TypeError): pydantic converts only ValueError/
+                # AssertionError inside BeforeValidator into a typed ValidationError.
+                raise ValueError(  # noqa: TRY004 - deliberate, see comment above
+                    "each follow_ups entry must be an action-spec object."
+                ) from None
+            coerced.append(item)
+        return coerced
+    raise ValueError("follow_ups must be a list of action-spec objects.") from None
+
+
+#: Follow-up queue type — schema still says array-of-object (dict[str, Any]).
+TolerantFollowUps = Annotated[list[dict[str, Any]], BeforeValidator(_coerce_tolerant_follow_ups)]
+
+
+# --- REM-G plain advertised schemas (ORVEX-CORTEX-055, live-test hardening 2) --------------------
+# TWO further Kimi Code / GLM-5V live runs (REM-F runtime coercion already in
+# place) still failed on EVERY parameter whose ADVERTISED wire schema uses
+# pydantic's Optional anyOf union form — a plain integer x=679, a plain array
+# keys=["enter"], a valid follow_ups array, allowed_processes=["mspaint.exe"]
+# all came back "/x must be integer; /x must be null; /x must match a schema in
+# anyOf" from the CLIENT-side validator, while plain-string params passed. The
+# client chokes on the anyOf UNION FORM itself, not the types.
+#
+# Fix (advertised shape only — runtime validation is EXACTLY as today): a small
+# ``_PlainJsonSchema`` marker attached via ``Annotated[T | None, marker]``
+# flattens each Optional parameter's advertised JSON Schema from anyOf[X, null]
+# to the maximally-compatible type-array form ({"type": ["integer", "null"]},
+# {"type": ["array", "null"], "items": ...}). The marker is the LAST Annotated
+# metadata item so pydantic honors it for the WHOLE union (an inner placement
+# would only cover the non-null arm). "default": null semantics survive —
+# the marker's schema merges with the Field default (pinned by tests). The
+# REM-F BeforeValidator coercions are COMPOSED, not replaced: the union still
+# validates X through the tolerant arm and null through the None arm.
+
+
+class _PlainJsonSchema:
+    """Schema marker: advertise a fixed plain shape for the WHOLE Optional union.
+
+    Implements pydantic's ``__get_pydantic_json_schema__`` protocol. Used only
+    at the MCP tool boundary to flatten ``anyOf[X, null]`` wire schemas into the
+    maximally-compatible type-array form; the union's RUNTIME validation (REM-F
+    tolerant arm + null arm) is untouched.
+    """
+
+    def __init__(self, shape: dict[str, Any]) -> None:
+        self._shape = shape
+
+    def __get_pydantic_json_schema__(  # noqa: D105 - pydantic protocol, not docstring-able
+        self,
+        schema: Any,
+        handler: Any,
+    ) -> dict[str, Any]:
+        return dict(self._shape)
+
+
+#: The flattened advertised shapes (the only wire-schema change REM-G makes).
+_PLAIN_NULLABLE_INTEGER = _PlainJsonSchema({"type": ["integer", "null"]})
+_PLAIN_NULLABLE_STRING = _PlainJsonSchema({"type": ["string", "null"]})
+_PLAIN_NULLABLE_BOOLEAN = _PlainJsonSchema({"type": ["boolean", "null"]})
+_PLAIN_NULLABLE_STRING_ARRAY = _PlainJsonSchema(
+    {"type": ["array", "null"], "items": {"type": "string"}}
+)
+_PLAIN_NULLABLE_OBJECT_ARRAY = _PlainJsonSchema(
+    {"type": ["array", "null"], "items": {"type": "object", "additionalProperties": True}}
+)
+_PLAIN_NULLABLE_STRING_MAP = _PlainJsonSchema(
+    {"type": ["object", "null"], "additionalProperties": True}
+)
+_PLAIN_NULLABLE_NUMBER_MAP = _PlainJsonSchema(
+    {"type": ["object", "null"], "additionalProperties": {"type": "number"}}
+)
+
+
+def _coerce_tolerant_keys(value: Any) -> list[str] | None:
+    """Boundary coercion for the ``keys`` parameter (REM-G weak-model tolerance).
+
+    Accepts list[str] as today, PLUS weak-model serializations: a bare STRING
+    "enter" -> ["enter"] (a single key name) and a JSON-encoded array string
+    '["ctrl","a"]' -> parsed (same pattern as the REM-F follow_ups tolerance).
+    Non-JSON bracket strings and non-list/non-string values raise a typed error.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"keys string is not a valid JSON array: {exc}") from None
+            if not isinstance(parsed, list):
+                raise ValueError("keys JSON string must encode an ARRAY of key names.")
+            value = parsed
+        elif not stripped:
+            return []
+        else:
+            return [stripped]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    # ValueError (not TypeError): pydantic converts only ValueError/AssertionError
+    # inside BeforeValidator into a typed ValidationError — a raw TypeError would
+    # escape the validation boundary as a crash.
+    raise ValueError(
+        f"keys must be an array of key names (or one key name as a string), "
+        f"got {type(value).__name__}."
+    ) from None
+
+
+#: ``keys`` tool type — runtime list[str] with REM-G string tolerance; the
+#: advertised schema is flattened to array-of-string|null (see _PlainJsonSchema).
+TolerantKeys = Annotated[list[str], BeforeValidator(_coerce_tolerant_keys)]
+
+
+#: Optional tool parameter types with FLATTENED advertised schemas (REM-G). Each
+#: composes the EXISTING REM-F tolerant runtime type with the plain-union marker:
+#: runtime validation is byte-identical, only the wire schema loses anyOf.
+NullableInt = Annotated[TolerantInt | None, _PLAIN_NULLABLE_INTEGER]
+NullableStr = Annotated[str | None, _PLAIN_NULLABLE_STRING]
+NullableBool = Annotated[bool | None, _PLAIN_NULLABLE_BOOLEAN]
+NullableStrList = Annotated[TolerantStrList | None, _PLAIN_NULLABLE_STRING_ARRAY]
+NullableFollowUps = Annotated[TolerantFollowUps | None, _PLAIN_NULLABLE_OBJECT_ARRAY]
+NullableStrMap = Annotated[dict[str, Any] | None, _PLAIN_NULLABLE_STRING_MAP]
+NullableNumberMap = Annotated[dict[str, float] | None, _PLAIN_NULLABLE_NUMBER_MAP]
+NullableKeys = Annotated[TolerantKeys | None, _PLAIN_NULLABLE_STRING_ARRAY]
+
+
+def _coerce_follow_up_entry(item: dict[str, Any]) -> dict[str, Any]:
+    """Apply the same coordinate coercion INSIDE one follow_ups entry (REM-F).
+
+    The boundary validates the queue as list[dict[str, Any]]; the strict
+    :class:`~computer_use_mcp.models.ActionSpec` (unchanged) then rejects a float
+    ``x`` the same way the tool parameter used to. This helper reuses the parameter
+    coercion on the coordinate fields only — the strict internal model still
+    enforces every bound and rejects garbage identically.
+    """
+    if not isinstance(item, dict):
+        return item  # the strict model produces the typed failure
+    coerced = dict(item)
+    for name in _SPEC_COORDINATE_FIELDS:
+        if name in coerced and coerced[name] is not None:
+            try:
+                coerced[name] = _coerce_tolerant_int(coerced[name], field=name)
+            except ValueError:
+                return item  # let the strict model emit its own typed error
+    return coerced
+
+
 # --- teach-in-text action vocabulary (PERF-004 C6) ------------------------------------------
 # The EXACT ActionType vocabulary from models.py (verbatim enum values):
 # click, double_click, drag, type, keypress, scroll, wait, done, move, hotkey,
@@ -437,7 +827,10 @@ ACTION_VOCABULARY = (
     "hotkey (keys=[2-12 key names], e.g. [\"ctrl\",\"a\"]), scroll (delta -20..20), "
     "wait (delta 0..20 seconds), focus_window (target = window title), "
     "ensure_app (target = \"process\" or \"process|doc-token\"; attaches to an EXISTING "
-    "instance — REATTACHED/AMBIGUOUS_INSTANCE/NO_INSTANCE — never launches by default), done."
+    "instance — REATTACHED/AMBIGUOUS_INSTANCE/NO_INSTANCE — and may launch the target "
+    "server-side when no instance matches, the target is allowlisted, and the "
+    "launch=\"server\" policy holds (the default; CORTEX_ATTACH_OR_LAUNCH=driver "
+    "restores never-launch)), done."
 )
 
 #: Key-name rule taught alongside the vocabulary (Session 1 failure class: text sent
@@ -742,11 +1135,11 @@ def start_session(
     max_steps: int = 30,
     max_retries_per_action: int = 1,
     min_confidence: float = 0.70,
-    allowed_windows: list[str] | None = None,
-    allowed_processes: list[str] | None = None,
-    limits: dict[str, float] | None = None,
-    resume_from_checkpoint: str | None = None,
-    interference: dict[str, Any] | None = None,
+    allowed_windows: NullableStrList = None,
+    allowed_processes: NullableStrList = None,
+    limits: NullableNumberMap = None,
+    resume_from_checkpoint: NullableStr = None,
+    interference: NullableStrMap = None,
 ) -> dict[str, object]:
     """Start a guarded session; per-action approval is enabled by default.
 
@@ -760,6 +1153,12 @@ def start_session(
     ``allowed_processes`` enforces a process allowlist (P0-G); ``limits`` carries any
     :class:`~computer_use_mcp.limits.Limits` field (validated + clamped, fail-closed on
     unknown names). No API key is required to start (the provider is lazy).
+
+    REM-F weak-model tolerance: ``allowed_processes``/``allowed_windows`` also accept
+    a comma/space-separated STRING ("mspaint.exe, notepad.exe") or a single bare
+    string, coerced to the documented list at the tool boundary only — the
+    advertised schema stays array-of-string and ``limits`` stays STRICT
+    (fail-closed numeric contract, untouched).
 
     Interference policy (T8, trailing optional): ``interference`` is a dict of policy
     sections for the Interference Guard (``focus_guard`` / ``attach_or_launch`` /
@@ -802,6 +1201,13 @@ def start_session(
         # Fail-closed policy parsing (mirrors ``invalid_limits``): a malformed policy
         # can never silently weaken the protective defaults.
         return {"ok": False, "error": "invalid_interference", "message": str(exc)}
+    # REM-F: normalize the tolerant allowlist shapes for DIRECT callers too (the
+    # boundary coercion already produced lists for MCP callers — idempotent here).
+    try:
+        allowed_windows = _coerce_tolerant_str_list(allowed_windows)
+        allowed_processes = _coerce_tolerant_str_list(allowed_processes)
+    except ValueError as exc:
+        return {"ok": False, "error": "invalid_limits", "message": str(exc)}
     try:
         context = _registry.create()
     except SessionLimitExceeded as exc:
@@ -840,7 +1246,7 @@ def start_session(
             allowed_processes=allowed_processes or [],
             interference=interference_policy,
         )
-    except Exception as exc:  # noqa: BLE001 - never leak a traceback; release the slot
+    except Exception as exc:  # noqa: BLE001 - structured error, no traceback
         _registry.remove(session_id)
         return _error_response(exc)
     with _lock:
@@ -1022,18 +1428,25 @@ def computer_observe(session_id: str) -> Any:
     except Exception:
         logger.debug("observation audit failed", exc_info=True)
     bundle.metrics.incr("screenshot_count")
+    observation_dump = observation.model_dump(mode="json", exclude={"image_base64"})
+    # REM-E (live-test gap): the OUTBOUND ImageContent rides the SAME budget as
+    # the execute path (`_bound_outbound_image`, CORTEX_RESULT_IMAGE_MAX_KB —
+    # observe and execute). The live probe shipped a 1.37 MB PNG block and blew
+    # the provider request; the INTERNAL Observation stays PNG untouched below,
+    # so pixel-diff, staleness digests, and checkpoints are unaffected.
+    outbound_b64, outbound_mime = _bound_outbound_image(observation.image_base64)
     metadata = {
-        "observation": observation.model_dump(mode="json", exclude={"image_base64"}),
+        "observation": _bound_observe_lists(observation_dump),
         "digest": digest,
         "observation_id": observation.observation_id,
         "active_app": info.process_name if info is not None else observation.active_window,
-        "image_format": "image/png",
+        "image_format": outbound_mime,
         # PERF-004 C8 (additive): bounded one-line grounding text for weak models.
         "text_summary": text_summary,
     }
     return [
         TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
-        ImageContent(type="image", data=observation.image_base64, mimeType="image/png"),
+        ImageContent(type="image", data=outbound_b64, mimeType=outbound_mime),
     ]
 
 
@@ -1047,19 +1460,19 @@ def computer_screenshot(session_id: str) -> Any:
 async def computer_execute(
     session_id: str,
     action: str,
-    x: int | None = None,
-    y: int | None = None,
-    text: str | None = None,
-    keys: list[str] | None = None,
+    x: NullableInt = None,
+    y: NullableInt = None,
+    text: NullableStr = None,
+    keys: NullableKeys = None,
     delta: int = 0,
     approved: bool = False,
-    expected_effect: str | None = None,
-    x2: int | None = None,
-    y2: int | None = None,
-    target: str | None = None,
-    include_screenshot_after: bool | None = None,
-    follow_ups: list[dict[str, Any]] | None = None,
-) -> dict[str, object]:
+    expected_effect: NullableStr = None,
+    x2: NullableInt = None,
+    y2: NullableInt = None,
+    target: NullableStr = None,
+    include_screenshot_after: NullableBool = None,
+    follow_ups: NullableFollowUps = None,
+) -> Any:
     """Validate and execute one grounded action; approval applies only to this action call.
 
     ACTION VOCABULARY (exact names, from the models enum): click, double_click, drag,
@@ -1069,7 +1482,10 @@ async def computer_execute(
     NAMES ("ctrl", "a", "enter", "esc") — never text or sentences; to type text use
     {"action": "type", "text": "..."}. "ensure_app" takes target="process" or
     "process|doc-token" (e.g. "excel|book1") and attaches to an EXISTING instance
-    (REATTACHED / AMBIGUOUS_INSTANCE / NO_INSTANCE payloads; never launches by default).
+    (REATTACHED / AMBIGUOUS_INSTANCE / NO_INSTANCE payloads; with the default
+    launch="server" policy a NO_INSTANCE for an allowlisted target launches the
+    process server-side — launch="driver" or CORTEX_ATTACH_OR_LAUNCH=driver keeps
+    the never-launch behavior).
 
     The hardcoded ``confidence=1.0`` is the client-asserted MODEL confidence; grounding,
     staleness, risk, approval, and verification run independently. ``expected_effect``
@@ -1080,20 +1496,36 @@ async def computer_execute(
     ``x``/``y``; ``action="hotkey"`` requires ``keys`` (2-12 key names);
     ``action="focus_window"`` requires ``target`` (a window title).
 
+    REM-F weak-model tolerance (boundary only): integer coordinates also accept
+    integral floats (1343.0) and numeric strings ("1343"); NON-INTEGRAL values ROUND
+    to the nearest int (a vision model aiming at pixel 1343.7 must not hard-fail).
+    The advertised schema still says "integer"; non-numeric garbage ("left") still
+    fails with a clean typed error. ``follow_ups`` also accepts a JSON-encoded string
+    containing the list, a single dict (wrapped into a one-entry list), and
+    per-entry JSON strings — same fail-closed queue semantics afterwards.
+
     Host-payload opt-out (PERF-004, trailing optional): pass
-    ``include_screenshot_after=false`` to OMIT the heavy ``screenshot_after_base64``
-    (~1-2 MB) from this response — recommended for actions whose outcome you check via
-    the verification verdict + digest instead of the image (the full image stays
-    available via computer_observe). Omitted or None keeps the legacy payload unchanged.
+    ``include_screenshot_after=false`` to OMIT the heavy image block
+    (and any image bytes) from this response — recommended for actions whose outcome
+    you check via the verification verdict + digest instead of the image (the full
+    image stays available via computer_observe). Omitted or None keeps the default
+    response. Result image budget (REM-A H7): the outbound image is kept under
+    ``CORTEX_RESULT_IMAGE_MAX_KB`` (default 180 KB; oversized PNG re-encodes as JPEG
+    outbound only — internal captures stay PNG). Executed responses return MCP
+    content blocks (TextContent result JSON + ImageContent post-action screenshot,
+    parity with computer_observe); error/rejection/approval shapes stay plain dicts.
 
     Queued actions (PERF-004, trailing optional): ``follow_ups`` is a list of at most 5
     action specs (same fields as this tool's action parameters, e.g.
     {"action": "click", "x": 10, "y": 20, "expected_effect": "..."}). Each follow-up
     passes the FULL independent pipeline (validate -> safety -> approval semantics ->
     execute -> verify) exactly like a single action — zero bypass; the queue stops at
-    the first verification failure, safety rejection, approval requirement, or
-    post-action digest surprise (the screen changed since the queued premise was
-    captured). Batch small related groups and end the batch with an observation.
+    the first DEFINITIVE verification failure, safety rejection, approval requirement,
+    or post-action digest surprise (the screen changed since the queued premise was
+    captured). An UNCERTAIN verification (no expectation stated / a non-visual
+    action pixels cannot judge) does NOT stop the queue; its per-item entry keeps
+    the honest uncertain verdict. Batch small related groups and end the batch with
+    an observation.
     Per-item results arrive in the additive ``follow_up_results`` field (bounded, no
     per-item screenshots) with ``follow_ups_stopped_reason`` (None = all verified).
     """
@@ -1102,9 +1534,15 @@ async def computer_execute(
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
     if follow_ups is not None:
-        if not isinstance(follow_ups, list) or any(
-            not isinstance(item, dict) for item in follow_ups
-        ):
+        # REM-F: normalize the tolerant shapes for DIRECT callers too (the boundary
+        # coercion already produced list[dict] for MCP callers — idempotent here:
+        # a list[dict] passes through unchanged; JSON strings parse; a dict wraps).
+        try:
+            follow_ups = _coerce_tolerant_follow_ups(follow_ups)
+        except ValueError as exc:
+            return _teaching_invalid_action(exc, action)
+        assert isinstance(follow_ups, list)
+        if any(not isinstance(item, dict) for item in follow_ups):
             return _teaching_invalid_action(
                 ValueError("follow_ups must be a list of action-spec objects."), action
             )
@@ -1129,13 +1567,15 @@ async def computer_execute(
             expected_effect=expected_effect,
             target=target,
         )
-    except Exception as exc:  # noqa: BLE001 - unknown action type: fail closed, no crash
+    except Exception as exc:  # noqa: BLE001 - structured error, no traceback
         return _teaching_invalid_action(exc, action)
     specs: list[ActionSpec] = []
     if follow_ups:
         for item in follow_ups:
             try:
-                specs.append(ActionSpec.model_validate(item))
+                # REM-F: tolerate the same weak-model coordinate shapes inside
+                # entries; every strict ActionSpec bound still applies afterwards.
+                specs.append(ActionSpec.model_validate(_coerce_follow_up_entry(item)))
             except Exception as exc:  # noqa: BLE001 - malformed queue item: fail closed
                 return _teaching_invalid_action(exc, str(item.get("action", "")))
     try:
@@ -1185,7 +1625,7 @@ async def computer_execute(
     # PERF-004 C4: host-payload opt-out (additive, off by default) — omit the heavy
     # image from the response entirely when the caller asked for it.
     if include_screenshot_after is False:
-        response.pop("screenshot_after_base64", None)
+        response.pop("screenshot_after_base64", None)  # also covers any nested path (H5)
     # PERF-004 C7: additive queue bookkeeping on every response shape.
     if outcome.follow_up_results is not None:
         response["follow_up_results"] = [
@@ -1196,6 +1636,15 @@ async def computer_execute(
     # payloads the driver parses per DRIVER-PROTOCOL.md).
     if outcome.interference_events:
         response["interference_events"] = list(outcome.interference_events)
+    # REM-A H3 (master-mission Phase 2): EXECUTED responses return MCP content blocks
+    # in parity with computer_observe — a slim TextContent (result JSON without the
+    # image blob; queue entries never carry image bytes) plus one ImageContent with
+    # the post-action screenshot under the CORTEX_RESULT_IMAGE_MAX_KB budget (H7).
+    # Error/rejection/approval shapes have no image key and stay plain dicts.
+    # include_screenshot_after=False was applied above, so the opt-out never enters
+    # this branch (H5: no ImageContent, and none nested in follow_up_results).
+    if outcome.kind == "executed" and "screenshot_after_base64" in response:
+        return _execute_response_blocks(response)
     return response
 
 
@@ -1303,7 +1752,7 @@ async def run_goal(
 def create_subtask(
     session_id: str,
     description: str,
-    depends_on: list[str] | None = None,
+    depends_on: Annotated[list[str] | None, _PLAIN_NULLABLE_STRING_ARRAY] = None,
 ) -> dict[str, object]:
     """Create one manual subtask (spec section 9); fail-closed on invalid graphs.
 

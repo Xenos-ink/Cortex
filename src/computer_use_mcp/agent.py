@@ -78,10 +78,12 @@ PERF-004 loop-economics doctrines (additive; no gate, guarantee, or audit is rem
 - **Queued host actions (C7)**: ``run_single`` accepts trailing-optional
   ``follow_ups`` (max :data:`~computer_use_mcp.models.MAX_FOLLOW_UPS`). Every queue
   item passes the FULL independent pipeline exactly like a single action; the queue
-  stops at the first verification failure, safety rejection, approval requirement, or
-  post-action DIGEST SURPRISE (a queued item's staleness probe shows the screen
-  changed since the premise it was grounded from — speculative actions never run
-  against a screen nobody has seen).
+  stops at the first DEFINITIVE verification failure, safety rejection, approval
+  requirement, or post-action DIGEST SURPRISE (a queued item's staleness probe shows
+  the screen changed since the premise it was grounded from — speculative actions
+  never run against a screen nobody has seen). An UNCERTAIN verification does not
+  stop the queue (REM-B: uncertain is not failure) but is reported honestly per
+  item.
 """
 
 from __future__ import annotations
@@ -145,6 +147,7 @@ def _process_matches_pattern(candidate: str, pattern: str) -> bool:
     normalize = lambda value: value.strip().casefold().removesuffix(".exe")
     return normalize(candidate) == normalize(pattern)
 from .verification import (
+    FOCUS_CHANGE_INTENT_FLAG,
     ScreenshotDiffStrategy,
     VerificationEngine,
     VerificationIntent,
@@ -400,9 +403,11 @@ class ComputerUseAgent:
     def _ensure_app_allow_launch(self, action: GroundedAction) -> bool:
         """Whether THIS ensure_app may spawn a process (T8 mechanism ii policy gate).
 
-        Server-side launching requires the explicit ``attach_or_launch.launch="server"``
-        policy AND — when a process allowlist is configured — the target process being
-        allowlisted. The default policy (``launch="driver"``) NEVER launches.
+        Server-side launching requires the ``attach_or_launch.launch="server"`` policy
+        (the REM-B DEFAULT — an explicitly requested ``launch="driver"`` policy or the
+        ``CORTEX_ATTACH_OR_LAUNCH=driver`` env knob restores the old never-launch
+        default) AND — when a process allowlist is configured — the target process
+        being allowlisted. Approval semantics, StopToken, and limits are unchanged.
         """
         if action.action is not ActionType.ENSURE_APP:
             return False
@@ -761,6 +766,31 @@ class ComputerUseAgent:
             process_name = process_name or effect
         elif kind == VerificationKind.VISUAL_CHANGE.value and effect:
             expected_change = True
+            # REM-B (H2c): a CLICK/DOUBLE_CLICK with a stated effect is a
+            # focus-type expectation ("Hex input focused", "Edit colors dialog
+            # opens") far more often than a pixel-threshold one — focusing a field
+            # or opening a dialog sits BELOW the pixel-diff thresholds. Flag the
+            # intent so the deterministic FocusChangeStrategy tier (UIA focused
+            # element / window identity / digest) runs BEFORE the pixel-diff
+            # definitive failure. Other visual-change intents are untouched.
+            if action.action in {ActionType.CLICK, ActionType.DOUBLE_CLICK}:
+                metadata: dict[str, Any] = {
+                    "action_id": action.action_id,
+                    "verification_hint": hint,
+                    FOCUS_CHANGE_INTENT_FLAG: True,
+                }
+                return VerificationIntent(
+                    kind=kind,
+                    expected_text=expected_text,
+                    expected_window_title=window_title,
+                    window_title_match=window_title_match,
+                    expected_process_name=process_name,
+                    expected_change=expected_change,
+                    expected_effect=effect,
+                    predicate=predicate,
+                    predicate_name=predicate_name,
+                    metadata=metadata,
+                )
         return VerificationIntent(
             kind=kind,
             expected_text=expected_text,
@@ -915,8 +945,12 @@ class ComputerUseAgent:
                 observation_id=after.observation_id,
             )
         try:
-            before_b64 = _image_to_base64(ScreenshotDiffStrategy._decode(before.image_base64))
-            after_b64 = _image_to_base64(ScreenshotDiffStrategy._decode(after.image_base64))
+            # H1 (master-mission Phase 2 / REM-A): the observations already carry
+            # PNG base64 — reuse those encoded bytes verbatim instead of the old
+            # redundant decode -> PIL -> re-encode roundtrip. No verification-semantics
+            # change: the judge receives the same image bytes as before.
+            before_b64 = before.image_base64
+            after_b64 = after.image_base64
             raw = judge(before_b64, after_b64, intent.expected_effect or "")
             if inspect.isawaitable(raw):
                 raw = await raw
@@ -1976,9 +2010,12 @@ class ComputerUseAgent:
         :data:`~computer_use_mcp.models.MAX_FOLLOW_UPS` additional actions after the
         primary action. Each queue item passes the FULL independent pipeline
         (ground -> validate -> safety -> approval semantics -> execute -> verify)
-        exactly like a single action; the queue stops at the first verification
-        failure, safety rejection, approval requirement, or post-action digest
-        surprise. Every executed action emits its own audit events. ``approved``
+        exactly like a single action; the queue stops at the first DEFINITIVE
+        verification failure, safety rejection, approval requirement, or
+        post-action digest surprise. An UNCERTAIN verification (no expectation
+        stated / a non-visual action pixels cannot judge) does NOT stop the queue
+        (REM-B H2b) — its per-item entry keeps the honest uncertain verdict.
+        Every executed action emits its own audit events. ``approved``
         applies to every item (the safety policy evaluates each independently).
         """
         if follow_ups:
@@ -2005,8 +2042,13 @@ class ComputerUseAgent:
         SAFETY MANDATE — zero bypass: every item runs the complete independent pipeline
         (no state is shared between items except the fresh post-action observation that
         becomes the next item's grounding source — the observe-reuse doctrine). Stops:
-        first verification failure (``result.ok is False``), safety rejection, approval
-        requirement, validator rejection, digest surprise, stop token, or limit trip.
+        named interference stops (modal dialog / focus drift), safety rejection,
+        approval requirement, validator rejection, digest surprise, stop token, limit
+        trip, DEFINITIVE verification failure (``result.ok is False`` with a failed
+        verdict), or a missing post-action observation. REM-B (H2b): an item whose
+        verification is UNCERTAIN (no expectation stated / non-visual action the diff
+        cannot judge) does NOT stop the queue — uncertain is not failure — but its
+        per-item result keeps the honest uncertain verdict and ``ok=False``.
         """
         queue_items: list[tuple[GroundedAction, str | None]] = [(action, expected_effect)]
         for spec in follow_ups:
@@ -2051,7 +2093,25 @@ class ComputerUseAgent:
             if named_stop is not None:
                 stopped_reason = named_stop
                 break
-            if outcome.kind != "executed" or outcome.result is None or not outcome.result.ok:
+            # REM-B (H2b queue-stop softening): an UNCERTAIN verification is not a
+            # failure — the logged ctrl+a/hotkey keystrokes were flushed purely
+            # because "no expectation stated" verdicts set ok=False. The queue now
+            # CONTINUES past an item whose verification outcome is "uncertain" (no
+            # expectation stated / a non-visual action the screenshot diff cannot
+            # judge); every honest stop remains: non-executed kinds, DEFINITIVE
+            # verification failures, safety rejections, approval requirements,
+            # digest surprises, and the no-post-observation guard below. Per-item
+            # results keep their own truthful verdict (ok=False + uncertain).
+            if outcome.kind != "executed" or outcome.result is None:
+                stopped_reason = (
+                    self._interference_stop_reason(outcome)
+                    or (outcome.kind if outcome.kind != "executed" else "verification_failed")
+                )
+                break
+            item_verification = outcome.result.verification
+            if not outcome.result.ok and not (
+                item_verification is not None and item_verification.outcome == "uncertain"
+            ):
                 stopped_reason = (
                     self._interference_stop_reason(outcome)
                     or (outcome.kind if outcome.kind != "executed" else "verification_failed")
@@ -2101,7 +2161,14 @@ class ComputerUseAgent:
 
     @staticmethod
     def _queue_entry(index: int, action: GroundedAction, outcome: SingleActionOutcome) -> dict[str, Any]:
-        """Bounded per-item queue result (heavy payloads stripped; redaction at the sink)."""
+        """Slim bounded per-item queue result (redaction at the sink).
+
+        REM-A H5/H6 (master-mission Phase 2): queue entries carry ONLY the per-item
+        essentials (ok, action identity, verification outcome/note, confidences) —
+        never screenshot bytes in ANY form (nested or otherwise) and never a second
+        copy of the top-level payload blobs: the primary action's full result rides
+        the top-level response payload exactly once.
+        """
         result = outcome.result
         entry: dict[str, Any] = {
             "index": index,
@@ -2116,11 +2183,9 @@ class ComputerUseAgent:
             "grounding_confidence": outcome.grounding_confidence,
             "verification_confidence": outcome.verification_confidence,
         }
-        if result is not None and index == 0:
-            # The primary action's full result rides on the legacy response payload.
-            entry["result"] = result
         if result is not None and result.verification is not None:
             entry["verification_outcome"] = result.verification.outcome
+            entry["verification_note"] = result.verification.note[:200]
         return entry
 
     async def _run_single_pipeline(

@@ -68,7 +68,16 @@ def test_defaults_match_a12_policy_table() -> None:
     assert policy.focus_guard.on_identity_unknown == "abort"
 
     assert policy.attach_or_launch.enabled is True
-    assert policy.attach_or_launch.launch == "driver"
+    # REM-B (H2a): the launch default flipped driver -> server so ensure_app can
+    # bootstrap control (target still allowlist-gated on the agent). The env knob
+    # CORTEX_ATTACH_OR_LAUNCH=driver restores the old default for legacy hosts.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.delenv("CORTEX_ATTACH_OR_LAUNCH", raising=False)
+    try:
+        policy = parse_interference(None)
+        assert policy.attach_or_launch.launch == "server"
+    finally:
+        monkeypatch.undo()
 
     assert policy.dialog_sentinel.enabled is True
     assert policy.dialog_sentinel.policy == "halt"
@@ -96,8 +105,9 @@ def test_parse_round_trip_and_partial_overrides() -> None:
     assert policy.dialog_sentinel.policy == "report"
     assert policy.dialog_sentinel.title_table == ["save as", "overwrite?"]
     assert policy.hotkey_guard.on_stuck_modifier == "release"
-    # Untouched sections keep their protective defaults.
-    assert policy.attach_or_launch.launch == "driver"
+    # Untouched sections keep their protective defaults (REM-B: launch default is
+    # server — see test_defaults_match_a12_policy_table for the flip rationale).
+    assert policy.attach_or_launch.launch == "server"
     assert policy.focus_continuity.on_drift == "abort"
 
 

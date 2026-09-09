@@ -50,6 +50,8 @@ import io
 import os
 import platform
 import re
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -464,6 +466,47 @@ class FocusDriftError(BackendError):
     further chunks are dispatched — text must never land in a foreign field). Carries
     the FOCUS_DRIFTED event payload for the controller to surface verbatim.
     """
+
+
+class LaunchTargetError(BackendError):
+    """An ``ensure_app`` launch target (process needle) failed launch validation.
+
+    REM-C (V-2 F3/B7.b): ``_launch_process`` once spawned the needle through
+    ``subprocess.Popen([needle], shell=True)``, handing a quote-breakout needle
+    (``x" & victim.bat``) to cmd.exe. Validation now runs BEFORE any spawn and
+    rejects everything outside ``^[A-Za-z0-9._ -]+`` (no path separators, colons,
+    quotes, or cmd.exe metacharacters) — a hostile target never reaches a process
+    and surfaces as ``launch_rejected=LaunchTargetError`` in the NO_INSTANCE
+    payload instead of spawning.
+    """
+
+    def __init__(self, needle: str) -> None:
+        self.needle = needle
+        super().__init__(
+            f"launch target {needle!r} failed validation; only process-name "
+            "characters [A-Za-z0-9._ -] are allowed (no paths, quotes, or "
+            "shell metacharacters)"
+        )
+
+
+#: REM-C (V-2 F3): the launch-needle allowlist — alphanumerics, dot, underscore,
+#: space, hyphen ONLY. Everything else (path separators ``/`` ``\\``, ``:`` drive
+#: syntax, quotes, cmd.exe metacharacters ``& | > < % ^ ( ) ; , = ! @ # $ * + ? [ ] { } ` ~``
+#: and other punctuation) is a typed rejection BEFORE anything spawns.
+LAUNCH_NEEDLE_PATTERN = re.compile(r"^[A-Za-z0-9._ -]+$")
+
+
+def validate_launch_needle(needle: str) -> str:
+    """Validate an ``ensure_app`` launch needle; return it unchanged when valid.
+
+    Accepts exactly the process-name charset ``^[A-Za-z0-9._ -]+$`` (alphanumerics,
+    dot, underscore, space, hyphen) so no path, quote, or cmd.exe metacharacter can
+    ride through to a spawn; anything else raises :class:`LaunchTargetError`
+    (fail-closed, before any process is created).
+    """
+    if not isinstance(needle, str) or not LAUNCH_NEEDLE_PATTERN.match(needle):
+        raise LaunchTargetError(needle if isinstance(needle, str) else repr(needle))
+    return needle
 
 
 class AppWindowCandidate:
@@ -2933,7 +2976,12 @@ class LocalComputerBackend(ComputerBackend):
         if not candidates:
             payload = format_no_instance(target, "server" if allow_launch else "driver")
             if allow_launch:
-                launched = self._launch_process(process_needle)
+                # REM-C (V-2 F3): a typed needle rejection folds into the NO_INSTANCE
+                # payload — nothing is spawned, ``launched=`` stays absent.
+                try:
+                    launched = self._launch_process(process_needle)
+                except LaunchTargetError:
+                    return f"{payload} launch_rejected=LaunchTargetError"
                 if launched:
                     payload = f"{payload} launched={launched}"
             return payload
@@ -2956,11 +3004,51 @@ class LocalComputerBackend(ComputerBackend):
         return format_ambiguous_instance(candidates)
 
     def _launch_process(self, process_needle: str) -> str | None:
-        """Best-effort shell launch of an explicitly-authorized process; never raises."""
-        try:
-            import subprocess
+        """Best-effort direct launch of an explicitly-authorized process.
 
-            subprocess.Popen([process_needle], shell=True)
+        REM-C (V-2 F3/B7.b) hardening:
+
+        - the needle is validated FIRST (:func:`validate_launch_needle`,
+          ``^[A-Za-z0-9._ -]+$`` only) — an invalid needle raises
+          :class:`LaunchTargetError` BEFORE any spawn (nothing is created);
+        - the validated needle is resolved via ``shutil.which`` and spawned as a
+          plain one-element argv with ``shell=False`` (the cmd.exe quote-breakout
+          surface is gone);
+        - any soft failure (``FileNotFoundError`` etc.) keeps the REM-B contract:
+          ``None`` (payload degrade), never an exception — only an INVALID needle
+          is a typed rejection.
+
+        REM-E (live-test gap, Store execution aliases): on this machine Paint and
+        other Microsoft Store apps are reachable ONLY through the execution-alias
+        reparse point under ``%LOCALAPPDATA%\\Microsoft\\WindowsApps\\<name>``
+        (``shutil.which`` returns None for the bare name — the alias dir is not on
+        the resolved PATH as a normal executable — and a raw-name Popen raises
+        FileNotFoundError, so the launch degraded to the NO_INSTANCE probe with
+        nothing spawned). The alias is now tried BETWEEN ``which`` and the
+        raw-name fallback: order is (1) ``shutil.which(needle)``; (2) the Store
+        alias path when it EXISTS under ``%LOCALAPPDATA%`` (alias resolution runs
+        only on win32); (3) the raw-name fallback (Windows CreateProcess PATH
+        search) unchanged. The needle is already charset-validated by then, so
+        the alias join can never smuggle a path or metacharacter; launching
+        through the alias stays a plain ``shell=False`` Popen on the alias path.
+        """
+        process_needle = validate_launch_needle(process_needle)  # raises before any spawn
+        resolved = shutil.which(process_needle)
+        spawn_target = resolved if resolved else process_needle
+        if resolved is None and IS_WINDOWS:
+            # REM-E: Windows Store execution alias (%LOCALAPPDATA%\Microsoft\
+            # WindowsApps\<needle>) — a reparse-point symlink into WindowsApps
+            # that which() does not surface. Only the per-user alias dir is
+            # readable; C:\Program Files\WindowsApps is ACL-locked, never probed.
+            localappdata = os.environ.get("LOCALAPPDATA", "")
+            if localappdata:
+                alias_path = os.path.join(
+                    localappdata, "Microsoft", "WindowsApps", process_needle
+                )
+                if os.path.exists(alias_path):
+                    spawn_target = alias_path
+        try:
+            subprocess.Popen([spawn_target], shell=False)
             return process_needle
         except Exception:  # noqa: BLE001 - a launch failure degrades to the payload
             return None
@@ -3267,6 +3355,14 @@ class FakeComputerBackend(ComputerBackend):
         if not candidates:
             payload = format_no_instance(target, "server" if allow_launch else "driver")
             if allow_launch:
+                # REM-C (V-2 F3): same typed validation as the real backend — a
+                # hostile needle is never recorded as spawned and never reaches
+                # ``launched=`` (launch_rejected=LaunchTargetError folds into the
+                # NO_INSTANCE payload instead).
+                try:
+                    validate_launch_needle(process_needle)
+                except LaunchTargetError:
+                    return f"{payload} launch_rejected=LaunchTargetError"
                 self.launched_processes.append(process_needle)
                 payload = f"{payload} launched={process_needle}"
             return payload
