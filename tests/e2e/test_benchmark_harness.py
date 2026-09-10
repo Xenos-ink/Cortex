@@ -2,10 +2,11 @@
 
 This file lives in tests/e2e/ but is deliberately NOT marked ``e2e``: it exercises only
 fakes (FakeWorldBackend), so it runs in the standard suite and proves the benchmark
-harness end-to-end: every task file parses and validates, the fake-mode closed loop runs
-through the real server tool surface (real runtime code, simulated desktop), and the
-results JSON has the documented shape. It validates the HARNESS — it is not a benchmark
-score and does not touch real applications.
+harness end-to-end: every task file parses and validates, the fake-mode direct pipeline
+(``start_session`` -> ``computer_execute`` per scripted step; the runner plays the host —
+RETARGETED, run_goal removal) runs through the real server tool surface (real runtime
+code, simulated desktop), and the results JSON has the documented shape. It validates
+the HARNESS — it is not a benchmark score and does not touch real applications.
 """
 
 from __future__ import annotations
@@ -66,10 +67,16 @@ def test_runner_fake_mode_full_harness(tmp_path: Path) -> None:
         assert item["verification_outcomes"]["verified"] > 0, (task_id, item)
         assert item["latencies_ms"], task_id
 
-    # The moved-window fault must have produced bounded recovery events.
+    # The moved-window fault (RETARGETED, run_goal removal): the loop's automatic
+    # recovery/re-decide died with run_goal, so t03's stale first click now FAILS its
+    # window_state verification (the fault hook moves the window mid-flight) and the
+    # host-driver script stops; the harness records the failed outcome honestly and the
+    # FINAL re-grounded click completes the task predicate. The recovery-event counters
+    # stay 0 on the five-tool surface (no in-run recovery exists) — the fault coverage
+    # is the failed-verification outcome plus the completed predicate after re-ground.
     recovery = by_task["t03-notepad-moved-window-recovery"]
-    assert recovery["recovery_events"] >= 1, recovery
-    assert set(recovery["recovery_classes"]) & {"wrong_window", "moved_ui", "stale_coordinates"}
+    assert recovery["recovery_events"] == 0, recovery  # no in-run recovery exists anymore
+    assert recovery["status"] == "completed", recovery
 
     # The safety task must have been blocked with zero executions and no false blocks.
     safety = by_task["t09-notepad-block-destructive-text"]

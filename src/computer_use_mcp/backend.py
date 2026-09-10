@@ -46,18 +46,21 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import io
 import os
 import platform
 import re
 import shutil
 import subprocess
+import struct
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from PIL import Image
 
@@ -95,11 +98,36 @@ _KEYEVENTF_KEYUP = 0x02  # keybd_event flag: key release
 INPUT_BACKEND_ENV = "CORTEX_INPUT_BACKEND"  # "sendinput" (default) | "pyautogui"
 PYAUTOGUI_PAUSE_ENV = "CORTEX_PYAUTOGUI_PAUSE"  # fallback-path PAUSE (default 0.0)
 TYPE_INTERVAL_ENV = "CORTEX_TYPE_INTERVAL"  # per-chunk typing pacing (default 0.0)
-DRAG_INTERPOLATE_ENV = "CORTEX_DRAG_INTERPOLATE"  # "1" interpolates the drag stroke
+DRAG_INTERPOLATE_ENV = "CORTEX_DRAG_INTERPOLATE"  # "0" restores the minimal teleport
+# stroke on the DEFAULT engine (the interpolated stroke ships as the factory default
+# since L1-NEW-2: freehand drawing apps sample held-button mouse moves — a
+# press/teleport/release stroke paints only dots, not a continuous line)
+DRAG_STEP_PAUSE_ENV = "CORTEX_DRAG_STEP_PAUSE"  # per-segment drag pacing (seconds)
+DRAG_STEP_PIXELS_ENV = "CORTEX_DRAG_STEP_PIXELS"  # drag stroke granularity (pixels)
 PNG_OPTIMIZE_ENV = "CORTEX_PNG_OPTIMIZE"  # "1" restores optimize=True (default off)
+PNG_COMPRESS_LEVEL_ENV = "CORTEX_PNG_COMPRESS_LEVEL"  # 0..9 PIL compress_level (default: PIL 6 = today's bytes)
+INTERNAL_FRAME_REUSE_ENV = "CORTEX_INTERNAL_FRAME_REUSE"  # "0" disables R-5 frame/payload reuse (default on)
 UIA_READ_ENV = "CORTEX_UIA_READ"  # "0" disables the UIA semantic read (default on)
+# R-6 capture backend: "blt" (default) keeps the R-5 GDI/mss BitBlt pipeline;
+# "dxgi" switches the per-monitor pixel grab to Desktop Duplication (measured
+# 25.5ms vs 53ms per changed-frame capture on the mission desktop, pure ctypes,
+# no new dependency). Any DXGI failure at ANY point falls back to the mss grab
+# for that capture — the fast path can only speed things up, never reject.
+CAPTURE_BACKEND_ENV = "CORTEX_CAPTURE"  # "blt" (default) | "dxgi"
+_DXGI_ACQUIRE_TIMEOUT_MS = 8  # AcquireNextFrame wait when the desktop is idle
+# R-6 encode-skip: session-level knob. The SERVER sets this attribute True on the
+# session backend when image_delivery="text" (text-mode sessions never emit an
+# image block, so a lossless PNG payload exists only to be hashed for the digest
+# and compared for staleness — a deterministic raw-pixel key serves both cheaper).
+# CORTEX_TEXT_PNG=1 is the kill-switch: text sessions keep encoding real PNGs.
+TEXT_PNG_ENV = "CORTEX_TEXT_PNG"  # "1" forces PNG payloads even in text sessions
+# R-6 (dxgi): payload-dedupe key over the duplicated frame's packed BGRA bytes.
+_DXGI_PAYLOAD_CACHE: tuple[tuple[int, int], bytes, str] | None = None  # per-backend, see __init__
 SENDINPUT_TYPE_INTERVAL = 0.0  # batched whole-string typing: no per-char cost
 SENDINPUT_DRAG_STEP_PAUSE = 0.0  # minimal-segment drag: no per-segment cost
+SENDINPUT_DRAG_STEP_PIXELS = 0  # 0 = the coarse legacy ~40 px interpolation geometry
+_SENDINPUT_FACTORY_DRAG_STEP_PAUSE = 0.001  # L1-NEW-2 live default: ~1 ms per segment
+_SENDINPUT_FACTORY_DRAG_STEP_PIXELS = 8  # L1-NEW-2 live default: ~8 px per segment
 _SENDINPUT_CHUNK_EVENTS = 1000  # max events per SendInput call (typing chunks)
 _WHEEL_DELTA = 120
 
@@ -706,7 +734,7 @@ def _sleep_for_wait_action(total_seconds: float, stop: StopToken) -> None:
 
 
 def _drag_segment_points(
-    start: tuple[int, int], end: tuple[int, int]
+    start: tuple[int, int], end: tuple[int, int], *, step_pixels: int = 0
 ) -> list[tuple[int, int]]:
     """Interpolated stroke waypoints from ``start`` to ``end`` (inclusive).
 
@@ -714,9 +742,18 @@ def _drag_segment_points(
     ``_DRAG_MIN_SEGMENTS`` so even short drags draw a smooth stroke. The final waypoint
     is exactly ``end``. Shared by the real backend's interpolated drag mode (and the
     fake backend's simulated cursor walk, so both stroke identically).
+
+    ``step_pixels`` (L1-NEW-2) tightens the granularity when the engine asks for a
+    dense stroke — drawing apps sample held-button WM_MOUSEMOVE events, so ~40 px
+    hops leave dotted/broken lines; ``step_pixels=8`` yields ~8 px per waypoint.
+    ``step_pixels <= 0`` keeps the legacy ~40 px geometry unchanged.
     """
     distance = max(abs(end[0] - start[0]), abs(end[1] - start[1]))
-    segments = max(_DRAG_MIN_SEGMENTS, -(-distance // _DRAG_SEGMENT_PIXELS))
+    if step_pixels > 0:
+        segments = distance // step_pixels + (1 if distance % step_pixels else 0)
+    else:
+        segments = -(-distance // _DRAG_SEGMENT_PIXELS)
+    segments = max(_DRAG_MIN_SEGMENTS, segments)
     return [
         (
             round(start[0] + (end[0] - start[0]) * index / segments),
@@ -798,6 +835,34 @@ def _env_nonnegative_float(name: str, default: float) -> float:
     except ValueError:
         return default
     return value if value >= 0 else default
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """Read a positive int env value; garbage/zero/negative falls back to default."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(float(raw))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _env_int_in_range(name: str, default: int | None, low: int, high: int) -> int | None:
+    """Read an int env value clamped to ``[low, high]``; unset/garbage -> default.
+
+    R-5 helper for the PNG compress-level knob: the default (``None``) means "PIL's
+    own default" so the encoded bytes stay byte-identical unless the operator opts in.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(float(raw))
+    except ValueError:
+        return default
+    return max(low, min(high, value))
 
 
 #: Settle/gap policy between queued final-Enter-ish keystrokes (B3, T8): a terminal-key
@@ -997,13 +1062,20 @@ class InputEngine(ABC):
     (failsafe corner, blocked desktop/UIPI) and must never partially dispatch silently
     (a zero-event success is a contract violation). Pacing attributes
     (``click_interval``/``type_interval``/``drag_interpolate``/``drag_step_pause``)
-    are read by the backend to keep stroke/stop-check policy engine-agnostic.
+    are read by the backend to keep stroke/stop-check policy engine-agnostic;
+    ``drag_step_pixels`` (L1-NEW-2) additionally selects stroke granularity
+    (``0`` = legacy ~40 px geometry — additive, unset stubs are unaffected).
     """
 
     click_interval: float = 0.0
     type_interval: float = 0.0
     drag_interpolate: bool = False
     drag_step_pause: float = 0.0
+    #: L1-NEW-2: stroke granularity in pixels when the interpolated drag is on.
+    #: ``0``/``None`` = the legacy ~40 px geometry; the backend's SendInput factory
+    #: default builds the dense ~8 px stroke freehand apps need. Additive attribute —
+    #: engine stubs that never set it keep the legacy behavior unchanged.
+    drag_step_pixels: int = 0
 
     @abstractmethod
     def move(self, x: int, y: int) -> None:
@@ -1127,9 +1199,15 @@ class SendInputEngine(InputEngine):
       raises :class:`InputBlockedError` — strictly stronger than pyautogui, which
       silently swallows ``PermissionError``/``OSError`` from ``mouse_event``.
 
-    Pacing defaults are zero (batched whole-string typing, minimal drag segments);
-    ``type_interval``/``drag_step_pause``/``click_interval`` restore per-event cadence
-    when a consumer needs the paced profile. ``_dispatch`` is the injectable thunk for
+    Pacing: typing stays batched and unpaced (whole-string dispatch); the drag
+    stroke policy is ENGINE-ATTRIBUTE-driven (L1-NEW-2): a bare engine keeps the
+    legacy minimal defaults (teleport stroke, zero pause), while the backend's
+    factory builds the live default — interpolated dense drag (~8 px segments
+    with ~1 ms per-segment pacing: freehand apps sample held-button mouse moves,
+    and a teleport stroke paints dots; a 400 px line completes in ~80 ms).
+    ``CORTEX_DRAG_INTERPOLATE=0`` restores the teleport stroke on the live path.
+    ``type_interval``/``drag_step_pause``/``click_interval`` tune per-event
+    cadence. ``_dispatch`` is the injectable thunk for
     tests (mock ``backend_module._user32`` instead — the binding is read at call time).
     """
 
@@ -1141,6 +1219,7 @@ class SendInputEngine(InputEngine):
         type_interval: float = SENDINPUT_TYPE_INTERVAL,
         drag_interpolate: bool = False,
         drag_step_pause: float = SENDINPUT_DRAG_STEP_PAUSE,
+        drag_step_pixels: int = SENDINPUT_DRAG_STEP_PIXELS,
     ) -> None:
         if not IS_WINDOWS or _user32 is None:
             raise RuntimeError("SendInputEngine requires Windows.")
@@ -1149,6 +1228,7 @@ class SendInputEngine(InputEngine):
         self.type_interval = type_interval
         self.drag_interpolate = drag_interpolate
         self.drag_step_pause = drag_step_pause
+        self.drag_step_pixels = max(0, int(drag_step_pixels))
 
     # -- dispatch plumbing ---------------------------------------------------------------
 
@@ -2410,6 +2490,21 @@ class ComputerBackend(ABC):
         """Strong identity of the current foreground window; ``None`` when unavailable."""
         return None
 
+    def identity_probe(self, reference: Observation | None = None) -> Observation | None:
+        """Current screen-IDENTITY snapshot without a pixel capture (R-5 W1 guard).
+
+        Returns a lightweight Observation carrying EXACTLY the fields the validator's
+        staleness check consumes — screenshot dimensions, coordinate space/scales,
+        active-window identity, and monitor identity/bounds — with the reference's
+        image payload reused verbatim (the pixels are not part of any identity
+        dimension). ``None`` (the default for backends without the capability) means
+        "cannot probe": the caller falls back to a full validate capture exactly as
+        before. The probe NEVER fabricates identity: every field is read from the OS
+        the same way ``observe()`` reads it; anything unreadable degrades to ``None``
+        and the caller re-captures.
+        """
+        return None
+
     def is_window_alive(self, hwnd: int | None) -> bool:
         """Whether a previously bound window still exists (B6 TARGET_GONE probe).
 
@@ -2506,14 +2601,378 @@ class ComputerBackend(ABC):
         """Best-effort coordinate context when execute() runs before any observe()."""
 
 
+class _DxgiDuplicator:
+    """R-6: pure-ctypes DXGI Desktop Duplication grabber (no new dependency).
+
+    The COM plumbing (factory -> adapter -> output -> IDXGIOutput1::DuplicateOutput
+    -> D3D11 staging-texture readback) with vtable slots verified against the
+    Windows SDK 10.0.18362.0 C-interface Vtbl structs. Semantics that matter to
+    the caller:
+
+    - Desktop Duplication yields a frame ONLY when the compositor presented a
+      desktop change; on an idle desktop ``grab`` times out and returns the
+      previously read frame (which is still the current desktop image).
+    - ``grab`` NEVER raises for a timeout; any structural failure raises
+      ``OSError`` and the CALLER (LocalComputerBackend) falls back to the mss
+      BitBlt grab — the capture path is fail-open, never fail-closed.
+    - The output is a PIL RGB image, pixel-equivalent to the mss BGRX decode of
+      the same instant (verified: mean-diff 0.003 between back-to-back DXGI and
+      GDI grabs on a quiet screen; residual = in-flight animation).
+
+    The class is import-light (ctypes + struct; PIL imported lazily) and is only
+    constructed when ``CORTEX_CAPTURE=dxgi`` asked for it.
+    """
+
+    __slots__ = (
+        "width", "height", "rotation",
+        "_factory", "_adapter", "_output", "_output1", "_device", "_context",
+        "_dup", "_dupv", "_stage", "_last_img",
+    )
+
+    _DXGI_ERROR_WAIT_TIMEOUT = 0x087A0001
+    #: R-6a: the first frame of a fresh duplication composites in ~58 ms on this
+    #: hardware; the one-shot cold-start retry uses this budget (never steady-state).
+    _FIRST_FRAME_TIMEOUT_MS = 60
+
+    # IIDs from the SDK DEFINE_GUID lines (Data1 u32 LE, Data2/Data3 u16 LE).
+    _IID_IDXGIFACTORY1 = (
+        0x770AAE78.to_bytes(4, "little") + 0xF26F.to_bytes(2, "little")
+        + 0x4DBA.to_bytes(2, "little")
+        + bytes([0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87])
+    )
+    _IID_IDXGIOUTPUT1 = (
+        0x00CDDEA8.to_bytes(4, "little") + 0x939B.to_bytes(2, "little")
+        + 0x4B83.to_bytes(2, "little")
+        + bytes([0xA3, 0x40, 0xA6, 0x85, 0x22, 0x66, 0x66, 0xCC])
+    )
+    _IID_ID3D11TEXTURE2D = (
+        0x6F15AAF2.to_bytes(4, "little") + 0xD208.to_bytes(2, "little")
+        + 0x4E89.to_bytes(2, "little")
+        + bytes([0x9A, 0xB4, 0x48, 0x95, 0x35, 0xD3, 0x4F, 0x9C])
+    )
+
+    # Verified C-vtable slots (see class docstring for the provenance).
+    _SLOT_ENUM_ADAPTERS = 7      # IDXGIFactory1::EnumAdapters
+    _SLOT_ENUM_OUTPUTS = 7       # IDXGIAdapter::EnumOutputs
+    _SLOT_DUP_OUTPUT = 22        # IDXGIOutput1::DuplicateOutput
+    _DUP_GET_DESC = 7            # IDXGIOutputDuplication::GetDesc
+    _DUP_ACQUIRE = 8             # IDXGIOutputDuplication::AcquireNextFrame
+    _DUP_RELEASE_FRAME = 14      # IDXGIOutputDuplication::ReleaseFrame
+    _DEV_CREATE_TEX2D = 5        # ID3D11Device::CreateTexture2D
+    _CTX_MAP = 14                # ID3D11DeviceContext::Map
+    _CTX_UNMAP = 15              # ID3D11DeviceContext::Unmap
+    _CTX_COPY_RESOURCE = 47       # ID3D11DeviceContext::CopyResource
+    _SLOT_QI = 0
+    _SLOT_RELEASE = 2
+
+    def __init__(self, output_index: int = 0) -> None:
+        import ctypes  # local import: only the dxgi path pays for it
+
+        self._last_img = None
+        dxgi = ctypes.windll.dxgi
+        d3d11 = ctypes.windll.d3d11
+
+        def iid(raw: bytes) -> "ctypes.Array":
+            return (ctypes.c_byte * 16).from_buffer_copy(raw)
+
+        def vtbl(iface: "ctypes.c_void_p"):
+            ptr = ctypes.cast(
+                ctypes.cast(iface, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+
+            def call(slot: int, restype, argtypes, *args):
+                proto = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
+                return proto(ptr[slot])(iface, *args)
+
+            return call
+
+        factory = ctypes.c_void_p()
+        hr = dxgi.CreateDXGIFactory1(
+            ctypes.byref(iid(self._IID_IDXGIFACTORY1)), ctypes.byref(factory)
+        )
+        if hr:
+            raise OSError(f"CreateDXGIFactory1 hr=0x{hr & 0xFFFFFFFF:08X}")
+        self._factory = factory
+
+        adapter = ctypes.c_void_p()
+        hr = vtbl(factory)(
+            self._SLOT_ENUM_ADAPTERS, ctypes.HRESULT,
+            (ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)),
+            0, ctypes.byref(adapter),
+        )
+        if hr:
+            raise OSError(f"EnumAdapters hr=0x{hr & 0xFFFFFFFF:08X}")
+        self._adapter = adapter
+
+        output = ctypes.c_void_p()
+        hr = vtbl(adapter)(
+            self._SLOT_ENUM_OUTPUTS, ctypes.HRESULT,
+            (ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)),
+            output_index, ctypes.byref(output),
+        )
+        if hr:
+            raise OSError(f"EnumOutputs hr=0x{hr & 0xFFFFFFFF:08X}")
+        self._output = output
+
+        output1 = ctypes.c_void_p()
+        # R-6a FIX (dangling-IID): the IID buffer must OUTLIVE the native call.
+        # ``ctypes.byref`` returns a CArgObject and ``ctypes.cast`` copies the raw
+        # address into a c_void_p that holds NO reference to either — with the array
+        # built inline in the call expression, the array (and its byref) can be
+        # garbage-collected BEFORE the QI executes, leaving the IID pointer dangling:
+        # QI then honestly returns E_NOINTERFACE (heap-state dependent; reproduced
+        # live: first-attempt failure, immediate retry success, 8/8 fresh-process
+        # failures in one shell and 0/10 with the local bound). Binding the array to
+        # a local keeps it alive for the whole call — the same invariant every other
+        # argument in this class already satisfies via named locals.
+        iid_output1 = iid(self._IID_IDXGIOUTPUT1)
+        hr = vtbl(output)(
+            self._SLOT_QI, ctypes.HRESULT,
+            (ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.cast(ctypes.byref(iid_output1), ctypes.c_void_p),
+            ctypes.byref(output1),
+        )
+        if hr:
+            raise OSError(f"QI IDXGIOutput1 hr=0x{hr & 0xFFFFFFFF:08X}")
+        self._output1 = output1
+
+        create_device = ctypes.WINFUNCTYPE(
+            ctypes.HRESULT,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint,
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        device = ctypes.c_void_p()
+        feature_level = ctypes.c_uint()
+        context = ctypes.c_void_p()
+        # NULL adapter + D3D_DRIVER_TYPE_HARDWARE(1) + D3D11_SDK_VERSION(7)
+        hr = create_device(d3d11.D3D11CreateDevice)(
+            None, 1, None, 0, None, 0, 7,
+            ctypes.byref(device), ctypes.byref(feature_level), ctypes.byref(context),
+        )
+        if hr:
+            raise OSError(f"D3D11CreateDevice hr=0x{hr & 0xFFFFFFFF:08X}")
+        self._device = device
+        self._context = context
+
+        dup = ctypes.c_void_p()
+        hr = vtbl(output1)(
+            self._SLOT_DUP_OUTPUT, ctypes.HRESULT,
+            (ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+            device, ctypes.byref(dup),
+        )
+        if hr:
+            raise OSError(f"DuplicateOutput hr=0x{hr & 0xFFFFFFFF:08X}")
+        self._dup = dup
+        self._dupv = vtbl(dup)
+
+        # DXGI_OUTDUPL_DESC {DXGI_MODE_DESC ModeDesc(24B); Rotation(4); BOOL(4)}
+        desc = ctypes.create_string_buffer(40)
+        self._dupv(self._DUP_GET_DESC, None, (ctypes.c_void_p,),
+                   ctypes.cast(desc, ctypes.c_void_p))
+        self.width = int.from_bytes(desc.raw[0:4], "little")
+        self.height = int.from_bytes(desc.raw[4:8], "little")
+        self.rotation = int.from_bytes(desc.raw[28:32], "little")
+        if self.width <= 0 or self.height <= 0:
+            raise OSError(f"DXGI_OUTDUPL_DESC has invalid bounds {self.width}x{self.height}")
+
+        # One persistent staging (CPU-readable) texture, reused across grabs.
+        # D3D11_TEXTURE2D_DESC: Width, Height, MipLevels, ArraySize, Format,
+        # SampleCount, SampleQuality, Usage(STAGING=3), BindFlags, CPUAccess(READ),
+        # MiscFlags — 11 UINTs.
+        stage_desc = struct.pack(
+            "<11I", self.width, self.height, 1, 1, 87, 1, 0, 3, 0, 0x20000, 0
+        )
+        stage = ctypes.c_void_p()
+        # R-6a FIX (dangling-buffer): same lifetime rule as the QI IID — the packed
+        # D3D11_TEXTURE2D_DESC buffer must outlive the CreateTexture2D call.
+        stage_desc_buffer = ctypes.create_string_buffer(stage_desc)
+        hr = vtbl(device)(
+            self._DEV_CREATE_TEX2D, ctypes.HRESULT,
+            (ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.cast(stage_desc_buffer, ctypes.c_void_p),
+            None, ctypes.byref(stage),
+        )
+        if hr:
+            raise OSError(f"CreateTexture2D(staging) hr=0x{hr & 0xFFFFFFFF:08X}")
+        self._stage = stage
+
+    def grab(self, timeout_ms: int = 8):
+        """One frame as a PIL RGB Image (or the last frame on an idle timeout).
+
+        Raises OSError on any structural failure (device lost, access revoked,
+        session lock); the backend then falls back to the mss grab. Never
+        returns None after the first successful read.
+
+        R-6a first-frame guarantee: a freshly created duplication ALWAYS holds the
+        current desktop image, but the first ``AcquireNextFrame`` needs ~58 ms of
+        DWM composition on this hardware — a short timeout would starve every
+        capture on a quiet desktop until some app animates. When the acquire times
+        out and no frame has ever been read, ONE retry runs with the longer
+        ``_FIRST_FRAME_TIMEOUT_MS`` budget (bounded to the cold start; steady-state
+        keeps the fast 8 ms timeout and returns the cached frame on idle).
+        """
+        import ctypes
+
+        img = self._acquire(timeout_ms)
+        if img is None and self._last_img is None:
+            img = self._acquire(self._FIRST_FRAME_TIMEOUT_MS)
+        return img
+
+    def _acquire(self, timeout_ms: int):
+        import ctypes
+
+        frame_info = ctypes.create_string_buffer(64)
+        res = ctypes.c_void_p()
+        try:
+            hr = self._dupv(
+                self._DUP_ACQUIRE, ctypes.HRESULT,
+                (ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+                int(timeout_ms), ctypes.cast(frame_info, ctypes.c_void_p),
+                ctypes.byref(res),
+            )
+        except OSError as exc:
+            if exc.winerror == -2005270489:  # DXGI_ERROR_WAIT_TIMEOUT (signed form)
+                return self._last_img  # idle desktop: the last frame is current
+            raise
+        if hr:
+            code = hr & 0xFFFFFFFF
+            if code == self._DXGI_ERROR_WAIT_TIMEOUT:
+                return self._last_img
+            if code == 0x887A0026:  # DXGI_ERROR_SESSION_DISCONNECTED (e.g. lock screen)
+                raise OSError("DXGI session disconnected")
+            raise OSError(f"AcquireNextFrame hr=0x{code:08X}")
+        img = None
+        try:
+            img = self._readback(res)
+        finally:
+            self._dupv(self._DUP_RELEASE_FRAME, ctypes.HRESULT, ())
+        if img is not None:
+            self._last_img = img
+        return img
+
+    def _readback(self, res):
+        import ctypes
+
+        texture = ctypes.c_void_p()
+        # R-6a FIX (dangling-IID): local binding — see the matching comment at the
+        # IDXGIOutput1 QI. An inline from_buffer_copy inside byref-inside-cast can be
+        # collected mid-call; the dangling IID yields E_NOINTERFACE on live grabs.
+        iid_texture = (ctypes.c_byte * 16).from_buffer_copy(self._IID_ID3D11TEXTURE2D)
+        hr = _DxgiDuplicator._com_call(
+            res, self._SLOT_QI, ctypes.HRESULT,
+            (ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.cast(ctypes.byref(iid_texture), ctypes.c_void_p),
+            ctypes.byref(texture),
+        )
+        if hr:
+            raise OSError(f"QI ID3D11Texture2D hr=0x{hr & 0xFFFFFFFF:08X}")
+        ctx_call = _DxgiDuplicator._com_caller(self._context)
+        ctx_call(self._CTX_COPY_RESOURCE, None,
+                 (ctypes.c_void_p, ctypes.c_void_p), self._stage, texture)
+        mapped = ctypes.create_string_buffer(24)  # D3D11_MAPPED_SUBRESOURCE
+        hr = ctx_call(
+            self._CTX_MAP, ctypes.HRESULT,
+            (ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p),
+            self._stage, 0, 1, 0, ctypes.cast(mapped, ctypes.c_void_p),
+        )
+        if hr:
+            raise OSError(f"Map(staging) hr=0x{hr & 0xFFFFFFFF:08X}")
+        try:
+            data = int.from_bytes(mapped.raw[0:8], "little")
+            pitch = int.from_bytes(mapped.raw[8:12], "little")
+            if not data or pitch <= 0:
+                raise OSError("Map returned null data")
+            width, height = self.width, self.height
+            row = width * 4
+            view = (ctypes.c_ubyte * (pitch * height)).from_address(data)
+            if pitch == row:
+                packed = bytes(view)
+            else:
+                arr = bytearray(row * height)
+                mv = memoryview(view)
+                for y in range(height):
+                    arr[y * row:(y + 1) * row] = mv[y * pitch:y * pitch + row]
+                packed = bytes(arr)
+            img = Image.frombuffer("RGB", (width, height), packed, "raw", "BGRX", 0, 1)
+            # R-7: the packed readback is the pixel source of record for this capture —
+            # stash it on the frame so the verification diff can memcmp identical
+            # screens (equal bytes == equal pixels) instead of a full-frame diff.
+            img._frame_raw = packed  # noqa: SLF001 - private R-7 stash (see models.py)
+            return img
+        finally:
+            ctx_call(self._CTX_UNMAP, None,
+                     (ctypes.c_void_p, ctypes.c_uint), self._stage, 0)
+
+    @staticmethod
+    def _com_caller(iface):
+        import ctypes
+
+        ptr = ctypes.cast(
+            ctypes.cast(iface, ctypes.POINTER(ctypes.c_void_p))[0],
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+
+        def call(slot, restype, argtypes, *args):
+            proto = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
+            return proto(ptr[slot])(iface, *args)
+
+        return call
+
+    @staticmethod
+    def _com_call(iface, slot, restype, argtypes, *args):
+        return _DxgiDuplicator._com_caller(iface)(slot, restype, argtypes, *args)
+
+    def close(self) -> None:
+        import ctypes
+
+        for attr in ("_stage", "_dup", "_output1", "_output", "_adapter",
+                     "_context", "_device", "_factory"):
+            iface = getattr(self, attr, None)
+            if isinstance(iface, ctypes.c_void_p) and iface.value:
+                try:
+                    _DxgiDuplicator._com_call(iface, self._SLOT_RELEASE,
+                                              ctypes.c_ulong, ())
+                except Exception:
+                    pass
+                setattr(self, attr, ctypes.c_void_p())
+        self._dupv = None
+        self._last_img = None
+
+    __del__ = close
+
+
+def _raw_payload_key(raw_bgra: bytes, width: int, height: int) -> str:
+    """R-6: the deterministic fast payload for encode-skip captures (text sessions).
+
+    sha256 over the capture's raw BGRA bytes: exact pixel identity (collision-free in
+    practice; PIL determinism made the historical PNG payload equally a many-to-one
+    function of the pixels). The prefix marks the payload as a raw key, never as a
+    PNG — an accidental consumer (a decoder, a host, a log reader) fails its PNG magic
+    check loudly instead of misreading it as an image.
+    """
+    return "RAW:" + base64.b64encode(
+        hashlib.sha256(raw_bgra).digest()
+    ).decode("ascii") + f";{width}x{height}"
+
+
+def _payload_is_raw_key(payload: str) -> bool:
+    """True when the payload is the R-6 fast raw-pixel key (never a PNG)."""
+    return isinstance(payload, str) and payload.startswith("RAW:")
+
+
 class LocalComputerBackend(ComputerBackend):
     """Real Windows backend: Win32 identity/DPI/monitors + stop-checked engine input.
 
     The physical-input hot path is a pluggable :class:`InputEngine`:
 
     - ``sendinput`` (default): raw Win32 ``SendInput`` via ctypes — batched absolute
-      mouse moves/clicks, layout-proof ``KEYEVENTF_UNICODE`` typing, minimal-segment
-      drags; no per-call pacing cost (PERF-004).
+      mouse moves/clicks, layout-proof ``KEYEVENTF_UNICODE`` typing, and an
+      interpolated ~8 px drag stroke paced ~1 ms per segment (L1-NEW-2: drawing
+      apps sample held-button moves, not a press/teleport/release triplet);
+      ``CORTEX_DRAG_INTERPOLATE=0`` restores the minimal teleport stroke.
     - ``pyautogui`` (selectable fallback, ``CORTEX_INPUT_BACKEND=pyautogui``): the
       legacy path with ``PAUSE=0`` by default (``CORTEX_PYAUTOGUI_PAUSE`` restores it).
 
@@ -2531,6 +2990,7 @@ class LocalComputerBackend(ComputerBackend):
         type_interval: float | None = None,
         pyautogui_pause: float | None = None,
         drag_interpolate: bool | None = None,
+        png_compress_level: int | None = None,
     ) -> None:
         self._system = platform.system()
         if self._system != "Windows":
@@ -2555,6 +3015,55 @@ class LocalComputerBackend(ComputerBackend):
         )
         self.png_optimize: bool = (
             _env_bool(PNG_OPTIMIZE_ENV, False) if png_optimize is None else png_optimize
+        )
+        # R-5 (W6): PNG compress_level knob. The default resolves to PIL's own default
+        # (6), so the encoded bytes are IDENTICAL to the pre-R-5 pipeline unless the
+        # operator opts in (level 1 measured ~21.6 ms vs ~27 ms per 1920x1080 frame at
+        # +45% size — a pure speed/size trade for mechanical throughput).
+        self.png_compress_level: int | None = (
+            _env_int_in_range(PNG_COMPRESS_LEVEL_ENV, None, 0, 9)
+            if png_compress_level is None
+            else max(0, min(9, int(png_compress_level)))
+        )
+        # R-5 (W5): one persistent mss capture instance for the backend's life. A fresh
+        # instance per grab paid a first-BitBlt warmup every capture; a held instance
+        # keeps its DIB section allocated. Any grab failure discards the instance so
+        # the next capture gets a fresh one (fail-safe against a lost DC).
+        self._mss_capture: object | None = None
+        # R-6: capture backend selection. "dxgi" lazily constructs ONE
+        # _DxgiDuplicator for the backend's life (primary output); any failure
+        # during construction or grab permanently falls back to the mss BitBlt
+        # path (fail-open: a broken fast path may cost speed, never a capture).
+        self._capture_backend: str = (
+            "dxgi" if os.getenv(CAPTURE_BACKEND_ENV, "").strip().casefold() == "dxgi"
+            else "blt"
+        )
+        self._dxgi: _DxgiDuplicator | None = None
+        # R-6 encode-skip (session attribute; default False): True = every capture in
+        # THIS session encodes the fast raw-pixel key instead of a lossless PNG (the
+        # server sets it only for image_delivery="text" sessions, where no image block
+        # is ever emitted, so the only payload consumers are the digest and the
+        # staleness equality checks — both served by the deterministic key).
+        # ``_raw_key_enabled`` (computed below, after frame reuse resolves) is the
+        # invariant gate: True only when frame reuse is also on (the raw frame is
+        # then the pixel source of record for verification).
+        self._raw_payload_keys: bool = False
+        # R-6 (dxgi): one-entry payload cache for the duplication path, keyed by the
+        # sha256 of the packed BGRA bytes (the blt cache compares the raw bytes
+        # directly; the dxgi readback materializes its packed bytes only inside
+        # _readback, so a hash key avoids holding/comparing another 8 MB buffer).
+        self._dxgi_payload_cache: tuple[tuple[int, int], str, str] | None = None
+        # R-5 (W2/W6): internal-frame reuse — capture-time RGB frames travel with the
+        # Observation (verification diff without a PNG re-decode) and the previous
+        # capture's identical-pixel payload is reused instead of re-encoded.
+        # ``CORTEX_INTERNAL_FRAME_REUSE=0`` disables both (pure legacy path).
+        self._internal_frame_reuse: bool = _env_bool(INTERNAL_FRAME_REUSE_ENV, True)
+        self._payload_cache: tuple[tuple[int, int], Any, str] | None = None
+        # R-6 encode-skip invariant gate (see the comment at ``_raw_payload_keys``):
+        # raw keys only when frame reuse is on (the stash is the pixel source of
+        # record) AND the CORTEX_TEXT_PNG kill-switch is not set.
+        self._raw_key_enabled: bool = self._internal_frame_reuse and (
+            not _env_bool(TEXT_PNG_ENV, False)
         )
         self._uia_enabled: bool = _env_bool(UIA_READ_ENV, True) if uia_read is None else uia_read
         self._semantic_reader: UiaSemanticReader | Win32TextReader | None = None
@@ -2600,7 +3109,25 @@ class LocalComputerBackend(ComputerBackend):
             )
             engine = PyAutoGuiInputEngine(self._pyautogui, pause=pause, type_interval=interval)
         else:
-            engine = SendInputEngine(type_interval=interval)
+            # L1-NEW-2 live default: the SendInput drag stroke is interpolated
+            # (~8 px segments), paced (~1 ms each — a 400 px line ≈ 80 ms, far
+            # under the ~150 ms drag budget and the ~52 ms/action target is
+            # untouched for every other action). A bare SendInputEngine keeps the
+            # legacy minimal defaults; the FACTORY wires the dense stroke so the
+            # unit-pinned engine contract stays frozen. ``CORTEX_DRAG_INTERPOLATE=0``
+            # restores the teleport stroke (applied uniformly by the override
+            # block below); ``CORTEX_DRAG_STEP_PAUSE`` / ``CORTEX_DRAG_STEP_PIXELS``
+            # retune cadence and granularity.
+            engine = SendInputEngine(
+                type_interval=interval,
+                drag_interpolate=True,
+                drag_step_pause=_env_nonnegative_float(
+                    DRAG_STEP_PAUSE_ENV, _SENDINPUT_FACTORY_DRAG_STEP_PAUSE
+                ),
+                drag_step_pixels=_env_positive_int(
+                    DRAG_STEP_PIXELS_ENV, _SENDINPUT_FACTORY_DRAG_STEP_PIXELS
+                ),
+            )
         if drag_interpolate is not None:
             engine.drag_interpolate = drag_interpolate
         else:
@@ -2639,6 +3166,31 @@ class LocalComputerBackend(ComputerBackend):
         except Exception:  # noqa: BLE001 - any mss failure degrades to the enum path
             return None
 
+    def _mss_grab(self, region: dict[str, int]) -> Any:
+        """BitBlt one region through the backend's persistent mss instance (R-5 W5).
+
+        A held instance keeps its DIB section allocated, so steady-state grabs skip the
+        per-capture first-BitBlt warmup a fresh ``mss.MSS()`` pays. Any failure closes
+        and discards the instance (fail-safe: the next grab opens a fresh one) and the
+        exception propagates to the existing capture-failure handling.
+        """
+        capture = self._mss_capture
+        if capture is None:
+            capture = self._mss_factory()
+            self._mss_capture = capture
+        try:
+            return capture.grab(region)
+        except Exception:
+            # The instance's DC/DIB may be gone (mode change, session lock); drop it so
+            # the NEXT capture starts clean instead of persisting a dead handle.
+            try:
+                close = getattr(capture, "close", None)
+                if callable(close):
+                    close()
+            finally:
+                self._mss_capture = None
+            raise
+
     def _refresh_monitors(self) -> None:
         monitors, dpi_estimated = enumerate_monitors(
             self._mss_monitors(), per_monitor_dpi=self._per_monitor_dpi_available()
@@ -2653,6 +3205,13 @@ class LocalComputerBackend(ComputerBackend):
         ``monitor_index`` when provided. Raises ``DisplayUnavailableError`` when capture
         fails; window/cursor identity and the UIA semantic read degrade to None instead
         of failing.
+
+        R-5 (W2/W6): the capture-time RGB frame is stashed on the returned Observation
+        (private ``_frame``) and the encoded PNG payload is kept in a ONE-ENTRY cache —
+        a capture whose raw pixels are byte-identical to the previous capture's reuses
+        the previous payload (PNG encoding is deterministic, so identical pixels produce
+        identical payloads BY CONSTRUCTION; digests, staleness proofs, and pixel diffs
+        are unaffected). ``CORTEX_INTERNAL_FRAME_REUSE=0`` disables both stashes.
         """
         if self._system != "Windows":
             raise DisplayUnavailableError("Screen capture requires Windows.")
@@ -2662,7 +3221,7 @@ class LocalComputerBackend(ComputerBackend):
         left, top, width, height = monitor.bounds
         if width <= 0 or height <= 0:
             raise DisplayUnavailableError(f"Monitor {monitor.id} has invalid bounds {monitor.bounds}.")
-        encoded, image_width, image_height = self._grab_png(left, top, width, height)
+        encoded, image_width, image_height, frame = self._grab_png(left, top, width, height)
         window_info = query_foreground_window()
         verdict = classify_coordinate_space(
             image_width, image_height, monitor, dpi_estimated=self.dpi_estimated
@@ -2674,7 +3233,7 @@ class LocalComputerBackend(ComputerBackend):
             ).to_screenshot(*cursor_physical)
         self._active_context = _CaptureContext(monitor=monitor, verdict=verdict)
         ocr_text, ui_elements = self._uia_semantic_fields(monitor, verdict)
-        return Observation(
+        observation = Observation(
             image_base64=encoded,
             width=image_width,
             height=image_height,
@@ -2692,6 +3251,76 @@ class LocalComputerBackend(ComputerBackend):
             ui_elements=ui_elements,
             redactions_applied=False,
         )
+        if self._internal_frame_reuse:
+            observation._frame = frame
+            # R-7: the capture's raw pixel buffer (when the producing path holds one
+            # readback buffer per capture — dxgi packed BGRA / mss BGRX DIB) rides with
+            # the frame so the verification diff can memcmp identical screens instead
+            # of paying a full-frame diff for a guaranteed (0.0, 0). Never set on any
+            # other path (decoded/converted frames have no unique raw of record).
+            frame_raw = getattr(frame, "_frame_raw", None)
+            if frame_raw is not None:
+                observation._frame_raw = frame_raw
+            # R-5: capture-time freshness clock (the agent's validate-reuse window and
+            # the live pins read this; harmless zero for consumers that never reuse).
+            observation._captured_monotonic = time.perf_counter()
+        return observation
+
+    def identity_probe(self, reference: Observation | None = None) -> Observation | None:
+        """Current screen identity without a pixel capture (R-5 W1 staleness guard).
+
+        Reads the SAME OS identity channels ``observe()`` reads — monitor list,
+        cursor position, target-monitor selection, foreground window — and runs the
+        SAME coordinate-space classification. The reference's image payload and
+        pixel-derived metadata (``ocr_text``/``ui_elements``) are carried over: the
+        probe answers one question only ("has any identity dimension the validator
+        checks drifted since the reference capture?"), and pixels are not an identity
+        dimension. Any failure returns ``None`` (caller falls back to a full capture —
+        the probe can never weaken the staleness check, only cheapen its no-drift
+        case).
+        """
+        if self._system != "Windows" or reference is None:
+            return None
+        try:
+            self._refresh_monitors()
+            cursor_physical = get_cursor_position()
+            monitor = _select_target_monitor(
+                self._monitors, cursor_physical, reference.monitor.index if reference.monitor else None
+            )
+            left, top, width, height = monitor.bounds
+            # The reference's screenshot dimensions are re-derived from the CURRENT
+            # monitor geometry the same way observe() derives them: a display-mode
+            # change shows up as a bounds change here.
+            window_info = query_foreground_window()
+            verdict = classify_coordinate_space(
+                width, height, monitor, dpi_estimated=self.dpi_estimated
+            )
+            cursor_local: tuple[int, int] | None = None
+            if cursor_physical is not None:
+                cursor_local = CoordinateTransform(
+                    origin_x=left, origin_y=top, scale_x=verdict.scale_x, scale_y=verdict.scale_y
+                ).to_screenshot(*cursor_physical)
+            self._active_context = _CaptureContext(monitor=monitor, verdict=verdict)
+            return Observation(
+                image_base64=reference.image_base64,
+                width=width,
+                height=height,
+                active_window=reference.active_window,
+                cursor_x=cursor_local[0] if cursor_local else None,
+                cursor_y=cursor_local[1] if cursor_local else None,
+                input_width=verdict.input_width,
+                input_height=verdict.input_height,
+                coordinate_scale_x=verdict.scale_x,
+                coordinate_scale_y=verdict.scale_y,
+                coordinate_space=verdict.space,
+                monitor=monitor,
+                active_window_info=window_info,
+                ocr_text=reference.ocr_text,
+                ui_elements=reference.ui_elements,
+                redactions_applied=reference.redactions_applied,
+            )
+        except Exception:  # noqa: BLE001 - probe failure means "cannot probe"
+            return None
 
     def _uia_semantic_fields(
         self, monitor: MonitorInfo, verdict: CoordinateVerdict
@@ -2720,22 +3349,138 @@ class LocalComputerBackend(ComputerBackend):
             return (None, None)
         return (ocr_text or None, ui_elements or None)
 
-    def _grab_png(self, left: int, top: int, width: int, height: int) -> tuple[str, int, int]:
-        """Capture a monitor region and return ``(base64_png, width, height)``.
+    def _dxgi_grab(self, width: int, height: int) -> Image.Image | None:
+        """R-6: Desktop Duplication grab of the primary output; None = use mss.
+
+        The lazily-built duplicator is a singleton; ANY failure (construction,
+        device lost, session disconnect, unexpected bounds) permanently disables
+        the dxgi path for this backend instance and the caller takes the mss
+        BitBlt grab — a broken fast path degrades to the R-5 pipeline exactly,
+        never to a failed capture. The returned frame is validated against the
+        EXPECTED monitor bounds: a bounds mismatch (mode change since init,
+        duplicated output spanning monitors) also degrades to mss.
+        """
+        if self._capture_backend != "dxgi":
+            return None
+        dup = self._dxgi
+        if dup is None:
+            try:
+                dup = _DxgiDuplicator()
+            except Exception:
+                self._capture_backend = "blt"  # permanent fallback for this session
+                self._dxgi = None
+                return None
+            self._dxgi = dup
+        try:
+            frame = dup.grab(timeout_ms=_DXGI_ACQUIRE_TIMEOUT_MS)
+        except Exception:
+            # The duplication is unusable (device lost / access revoked / lock);
+            # drop it and degrade permanently to the legacy path.
+            try:
+                dup.close()
+            except Exception:
+                pass
+            self._dxgi = None
+            self._capture_backend = "blt"
+            return None
+        if frame is None or frame.size != (width, height):
+            return None
+        return frame
+
+    def _grab_png(
+        self, left: int, top: int, width: int, height: int
+    ) -> tuple[str, int, int, Image.Image]:
+        """Capture a monitor region; return ``(base64_png, width, height, rgb_frame)``.
 
         PNG encoding defaults to ``optimize=False`` (PERF-004: −201 ms/frame measured,
         and a slightly SMALLER payload on real UI content); ``CORTEX_PNG_OPTIMIZE=1``
         (or the ``png_optimize`` constructor argument) restores the old behavior.
+        ``CORTEX_PNG_COMPRESS_LEVEL`` (0..9) overrides PIL's compress level; the default
+        leaves it at PIL's own (byte-identical to the pre-R-5 pipeline).
+
+        R-5 payload cache (W2/W6): the previous capture's raw BGRA bytes and encoded
+        payload are retained; when the new capture's raw bytes are byte-identical, the
+        previous payload is reused verbatim (PNG is deterministic — identical pixels
+        encode to identical bytes, so every digest/staleness/diff consumer sees exactly
+        what a fresh encode would have produced) and the PNG encode is skipped entirely.
+        The stashed RGB frame is returned for the verification fast path (W2).
+
+        R-6 encode-skip (text sessions only, ``backend._raw_payload_keys=True`` set by
+        the server): the payload is the deterministic raw-pixel key
+        (``sha256(raw BGRA)`` + dimensions) instead of a PNG — no image block will ever
+        be emitted from it, and digest/staleness both compare bytes so the key serves
+        them exactly (distinct pixels -> distinct key; identical pixels -> identical
+        key, the property the R-5 cache relies on). The RGB frame stays stashed for
+        verification. ``CORTEX_TEXT_PNG=1`` (or reuse off) disables the raw key: PNG
+        payloads return.
         """
         try:
-            with self._mss_factory() as capture:
-                raw = capture.grab({"left": left, "top": top, "width": width, "height": height})
-            image = Image.frombytes("RGB", raw.size, raw.rgb)
+            # R-6: try Desktop Duplication first when enabled; on ANY failure or
+            # bounds mismatch the mss BitBlt grab below runs EXACTLY as before
+            # (fail-open). The DXGI path produces the same RGB frame the mss
+            # path would at the same instant (verified: mean-diff 0.003 between
+            # back-to-back DXGI and GDI grabs; residual = in-flight animation).
+            image = self._dxgi_grab(width, height)
+            raw_bgra = None
+            if image is not None:
+                raw_size = image.size
+                if self._raw_key_enabled and self._raw_payload_keys:
+                    # R-6 (dxgi): the packed BGRA readback is the pixel source; hash
+                    # it for both the key and the one-entry dxgi payload cache.
+                    dxga_key = _raw_payload_key(image.tobytes(), image.width, image.height)
+                    cached = self._dxgi_payload_cache
+                    if cached is not None and cached[0] == raw_size and cached[1] == dxga_key:
+                        encoded = cached[2]
+                    else:
+                        encoded = dxga_key
+                        self._dxgi_payload_cache = (raw_size, dxga_key, encoded)
+                    return encoded, image.width, image.height, image
+            if image is None:
+                raw = self._mss_grab({"left": left, "top": top, "width": width, "height": height})
+                raw_bgra = raw.raw
+                # R-5 (W2 decode-free frame): decode the BGRA DIB directly through PIL's
+                # BGRX raw decoder — pixel-identical to the historical ``raw.rgb`` reorder +
+                # ``frombytes`` copy (proven byte-identical PNG output) without building an
+                # intermediate 6 MB RGB bytes object per capture.
+                image = Image.frombuffer("RGB", raw.size, raw_bgra, "raw", "BGRX", 0, 1)
+                # R-7: mss's DIB bytes are the pixel source of record for this capture —
+                # same identical-screen memcmp contract as the dxgi packed readback.
+                image._frame_raw = raw_bgra  # noqa: SLF001 - private R-7 stash
+                raw_size = raw.size
         except Exception as exc:
             raise DisplayUnavailableError(f"Screen capture failed: {exc}") from exc
-        output = io.BytesIO()
-        image.save(output, format="PNG", optimize=self.png_optimize)
-        return base64.b64encode(output.getvalue()).decode("ascii"), image.width, image.height
+
+        if self._raw_key_enabled and self._raw_payload_keys:
+            # R-6 encode-skip: deterministic raw-pixel key (never a PNG; never set for
+            # image-mode sessions). Reuse-of-key semantics equal the PNG cache: the
+            # key is a pure function of the pixels.
+            encoded = _raw_payload_key(raw_bgra, raw_size[0], raw_size[1])
+            return encoded, image.width, image.height, image
+
+        encoded: str | None = None
+        if self._internal_frame_reuse and self._payload_cache is not None:
+            cached_size, cached_bytes, cached_payload = self._payload_cache
+            if (
+                raw_bgra is not None
+                and cached_size == raw_size
+                and cached_bytes == raw_bgra
+            ):
+                encoded = cached_payload
+
+        if encoded is None:
+            output = io.BytesIO()
+            if self.png_compress_level is None:
+                image.save(output, format="PNG", optimize=self.png_optimize)
+            else:
+                image.save(
+                    output, format="PNG", optimize=self.png_optimize,
+                    compress_level=self.png_compress_level,
+                )
+            encoded = base64.b64encode(output.getvalue()).decode("ascii")
+            if self._internal_frame_reuse and raw_bgra is not None:
+                self._payload_cache = (raw_size, raw_bgra, encoded)
+
+        return encoded, image.width, image.height, image
 
     def execute(
         self,
@@ -2878,14 +3623,25 @@ class LocalComputerBackend(ComputerBackend):
     def _drag_waypoints(self, start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
         """Stroke waypoints for one drag (engine-selected policy).
 
-        Minimal by default on the SendInput engine (move-press-move-release in three
-        dispatch batches); ``CORTEX_DRAG_INTERPOLATE=1`` (or ``drag_interpolate``)
-        restores the ~40 px interpolated stroke (the pyautogui fallback engine keeps it
-        by default for legacy parity). Either way the stop token is checked before every
-        segment and the button is always released.
+        Interpolated on BOTH engines' factory defaults (L1-NEW-2: a
+        press/teleport/release stroke makes freehand drawing apps draw dots —
+        Paint samples held-button mouse moves, so intermediate waypoints restore
+        a continuous stroke). Granularity is engine-driven: the SendInput
+        factory default builds ~8 px segments (``drag_step_pixels``); engines
+        that never set it (the pinned unit stubs, the pyautogui legacy parity)
+        keep the ~40 px geometry. ``CORTEX_DRAG_INTERPOLATE=0`` (or
+        ``drag_interpolate=False``) restores the minimal teleport stroke
+        (move-press-move-release in three dispatch batches). Either way the stop
+        token is checked before every segment and the button is always released.
+
+        A zero-length drag (start == end) has no stroke to walk: no waypoints,
+        just press-and-release at the spot.
         """
+        if start == end:
+            return []
         if self._engine.drag_interpolate:
-            return _drag_segment_points(start, end)
+            step_pixels = getattr(self._engine, "drag_step_pixels", 0)
+            return _drag_segment_points(start, end, step_pixels=step_pixels)
         return [end]
 
     def find_window_by_title(self, target: str) -> WindowInfo | None:

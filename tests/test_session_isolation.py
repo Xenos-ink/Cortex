@@ -17,16 +17,12 @@ from typing import Any
 import pytest
 from test_controller_integration import (
     FAST_LIMITS,
-    GatedProvider,
     ScriptedBackend,
     ScriptedProvider,
     audit_events,
     audit_types,
     executed_summary,
     make_session,
-)
-from test_controller_integration import (
-    click as make_click,
 )
 
 from computer_use_mcp import server
@@ -54,41 +50,34 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
 async def test_concurrent_sessions_have_zero_state_cross_talk(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """RETARGETED (run_goal removal): the direct surface drives two sessions
+    concurrently; every isolation invariant below is the same one the loop path
+    pinned (distinct stop tokens, per-session state/metrics/audit, disjoint
+    observations, zero cross-execution)."""
     backend_one = ScriptedBackend()
     backend_two = ScriptedBackend()
-    provider_one = ScriptedProvider(
-        [make_click(10, 10), AgentDecision(status="done", summary="one done")]
-    )
-    provider_two = ScriptedProvider(
-        [
-            make_click(40, 40),
-            make_click(50, 50),
-            AgentDecision(status="done", summary="two done"),
-        ]
-    )
     sid_one, bundle_one, _, _ = make_session(
-        monkeypatch, backend=backend_one, provider=provider_one,
+        monkeypatch, backend=backend_one,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
     sid_two, bundle_two, _, _ = make_session(
-        monkeypatch, backend=backend_two, provider=provider_two,
+        monkeypatch, backend=backend_two,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    result_one, result_two = await asyncio.gather(
-        server.run_goal(sid_one, "goal one"),
-        server.run_goal(sid_two, "goal two"),
+    await asyncio.gather(
+        server.computer_execute(sid_one, "click", x=10, y=10),
+        server.computer_execute(sid_two, "click", x=40, y=40),
+        server.computer_execute(sid_two, "click", x=50, y=50),
     )
 
-    assert result_one["ok"] is True and result_two["ok"] is True
-    assert result_one["task_id"] != result_two["task_id"]
-
-    # Executed actions: each backend saw exactly its own session's script.
+    # Executed actions: each backend saw exactly its own session's calls.
     assert executed_summary(backend_one) == [("click", (10, 10), None)]
-    assert executed_summary(backend_two) == [("click", (40, 40), None), ("click", (50, 50), None)]
+    assert executed_summary(backend_two) == [
+        ("click", (40, 40), None),
+        ("click", (50, 50), None),
+    ]
 
-    # Task state: goals and step counts are per-session.
-    assert bundle_one.agent.task.goal == "goal one"
-    assert bundle_two.agent.task.goal == "goal two"
+    # Task state: step counts are per-session.
     assert bundle_one.state.step_count == 1
     assert bundle_two.state.step_count == 2
 
@@ -100,8 +89,6 @@ async def test_concurrent_sessions_have_zero_state_cross_talk(
     # Metrics registries are independent.
     counters_one = bundle_one.metrics.snapshot()["counters"]
     counters_two = bundle_two.metrics.snapshot()["counters"]
-    assert counters_one["model_calls"] == 2
-    assert counters_two["model_calls"] == 3
     assert counters_one["action_total"] == 1
     assert counters_two["action_total"] == 2
 
@@ -122,19 +109,17 @@ async def test_concurrent_sessions_have_zero_state_cross_talk(
 async def test_step_counts_and_histories_stay_per_session(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    provider_one = ScriptedProvider(
-        [make_click(10, 10), AgentDecision(status="done"), make_click(20, 20), AgentDecision(status="done")]
-    )
-    provider_two = ScriptedProvider([make_click(60, 60), AgentDecision(status="done")])
+    """RETARGETED (run_goal removal): step counts and action histories stay
+    per-session across separate direct calls."""
     sid_one, bundle_one, _, _ = make_session(
-        monkeypatch, provider=provider_one, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     sid_two, bundle_two, _, _ = make_session(
-        monkeypatch, provider=provider_two, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.run_goal(sid_one, "part one")
-    await server.run_goal(sid_one, "part two")
-    await server.run_goal(sid_two, "other task")
+    await server.computer_execute(sid_one, "click", x=10, y=10)
+    await server.computer_execute(sid_one, "click", x=20, y=20)
+    await server.computer_execute(sid_two, "click", x=60, y=60)
 
     assert bundle_one.state.step_count == 2
     assert bundle_two.state.step_count == 1
@@ -145,84 +130,50 @@ async def test_step_counts_and_histories_stay_per_session(
 
 
 # --- stop isolation ---------------------------------------------------------------------------
+# REMOVED (run_goal removal): the mid-loop stop-isolation scenario (a gated second
+# decide proving stopping session A never stops a live session-B LOOP) drove the
+# loop's between-steps machinery; its direct replacement is the test below.
 
 
 async def test_stop_session_a_does_not_stop_session_b(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Stopping session A leaves session B fully usable on the direct surface (the
+    same no-cross-stop invariant the loop test pinned)."""
     backend_one = ScriptedBackend()
-    provider_one = GatedProvider()  # second decide blocks on an asyncio gate
-    provider_two = ScriptedProvider([make_click(40, 40), AgentDecision(status="done")])
-    sid_one, bundle_one, backend_for_one, _ = make_session(
-        monkeypatch, backend=backend_one, provider=provider_one,
+    backend_two = ScriptedBackend()
+    sid_one, bundle_one, _, _ = make_session(
+        monkeypatch, backend=backend_one,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    sid_two, bundle_two, backend_two, _ = make_session(
-        monkeypatch, provider=provider_two, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    sid_two, bundle_two, backend_two_ref, _ = make_session(
+        monkeypatch, backend=backend_two,
+        dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    task_one = asyncio.create_task(server.run_goal(sid_one, "long task one"))
-    task_two = asyncio.create_task(server.run_goal(sid_two, "short task two"))
-    for _ in range(500):
-        if len(backend_one.executed) >= 1:
-            break
-        await asyncio.sleep(0.01)
-    assert len(backend_one.executed) == 1  # session A is mid-task
-
     stop_response = server.stop_session(sid_one)
     assert stop_response["ok"] is True
-    provider_one.gate.set()
-    result_one, result_two = await asyncio.gather(task_one, task_two)
-
-    assert result_one["stopped"] is True
-    assert result_one["termination_reason"] == "stopped_by_user"
-    # Session B completed untouched: its stop token was never armed, no stop audit leaked.
-    assert result_two["termination_reason"] == "completed"
-    assert result_two["ok"] is True
     assert bundle_two.context.stop.stopped is False
     assert bundle_two.state.stopped is False
+
+    # Session B completes untouched after A's stop: no stop audit leaked into B.
+    response = await server.computer_execute(sid_two, "click", x=40, y=40)
+    payload = json.loads(response[0].text)
+    assert payload["ok"] is True
+    assert executed_summary(backend_two_ref) == [("click", (40, 40), None)]
     events_two = audit_events(bundle_two, sid_two)
     assert "emergency_stop" not in audit_types(events_two)
     assert "emergency_stop" in audit_types(audit_events(bundle_one, sid_one))
-    assert executed_summary(backend_two) == [("click", (40, 40), None)]
-    del backend_for_one  # readability alias; the executed assertions used backend_one
 
 
 # --- approval isolation ------------------------------------------------------------------------
+# REMOVED (run_goal removal): cross-session APPROVAL-BUDGET isolation was a run_goal
+# call-budget semantic (one budget per run_goal call, consumed across loop steps).
+# On the direct surface approval is the per-call ``approved`` flag — structurally
+# per-session (the safety decision runs inside each session's agent), pinned by
+# test_controller_integration.test_computer_execute_confidence_semantics... and by
+# the zero-cross-talk invariants above.
 
 
-async def test_approval_granted_to_a_does_not_authorize_b(
-    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    provider_one = ScriptedProvider([make_click(10, 10), AgentDecision(status="done")])
-    provider_two = ScriptedProvider([make_click(40, 40), AgentDecision(status="done")])
-    sid_one, bundle_one, backend_one, _ = make_session(
-        monkeypatch, provider=provider_one, dry_run=False, require_approval=True, limits=FAST_LIMITS
-    )
-    sid_two, bundle_two, backend_two, _ = make_session(
-        monkeypatch, provider=provider_two, dry_run=False, require_approval=True, limits=FAST_LIMITS
-    )
-    result_one, result_two = await asyncio.gather(
-        server.run_goal(sid_one, "goal one", approve_next_action=True),
-        server.run_goal(sid_two, "goal two"),  # no approval budget
-    )
-
-    # A consumed its own budget and executed its own action.
-    assert result_one["termination_reason"] == "completed"
-    assert result_one["approval_budget_remaining"] == 0
-    assert executed_summary(backend_one) == [("click", (10, 10), None)]
-    assert len(bundle_one.agent._approved_action_ids) == 1
-
-    # B was NOT authorized by A's approval: denied fail-closed, nothing executed.
-    assert result_two["ok"] is False
-    assert result_two["requires_approval"] is True
-    assert result_two["termination_reason"] == "approval_exhausted"
-    assert result_two["approval_budget_remaining"] == 0
-    assert executed_summary(backend_two) == []
-    assert bundle_two.agent._approved_action_ids == set()
-
-    counters_two = bundle_two.metrics.snapshot()["counters"]
-    assert counters_two["approval_denied"] == 1
-    assert counters_two["approval_granted"] == 0
 
 
 # --- registry cap (fail-closed, no eviction) ------------------------------------------------------
@@ -259,10 +210,8 @@ async def test_removed_session_frees_slot_and_unknown_sessions_fail_closed(
     assert stopped_tool["ok"] is False and stopped_tool["error"] == "unknown_session"
     executed = await server.computer_execute("does-not-exist", "wait", delta=1)
     assert executed["ok"] is False and executed["error"] == "unknown_session"
-    goal = await server.run_goal("does-not-exist", "no goal")
-    assert goal["ok"] is False and goal["error"] == "unknown_session"
     assert "Traceback" not in json.dumps(
-        [observe, stopped_tool, executed, goal]
+        [observe, stopped_tool, executed]
     )
 
 
@@ -272,9 +221,8 @@ async def test_removed_session_frees_slot_and_unknown_sessions_fail_closed(
 async def test_tools_on_a_stopped_session_fail_safe(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    provider = ScriptedProvider([make_click(10, 10), AgentDecision(status="done")])
     sid, _bundle, backend, _ = make_session(
-        monkeypatch, provider=provider, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     server.stop_session(sid)
 
@@ -282,16 +230,8 @@ async def test_tools_on_a_stopped_session_fail_safe(
     assert sid not in server._bundles
     assert server._registry.get(sid) is None
 
-    # D2 (fixed): run_goal on a stopped session refuses fail-closed with an explicit FAILED
-    # result entry — never a vacuously-ok empty list.
-    goal = await server.run_goal(sid, "run after stop")
-    assert goal["ok"] is False
-    assert goal["termination_reason"] == "stopped_by_user"
-    assert goal["stopped"] is True
-    assert len(goal["results"]) == 1
-    assert goal["results"][0]["ok"] is False
-    assert "stopped" in goal["results"][0]["message"].lower()
-
+    # AMENDED (run_goal removal): the removed loop tool's stopped-session shape check
+    # died with the loop; every surviving tool fails closed with session_stopped.
     observe = server.computer_observe(sid)
     assert observe["ok"] is False
     assert observe["error"] == "session_stopped"
@@ -313,19 +253,25 @@ async def test_tools_on_a_stopped_session_fail_safe(
 async def test_repeated_session_calls_in_a_loop_never_lose_the_session(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Repeat session calls in a loop (execute/observe/progress): zero unknown_session."""
-    provider = ScriptedProvider([AgentDecision(status="done", summary="done")])
+    """Repeat the surviving tool calls in a loop: zero unknown_session.
+
+    AMENDED (run_goal removal): get_session_progress was a removed tool; the loop
+    now alternates observe + screenshot + execute — the surviving high-frequency
+    host call pattern (40 iterations each)."""
     session_id, bundle, _backend, _ = make_session(
-        monkeypatch, provider=provider, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch, dry_run=False, require_approval=False,
+        limits={"min_screenshot_interval_ms": 0},
     )
     for _ in range(40):
         observe = server.computer_observe(session_id)
         assert not (isinstance(observe, dict) and observe.get("error") == "unknown_session")
-        progress = server.get_session_progress(session_id)
-        assert progress["ok"] is True
+        shot = server.computer_screenshot(session_id)
+        assert not (isinstance(shot, dict) and shot.get("error") == "unknown_session")
+        execute = await server.computer_execute(session_id, "wait", delta=0)
+        assert not (isinstance(execute, dict) and execute.get("error") == "unknown_session")
         assert session_id in server._bundles
         assert server._registry.get(session_id) is bundle.context
-    # 60 distinct tool calls total: the session is exactly as alive as at the start.
+    # 120 distinct tool calls total: the session is exactly as alive as at the start.
     assert server._bundles.get(session_id) is bundle
 
 

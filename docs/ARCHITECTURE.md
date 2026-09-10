@@ -3,12 +3,18 @@
 Status: production-hardening Waves 1–5 landed (including the E6 defect round D1–D10 and
 the red-team fix round F1–F7), followed by the Cortex naming pass, the DRAG action, the
 compact-change verification upgrade, and the move/hotkey/focus_window actions (full
-pipeline support, allowlist-gated focus, deterministic verification). This document
-describes the code as it exists
+pipeline support, allowlist-gated focus, deterministic verification), then the
+PERF-004 release, and finally the run_goal-removal wave (user order): the internal
+autonomous loop and its subtask-orchestration MCP tools are GONE — the server exposes
+exactly five tools (start_session, stop_session, computer_observe, computer_screenshot
+alias, computer_execute); the sealed checkpoint/resume machinery on start_session
+survives. This document describes the code as it exists
 at the open-source release HEAD; every claim is traceable to a named module under
 `src/computer_use_mcp/` (or `benchmarks/`, `tests/e2e/`) and, where noted, to the test
-suite (standard suite: **857 passed, 7 skipped** — the skips are the gated
-real-Windows E2E desktop tests; `ruff check src tests benchmarks` clean at HEAD;
+suite (standard suite: **1195 passed, 7 skipped** — count moves with the in-flight
+mission-056 tree; the skips are the gated
+real-Windows E2E desktop tests, skipped BY DEFAULT by the D6 fail-closed gate;
+`ruff check src tests benchmarks` clean at HEAD;
 observed on the reference machine). The layered rules and pinned contracts come from the
 mission architecture (master mission §5–§6); where reality differs from the plan, this
 document records reality. The Long-Running Sessions wave (an orchestration layer ABOVE the
@@ -274,8 +280,10 @@ closed with `process_identity_unavailable`).
 Bounds: `max_recovery_per_action = 2`, `max_recovery_per_task = 6` (defaults). Budget
 exhaustion → `TERMINATE_SAFELY` with the phase-mapped termination reason
 (`decide` → `provider_error`, `verify` → `failed_verification`, else
-`unrecoverable`). Recovery retries of an approved action instance do not re-consume
-the `run_goal` approval budget (bound by `action_id`, see §10). Dismiss accounting
+`unrecoverable`). (Historical note: recovery retries of an approved action instance did
+not re-consume the removed loop's approval budget — bound by `action_id`; the recovery
+machinery itself is retained for the loop-internal history but no longer reachable from
+any tool — the five-tool surface surfaces typed failures to the host instead.) Dismiss accounting
 (D6): every dismiss attempt increments `recovery_dismiss_total` and `action_total`;
 a successful dismiss also consumes action budget (`record_action`) while a failed one
 increments `action_failure` only — keeping `action_total == action_success +
@@ -361,12 +369,20 @@ failures never break the control loop (logged, swallowed).
 use by the BLOCKED_UI dismiss path (unknown counters are created dynamically).
 Latencies (bounded 1024-sample deques with
 count/avg/p50/p95/max): `observation_ms`, `model_ms`, `execution_ms`,
-`verification_ms`, `task_ms`. `run_goal` returns the full snapshot per call.
+`verification_ms`, `task_ms`. (The removed `run_goal` loop used to return the
+snapshot per call; on the five-tool surface the registry is read at the bundle seam.)
 
 ## 10. Backward-compatibility decisions (binding)
 
-1. **Tool surface**: the 6 tool names, stdio transport, and parameter positions are
-   preserved; additions are trailing optional parameters only —
+1. **Tool surface (AMENDED, run_goal-removal wave)**: the server now exposes exactly
+   FIVE tools — `start_session`, `stop_session`, `computer_observe` (+ the
+   `computer_screenshot` alias), `computer_execute`. The internal-loop family
+   (`run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`,
+   `get_session_progress`) was REMOVED by explicit user order (the internal LLM/vision
+   loop was the sole home of two confirmed defects and doubled the failure surface;
+   the host model drives every action directly). The surviving tools keep their names,
+   stdio transport, parameter positions, and response shapes; additions remain
+   trailing optional parameters only —
    `start_session(..., allowed_processes=None, limits=None)` and
    `computer_execute(..., expected_effect=None, x2=None, y2=None, target=None)` (the
    trailing `x2`/`y2` carry the drag end point; the trailing `target` carries the
@@ -383,11 +399,11 @@ count/avg/p50/p95/max): `observation_ms`, `model_ms`, `execution_ms`,
    Documented degradation: direct calls whose intent is `expected_text` with no OCR
    evidence fall back to the deterministic visual-change check; the outcome still
    comes from evidence and uncertain is never upgraded.
-3. **`run_goal` approval budget**: exactly `approval_budget = 1` per call when
-   `approve_next_action=True`. The grant is bound to the approved action *instance id*
-   (`_approved_action_ids`), so bounded recovery retries of the same instance never
-   re-consume budget; a new distinct action after exhaustion is denied fail-closed and
-   surfaces via `requires_approval: true` in the response.
+3. **`run_goal` approval budget — REMOVED with the tool**: the per-call
+   `approve_next_action=True` budget semantic died with the loop. The five-tool
+   approval surface is `computer_execute(approved=True)`: one call, one action,
+   per-call authorization (approval events are audited; a denial or a
+   `requires_approval` response never executes).
 4. **`stop_session`**: signature and return shape unchanged; now arms the thread-safe
    StopToken kill path and audits `stop` + `emergency_stop`.
 5. **Lazy provider key**: `start_session` never requires an API key. The server wraps
@@ -416,13 +432,31 @@ subsequent tool call on that session id returns `session_stopped`.
 
 **`start_session(dry_run=False, require_approval=True, max_steps=30,
 max_retries_per_action=1, min_confidence=0.70, allowed_windows=None,
-allowed_processes=None, limits=None)`**
+allowed_processes=None, limits=None, resume_from_checkpoint=None, interference=None,
+image_delivery=None)`**
 → `SessionState` dump plus `allowed_processes`, `limits` (string), `task_id`.
 Creates the registry entry, per-session audit dir, metrics, agent. PERF-004 C5
 intentional default change: `dry_run` now defaults to False (live session); the
 Session-1 forensics showed the old `dry_run=True` default silently wasted a full
 agent turn, and every dry-run result message now starts with the unmistakable banner
 `DRY-RUN (no input dispatched):`.
+D1 image delivery (trailing optional): `image_delivery` ("image" default / "text")
+fixes the session's screenshot delivery before the first image exists (param >
+env `CORTEX_IMAGE_DELIVERY` > default "image"; invalid values fail closed with
+`invalid_image_delivery` before any session is created). **Non-vision models**: a
+model that cannot view images receives text-only metadata in "text" mode — one
+`ImageContent` part in its conversation gets the whole provider request rejected
+with a 400 and the session dies permanently; the tool description therefore teaches
+judging by WHAT THE MODEL RECEIVES (text-only inputs → "text", required; unsure →
+"text" — a vision model in text mode only loses pixels, never crashes) rather than
+by model self-identity, which live evidence showed to be unreliable ("my host is
+multimodal"). The deterministic user-side mitigation is
+`CORTEX_IMAGE_DELIVERY=text` in the MCP server entry's `env` block (e.g. Kimi
+Code's `mcp.json`), recommended whenever the host's default model lacks image
+input; a vision model overrides per session via the parameter. The mode is
+deliberately not checkpointed — a resumed session is governed by its own fresh
+call. Text mode keeps internal capture, digests, pixel-diff, metrics, and audit
+byte-identical (outbound-only suppression, REM-E doctrine).
 
 **`stop_session(session_id)`**
 → `{ok, session_id, message, task_id, termination_reason}`; arms the kill path via the
@@ -437,9 +471,9 @@ weak models: window title/process, cursor, a focused-control hint when the backe
 populates `ui_elements` (omitted gracefully when absent), and changed/unchanged versus
 the session's previous observation.
 **No rate gate on this explicit client tool** (measured ~46 captures/s; every capture
-emits an audit row). The `run_goal` internal loop is the rate-gated path
-(`min_screenshot_interval_ms`, PERF-004 C2 refined semantics: fresh observations
-only — intra-step verification captures are burst-exempt but recorded);
+emits an audit row). The per-call grounding capture on `computer_execute` is the
+rate-gated path (`min_screenshot_interval_ms`, PERF-004 C2 refined semantics: fresh
+observations only — intra-call verification captures are burst-exempt but recorded);
 accepted-by-design for explicit client calls — clients wanting throttling should
 self-limit (F5).
 
@@ -508,17 +542,17 @@ The three newer actions:
   Classified `MEDIUM` (`window_focus_change`) always; verified via deterministic
   `window_state` (active-window title contains the target), never pixels.
 
-**`run_goal(session_id, goal, approve_next_action=False)`**
-→ `{ok, approval_budget_remaining, results: [ExecutionResult…], session_id, task_id,
-termination_reason, stopped, requires_approval, step_count, metrics}`. Refinements:
-`ok` is `bool(results) and all(...)` — an empty result list is NOT a success (D2);
-each result may carry `suspicious_content` (the provider's injection report for that
-action, persisted as data on the agent, capped at 200 entries, redacted at the audit
-sink — D3) and `completion_evidence: "model_declared"` whenever the result's
-verification came from the provider-done path (F3: model-asserted completion is
-labeled, never presented as an evidenced check — see §5/§4); every result payload is
-redacted on the way out (F2). If an internally-armed kill path terminated the run,
-the same bundle hygiene as `stop_session` applies before returning (F7).
+**`run_goal` — REMOVED (run_goal-removal wave, user order).** The internal closed-loop
+tool and its family (`create_subtask`, `list_subtasks`, `run_subtask`,
+`get_session_progress`) no longer exist; tools/list returns exactly the five tools.
+The loop's historical guarantees live on in the direct path: every `computer_execute`
+call runs the identical §4 pipeline (grounding, validation, risk, approval, execution,
+verification) and returns the per-action result — action record, message, verification
+outcome/evidence, redacted on the way out (F2) — directly to the host. Loop-only
+guarantees that died with the tool: the per-call approval budget (replaced by
+per-call `approved=True`), in-run bounded recovery/redecide (replaced by typed
+outcomes to the host), and `completion_evidence: "model_declared"` labeling (task
+completion is the host's decision on evidenced `verified` outcomes).
 
 **`stop_session` / registry limits**: sessions are capped (`max_sessions`, default 4);
 a refused create returns `session_limit_exceeded`.
@@ -566,24 +600,35 @@ per `start_session`; tests monkeypatch them and inspect wiring via `_get_bundle`
 
 **E2E suite** (`tests/e2e/`, E7): live-desktop tests driving REAL applications
 (Notepad, classic Calculator, Microsoft Edge on a local page) through the runtime's own
-MCP tool surface (`start_session` → `computer_observe` → `run_goal`/`computer_execute`)
-with deterministic scripted providers — no vision model, no network. 10 tests total:
+MCP tool surface (`start_session` → `computer_observe` → `computer_execute`; all E2E
+tests were RETARGETED to the five-tool surface in the run_goal-removal wave) — no
+vision model, no network. 10 tests total:
 
 | Test | What it proves |
 |---|---|
 | `test_notepad_window_identity_observation` | `WindowInfo` hwnd/pid/process/exe/class populated on real Windows (P0-G/I) |
-| `test_notepad_type_semantic_verification` | semantic typing verification (P0-A) |
-| `test_notepad_moved_window_recovery` | moved-window fault → `WRONG_WINDOW` → bounded recovery (P0-B) |
-| `test_notepad_window_switch_stale_observation` | true `STALE_OBSERVATION` rejection on window switch (P0-H) |
+| `test_notepad_type_semantic_verification` | semantic typing verification on the direct path (P0-A) |
+| `test_notepad_moved_window_verification_failure_returns_to_host` | moved-window fault → typed verification failure returned to the host (P0-B, retargeted: the loop's auto-re-decide died with run_goal) |
+| `test_notepad_window_switch_stale_observation` | foreground-switch staleness defense on the direct path (P0-H companion; the mid-flight STALE rejection is pinned hermetically in tests/test_fault_injection.py) |
 | `test_calculator_clicks_and_display_verification` | grounded clicks + display-predicate verification |
 | `test_calculator_division_precision` | precise small-target clicks, verified display value |
 | `test_browser_local_page_window_state_verification` | local page in Edge verified via window state |
 | `test_benchmark_harness.py` (3 tests, NOT e2e-marked) | benchmark runner validation in fake mode; runs in the standard suite |
 
-Gate mechanics (`tests/e2e/conftest.py`): desktop tests carry `@pytest.mark.e2e`
-(registered in conftest; pyproject untouched) and are auto-skipped unless
-`CUMCP_RUN_E2E=1`; the gate tests the marker itself (`get_closest_marker`), not path
-keywords. Per-test deadline fixture (`CUMCP_E2E_TEST_TIMEOUT`, default 240 s) instead
+Gate mechanics (`tests/e2e/conftest.py`, hardened by D6/R-8): desktop tests carry
+`@pytest.mark.e2e` (registered in conftest; pyproject untouched) and are auto-skipped
+BY DEFAULT with a LOUD reason stating the exact opt-in and the real-desktop warning;
+the gate opens only for the exact `CUMCP_RUN_E2E=1` (the pure predicate
+`e2e_real_input_enabled` — fail-closed against `true`/`yes`/`on`/`2` and every
+`E2E_*`/`REAL*`/`DESKTOP*` variable; pinned in `tests/test_r8_pins.py`), and it tests
+the marker itself (`get_closest_marker`), not path keywords. Window isolation (D6):
+every e2e app instance carries a run-unique window token (`cumcp-e2e-<pid>-<n>-<ts>`)
+— Notepad via the scratch filename, Edge via the page title, Calculator via
+PID-scoped attach — and attach goes through marker-only enumeration
+(`attach_window_by_unique_title`), so the suite can never attach to, type into, or
+close a window it did not launch itself; teardown closes exactly the launched
+instance (exact-hwnd close / pid-scoped taskkill). Per-test deadline fixture
+(`CUMCP_E2E_TEST_TIMEOUT`, default 240 s) instead
 of pytest-timeout (no new dependencies). Every desktop test writes evidence to
 `evidence/e2e/<test_name>/` (observation dumps with window identity, downscaled
 screenshots, audit excerpt, transcript, result.json) and appends to
@@ -662,10 +707,20 @@ numbers, not performance claims; scores require a real vision-provider run.
 
 ## 15. Long-Running Runtime (orchestration layer)
 
-Long-running sessions add an orchestration layer for goals too large for one `run_goal`
-call: the goal is decomposed into subtasks, and the subtasks execute sequentially — each
-through the SAME closed-loop executor of §4. Session state persists server-side between
-MCP calls; checkpoints on disk allow stop/resume.
+**STATUS (run_goal-removal wave, user order): the subtask orchestration layer's MCP
+tools were REMOVED** (`run_goal(auto_subtasks=…)`, `create_subtask`, `list_subtasks`,
+`run_subtask`, `get_session_progress`). What SURVIVES in production code and remains
+fully wired: the sealed checkpoint/resume machinery (`checkpoint_manager.py`,
+`resume_manager.py`, `context_manager.py`) and the shared `SessionBudgetTracker`
+restoration on `start_session(resume_from_checkpoint=…)` — the §15.6/§15.7 contracts
+below are live behavior; §15.2–§15.5, §15.9 epoch gates, and the subtask-execution
+machinery of §15.10–§15.12 describe the retained modules and their contracts but are no
+longer reachable from any tool (the domain modules and their tests remain; the
+checkpoint seal and budget cross-checks are pinned in tests/test_checkpoint_integrity.py
+and tests/test_subtask_domain.py). Historically the layer orchestrated goals too large
+for one call: a goal decomposed into subtasks executed sequentially through the §4
+executor; session state persisted server-side between MCP calls; checkpoints on disk
+allowed stop/resume.
 
 ### 15.1 Layering and the single-executor invariant
 
@@ -711,7 +766,7 @@ is the `set_enforcer` seam (§15.10).
 Data flow of one orchestration step:
 
 ```text
- MCP tool call (run_goal auto_subtasks / run_subtask)
+ MCP tool call (historical: run_goal auto_subtasks / run_subtask — REMOVED)
        v
  LongRunningRuntime  (orchestration only)
    |  budget.check_all() .............. shared SessionBudgetTracker (monotonic)
@@ -954,7 +1009,8 @@ second execution loop (the monitor holds no action executor and never performs a
   epoch. Nothing auto-renews; `grant()` is the only renewal path (a fresh epoch with
   reset clocks/counters). In the runtime, the only grant sources are session start and
   an explicit MCP call with `approve_next_action=True` (which also restarts the
-  unattended clock). The per-call approval budget stays exactly 1 (run_goal semantics).
+  unattended clock). (Historical: the loop's per-call approval budget was exactly 1;
+  the five-tool approval surface is per-call `approved=True` on computer_execute.)
 - **Prolonged unattended execution** (`effective_protection`, spec §12): once the session
   has run without human interaction for ≥ `PROLONGED_UNATTENDED_SECONDS = 3600` s
   (inclusive), a pure RAISE-ONLY modifier activates — `LOW` is treated as `MEDIUM`,
@@ -997,22 +1053,20 @@ there is no second executor.
 
 ### 15.12 MCP surface, bounded responses, and audit
 
-- **Tools** (§11 covers the six existing ones): `create_subtask(session_id, description,
-  depends_on=None)`, `list_subtasks(session_id)`, `run_subtask(session_id, subtask_id,
-  approve_next_action=False)`, `get_session_progress(session_id)`. Trailing-optional
-  additions follow the §10 discipline: `run_goal(..., auto_subtasks=False)` and
-  `start_session(..., resume_from_checkpoint=None)` (omitting them is byte-identical;
-  `run_goal(auto_subtasks=True)` keeps the run_goal response shape and adds
-  `planned_subtasks`, `executed_subtasks`, `replan_attempts`, `detail`, `progress`).
-- **Deterministic progress**: the percentage is computed from manager state —
-  `round(100 * completed / total, 2)`, 0.0 with zero subtasks — never invented; the
-  response carries status, counts, current subtask, elapsed seconds (from the shared
-  tracker), resource counters/limits, approval-epoch snapshot, checkpoint status, and the
-  replan budget (`replan_attempts_used` / `replan_attempts_max`).
-- **Bounded responses** (§19 discipline): orchestration result lists are capped
-  (`MAX_ORCHESTRATION_RESULTS = 200`), `detail` fields at 500 chars, list summaries at
-  300-char fields, goal echoes at 2000 chars redacted; `list_subtasks` never returns
-  result payloads or history. Typed error codes include `subtask_not_ready`
+- **Tools** — REMOVED (run_goal-removal wave): `create_subtask`, `list_subtasks`,
+  `run_subtask`, `get_session_progress` no longer exist on the surface, and
+  `run_goal(auto_subtasks=…)` died with `run_goal`. The one trailing-optional parameter
+  that survives is `start_session(..., resume_from_checkpoint=None)` (§15.6–§15.7);
+  the typed error codes below remain the domain modules' vocabulary (pinned in
+  tests/test_subtask_domain.py and tests/test_checkpoint_integrity.py).
+- **Deterministic progress** (historical, with the removed `get_session_progress`
+  tool): the percentage was computed from manager state — `round(100 * completed /
+  total, 2)`, 0.0 with zero subtasks — never invented.
+- **Bounded responses** (§19 discipline, retained in the surviving modules):
+  orchestration result lists are capped (`MAX_ORCHESTRATION_RESULTS = 200`),
+  `detail` fields at 500 chars, list summaries at 300-char fields, goal echoes at
+  2000 chars redacted; subtask list summaries never returned result payloads or
+  history. Typed error codes include `subtask_not_ready`
   (+ `unmet_dependencies`), `subtask_limit_exceeded`, `unknown_subtask`,
   `subtask_already_exists`, `invalid_subtask`, `unknown_dependency`, `self_dependency`,
   `dependency_cycle`, `invalid_transition`, `runtime_busy`, `planner_unavailable`,
@@ -1023,9 +1077,9 @@ there is no second executor.
   `resume`, `approval_epoch`, `health_check` (existing 15 types untouched; all metadata
   passes the same write-time redaction).
 - **Degradation without a key**: planner unavailability is a typed, fail-closed
-  degradation — the session stays fully usable for manual `create_subtask` (no planner
-  key needed); the context summarizer similarly falls back to its deterministic bounded
-  summary.
+  degradation — historically the session stayed usable for manual `create_subtask` (no
+  planner key needed); the context summarizer similarly falls back to its deterministic
+  bounded summary (this fallback remains live for the resumed-context path).
 
 
 ## 16. Interference Guard (T8: window binding, reattach, dialogs, focus, hotkeys)

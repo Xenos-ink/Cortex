@@ -40,9 +40,6 @@ from test_controller_integration import (
     executed_summary,
     make_session,
 )
-from test_controller_integration import (
-    click as make_click,
-)
 
 from computer_use_mcp import server
 from computer_use_mcp.models import (
@@ -139,44 +136,54 @@ def _observe_metadata(session_id: str) -> dict[str, Any]:
 async def test_run_loop_reuses_post_action_capture_as_next_loop_top(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    provider = ScriptedProvider([make_click(10, 10), make_click(20, 20), done()])
-    session_id, bundle, backend, _ = make_session(
-        monkeypatch, provider=provider, dry_run=False, require_approval=False, limits=FAST_LIMITS
-    )
-    response = await server.run_goal(session_id, "two clicks")
+    """C1 observe reuse SURVIVES the run_goal removal on the direct surface: a queued
+    action's grounding reuses the previous item's post-action capture (no new fresh
+    capture), and the reuse is audited, never silent.
 
-    assert response["termination_reason"] == "completed"
+    RETARGETED (run_goal removal): the loop's loop_top reuse died with the loop; the
+    SAME reuse mechanism lives on in the follow_ups queue (agent._run_action_queue
+    passes each post-action capture as the next item's source_observation)."""
+    session_id, bundle, backend, _ = make_session(
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    response = await server.computer_execute(
+        session_id, "click", x=10, y=10, follow_ups=[{"action": "click", "x": 20, "y": 20}]
+    )
+    payload = execute_payload(response)
+    assert payload["ok"] is True, payload
     assert len(executed_summary(backend)) == 2
-    # Step 1: loop_top + validate probe + post_action = 3 captures.
-    # Step 2: loop_top REUSED + validate probe + post_action = 2 captures.
-    # Step 3: loop_top reused, decide -> done. Total = 5 (was 7 before PERF-004).
-    counters = bundle.metrics.snapshot()["counters"]
-    assert counters["screenshot_count"] == 5
-    assert counters["observation_reuse"] == 2
+    # Queued pipeline: primary direct_request + validate + post_action, then the
+    # queued item's grounding REUSES that post-action capture (no new fresh capture):
+    # reuse events are audited, never silent.
     events = audit_events(bundle, session_id)
     reused = [
         event
         for event in events
         if event["event_type"] == "observation" and event.get("metadata", {}).get("reused")
     ]
-    assert reused  # the reuse is audited, never silent
+    assert reused, "the queue's observe reuse must be audited"
+    counters = bundle.metrics.snapshot()["counters"]
+    assert counters["observation_reuse"] >= 1
 
 
 async def test_validation_audits_digest_staleness_proof(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    provider = ScriptedProvider([make_click(10, 10), done()])
+    """Every direct-action validation audits its staleness proof (digest match).
+
+    RETARGETED (run_goal removal): the direct path drives the same digest-first
+    staleness proof the loop used to exercise."""
     session_id, bundle, _backend, _ = make_session(
-        monkeypatch, provider=provider, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.run_goal(session_id, "one click")
+    response = await server.computer_execute(session_id, "click", x=15, y=15)
+    response = execute_payload(response)
+    assert response["ok"] is True
     events = audit_events(bundle, session_id)
     validations = [event for event in events if event["event_type"] == "validation"]
     assert validations
     proofs = {event["metadata"]["staleness_proof"] for event in validations}
     assert proofs <= {"digest_match", "digest_mismatch"}
-    # Step 2 validates against the REUSED post-action capture; the flip backend's
-    # validate probe is pixel-identical to it -> the digest PROVES screen identity.
     assert "digest_match" in proofs
 
 
@@ -197,48 +204,13 @@ async def test_run_single_audits_staleness_proof(
 
 
 # --- C2: rate-gate semantics ---------------------------------------------------------------------
-
-
-async def test_gate_consults_only_fresh_observations(
-    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    provider = ScriptedProvider([make_click(10, 10), make_click(20, 20), done()])
-    session_id, bundle, _backend, _ = make_session(
-        monkeypatch, provider=provider, dry_run=False, require_approval=False,
-        limits={"min_screenshot_interval_ms": 250},
-    )
-    enforcer = bundle.enforcer
-    consultations = {"count": 0}
-    original = enforcer.can_screenshot
-
-    def counting() -> bool:
-        consultations["count"] += 1
-        return original()
-
-    monkeypatch.setattr(enforcer, "can_screenshot", counting)
-    response = await server.run_goal(session_id, "gate policy")
-
-    assert response["termination_reason"] == "completed"
-    # FRESH observations only: step 1's loop_top. Steps 2-3 loop_top are REUSED and the
-    # intra-step validate/post_action probes are burst-exempt -> never consulted.
-    assert consultations["count"] == 1
-
-
-async def test_burst_captures_still_recorded_and_paced(
-    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    provider = ScriptedProvider([make_click(10, 10), make_click(20, 20), done()])
-    session_id, bundle, _backend, _ = make_session(
-        monkeypatch, provider=provider, dry_run=False, require_approval=False,
-        limits={"min_screenshot_interval_ms": 250},
-    )
-    await server.run_goal(session_id, "burst accounting")
-    snapshot = bundle.enforcer.snapshot()
-    assert snapshot["screenshots"] == 5  # 1 gated loop_top + 4 intra-step captures
-    assert snapshot["burst_screenshots"] == 4  # validate probe + post_action per step
-    # Pacing truth: burst captures refresh the timestamp, so a FRESH capture right
-    # after would be gated (session-wide protection stays enforced and bounded).
-    assert bundle.enforcer.can_screenshot() is False
+# REMOVED (run_goal removal): the two loop-driven C2 pins (gate-consults-only-fresh-
+# observations, burst-captures-paced-through-the-loop) exercised the internal loop's
+# loop_top capture cadence and died with the loop. The SURVIVING gate semantics on the
+# direct surface are pinned by test_p5_redteam.rt3 (fresh-gate fail-closed + pacing)
+# and test_controller_integration.test_screenshot_rate_limit_trips_cleanly (the
+# host-driven observe path trips typed). Burst accounting on the direct path is
+# pinned by test_p5_redteam.test_rt3_direct_execute_path_captures_are_burst_bounded.
 
 
 # --- C3: verification ladder ----------------------------------------------------------------------
@@ -247,25 +219,60 @@ async def test_burst_captures_still_recorded_and_paced(
 async def test_deterministic_tier_skips_model_judge(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """C3 on the direct surface: a deterministic-verifiable action NEVER reaches the
+    model judge.
+
+    RETARGETED (run_goal removal): the direct path has no provider hint channel
+    (verification_hint was a loop-only envelope field), so the model-judge LADDER
+    itself is pinned below through the agent seam — same method, same tiers — and
+    this test pins the SURVIVING equivalent: a deterministic-verifiable action
+    (focus_window -> window_state) resolves verified with the judge never invoked."""
     backend = ScriptedBackend(
         active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App Window")
     )
-    provider = JudgingProvider(
-        [focus_window("App", hint="model_judge"), done()], verdict="verified"
-    )
-    session_id, bundle, _backend, _ = make_session(
+    provider = JudgingProvider([], verdict="verified")
+    session_id, _bundle, _backend, _ = make_session(
         monkeypatch, backend=backend, provider=provider, dry_run=False,
         require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.run_goal(session_id, "focus deterministically")
-    assert response["termination_reason"] == "completed"
+    response = await server.computer_execute(session_id, "focus_window", target="App")
+    response = execute_payload(response)
+    assert response["ok"] is True, response
+    assert response["verification"]["outcome"] == "verified"
+    assert response["verification"]["verification_method"] == "window_state"
     assert provider.judge_calls == 0  # the deterministic tier decided; judge skipped
-    events = audit_events(bundle, session_id)
-    verification = [event for event in events if event["event_type"] == "verification"]
-    assert any(
-        event["metadata"].get("ladder_tier") == "deterministic" and event["result"] == "verified"
-        for event in verification
+
+
+async def test_ladder_deterministic_tier_returns_before_the_judge(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C3 LADDER pin (agent seam, loop-free): a model-judge intent whose deterministic
+    criteria already reach a verdict resolves at tier "deterministic" — the judge is
+    never consulted.
+
+    RETARGETED (run_goal removal): this is the old in-loop pin moved to the agent
+    seam (``_verify_judge_ladder``), the exact method the loop used to call."""
+    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+
+    backend = ScriptedBackend(
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App Window")
     )
+    provider = JudgingProvider([], verdict="verified")
+    session_id, _bundle, _backend, _ = make_session(
+        monkeypatch, backend=backend, provider=provider, dry_run=False,
+        require_approval=False, limits=FAST_LIMITS,
+    )
+    agent = server._get_bundle(session_id).agent
+    before = backend.observe()
+    after = backend.observe()
+    intent = VerificationIntent(
+        kind=VerificationKind.MODEL_JUDGE,
+        expected_window_title="App",
+    )
+    result, tier = await agent._verify_judge_ladder(intent, before, after)
+    assert result.outcome == "verified"
+    assert tier == "deterministic"
+    assert provider.judge_calls == 0
 
 
 async def test_pixel_diff_tier_fails_judge_intent_before_judge(
@@ -293,22 +300,31 @@ async def test_pixel_diff_tier_fails_judge_intent_before_judge(
 async def test_judge_tier_runs_when_cheap_tiers_uncertain(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    provider = JudgingProvider(
-        [with_hint(make_click(10, 10, expected_change="changes"), "model_judge"), done()],
-        verdict="verified",
+    """C3 LADDER pin (agent seam, loop-free): a model-judge intent no cheap tier can
+    decide falls through to the judge tier and adopts its verdict.
+
+    RETARGETED (run_goal removal): the old in-loop pin, moved to the exact method
+    (``_verify_judge_ladder``) the loop used to call. Pixels differ (ShiftingScreen),
+    no deterministic criteria -> the judge runs ONCE and its verdict wins."""
+    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+
+    provider = JudgingProvider([], verdict="verified")
+    session_id, _bundle, _backend, _ = make_session(
+        monkeypatch, backend=ShiftingScreenBackend(), provider=provider,
+        dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    session_id, bundle, _backend, _ = make_session(
-        monkeypatch, provider=provider, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    agent = server._get_bundle(session_id).agent
+    before = agent._observe("probe_before")
+    after = agent._observe("probe_after")  # ShiftingScreenBackend: pixels differ
+    intent = VerificationIntent(
+        kind=VerificationKind.MODEL_JUDGE,
+        expected_change=True,
+        expected_effect="changes",
     )
-    response = await server.run_goal(session_id, "judge when cheap tiers abstain")
-    assert response["termination_reason"] == "completed"
+    result, tier = await agent._verify_judge_ladder(intent, before, after)
     assert provider.judge_calls == 1  # no deterministic criteria, pixels differ -> judge
-    events = audit_events(bundle, session_id)
-    verification = [event for event in events if event["event_type"] == "verification"]
-    assert any(
-        event["metadata"].get("ladder_tier") == "model_judge" and event["result"] == "verified"
-        for event in verification
-    )
+    assert tier == "model_judge"
+    assert result.outcome == "verified"
 
 
 # --- C4: host-payload opt-out ---------------------------------------------------------------------
@@ -365,19 +381,15 @@ def test_start_session_defaults_to_live_with_approval(
 async def test_dry_run_results_carry_unmistakable_banner(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    provider = ScriptedProvider([make_click(10, 10), done()])
     session_id, _bundle, backend, _ = make_session(
-        monkeypatch, provider=provider, dry_run=True, require_approval=False, limits=FAST_LIMITS
+        monkeypatch, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
     execute_response = await server.computer_execute(session_id, "wait", delta=1)
     execute_response = execute_payload(execute_response)
     assert execute_response["message"].startswith("DRY-RUN (no input dispatched):")
-    goal_response = await server.run_goal(session_id, "banner check")
-    results = goal_response["results"]
-    assert results
-    # The dry-run ACTION stub carries the banner (the provider "done" result is not a
-    # dry-run result and keeps its legacy message).
-    assert results[0]["message"].startswith("DRY-RUN (no input dispatched):")
+    # AMENDED (run_goal removal): the loop's second banner check died with the loop;
+    # the direct-surface banner above is the surviving pin (RT6 fuzz in
+    # test_p5_redteam covers 25 hostile dry-run shapes).
     assert backend.executed == []  # still a no-op
 
 
@@ -728,53 +740,29 @@ async def test_screenshot_opt_out_keeps_verification_fresh_and_diff_verified(
 async def test_starved_after_capture_routes_past_the_diff_tier(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A judge intent with a starved (self-comparison) ladder is NOT false-failed at 0.0 diff."""
+    """A judge intent with a starved (self-comparison) ladder is NOT false-failed at 0.0 diff.
 
-    class FrozenPostActionBackend(ScriptedBackend):
-        """Returns the SAME capture object for the post-action observe (starved ladder)."""
+    RETARGETED (run_goal removal): the starved-ladder guarantee is pinned at the
+    agent seam (``_verify`` with before == after, the SAME observation object) —
+    the exact starved shape the loop used to produce via a frozen post-action
+    capture. The diff tier is routed past; the judge tier decides."""
 
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self._starved = False
-            self._frozen: Any = None
-
-        def execute(self, action: Any, stop: Any = None, **kwargs: Any) -> str:
-            self._starved = True  # from now on, the post-action capture is frozen
-            return super().execute(action, stop)
-
-        def observe(self) -> Any:
-            if self._starved and self._frozen is not None:
-                return self._frozen  # the SAME observation object as the last capture
-            observation = super().observe()
-            if self._starved:
-                self._frozen = observation
-            return observation
-
-    provider = JudgingProvider(
-        [
-            # AgentDecision drops unknown kwargs (pydantic ignore): the hint must ride
-            # the pinned E4 envelope (SimpleNamespace) like the other ladder tests.
-            with_hint(
-                AgentDecision(
-                    status="action",
-                    action=GroundedAction(action="click", point={"x": 25, "y": 25}, confidence=1.0),
-                ),
-                "model_judge",
-            ),
-            AgentDecision(status="done", summary="done"),
-        ],
-        verdict="verified",
+    provider = JudgingProvider([], verdict="verified")
+    session_id, _bundle, _backend, _ = make_session(
+        monkeypatch, provider=provider, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    session_id, _bundle, backend, provider_holder = make_session(
-        monkeypatch, backend=FrozenPostActionBackend(), provider=provider,
-        dry_run=False, require_approval=False, limits=FAST_LIMITS,
+    agent = server._get_bundle(session_id).agent
+    backend = ScriptedBackend(flip=False)
+    frozen = backend.observe()  # the SAME observation object: starved self-comparison
+    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+
+    intent = VerificationIntent(
+        kind=VerificationKind.MODEL_JUDGE,
+        expected_change=True,
+        expected_effect="changes",
     )
-    _ = provider_holder
-    response = await server.run_goal(session_id, "click with a judge")
-    assert response["termination_reason"] == "completed"
-    first = response["results"][0]
+    result = await agent._verify(intent, frozen, frozen)
     # The judge tier decided (the diff tier was routed past on the self-comparison)...
     assert provider.judge_calls == 1
     # ...and the outcome is the judge's verdict — never a 0.0-diff false failure.
-    assert first["verification"]["outcome"] == "verified"
-    _ = backend
+    assert result.outcome == "verified"

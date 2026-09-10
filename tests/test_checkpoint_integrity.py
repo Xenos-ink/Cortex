@@ -1,5 +1,5 @@
 """Checkpoint integrity seal + state cross-checks (remediation of the zeroed-budget
-resume refill finding) and the tool-boundary type gates.
+resume refill finding) and the resumed-budget fail-closed runtime gate.
 
 Covers, each with a POSITIVE (legitimate values pass) and NEGATIVE (tampered value ->
 typed fail-closed refusal) case:
@@ -20,11 +20,16 @@ typed fail-closed refusal) case:
   counters (actions/model_calls = 1e9, no deterministic ceiling) resumes with counters
   EXACT and every further run fails closed with ``limit_exceeded`` — inflating counters
   grants no more work.
-- Tool boundary: ``create_subtask`` with a non-iterable (or string) ``depends_on``
-  returns the typed ``invalid_subtask`` error code instead of escaping a TypeError.
-- Dry-run budget semantics (doc note): dry-run executions consume a model call per
-  decision but advance NO step/action counters (the executor short-circuit precedes
-  ``step_count += 1``); this is why the checkpoint cross-checks use no lower bounds.
+- Tool boundary: ``SubtaskManager.create`` with a non-iterable (or string)
+  ``depends_on`` raises the typed ``InvalidSubtaskError`` instead of escaping a
+  TypeError (pinned at the domain seam in ``test_subtask_domain.py``; the MCP
+  ``create_subtask`` tool was removed with the run_goal family and its typed
+  ``invalid_subtask`` error mapping died with it).
+- Runtime overshoot defense on the five-tool surface:
+  ``start_session(resume_from_checkpoint=...)`` restores the sealed counters into the
+  live session's shared budget (``bundle.extra["long_running"].budget``), and that
+  budget fails closed (``SessionBudgetExceeded``) the moment any gated consumer runs —
+  inflating counters grants no more work.
 
 Threat model (honest scope): the seal defends against out-of-band tampering of the
 checkpoint FILE alone. An attacker who can also read/replace the per-installation key
@@ -47,7 +52,6 @@ from test_controller_integration import (
     FAST_LIMITS,
     ScriptedBackend,
     ScriptedProvider,
-    make_session,
 )
 
 from computer_use_mcp import server
@@ -57,8 +61,8 @@ from computer_use_mcp.checkpoint_manager import (
     CheckpointManager,
     CheckpointValidationError,
 )
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.models import AgentDecision, GroundedAction
+from computer_use_mcp.limits import Limits, SessionBudgetExceeded
+from computer_use_mcp.long_running import LongRunningRuntime
 from computer_use_mcp.resume_manager import ResumeManager
 from computer_use_mcp.state import SessionRegistry
 
@@ -323,89 +327,32 @@ async def test_sealed_overshoot_counters_resume_exactly_then_fail_closed_at_run_
     response = server.start_session(limits=FAST_LIMITS, resume_from_checkpoint=str(path))
     assert "error" not in response, response
     new_session_id = str(response["session_id"])
-    counters = server.get_session_progress(new_session_id)["resource_counters"]
-    assert counters["actions"] == 10**9 and counters["model_calls"] == 10**9
 
-    created = server.create_subtask(session_id=new_session_id, description="any work")
-    assert created["ok"] is True
-    attempt = await server.run_subtask(
-        session_id=new_session_id, subtask_id=created["subtask"]["subtask_id"]
-    )
-    assert attempt["ok"] is False
-    assert attempt["error"] == "limit_exceeded"
+    # Counters are restored EXACT (never reset) into the live session's shared budget.
+    bundle = server._bundles[new_session_id]
+    runtime = bundle.extra["long_running"]
+    assert isinstance(runtime, LongRunningRuntime)
+    restored = runtime.budget.snapshot()
+    assert restored["actions"] == 10**9 and restored["model_calls"] == 10**9
 
-
-# --- tool boundary: non-iterable depends_on is a typed error, never a TypeError ----------------
-
-
-def test_create_subtask_rejects_non_iterable_and_string_depends_on(
-    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    session_id, _bundle, _backend, _ = make_session(
-        monkeypatch, provider=ScriptedProvider([]), limits=FAST_LIMITS
-    )
-    for hostile in (42, 3.5, True, {"a": 1}, "not-a-list", b"bytes"):
-        response = server.create_subtask(
-            session_id=session_id, description="work", depends_on=hostile
-        )
-        assert response["ok"] is False, (hostile, response)
-        assert response["error"] == "invalid_subtask", (hostile, response)
-    assert server.list_subtasks(session_id)["total"] == 0  # nothing was created
+    # The shared budget itself fails closed with the typed error — inflated counters
+    # are DoS-only, never a bypass (RETARGETED, run_goal removal: the loop's per-run
+    # budget consumers died with run_goal; the restored session budget is the
+    # surviving gate and is exercised here at its own seam).
+    with pytest.raises(SessionBudgetExceeded):
+        runtime.budget.check_all()
 
 
-def test_create_subtask_still_accepts_valid_dependency_lists(
-    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    session_id, _bundle, _backend, _ = make_session(
-        monkeypatch, provider=ScriptedProvider([]), limits=FAST_LIMITS
-    )
-    first = server.create_subtask(session_id=session_id, description="stage one")
-    assert first["ok"] is True
-    second = server.create_subtask(
-        session_id=session_id,
-        description="stage two",
-        depends_on=[first["subtask"]["subtask_id"]],
-    )
-    assert second["ok"] is True
-    assert second["subtask"]["depends_on"] == [first["subtask"]["subtask_id"]]
-
-
-# --- dry-run budget semantics (doc note pinned as behavior) -------------------------------------
-
-
-async def test_dry_run_consumes_model_calls_but_no_step_or_action_counters(
-    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """DOC NOTE (executor semantics, unchanged): the dry-run EXECUTE short-circuit
-    returns a stub result BEFORE ``enforcer.record_action()`` and ``step_count += 1``,
-    while every DECIDE still consumes a model call. A completed dry-run subtask
-    therefore shows model_calls >= 1 with steps == 0 and actions == 0 — consumption is
-    honestly attributed per phase, and this is exactly why the checkpoint integrity
-    cross-checks use no lower bounds on steps/actions (they are not implied)."""
-    provider = ScriptedProvider(
-        [
-            AgentDecision(
-                status="action",
-                action=GroundedAction(action="click", point={"x": 1, "y": 1}, confidence=1.0),
-            ),
-            AgentDecision(status="done", summary="done"),
-        ]
-    )
-    session_id, _bundle, _backend, _ = make_session(
-        monkeypatch,
-        provider=provider,
-        limits=FAST_LIMITS,
-        require_approval=False,
-        dry_run=True,  # PERF-004 C5: the start_session default flipped to False; this
-        # test deliberately exercises the dry-run short-circuit, so it opts in.
-    )
-    created = server.create_subtask(session_id=session_id, description="dry-run work")
-    outcome = await server.run_subtask(
-        session_id=session_id, subtask_id=created["subtask"]["subtask_id"]
-    )
-    assert outcome["ok"] is True
-    assert outcome["status"] == "completed"
-    counters = server.get_session_progress(session_id)["resource_counters"]
-    assert counters["steps"] == 0
-    assert counters["actions"] == 0
-    assert counters["model_calls"] >= 2  # one per DECIDE (click + done)
+# REMOVED (run_goal removal): the MCP create_subtask tool-boundary tests (non-iterable
+# depends_on -> typed ``invalid_subtask``) died with the tool. The underlying domain rule
+# -- ``SubtaskManager.create`` raises typed ``InvalidSubtaskError`` on string/bytes/non-
+# iterable ``depends_on`` and accepts well-formed dependency lists -- is pinned at the
+# domain seam in ``test_subtask_domain.py`` (test_create_rejects_malformed_dependency_
+# shapes, test_create_rejects_unknown_dependency, test_create_cycle_defense).
+#
+# REMOVED (run_goal removal): the dry-run DECIDE/EXECUTE budget-attribution test drove
+# the loop (create_subtask -> run_subtask) and its model-call-per-decision semantics
+# were loop-only. The five-tool surface has no decide phase; the dry-run EXECUTE
+# short-circuit (no input, stub result) is pinned on the direct path in
+# test_controller_integration.py and test_resource_limits.py, and dry-run start_session
+# semantics are pinned in test_p5_redteam.py.

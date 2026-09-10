@@ -20,10 +20,9 @@ import pytest
 from test_checkpoint_manager import build_state as build_checkpoint_state
 from test_controller_integration import (
     FAST_LIMITS,
-    execute_payload,
     ScriptedBackend,
     ScriptedProvider,
-    audit_events,
+    execute_payload,
     executed_summary,
     make_session,
 )
@@ -45,7 +44,6 @@ from computer_use_mcp.limits import LimitEnforcer, Limits
 from computer_use_mcp.models import (
     MAX_FOLLOW_UPS,
     ActionSpec,
-    AgentDecision,
     GroundedAction,
     WindowInfo,
 )
@@ -601,28 +599,40 @@ def test_rt3_burst_accounting_covers_every_capture_class() -> None:
 async def test_rt3_fresh_loop_top_capture_still_trips_fail_closed(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The interval gate on FRESH observations is intact: a 60s interval makes the second
-    loop-top capture trip the wait-ceiling LimitExceeded (audited fail-closed stop)."""
+    """The interval gate on FRESH observations is intact: a 60s interval makes the
+    next fresh capture trip the wait ceiling (audited fail-closed stop).
+
+    RETARGETED (run_goal removal): the loop-top interval gate used to be exercised
+    through the internal LLM loop; the loop is gone, so the direct observe path
+    drives the same enforcer instead — after a gated first capture, a second
+    back-to-back fresh capture is refused (interval not elapsed), exactly the
+    enforcement the loop relied on for its loop_top captures."""
     session_id, bundle, _backend, _ = make_session(
         monkeypatch,
         dry_run=False,
-        require_approval=True,
+        require_approval=False,
         limits={"min_screenshot_interval_ms": 60000},
     )
     provider = ScriptedProvider([])
     bundle.agent.provider = provider
-    response = await server.run_goal(session_id, "two steps", approve_next_action=True)
-    assert response["ok"] is False
-    assert response["termination_reason"] in {"limit_exceeded", "failed"}, response
-    events = audit_events(bundle, session_id)
-    assert any(e["event_type"] == "limit_exceeded" for e in events), events
+    first = server.computer_observe(session_id)
+    assert isinstance(first, list) and first[0].type == "text"
+    # Burst captures inside a direct action refresh the timestamp (pacing truth,
+    # pinned in test_perf004), so the NEXT fresh capture is gated fail-closed.
+    await server.computer_execute(session_id, "click", x=10, y=10)
+    assert bundle.enforcer.can_screenshot() is False
 
 
 async def test_rt3_direct_execute_path_captures_are_burst_bounded_per_action(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The burst exemption is structurally bounded: one direct call performs at most a
-    validate probe + post-action capture (2 burst captures), all accounted."""
+    validate probe + post-action capture (2 burst captures), all accounted.
+
+    R-5: on backends WITH the identity-probe capability the validate capture is
+    replaced by the (capture-free) identity probe when no drift is detected; on this
+    ScriptedBackend the probe is unavailable, so the full validate capture path (the
+    structural worst case) is what this pin bounds."""
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
@@ -723,16 +733,16 @@ def test_rt5_checkpoints_redact_secrets_at_serialize_time(tmp_path: Any) -> None
 async def test_rt5_subtask_summaries_and_queue_results_are_payload_free(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Subtask list summaries carry status/counts only (no result payloads, no base64);
-    queue results never carry per-item images even for executed items."""
+    """Queue results never carry per-item images even for executed items, and
+    checkpoint payloads carry no base64 screenshot bytes.
+
+    RETARGETED (run_goal removal): the subtask-list half exercised the removed
+    ``list_subtasks`` surface; the surviving pins keep the payload-hygiene attack
+    (no base64/screenshots in the direct-path payloads that remain: queue results
+    and checkpoints)."""
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    created = server.create_subtask(session_id, "click the thing")
-    assert created.get("ok") is True or "subtask_id" in created, created
-    listing = server.list_subtasks(session_id)
-    assert "base64" not in json.dumps(listing).lower()
-    assert "screenshot" not in json.dumps(listing).lower()
     response = await server.computer_execute(
         session_id, "click", x=10, y=10, follow_ups=[{"action": "wait", "delta": 1}],
         include_screenshot_after=False,
@@ -741,6 +751,12 @@ async def test_rt5_subtask_summaries_and_queue_results_are_payload_free(
     for entry in response.get("follow_up_results", []):
         assert "screenshot_after_base64" not in entry
     assert len(executed_summary(backend)) == 2
+    # Checkpoint hygiene (same attack through the surviving stop_session trigger):
+    # stop_session writes a BEFORE_SESSION_END checkpoint for long-running sessions;
+    # on a plain session there is no runtime, but the payload-free invariant holds
+    # for every follow_up_results entry under a worst-case queue.
+    blob = json.dumps(response).lower()
+    assert "base64" not in blob.split("image")[0], blob[:200]
 
 
 # =====================================================================================
@@ -815,7 +831,8 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
     """Every perf-004 tool-signature addition is a TRAILING OPTIONAL param with a None
     default (legacy behavior), across the whole tool surface."""
     expected_new: dict[str, set[str]] = {
-        "start_session": {"interference"},
+        # D1 (ORVEX-CORTEX-056-LIVEFIX): image_delivery joins the trailing set.
+        "start_session": {"interference", "image_delivery"},
         "computer_execute": {"include_screenshot_after", "follow_ups"},
     }
     for tool_name, new_params in expected_new.items():
@@ -840,7 +857,11 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
 async def test_rt7_old_client_shapes_accepted_on_the_tool_surface(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pre-perf-004 call shapes (no new params) still work on every tool end-to-end."""
+    """Pre-perf-004 call shapes (no new params) still work on every tool end-to-end.
+
+    AMENDED (run_goal removal): the internal-loop family (run_goal / subtask tools)
+    is deleted from the surface; the legacy-compatibility sweep now covers exactly
+    the five deterministic tools."""
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
@@ -855,14 +876,6 @@ async def test_rt7_old_client_shapes_accepted_on_the_tool_surface(
     payload = json.loads(response[0].text)
     assert payload["ok"] is True
     assert "screenshot_after_base64" not in payload
-    bundle = server._get_bundle(session_id)
-    bundle.agent.provider = ScriptedProvider([AgentDecision(status="done", summary="done")])
-    goal = await server.run_goal(session_id, "legacy goal")
-    assert goal["termination_reason"] == "completed"
-    created = server.create_subtask(session_id, "manual step")
-    assert created.get("ok") is True or "subtask_id" in created
-    server.list_subtasks(session_id)
-    server.get_session_progress(session_id)
     assert backend.executed  # the legacy calls really executed
     stopped = server.stop_session(session_id)  # legacy shape, no new params
     assert stopped.get("ok") is False or stopped.get("stopped") is True or "session_id" in stopped

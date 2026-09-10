@@ -190,31 +190,41 @@ def audit_events(bundle: Any, session_id: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _executed_payload(response: Any) -> dict[str, Any]:
+    """Unwrap an executed computer_execute content-block response to its dict payload."""
+    if isinstance(response, list):
+        return json.loads(response[0].text)
+    return response
+
+
 # --- composed scaled-space executions (the gap E9 called out) --------------------------------
 
 
 async def test_scaled_125_percent_executes_origin_plus_screenshot_times_scale_once(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """125% DPI (screenshot 1536x864, input 1920x1080): a click decided at screenshot
+    """125% DPI (screenshot 1536x864, input 1920x1080): a click at screenshot
     (100, 200) must execute at (125, 250) — origin + screenshot * scale applied ONCE.
-    Before the F1 fix this executed at (156, 312) (scale squared)."""
+    Before the F1 fix this executed at (156, 312) (scale squared).
+
+    RETARGETED (run_goal removal): computer_execute drives the same
+    grounding -> validation -> execution composition; the client-asserted point
+    plays the role the provider decision used to play."""
     monitor = MonitorInfo(
         id="m", index=0, bounds=(0, 0, 1920, 1080), is_primary=True,
         dpi_scale_x=1.25, dpi_scale_y=1.25,
     )
     backend = _FlippingScaledBackend(width=1536, height=864, monitors=[monitor])
-    provider = _ScriptedProvider(
-        [_click(100, 200, expected_change="the screen changes"), AgentDecision(status="done")]
-    )
     session_id, _bundle, backend, _provider = make_session(
-        monkeypatch, backend=backend, provider=provider,
+        monkeypatch, backend=backend, provider=None,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.run_goal(session_id, "click the target")
+    response = await server.computer_execute(
+        session_id, "click", x=100, y=200, expected_effect="the screen changes"
+    )
+    response = _executed_payload(response)
 
-    assert response["ok"] is True
-    assert response["termination_reason"] == "completed"
+    assert response.get("ok") is True, response
     # The recorded action point stays in SCREENSHOT space end-to-end (grounding records
     # the scale; it never rewrites the point).
     assert executed_points(backend) == [("click", (100, 200))]
@@ -226,23 +236,24 @@ async def test_scaled_150_percent_executes_origin_plus_screenshot_times_scale_on
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """150% DPI (screenshot 1280x720, input 1920x1080): center click at screenshot
-    (640, 360) executes at (960, 540) — NOT (1440, 810) as the scale-squared bug did."""
+    (640, 360) executes at (960, 540) — NOT (1440, 810) as the scale-squared bug did.
+
+    RETARGETED (run_goal removal): computer_execute drives the same composition."""
     monitor = MonitorInfo(
         id="m", index=0, bounds=(0, 0, 1920, 1080), is_primary=True,
         dpi_scale_x=1.5, dpi_scale_y=1.5,
     )
     backend = _FlippingScaledBackend(width=1280, height=720, monitors=[monitor])
-    provider = _ScriptedProvider(
-        [_click(640, 360, expected_change="the screen changes"), AgentDecision(status="done")]
-    )
     session_id, _bundle, backend, _provider = make_session(
-        monkeypatch, backend=backend, provider=provider,
+        monkeypatch, backend=backend, provider=None,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.run_goal(session_id, "click the center")
+    response = await server.computer_execute(
+        session_id, "click", x=640, y=360, expected_effect="the screen changes"
+    )
+    response = _executed_payload(response)
 
-    assert response["ok"] is True
-    assert response["termination_reason"] == "completed"
+    assert response.get("ok") is True, response
     assert executed_points(backend) == [("click", (640, 360))]
     assert_single_transform(backend, screenshot_point=(640, 360), monitor_origin=(0, 0), scale=1.5)
     assert backend._cursor_physical == (960, 540)
@@ -253,23 +264,24 @@ async def test_negative_origin_secondary_monitor_executes_origin_plus_screenshot
 ) -> None:
     """Negative-origin secondary monitor at 125%: the single transform must apply the
     monitor origin exactly once — screenshot (960, 540) executes at (-720, -405),
-    matching origin + screenshot * scale including both negative offsets."""
+    matching origin + screenshot * scale including both negative offsets.
+
+    RETARGETED (run_goal removal): computer_execute drives the same composition."""
     monitor = MonitorInfo(
         id="m", index=0, bounds=(-1920, -1080, 1920, 1080), is_primary=True,
         dpi_scale_x=1.25, dpi_scale_y=1.25,
     )
     backend = _FlippingScaledBackend(width=1536, height=864, monitors=[monitor])
-    provider = _ScriptedProvider(
-        [_click(960, 540, expected_change="the screen changes"), AgentDecision(status="done")]
-    )
     session_id, _bundle, backend, _provider = make_session(
-        monkeypatch, backend=backend, provider=provider,
+        monkeypatch, backend=backend, provider=None,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.run_goal(session_id, "click the secondary monitor")
+    response = await server.computer_execute(
+        session_id, "click", x=960, y=540, expected_effect="the screen changes"
+    )
+    response = _executed_payload(response)
 
-    assert response["ok"] is True
-    assert response["termination_reason"] == "completed"
+    assert response.get("ok") is True, response
     assert executed_points(backend) == [("click", (960, 540))]
     assert_single_transform(backend, screenshot_point=(960, 540), monitor_origin=(-1920, -1080), scale=1.25)
     assert backend._cursor_physical == (-720, -405)
@@ -283,24 +295,26 @@ async def test_unverifiable_coordinate_space_refuses_end_to_end_fail_closed(
 ) -> None:
     """E9 probe 7b composed end to end: a screenshot/input ratio that matches no known
     DPI (1920/1000 = 1.92 vs 1.5) is UNVERIFIABLE, grounding refuses fail-closed, and
-    NOTHING executes — zero backend inputs, no cursor movement."""
+    NOTHING executes — zero backend inputs, no cursor movement.
+
+    RETARGETED (run_goal removal): computer_execute drives the same composition; the
+    refusal surfaces as the rejected outcome shape instead of an in-loop recovery."""
     monitor = MonitorInfo(
         id="m", index=0, bounds=(0, 0, 1920, 1080), is_primary=True,
         dpi_scale_x=1.25, dpi_scale_y=1.25,
     )
     backend = _FlippingScaledBackend(width=1000, height=720, monitors=[monitor])
-    provider = _ScriptedProvider(
-        [_click(100, 200, expected_change="the screen changes"), AgentDecision(status="done")]
-    )
     session_id, bundle, backend, _provider = make_session(
-        monkeypatch, backend=backend, provider=provider,
+        monkeypatch, backend=backend, provider=None,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.run_goal(session_id, "click on an unverifiable screen")
+    response = await server.computer_execute(
+        session_id, "click", x=100, y=200, expected_effect="the screen changes"
+    )
 
     assert backend.executed == []  # fail closed: zero physical inputs
     assert backend._cursor_physical is None  # the cursor never moved
-    assert response["termination_reason"] == "completed"  # refusal recovered -> scripted done
+    assert isinstance(response, dict) and response.get("ok") is False, response
     grounding_failures = [
         event for event in audit_events(bundle, session_id)
         if event["event_type"] == "grounding" and event.get("result") == "failed"
@@ -313,21 +327,22 @@ async def test_passthrough_scale_one_applies_no_transform(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Verified passthrough space (scale = 1): the executed physical position equals the
-    screenshot point exactly — no origin offset beyond (0, 0), no scaling."""
+    screenshot point exactly — no origin offset beyond (0, 0), no scaling.
+
+    RETARGETED (run_goal removal): computer_execute drives the same composition."""
     backend = _FlippingScaledBackend(width=1280, height=720)  # default monitor matches
     observation_probe = backend.observe()
     assert observation_probe.coordinate_space is CoordinateSpace.VERIFIED_PASSTHROUGH
-    provider = _ScriptedProvider(
-        [_click(300, 400, expected_change="the screen changes"), AgentDecision(status="done")]
-    )
     session_id, _bundle, backend, _provider = make_session(
-        monkeypatch, backend=backend, provider=provider,
+        monkeypatch, backend=backend, provider=None,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.run_goal(session_id, "click passthrough")
+    response = await server.computer_execute(
+        session_id, "click", x=300, y=400, expected_effect="the screen changes"
+    )
+    response = _executed_payload(response)
 
-    assert response["ok"] is True
-    assert response["termination_reason"] == "completed"
+    assert response.get("ok") is True, response
     assert executed_points(backend) == [("click", (300, 400))]
     assert backend._cursor_physical == (300, 400)
 

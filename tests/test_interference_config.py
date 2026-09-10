@@ -140,8 +140,13 @@ def test_start_session_interference_param_is_trailing_optional() -> None:
     import inspect
 
     parameters = list(inspect.signature(server.start_session).parameters.values())
-    assert [p.name for p in parameters][-1] == "interference"
+    # D1 (ORVEX-CORTEX-056-LIVEFIX): ``image_delivery`` is now the newest
+    # trailing-optional parameter; ``interference`` stays trailing-optional behind it.
+    assert [p.name for p in parameters][-1] == "image_delivery"
     assert parameters[-1].default is None
+    interference = [p for p in parameters if p.name == "interference"]
+    assert interference and interference[0].default is None
+    assert [p.name for p in parameters][-2] == "interference"
 
 
 def test_start_session_rejects_malformed_interference_fail_closed() -> None:

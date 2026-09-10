@@ -12,11 +12,13 @@
 
 ## What is Cortex
 
-Cortex is a Model Context Protocol (MCP) server that gives AI agents a safe, verifiable way to operate a Windows desktop. An agent connects over stdio and gets six core tools — start a guarded session, capture the screen, execute a single action (click, double-click, drag, move, type, keypress, hotkey, scroll, wait, focus_window), hand a goal to the autonomous loop, stop everything at any moment — plus four long-running session tools ([Long-Running Sessions](#long-running-sessions)). Between the proposal and the physical input, Cortex runs a fixed pipeline: it grounds the action against a fresh observation, validates it (staleness, allowlists, coordinate integrity), classifies its risk, requests approval when policy requires it, and only then executes through a stop-checked backend.
+Cortex is a Model Context Protocol (MCP) server that gives AI agents a safe, verifiable way to operate a Windows desktop. An agent connects over stdio and gets five deterministic tools — start a guarded session, capture the screen, execute a single action (click, double-click, drag, move, type, keypress, hotkey, scroll, wait, focus_window), take a raw screenshot, stop everything at any moment. Between the proposal and the physical input, Cortex runs a fixed pipeline: it grounds the action against a fresh observation, validates it (staleness, allowlists, coordinate integrity), classifies its risk, requests approval when policy requires it, and only then executes through a stop-checked backend.
 
-After execution, Cortex re-observes the screen and verifies the action **semantically**: did the intended state transition actually occur? Every verification ends in an explicit outcome — `verified`, `failed`, or `uncertain` — and `uncertain` is never treated as success. Failures route into a bounded recovery layer that classifies the fault (moved window, unexpected dialog, stale screen, blocked input) and re-plans instead of retrying blindly.
+After execution, Cortex re-observes the screen and verifies the action **semantically**: did the intended state transition actually occur? Every verification ends in an explicit outcome — `verified`, `failed`, or `uncertain` — and `uncertain` is never treated as success. The driving agent (the host) reads the outcome and re-drives from a fresh observation when a step fails — a moved window, an unexpected dialog, a stale screen are all surfaced as typed outcomes with evidence, never retried blindly inside the server.
 
-The design principle: the goal is not to click the right pixel — it is to reach the intended state and prove that it happened. Every exit from the loop carries an explicit, audited termination reason, and every session writes a redacted JSONL audit trail of every pipeline phase.
+The design principle: the goal is not to click the right pixel — it is to reach the intended state and prove that it happened. Every tool response carries an explicit outcome, and every session writes a redacted JSONL audit trail of every pipeline phase.
+
+**As of 0.5.5 the internal autonomous loop is gone.** The `run_goal` tool family (`run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`) was removed by explicit user order: the server is driven exclusively by a host agent making direct tool calls with a real model, which halves the failure surface and removes the two loop-only defects (an unset vision key surfacing as an in-run HTTP 401, and unbounded screenshot text embedded in loop results). The five-tool surface is the whole contract; the loop's guarantees live on because every direct call passes through the identical grounding, validation, risk, approval, execution, and verification pipeline.
 
 ## How it works
 
@@ -35,12 +37,13 @@ The design principle: the goal is not to click the right pixel — it is to reac
       v
  RE-OBSERVE --> SEMANTIC VERIFICATION --(verified)--> next action --+
                     |                                               |
-                    +--(failed / uncertain)--> RECOVERY/REPLANNING -+
-                                                (bounded: 2/action, 6/task;
-                                                 back to OBSERVATION)
+                    +--(failed / uncertain / typed refusal)--------> the HOST
+                                                 re-observes, re-grounds, re-decides
+                                                 (the driving agent; the server
+                                                  never retries blindly)
 
- stop token / resource limits / approval exhaustion --> FAIL SAFELY
- (every exit carries an explicit termination_reason)
+ stop token / resource limits / approval gates --> FAIL SAFELY
+ (every response carries an explicit typed outcome)
 ```
 
 **Observation.** The backend captures the screen with `mss` and reads the foreground window's identity through Win32: `hwnd`, `pid`, process name, executable path, window class, title, and bounds. Each observation also carries per-monitor DPI, the cursor position, a fresh `observation_id`, a UTC timestamp, and a measured coordinate-space classification — `verified_passthrough`, `scaled`, or `unverifiable`. An `unverifiable` space refuses coordinate input outright; coordinates are never sent to the OS on a guess.
@@ -49,19 +52,19 @@ The design principle: the goal is not to click the right pixel — it is to reac
 
 **Grounding.** The grounding router binds the action's target to the screen. Coordinate grounding bounds-checks the point in screenshot space — both endpoints for a drag — and records the verified screenshot-to-input scale without ever rewriting the coordinate; the single scale transform is applied exactly once, in the backend, at execution. Region, text-anchor (OCR), and accessibility (UIA) strategies can derive a target when the data exists; OCR and UIA are currently extension points that refuse fail-closed when absent, and the pipeline degrades gracefully to coordinate grounding. Non-spatial actions (type, keypress, hotkey, scroll, wait, done, focus_window) ground trivially — they carry text, key names, or a window title instead of coordinates.
 
-**Action validation.** Before anything executes, a second fresh observation is captured and the action is validated against it: screen bounds, confidence floor, window and process allowlists (process identity is authoritative; unknown identity while an allowlist is configured is a fail-closed rejection), and staleness. Coordinate actions bind to the observation they were grounded from; if the HWND, process, monitor, screenshot dimensions, or coordinate space drifted, the action is rejected (`STALE_OBSERVATION`) and the loop re-observes instead of executing stale coordinates.
+**Action validation.** Before anything executes, a second fresh observation is captured and the action is validated against it: screen bounds, confidence floor, window and process allowlists (process identity is authoritative; unknown identity while an allowlist is configured is a fail-closed rejection), and staleness. Coordinate actions bind to the observation they were grounded from; if the HWND, process, monitor, screenshot dimensions, or coordinate space drifted, the action is rejected (`STALE_OBSERVATION`). The direct path performs exactly one automatic re-observe + re-grounding on staleness before reporting the rejection — stale coordinates are never executed.
 
 **Risk / authorization.** A contextual engine classifies every action `LOW` / `MEDIUM` / `HIGH` / `CRITICAL` from the action type, its text, the active window/process identity, and the goal. `HIGH` always requires approval; `CRITICAL` is blocked pending explicit authorization that nothing on screen and nothing the model says can provide; a high-risk action with unknown context escalates to `CRITICAL` (fail closed). Approval messages state the action, the target identity, the reason, the consequence, and how to approve.
 
 **Execution.** The backend performs the physical input through PyAutoGUI. The stop token is checked before every input and between typed characters; waits are sliced at 100 ms so a stop lands within one slice; drags interpolate the stroke in segments and always release the mouse button, including on a mid-stroke stop. `focus_window` is the deliberate exception to PyAutoGUI: it drives the Win32 foreground switch directly (restore when minimized, then the standard `AttachThreadInput` foreground switch with an ALT-key nudge) and verifies that the foreground actually moved — a refusal is a typed `WindowFocusError`, never a silent success. Dry-run sessions validate the full pipeline but short-circuit before any input.
 
-**Re-observe.** A fresh post-action capture is taken. PERF-004 loop economics: that capture becomes the next step's loop-top observation (observe reuse: 3 full captures per action step instead of 4 — loop-top, staleness probe, post-action — measured before/after), and the `min_screenshot_interval_ms` rate gate (default 250 ms) now protects only FRESH observations — the loop-top capture on a new step and host-driven observes — while intra-step verification captures (the staleness probe, the post-action capture) are burst-exempt but still recorded, so session-wide capture volume stays enforced and bounded. The staleness check itself is digest-first: the grounding source's pixel digest is compared with the fresh pre-execution capture's digest (a pixel-identical capture proves identity drift impossible), and the full identity validation still decides — a digest mismatch is a hint, never a verdict.
+**Re-observe.** A fresh post-action capture is taken and returned with the result (as a real image block, or omitted with `include_screenshot_after=false` when the caller checks the verification verdict instead). PERF-004 rate-gate economics carry over to the direct surface: the `min_screenshot_interval_ms` rate gate (default 250 ms) protects FRESH observations — host-driven observes and the per-call grounding capture — while intra-call verification captures (the staleness probe, the post-action capture) are burst-exempt but still recorded, so session-wide capture volume stays enforced and bounded. The staleness check itself is digest-first: the grounding source's pixel digest is compared with the fresh pre-execution capture's digest (a pixel-identical capture proves identity drift impossible), and the full identity validation still decides — a digest mismatch is a hint, never a verdict.
 
 **Semantic verification.** A chain of six strategies answers "did the intended transition happen?" with `verified` / `failed` / `uncertain`. The first definitive outcome wins; an all-uncertain chain combines into `uncertain`; no code path upgrades `uncertain` to success (asserted by a dedicated test). The comparison baseline is always the observation the action was grounded from. For model-judge intents a cheap-first ladder applies: deterministic window/process/text/predicate strategies derived from the action intent run first, the pixel-diff supporting check second, and the provider model judge ONLY when both cheap tiers are inconclusive — a deterministic verdict always skips the judge.
 
-**Recovery / replanning.** Failures classify into a 12-value taxonomy. Recovery is bounded at 2 attempts per action and 6 per task; the same coordinates are never retried blindly — the loop re-observes, re-grounds, and re-decides. Authentication prompts always terminate safely; credentials are never auto-typed.
+**Recovery.** Failures classify into a 12-value taxonomy and surface to the host as typed outcomes with evidence (the loop-era bounded auto-recovery was removed with the loop; the host drives retries from fresh observations — the same coordinates are never retried blindly). Authentication prompts always fail safely; credentials are never auto-typed.
 
-**Complete / fail safely.** Every exit carries one of eight termination reasons (`completed`, `failed_verification`, `blocked_safety`, `approval_exhausted`, `limit_exceeded`, `stopped_by_user`, `unrecoverable`, `provider_error`). A model-declared "done" ends the task but is labeled `completion_evidence="model_declared"` — a model assertion, never presented as an evidenced check.
+**Fail safely.** Every refused call carries a typed outcome: grounding rejection (`reasons`), safety denial (policy message), approval request (`requires_approval`), limit exceeded, or a failed verification with evidence. On the five-tool surface success is always `ok: true` with a verification outcome the caller can trust; `uncertain` is reported honestly and is never success.
 
 ## Features
 
@@ -72,20 +75,20 @@ The design principle: the goal is not to click the right pixel — it is to reac
 | **Staleness protection** | Coordinate actions bind to the observation they were grounded from; screen-identity drift refuses the action. |
 | **Coordinate integrity** | Measured screenshot-vs-input classification (DPI-aware); unverifiable spaces refuse coordinate input. |
 | **Contextual risk engine** | `LOW`/`MEDIUM`/`HIGH`/`CRITICAL` from action + context; approval gates and `CRITICAL` blocking. |
-| **Bounded recovery** | 12-class failure taxonomy, 2 attempts/action, 6/task, no blind coordinate retries, no auto-typed credentials. |
+| **Typed failure outcomes** | 12-class failure taxonomy surfaced to the host; no blind coordinate retries, no auto-typed credentials. |
 | **Kill switch** | Thread-safe stop token checked before every physical input; `stop_session` closes the session fail-closed. |
 | **Audit trail** | Per-session JSONL with every phase event, redaction enforced at write time, 19 counters + 5 latency metrics. |
 | **Secret redaction** | 10 detection patterns enforced on audit, provider payloads, and tool responses; secret-like typed text is blocked. |
 | **Prompt-injection containment** | Five-channel prompt doctrine; screen text is untrusted data, never instructions or authorization. |
 | **Hard resource limits** | 9 enforceable limits (task time, actions, model calls, screenshot rate, sessions) with fail-closed termination. |
-| **Long-running sessions** | Subtask decomposition with deterministic plan validation, dependency-ordered sequential execution, atomic checkpoints/resume, approval epochs, and shared session budgets — all through the same closed-loop executor. |
+| **Checkpoint resume** | Sealed, atomic checkpoints (HMAC-SHA256 integrity) with fail-closed resume through `start_session(resume_from_checkpoint=…)` — counters restored, never reset, budgets never enlarged. |
 | **Benchmark scaffolding** | OSWorld-2.0-aligned task format plus a fake/env harness runner — harness only, no published scores. |
 
 ## Requirements
 
 - **Windows 10, Windows 11, or Windows Server** with an active, interactive display session. Observation and input go through the real desktop; there is no headless mode.
 - **Python 3.11 or newer.**
-- **An OpenAI-compatible vision endpoint** — required only for the autonomous `run_goal` mode (the model that decides actions and judges screenshots). Deterministic direct control through `computer_observe` + `computer_execute` calls no model at all.
+- **No vision endpoint required.** The five-tool server is fully deterministic — `computer_observe` + `computer_execute` call no model at all. The server-side vision provider configuration is retained only for host-driven `computer_execute` calls that opt into the model-judge verification tier (`model_visual`) via an `expected_effect` the cheap tiers cannot decide; a session works without it.
 
 ## Installation
 
@@ -176,7 +179,7 @@ The standard server object is the same in every case (replace C:\path\to\Cortex 
   }
 }
 ```
-Note: the whole `env` block applies to the autonomous `run_goal` mode only; deterministic direct control via `computer_observe` + `computer_execute` needs no API key. If the user did not ask for autonomous mode, drop `env` or leave it empty.
+Note: the whole `env` block is optional — the five-tool server is deterministic and needs no API key (the vision endpoint is only used by the model-judge verification tier when a call opts into it). If the user did not ask for it, drop `env` or leave it empty.
 
 a) Global configuration (user level — applies to every project):
 - ZCode: the file `%USERPROFILE%\.zcode\cli\config.json`, and the key there is `mcp.servers` (i.e. put the "cortex" object under `mcp.servers`, NOT under `mcpServers`; compatible fallback: `~\.agents\mcp.json` in the `mcpServers` shape above).
@@ -191,12 +194,12 @@ b) Per-project / agent-level configuration (inside the target project folder):
 Apply at least the method the user asked for; applying both (global + project) is recommended. If a config file already exists, merge the new "cortex" object into the existing `mcpServers`/`mcp.servers` without deleting any existing server. Respect JSON syntax strictly (double quotes, and doubled backslashes `\\` in Windows paths).
 
 Step 5 — Verification:
-- Restart the host application or reload its MCP connections, then confirm the tools list (tools/list) returns the nine Cortex tools: `start_session`, `computer_observe`, `computer_execute`, `run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`, `stop_session` (`computer_screenshot` also exists as a compatibility alias of `computer_observe`).
+- Restart the host application or reload its MCP connections, then confirm the tools list (tools/list) returns exactly the five Cortex tools: `start_session`, `computer_observe`, `computer_execute`, `stop_session`, `computer_screenshot` (a compatibility alias of `computer_observe`). The internal-loop family (`run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`) was REMOVED in 0.5.5 — if the host still lists any of them, it is running an older install.
 - A secondary command-line boot check: run `.\.venv\Scripts\python.exe -m computer_use_mcp.server` — a stdio server stays waiting on stdin, which is normal; end it once it starts with no import errors, and treat tools/list from the host as the final proof.
 
 Step 6 — Smoke test and notes:
 - With the user's consent, run a short session: `start_session`, then `computer_observe`, then `stop_session`. As of the PERF-004 release the `dry_run` default is `false` (a live session that performs real input) — pass `dry_run: true` explicitly for a validation-only session with no input (its results carry the `DRY-RUN (no input dispatched):` banner). The `require_approval` default remains `true`.
-- A missing `VISION_API_KEY` blocks nothing in `start_session` or the host-driven tools (`computer_observe`/`computer_execute`); the key is needed only when `run_goal` makes its first model call (it raises a clear, typed error at that point).
+- A missing `VISION_API_KEY` blocks nothing on the five-tool surface (`start_session`, `computer_observe`, `computer_execute`, `stop_session`); the key matters only for the model-judge verification tier, which raises a clear, typed error if a call actually needs it.
 - Multi-monitor and DPI: coordinates are always given in screenshot space; the server measures per-monitor DPI and classifies the coordinate space; an unverifiable space refuses coordinate input fail-closed. Multi-monitor logic is unit-tested only — on a multi-monitor machine, start with a `dry_run: true` session to check the classification before any live input.
 - If the tools do not appear: check the absolute path to `.venv\Scripts\python.exe` in the config and that the host was restarted after editing it; server logs go to stderr and per-session audit logs live under `%TEMP%\cortex\logs` (default level `LOG_LEVEL=INFO`).
 
@@ -212,7 +215,7 @@ Step 1 — Check before anything: inside the repository folder run `git status -
 Step 2 — Fetch the new version: `git pull`. If the original install was not via git (a ZIP copy), re-download the latest ZIP and extract it over the copy while keeping the existing `.venv` folder.
 Step 3 — Refresh dependencies: `.\.venv\Scripts\python.exe -m pip install -e .` (the same command as the original install; it re-resolves dependencies from the updated pyproject.toml).
 Step 4 — Restart: restart the MCP connection in the host application (restart the app or reload the MCP servers) so the connection picks up the new version.
-Step 5 — Re-verify: repeat the full verification — tools/list returns the nine Cortex tools (`start_session`, `computer_observe`, `computer_execute`, `run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`, `stop_session`), then a short smoke test (`start_session` → `computer_observe` → `stop_session`).
+Step 5 — Re-verify: repeat the full verification — tools/list returns exactly the five Cortex tools (`start_session`, `computer_observe`, `computer_execute`, `stop_session`, `computer_screenshot`), then a short smoke test (`start_session` → `computer_observe` → `stop_session`).
 Step 6 — Version ledger: read VERSIONS.md at the repository root and tell the user what changed in the new version and any Compatibility notes — pay special attention to default-value changes, such as `dry_run` now defaulting to `false` (a live session) as of the PERF-004 release.
 Rollback if needed: if something breaks after the update, return to the previous version listed in VERSIONS.md with `git checkout <tag-or-commit>` then `.\.venv\Scripts\python.exe -m pip install -e .`, then restart the host.
 
@@ -248,35 +251,46 @@ A generic `mcpServers` block; the same shape works in Claude Code, ZCode, Cursor
 }
 ```
 
-The `env` block is only needed if you plan to use `run_goal`; deterministic direct control needs no API key.
+The `env` block is optional — the five-tool server needs no API key (see the model-judge note above).
 
 ### Environment variables
 
 | Variable | Purpose |
 |---|---|
-| `VISION_API_KEY` | API key for the vision provider. **Lazy:** the server starts and `start_session` works without it; it is required only when `run_goal` makes its first model call (a missing key raises a typed, fail-closed error at that point). |
+| `VISION_API_KEY` | API key for the vision provider (the model-judge verification tier only). **Lazy:** the server starts and every deterministic tool works without it; a missing key raises a typed, fail-closed error only if a call actually reaches the judge tier. |
 | `OPENAI_API_KEY` | Fallback used when `VISION_API_KEY` is unset. |
 | `VISION_BASE_URL` | OpenAI-compatible API base URL (default `https://api.openai.com/v1`). |
 | `VISION_MODEL` | Multimodal model name (default `gpt-4.1-mini`). |
 | `COMPUTER_USE_MCP_LOG_DIR` | Root directory for per-session audit logs (default `%TEMP%\cortex\logs`). |
 | `COMPUTER_USE_MCP_CHECKPOINT_DIR` | Root directory for per-session long-running checkpoints (default `%TEMP%\computer-use-mcp\checkpoints`; one `checkpoint.json` per session). |
+| `CORTEX_IMAGE_DELIVERY` | Default screenshot delivery for ALL sessions: `text` suppresses every outbound image block (full metadata only — non-vision-safe), `image` (or unset/garbage, fail-safe) keeps real image blocks. Overridden per session by `start_session(image_delivery=…)`. **Recommended `text` whenever the host's default model cannot view images** — see [Non-vision models](#non-vision-models). |
+| `CORTEX_VALIDATE_REUSE_MS` | Freshness window (ms) for the mechanical-speed validate-reuse path: a direct `computer_execute` whose grounding capture was taken in the same tool call skips re-capturing the identical screen, guarded by a capture-free identity probe (monitors / foreground window / coordinate space — any drift reverts to the full capture + staleness rejection). Default `1500`; `0` restores a full validate capture on every action. Verification semantics unchanged on all values. |
+| `CORTEX_INTERNAL_FRAME_REUSE` | `0` disables the internal mechanical-speed stashes (capture-time RGB frame on observations + identical-pixel PNG payload dedupe) — the pure legacy pipeline. Default on; the stashes are in-process only, never serialized, and byte-identical in every digest/verification consumer. |
+| `CORTEX_PNG_COMPRESS_LEVEL` | Opt-in PNG encode/size trade for capture throughput: `0`–`9` PIL compress level (default unset = PIL's own level = the historical bytes). `1` measured ~21.6 ms vs ~27 ms per 1920×1080 frame at ~+45% size. Internal pipeline only; the outbound image budget (`CORTEX_RESULT_IMAGE_MAX_KB`, default 180 KB) is unaffected. |
+| `CORTEX_CAPTURE` | Capture backend: `blt` (default, the GDI/BitBlt mss pipeline) or `dxgi` — pure-ctypes DXGI Desktop Duplication (~26–43 ms vs ~53–90 ms per 1920×1080 capture on the mission desktop, no new dependency). Any other value degrades to `blt`. Fail-open by contract: a duplication that cannot be created (RDP/protected session, a second live duplicator in the process) or fails mid-session (device lost, lock screen) permanently falls back to the mss path for the session — the fast path can only speed captures up, never fail one. Idle-desktop semantics: duplication yields a frame only when the compositor changed something; on timeout the last frame (still current) is returned, and a cold duplication's first frame is fetched with a one-shot ~60 ms retry. |
+| `CORTEX_TEXT_PNG` | `1` keeps real PNG payloads in **text-delivery sessions** (`image_delivery="text"`), disabling the R-6 encode-skip: by default a text session's captures carry a deterministic raw-pixel key (`RAW:<sha256>;WxH`) instead of a lossless PNG nobody will ever see — the key serves the digest and staleness comparisons byte-faithfully (identical pixels → identical key) and verification keeps reading the capture-time RGB frame, so no verification semantics change. Default off (= fast keys in text sessions). |
 | `LOG_LEVEL` | Server log level (default `INFO`). |
+
+### Non-vision models (image delivery)
+
+`computer_observe` / `computer_execute` deliver screenshots as real MCP `ImageContent` blocks by default — correct for vision-capable client models. A model that **cannot view images** cannot consume those blocks: its provider rejects the whole request (`400 … 'content' must be a string…`) the moment one image part enters the conversation, and the turn dies permanently because the image replays in history. Two layers prevent this:
+
+- **Per session (model-taught):** the driving model passes `start_session(image_delivery="text")`. The `start_session` tool description teaches the model to judge by what it *receives* (text-only inputs → `text`, required) rather than by what it *thinks it is* — self-misclassification ("my host is multimodal") is the documented failure mode this wording targets. Text mode returns the full metadata payload (window, cursor, digest, OCR/UI elements, `text_summary`) and never an image block; it never crashes any model — a vision model in text mode merely loses the screenshot pixels. `image_delivery="image"` (or omitting the parameter) keeps real image blocks. Invalid values are rejected fail-closed (`invalid_image_delivery`) before any session exists. The mode is deliberately not checkpointed: a resumed session is governed by its own fresh call.
+- **Deterministic (user-set, recommended when the host's default model lacks image input):** set `"CORTEX_IMAGE_DELIVERY": "text"` in the Cortex MCP server entry's `env` block (e.g. Kimi Code's `mcp.json` `env`). This makes every session text-mode by default regardless of model self-assessment, and a vision model can still override per session via the parameter (`param > env > default`). Unset or garbage values fail-safe to `image` — a typo can never blind sessions silently.
 
 ## Usage
 
-### Two integration patterns
+### Integration pattern: host-driven direct control
 
-**Deterministic direct control.** The driving agent (or a human-supervised script) calls `computer_observe` and `computer_execute` itself: observe, decide what to do, execute one action, read the verification result, repeat. You keep full control of every step and no vision API is needed — but every action still passes through grounding, staleness validation, the risk engine, the approval gate, and semantic verification. Prefer this pattern when the steps are known in advance, when you want the calling agent to reason over raw observations, or when you are testing and want deterministic behavior.
-
-**Autonomous goal mode.** `run_goal` hands a goal to a configured vision model. The model observes the screen and proposes actions; Cortex grounds, validates, risk-checks, executes, verifies, and recovers with bounded autonomy — an approval budget of exactly one action per call, recovery bounded at 2 attempts per action and 6 per task, and the nine hard limits above everything. Prefer this pattern when the UI path is not known in advance and you want the loop to handle verification and failure recovery itself. It requires an OpenAI-compatible vision endpoint.
+**Direct control (the only pattern as of 0.5.5).** The driving agent calls `computer_observe` and `computer_execute` itself: observe, decide what to do, execute one action, read the verification result, repeat. You keep full control of every step and no vision API is needed — but every action still passes through grounding, staleness validation, the risk engine, the approval gate, and semantic verification. The autonomous `run_goal` loop was removed by explicit user order (see [What is Cortex](#what-is-cortex)); when the UI path is not known in advance, the host agent iterates over these tools — the same per-action guarantees apply, with the driving model doing the deciding.
 
 ### Tool reference
 
-Cortex exposes six core MCP tools; the four long-running session tools are documented under [Long-Running Sessions](#long-running-sessions).
+Cortex exposes exactly five MCP tools (`computer_screenshot` is a compatibility alias of `computer_observe`, making the wire surface five distinct names).
 
-**`start_session(dry_run=False, require_approval=True, max_steps=30, max_retries_per_action=1, min_confidence=0.70, allowed_windows=None, allowed_processes=None, limits=None, resume_from_checkpoint=None, interference=None)`**
+**`start_session(dry_run=False, require_approval=True, max_steps=30, max_retries_per_action=1, min_confidence=0.70, allowed_windows=None, allowed_processes=None, limits=None, resume_from_checkpoint=None, interference=None, image_delivery=None)`**
 
-Creates a guarded session and returns the session state plus `allowed_processes`, the effective `limits`, and `task_id`. PERF-004 intentional default change: `dry_run` now defaults to **False** (live session) — the old `dry_run=True` default silently produced no-op sessions that cost a full agent turn to discover; pass `dry_run=True` explicitly for a validation-only session, and every dry-run result message starts with the unmistakable banner `DRY-RUN (no input dispatched):`. `require_approval` still defaults to True. `allowed_windows` is a window-title allowlist, `allowed_processes` a process allowlist (authoritative when the OS reports process identity; fail-closed when it does not; `focus_window` targets are checked against both allowlists before any foregrounding call). `limits` accepts any `Limits` field as a dict; unknown field names or non-numeric values are rejected. No API key is required. The trailing optional `resume_from_checkpoint` resumes a previous long-running session from a checkpoint file as a continuation — see [Resume](#resume).
+Creates a guarded session and returns the session state plus `allowed_processes`, the effective `limits`, and `task_id`. PERF-004 intentional default change: `dry_run` now defaults to **False** (live session) — the old `dry_run=True` default silently produced no-op sessions that cost a full agent turn to discover; pass `dry_run=True` explicitly for a validation-only session, and every dry-run result message starts with the unmistakable banner `DRY-RUN (no input dispatched):`. `require_approval` still defaults to True. `allowed_windows` is a window-title allowlist, `allowed_processes` a process allowlist (authoritative when the OS reports process identity; fail-closed when it does not; `focus_window` targets are checked against both allowlists before any foregrounding call). `limits` accepts any `Limits` field as a dict; unknown field names or non-numeric values are rejected. No API key is required. The trailing optional `resume_from_checkpoint` resumes a previous long-running session from a checkpoint file as a continuation — see [Resume](#resume). The trailing optional `image_delivery` ("image" (default) or "text") controls how screenshots are delivered by `computer_observe` / `computer_execute` — see [Non-vision models](#non-vision-models).
 
 ```json
 {
@@ -292,7 +306,7 @@ Creates a guarded session and returns the session state plus `allowed_processes`
 
 **`computer_observe(session_id)`**
 
-Captures the current screen and returns MCP content blocks: one `ImageContent` block carrying the screenshot itself (`image/png`) — so vision-capable client models receive a real image, not text — plus one `TextContent` block with the JSON metadata `{ "observation": ..., "digest": <sha256 of the screenshot payload>, "observation_id": ..., "active_app": ..., "image_format": "image/png", "text_summary": <PERF-004 additive one-line summary> }`. The additive `text_summary` line carries the active window title/process, cursor position, a focused-control hint when the backend supplies `ui_elements` (omitted gracefully when absent), and a changed/unchanged note versus the previous observation of this session. The `observation` object carries dimensions, cursor position, coordinate-space classification, monitor identity (bounds, primary flag, DPI scales), and the full window/process identity; the raw base64 never travels as text. Error paths still return the structured error dict. This explicit tool is not rate-gated — every capture writes an audit row, so hammering clients generate audit volume at their own discretion; the `run_goal` loop is the rate-gated path. `computer_screenshot(session_id)` is a compatibility alias returning the same blocks.
+Captures the current screen and returns MCP content blocks: one `ImageContent` block carrying the screenshot itself (`image/png`) — so vision-capable client models receive a real image, not text — plus one `TextContent` block with the JSON metadata `{ "observation": ..., "digest": <sha256 of the screenshot payload>, "observation_id": ..., "active_app": ..., "image_format": "image/png", "text_summary": <PERF-004 additive one-line summary> }`. The additive `text_summary` line carries the active window title/process, cursor position, a focused-control hint when the backend supplies `ui_elements` (omitted gracefully when absent), and a changed/unchanged note versus the previous observation of this session. The `observation` object carries dimensions, cursor position, coordinate-space classification, monitor identity (bounds, primary flag, DPI scales), and the full window/process identity; the raw base64 never travels as text. Error paths still return the structured error dict. This explicit tool is not rate-gated — every capture writes an audit row, so hammering clients generate audit volume at their own discretion; the per-call grounding capture is the rate-gated path. `computer_screenshot(session_id)` is a compatibility alias returning the same blocks.
 
 **`computer_execute(session_id, action, x=None, y=None, text=None, keys=None, delta=0, approved=False, expected_effect=None, x2=None, y2=None, target=None, include_screenshot_after=None, follow_ups=None)`**
 
@@ -324,9 +338,7 @@ Host-payload opt-out (PERF-004, trailing optional): pass `include_screenshot_aft
 
 Queued actions (PERF-004, trailing optional): `follow_ups` accepts up to 5 action specs (same fields as the tool's action parameters). Each follow-up passes the FULL independent pipeline — grounding, validation, safety, approval semantics, execution, verification — exactly like a single action; the queue stops at the first verification failure, safety rejection, approval requirement, or post-action digest surprise (the screen changed since the queued premise was captured). Per-item results arrive in the additive `follow_up_results` field (bounded, no per-item screenshots) with `follow_ups_stopped_reason` (`null` = every item executed and verified). Batch small related groups and observe after the batch.
 
-**`run_goal(session_id, goal, approve_next_action=False, auto_subtasks=False)`**
-
-Runs the autonomous closed loop and returns `{ "ok", "approval_budget_remaining", "results", "session_id", "task_id", "termination_reason", "stopped", "requires_approval", "step_count", "metrics" }`. `results` is a list of per-action results (each with the action, message, verification outcome and evidence, and the post-action screenshot); each may carry `suspicious_content` (the model's own report of instruction-like screen text) and `completion_evidence` (`"model_declared"` when the model asserted completion without independent verification evidence). `metrics` is the full snapshot of counters and latency summaries. Approval budget: `approve_next_action=true` grants exactly **one** action per call. The grant binds to the approved action instance, so bounded recovery retries of that same instance do not re-consume it; a new, different action after exhaustion is denied fail-closed and surfaces as `requires_approval: true`. The trailing optional `auto_subtasks=true` switches to the Multi-Subtask mode (see [Long-Running Sessions](#long-running-sessions)); omitting it keeps byte-identical single-goal behavior.
+**`run_goal` — REMOVED (0.5.5, user order).** The autonomous loop tool and its family (`create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`) no longer exist; the five tools above are the entire surface. The loop's per-action guarantees did not die with it — every `computer_execute` call runs the identical grounding, validation, risk, approval, execution, and verification pipeline, and returns the per-action result (action record, message, verification outcome and evidence) directly to the host. Successive goals are host-side loops of `computer_observe` → `computer_execute`; task completion is the host's decision, made on evidenced `verified` outcomes.
 
 **`stop_session(session_id)`**
 
@@ -349,9 +361,9 @@ The kill switch. Arms the thread-safe `StopToken` — checked before every physi
 | `HIGH` | installers; killing processes; system settings; elevation; network configuration; pasting credentials | **always** requires approval |
 | `CRITICAL` | shell/command execution; registry writes; disk formatting; file deletion; destructive SQL; credential changes; disabling security controls; purchases and money transfers; sending email | **blocked** pending explicit authorization (no MCP tool grants it today — fail safe, and honest about it); a high-risk action with unknown window/process context escalates here |
 
-**Audit evidence.** Every phase of every action — observation, grounding, validation, safety decision, approval, execution, verification, recovery — is appended to a per-session JSONL file with redaction enforced at write time. `run_goal` additionally returns a metrics snapshot: 19 counters (actions, verifications by outcome, safety blocks, approvals, retries, recoveries, model calls, screenshots) and 5 latency summaries (observation, model, execution, verification, task) with count/avg/p50/p95/max.
+**Audit evidence.** Every phase of every action — observation, grounding, validation, safety decision, approval, execution, verification — is appended to a per-session JSONL file with redaction enforced at write time. The session also tracks the metrics registry: counters (actions, verifications by outcome, safety blocks, approvals, screenshots) and latency summaries (observation, execution, verification) with count/avg/p50/p95/max, visible to tests and tooling through the bundle.
 
-**Recovery without blind retries.** A moved window, an unexpected dialog, a blocked input, an app crash — each classifies into a named failure class with a bounded plan: re-observe and re-decide with fresh grounding, one bounded Escape-key dismiss for blocked input, or a single same-instance retry with fresh grounding. The same coordinates are never fired twice hoping the second click lands. Authentication prompts terminate the task safely; credentials are never typed.
+**Recovery without blind retries.** A moved window, an unexpected dialog, a blocked input, an app crash — each classifies into a named failure class and surfaces to the host as a typed outcome with evidence (a rejected stale click, a `InputBlockedError` action error, a `DisplayUnavailableError` root cause). The server never fires the same coordinates twice hoping the second click lands; the host re-observes and re-grounds. Authentication prompts fail safely; credentials are never typed.
 
 **Secret redaction.** Ten detection patterns (AWS keys, JWTs, private-key blocks, bearer tokens, basic-auth URLs, password/token assignments, Luhn-validated card numbers) are enforced on the audit sink, the provider payload, and the tool responses. A `type` action whose text resembles a secret, credential, or destructive command is blocked before it reaches the backend.
 
@@ -363,7 +375,7 @@ Every verification produces an outcome in `{verified, failed, uncertain}`:
 
 - **`verified`** — a strategy found affirmative evidence that the intended transition occurred.
 - **`failed`** — a strategy found affirmative evidence that it did not (expected text absent, screen pixel-identical when a change was required, window/process state mismatched).
-- **`uncertain`** — no strategy could decide from the available data. `uncertain` is **never** success anywhere in the codebase — no code path maps it to `verified`, and this is asserted by a dedicated test. Failed and uncertain verifications route to bounded recovery. The single documented carve-out: a `wait` action continues on `uncertain` with an audited note, because a wait makes no semantic claim about state.
+- **`uncertain`** — no strategy could decide from the available data. `uncertain` is **never** success anywhere in the codebase — no code path maps it to `verified`, and this is asserted by a dedicated test. Failed and uncertain verifications are reported to the host in the response (`ok` reflects the outcome for direct calls with a stated effect). The single documented carve-out: a `wait` action tolerates `uncertain` with an audited note, because a wait makes no semantic claim about state.
 
 Without a stated expectation, pixels alone stay ambiguous: an identical screen or a sub-threshold change yields `uncertain`, not a free success.
 
@@ -533,162 +545,75 @@ What happened inside: the typed text was checked against OCR evidence first — 
 
 From this point every tool call on that session id returns `{ "ok": false, "error": "session_stopped" }`. The session's full audit trail is on disk at `%TEMP%\cortex\logs\<session_id>\audit_<session_id>.jsonl`.
 
-The same session works in autonomous mode: skip step 3 and call `run_goal` with `{"session_id": "0f4a…", "goal": "Type 'Hello from Cortex' into the Notepad window", "approve_next_action": true}` — the vision model proposes the actions, and the same grounding, validation, risk, approval, verification, and recovery machinery wraps each one.
+For a multi-step goal the host repeats step 3 (optionally interleaving `computer_observe` for fresh grounding) — the same grounding, validation, risk, approval, and verification machinery wraps every single call.
 
-## Long-Running Sessions
+## Checkpoints and Resume
 
-Some goals are too big for one `run_goal` call. Long-Running Sessions add an orchestration layer **above** the closed-loop executor: a goal is decomposed into subtasks, and the subtasks execute sequentially — each through the exact same observe → ground → validate → risk → approve → execute → verify → recover pipeline as before. The orchestrator decides *when* each subtask runs; it never performs an action itself, and there is no second execution loop. Session state (subtasks, dependency graph, shared resource counters, bounded context, checkpoints) persists server-side between MCP calls, so no MCP connection needs to stay open for hours — every tool call performs one bounded unit of work and returns.
-
-Use it when the goal is naturally multi-stage (a report assembled from several sources, a multi-application workflow) or may legitimately run for hours. Skip it when one `run_goal` call is enough — the default behavior is unchanged.
-
-### Subtasks
-
-A subtask is a standalone entity: `subtask_id` (stable, serializable, at most 128 characters — preserved verbatim by checkpoint round-trips so dependency references never dangle), `description` (at most 2000 characters), `status`, `depends_on`, `created_at`, `started_at`, `completed_at`, bounded `results` (at most 20 per subtask, heavy screenshot payloads stripped before storage), and failure/recovery info (`failure_class`, `error`, `recovery_attempts`, `last_known_state`).
-
-Statuses: `pending`, `running`, `completed`, `failed`, `blocked`, `paused` — moved along a fixed transition table (terminal states move nowhere). Hard ceiling: 50 subtasks per session.
-
-Subtasks come from two sources: an LLM plan (`run_goal(auto_subtasks=True)`) or manual creation (`create_subtask`, which needs no planner key). An LLM plan is treated as an untrusted suggestion: a deterministic validator rejects the whole plan on any violation (duplicate ids, unknown/self/cyclic dependencies, oversize plans, invalid or non-`pending` statuses, unsafe content) before anything is created, and creation re-checks every rule again.
-
-### Dependencies
-
-Execution is strictly sequential. A subtask starts only when **all** of its dependencies are `completed` (the ready set is computed deterministically, in creation order). When a subtask fails, its transitive dependents are moved to `blocked` automatically — a failed prerequisite can never complete, so that branch is permanently unrunnable. The runtime may consult a bounded replan (at most 3 attempts per session) for replacement work; replacement entries never depend on dead ids. When only dead work remains and replanning cannot replace it, the session ends `unrecoverable`.
-
-### Progress
-
-`get_session_progress` returns a structured, bounded report: session status, the progress percentage, the current subtask, per-status counts, elapsed time, shared resource counters and limits, approval-epoch state, checkpoint status, and the replan budget. The percentage is **deterministic** — computed as completed/total from subtask-manager state (rounded to two decimals), never invented by a model.
+**As of 0.5.5 the subtask orchestration layer is gone with the loop** (`run_goal(auto_subtasks=…)`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress` were all removed by user order). What survives — and remains fully supported — is the sealed checkpoint/resume machinery on `start_session`: a long-running host session can be stopped and later resumed as a continuation, with its budget counters intact.
 
 ### Checkpoints
 
-Long-running state persists to disk so a session can be stopped and resumed:
+Session state persists to disk so a session can be stopped and resumed:
 
-- **Periodic cadence**: a checkpoint is written every 50 steps or every 30 minutes, whichever comes first.
-- **Lifecycle triggers**: subtask completed, subtask failed, transition into a new subtask, before session end (including `stop_session`), and before-resume transitions.
 - **Atomic**: the payload is serialized fully, written to a temp file, fsynced, then moved into place with `os.replace` — a reader never sees a partial file, and a failed write leaves the previous checkpoint intact.
 - **Redacted**: every string value passes the redaction engine; if any value still looks secret-like after redaction, the write is **refused** (fail-closed). Checkpoints store no secrets and no screenshots.
 - **Versioned**: `schema_version` gates loading; unknown/newer versions are rejected — never loaded best-effort. A corrupt checkpoint is rejected with a typed error; it is never deleted, repaired, or partially loaded.
-- **Sealed**: every checkpoint carries an HMAC-SHA256 integrity seal over the tamper-sensitive state (session identity, goal, current subtask, budget counters, limits, subtask states), keyed by a per-installation random key file (`.integrity_key`) under the checkpoint directory. Load verifies the seal before anything restores: tampered or unsigned checkpoints are refused (`invalid_checkpoint`), and a missing or replaced key refuses the resume — the load path never recreates the key. Checkpoints written before the seal existed (the pre-fix format) are refused by design, fail-closed.
+- **Sealed**: every checkpoint carries an HMAC-SHA256 integrity seal over the tamper-sensitive state (session identity, goal, budget counters, limits, subtask states), keyed by a per-installation random key file (`.integrity_key`) under the checkpoint directory. Load verifies the seal before anything restores: tampered or unsigned checkpoints are refused, and a missing or replaced key refuses the resume — the load path never recreates the key.
 - **Bounded, single file per session**: one `checkpoint.json` under the checkpoint directory (`COMPUTER_USE_MCP_CHECKPOINT_DIR`, default `%TEMP%\computer-use-mcp\checkpoints`), capped at 8 MB serialized.
 
-A checkpoint carries the session state, the goal, the subtask states and dependency graph, the current subtask, bounded necessary results, resource counters and limits, the context summary and recent history, termination state, the schema version, and a UTC timestamp.
+Deterministic counter cross-checks at load time (defense in depth behind the seal): `budget.subtasks <= limits.max_subtasks` and `budget.steps <= limits.max_session_steps` — a sealed-but-forged counter past the checkpoint's own ceiling is refused. Counters with no deterministic ceiling (actions/model_calls) resume exactly as recorded, and the restored shared budget fails closed the moment any gated consumer runs — inflating counters grants no more work.
 
 ### Resume
 
 `start_session(resume_from_checkpoint="<path to checkpoint.json>")` resumes a previous session as a **continuation**, not a new session:
 
-- The checkpoint is loaded and fully validated (schema/version, structure, integrity seal); checkpoints without a seal (the pre-fix format) are refused by design, fail-closed; any defect is a typed refusal (`invalid_checkpoint` / `resume_refused`) — never a partial restore.
+- The checkpoint is loaded and fully validated (schema/version, structure, integrity seal); any defect is a typed refusal (`invalid_checkpoint` / `resume_refused`) — never a partial restore.
 - Counters are **restored, never reset**: actions / model calls / steps / subtasks continue from the checkpoint values, and the elapsed-time anchor is re-based so wall-clock gaps cannot refill the duration budget.
 - Limits are the checkpoint's own (re-clamped) limits — a resume can never enlarge the budget.
-- Subtasks, the dependency graph, and the bounded context are restored under their stable ids.
 - The **current environment is re-verified** against the checkpoint's recorded expectations (foreground process and window, allowlists) before continuing; a mismatch — or missing current environment data — is a fail-closed refusal, and the freshly created session is discarded.
-- Approval is **fresh**: an approval epoch is never resurrected from checkpoint data.
+- The bounded context is restored under its stable identity.
 
 The start response carries `resumed: true` and `continuation_of` (the original session id).
 
 ### Session resource limits
 
-The same `limits` dict on `start_session` carries the long-running fields (validated and clamped fail-closed, like the nine per-task limits):
+The `limits` dict on `start_session` carries the long-running session fields (validated and clamped fail-closed, like the per-task limits):
 
 | Limit | Default | Clamp range | Meaning |
 |---|---|---|---|
 | `max_session_seconds` | 14400 (4 h) | 1..86400 | total wall-clock session duration (24 h max configurable) |
-| `max_session_actions` | 2000 | 1..2000 | interactive actions across all subtasks |
-| `max_session_model_calls` | 500 | 1..500 | model calls across all subtasks |
-| `max_session_steps` | 500 | 1..500 | loop steps across all subtasks |
-| `max_subtasks` | 50 | 1..50 | subtask ceiling |
+| `max_session_actions` | 2000 | 1..2000 | interactive actions across the session |
+| `max_session_model_calls` | 500 | 1..500 | model calls across the session |
+| `max_session_steps` | 500 | 1..500 | loop steps across the session |
+| `max_subtasks` | 50 | 1..50 | subtask ceiling (checkpoint cross-check bound) |
 | `context_summarize_every` | 25 | 1..500 | steps between context compressions |
-| `approval_epoch_seconds` | 1800 (30 min) | 60..86400 | wall-clock half of the approval epoch |
-| `approval_epoch_actions` | 50 | 1..1000 | interactive-action half of the approval epoch |
 | `health_check_interval` | 600 (10 min) | 60..3600 | minimum spacing between boundary health checks |
 
-These are **shared session budgets**: every subtask also gets its own fresh per-task limit scope, but everything it consumes is mirrored onto the session counters, which only ever grow. On resume the counters are restored from the checkpoint — never zeroed.
+These are **shared session budgets**: everything the resumed session consumes is mirrored onto the session counters, which only ever grow. On resume the counters are restored from the checkpoint — never zeroed.
 
-### New MCP tools
+### Example: stop, then resume later
 
-Long-running sessions add four tools (the six existing tools are unchanged):
-
-**`create_subtask(session_id, description, depends_on=None)`**
-
-Creates one manual subtask; fail-closed on invalid graphs (unknown dependency, self-dependency, cycle, over the 50-subtask ceiling) and on a non-iterable or string `depends_on` (typed `invalid_subtask` error at the tool boundary — never an escaping `TypeError`). Works without any planner/LLM key. Returns `{ok, session_id, subtask: {subtask_id, description, status, depends_on, created_at}, total_subtasks}`.
-
-**`list_subtasks(session_id)`**
-
-All subtasks with statuses as a structured, bounded response: `{ok, session_id, total, counts: {<status>: n}, subtasks: [...]}`. Each summary carries bounded scalar fields plus result/recovery **counts** — never result payloads, never history.
-
-**`run_subtask(session_id, subtask_id, approve_next_action=False)`**
-
-Executes exactly ONE ready subtask through the existing closed-loop executor — one bounded subtask per call; state and checkpoints persist server-side between calls. Only `pending` or `paused` subtasks can run; unmet dependencies fail with `subtask_not_ready` and the list of unmet dependencies. `approve_next_action=true` authorizes at most one interactive action in this call (the `run_goal` budget semantics). Returns `{ok, session_id, subtask_id, status, termination_reason, requires_approval, stopped, results, executed_subtasks, approval_budget_remaining, detail, progress, metrics}`. A subtask paused awaiting a fresh approval epoch resumes through this tool.
-
-**`get_session_progress(session_id)`**
-
-The deterministic progress report described above.
-
-Two existing tools gained trailing optional parameters: `run_goal(..., auto_subtasks=False)` and `start_session(..., resume_from_checkpoint=None)`.
-
-### Example: a long-running session end to end
-
-**1. Start a session with a long-running budget** (a vision API key is needed only for planning, summarization, and model decisions):
-
-```json
-// start_session
-{
-  "dry_run": false,
-  "require_approval": false,
-  "allowed_processes": ["notepad.exe", "explorer.exe"],
-  "limits": { "max_session_seconds": 7200, "max_session_steps": 300, "max_subtasks": 10 }
-}
-```
-
-**2. Decompose and run the goal** — `auto_subtasks=true` plans (LLM proposal → deterministic validation) and then executes ready subtasks sequentially, all inside this one call:
-
-```json
-// run_goal
-{ "session_id": "0f4a…", "goal": "Prepare the monthly report from the data on screen and file it", "auto_subtasks": true }
-```
-
-The response keeps the `run_goal` shape and adds `planned_subtasks`, `executed_subtasks`, `replan_attempts`, `detail`, and `progress`. When the approval epoch (30 min / 50 interactive actions by default) expires or a health check stops the run, `requires_approval: true` or `termination_reason: "blocked_safety"` with `detail` explains why — and a lifecycle checkpoint has already been written.
-
-**3. Check progress at any time:**
-
-```json
-// get_session_progress { "session_id": "0f4a…" }  (response, trimmed)
-{
-  "ok": true,
-  "status": "idle",
-  "total_subtasks": 5,
-  "completed_subtasks": 2,
-  "progress_percent": 40.0,
-  "counts": { "pending": 1, "running": 0, "completed": 2, "failed": 0, "blocked": 1, "paused": 1 },
-  "resource_counters": { "actions": 87, "model_calls": 40, "steps": 121, "subtasks": 3 },
-  "checkpoint": { "has_checkpoint": true, "last_trigger": "subtask_completed", "last_checkpoint_at": "2026-09-06T10:14:00.000000Z" }
-}
-```
-
-**4. Stop** — a `before_session_end` checkpoint is written before the kill path closes the session:
+**1. Stop the session** — a `before_session_end` checkpoint is written before the kill path closes the session:
 
 ```json
 // stop_session { "session_id": "0f4a…" }
 ```
 
-**5. Resume later as a continuation** (counters and subtask states return exactly as they were; the current environment must still match the checkpoint's expectations):
+**2. Resume later as a continuation** (counters return exactly as they were; the current environment must still match the checkpoint's expectations):
 
 ```json
 // start_session
-{ "resume_from_checkpoint": "C:\\…\\checkpoints\\0f4a…\\checkpoint.json" }
+{ "resume_from_checkpoint": "C:\…\checkpoints\0f4a…\checkpoint.json" }
 // → { "…", "resumed": true, "continuation_of": "0f4a…" }
 ```
 
-Then finish the remaining work one subtask at a time (`list_subtasks` first, then `run_subtask` — a paused subtask resumes with `approve_next_action: true`):
-
-```json
-// run_subtask
-{ "session_id": "<new session id>", "subtask_id": "<id from list_subtasks>", "approve_next_action": true }
-```
+The host then continues driving the session with `computer_observe` / `computer_execute` as usual — the resumed budget applies to everything it does.
 
 ### Backward compatibility
 
-- The six existing tools (`start_session`, `stop_session`, `computer_screenshot`, `computer_observe`, `computer_execute`, `run_goal`) keep their names, parameter positions, and response shapes; every long-running addition is a trailing optional parameter or an additive response field.
-- `run_goal` without `auto_subtasks` runs the exact same single-goal loop as before — byte-identical default behavior; subtask mode is strictly opt-in.
-- No existing limit was removed or weakened; the session-level limits above are additive and clamped like the rest. A subtask can never reset or enlarge a session counter.
+- The five tools (`start_session`, `stop_session`, `computer_screenshot`, `computer_observe`, `computer_execute`) keep their names, parameter positions, and response shapes.
+- The removed loop family (`run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`) is gone from tools/list; hosts must drive actions directly — the documented pattern since the loop's guarantees (grounding, validation, risk, approval, verification) wrap every `computer_execute` call.
+- No existing limit was removed or weakened; the session-level limits above are additive and clamped like the rest. A resume can never reset or enlarge a session counter.
 
 ## Testing
 
@@ -701,7 +626,7 @@ python -m ruff check src tests benchmarks
 CUMCP_RUN_E2E=1 pytest tests/e2e/
 ```
 
-Measured at HEAD on the development machine (Windows Server 2022, Python 3.12): **1105 passed, 7 skipped** for the standard suite, and ruff reports **all checks passed**. The 7 skips are the gated real-Windows E2E desktop tests. `tests/e2e/` collects 10 tests: the 7 gated desktop tests (window identity, semantic typing verification, moved-window recovery, staleness on window switch, grounded Calculator clicks, display-value verification, browser window-state verification) plus 3 benchmark-harness tests that run unconditionally in the standard suite. The desktop tests use deterministic scripted providers — no vision model, no network — and cross-check runtime assertions against real Win32 state so the runtime cannot self-certify.
+Measured at HEAD on the development machine (Windows Server 2022, Python 3.12): **1195 passed, 7 skipped** for the standard suite (count moves with the in-flight mission-056 tree; the 7 skips are the gated real-Windows E2E desktop tests, skipped BY DEFAULT by the D6 fail-closed gate with a loud opt-in reason), and ruff reports **all checks passed**. `tests/e2e/` collects 10 tests: the 7 gated desktop tests (window identity, semantic typing verification, moved-window typed verification failure, foreground-switch staleness defense, grounded Calculator clicks, display-value verification, browser window-state verification) plus 3 benchmark-harness tests that run unconditionally in the standard suite. The desktop tests are deterministic — no vision model, no network — and cross-check runtime assertions against real Win32 state so the runtime cannot self-certify. Desktop-safety doctrine (D6): the e2e gate opens ONLY for the exact opt-in `CUMCP_RUN_E2E=1` (any other variable or value stays closed), and every e2e app instance is isolated by a run-unique window token so the suite can never attach to, type into, or close a window it did not launch itself (see `tests/e2e/README.md`).
 
 ## Benchmarks
 

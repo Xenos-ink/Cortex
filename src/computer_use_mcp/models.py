@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, computed_field, model_validator
 
 
 def _utc_now() -> datetime:
@@ -288,6 +288,24 @@ class Observation(BaseModel):
             self.coordinate_space = CoordinateSpace.UNVERIFIABLE
         return self
 
+    # --- R-5 mechanical-speed private stash (never serialized; additive) -------------------
+    # ``_frame``: the capture-time RGB frame (a PIL Image) when the producing backend
+    # supports internal-frame reuse (LocalComputerBackend). Consumers that need pixels
+    # (verification pixel-diff, outbound re-encode) use it to skip a base64+PNG decode
+    # of a frame the pipeline JUST encoded; anything absent falls back to decoding
+    # ``image_base64`` exactly as before, so tests/fakes are unaffected.
+    _frame: Any = PrivateAttr(default=None)
+    # ``_captured_monotonic``: ``time.perf_counter()`` at capture (set by the agent's
+    # ``_observe``), the freshness clock for the validate-phase capture-reuse window.
+    _captured_monotonic: float = PrivateAttr(default=0.0)
+    # ``_frame_raw`` (R-7): the capture-time RAW pixel bytes the stashed ``_frame``
+    # was built from, when — and only when — the producing backend holds one readback
+    # buffer per capture (dxgi packed BGRA, mss BGRX DIB). The verification diff's
+    # identical-frame short-circuit memcmpes two stashes (equal bytes == equal pixels,
+    # ~0.5 ms vs a ~25 ms full-frame diff); absent on every other path (decoded PNGs,
+    # tests, fakes) and never serialized.
+    _frame_raw: Any = PrivateAttr(default=None)
+
 
 class GroundingValidation(BaseModel):
     valid: bool
@@ -334,6 +352,10 @@ class ExecutionResult(BaseModel):
     verification: VerificationResult | None = None
     screenshot_after_base64: str | None = None
     retry_count: int = 0
+    # R-5 (W4): the post-action capture's RGB frame (never serialized; additive). The
+    # server's outbound bounding uses it to skip re-decoding the PNG it just encoded;
+    # absent (legacy results, tests) the outbound path decodes exactly as before.
+    _frame: Any = PrivateAttr(default=None)
 
 
 # --- host-path action queue + observation summary (PERF-004, additive) -----------------------

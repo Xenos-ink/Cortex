@@ -234,21 +234,25 @@ async def test_drag_endpoints_coerce_tolerantly(
     assert executed == [("drag", (10, 20), (111, 70))]
 
 
-async def test_boundary_schema_still_declares_integer(
+async def test_boundary_schema_declares_widened_coordinate_types(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The advertised tool schema stays self-describing: x/y/x2/y2 allow "integer".
+    """The advertised tool schema stays self-describing AND D5-widened: x/y/x2/y2
+    allow integer | string | null (flat type-array, no anyOf).
 
-    The coercion is PRE-validation tolerance, not a semantics change — the driving
-    model is still told to send integers. REM-G flattened the advertised Optional
-    union from pydantic's anyOf[X, null] form to the plain type-array form
-    {"type": ["integer", "null"]} (client-side validators choked on anyOf); this
-    pin now asserts the flattened form directly.
+    The coercion is PRE-validation tolerance, not a semantics change. REM-G
+    flattened the Optional union to the plain type-array form (client-side
+    validators choked on anyOf); D5 (ORVEX-CORTEX-056-LIVEFIX, F-3 work order
+    WO-1) then WIDENED the coordinate advertisement to also admit "string" —
+    the live client-side ajv validator rejected numeric-string coordinates
+    BEFORE the REM-F coercions could ever run, burning 4 turns per vision
+    session. The runtime contract is unchanged: ints, integral floats, and
+    numeric strings coerce; non-numeric garbage still fails typed (pinned above).
     """
     meta = _meta("computer_execute")
     schema = meta.arg_model.model_json_schema()["properties"]
     for name in ("x", "y", "x2", "y2"):
-        assert schema[name].get("type") == ["integer", "null"], (name, schema[name])
+        assert schema[name].get("type") == ["integer", "string", "null"], (name, schema[name])
         assert "anyOf" not in schema[name], (name, schema[name])
 
 

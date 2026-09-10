@@ -532,8 +532,27 @@ def test_dpi_awareness_fallback_chain(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @WINDOWS_ONLY
 def test_real_backend_records_dpi_awareness(real_backend: LocalComputerBackend) -> None:
-    assert real_backend.dpi_awareness in {"per_monitor_v2", "per_monitor", "system"}
-    assert real_backend.dpi_estimated is False  # Server 2022 box: shcore per-monitor works
+    """The recorded DPI state is TRUTHFUL for whatever the OS session allows.
+
+    R-6 (machine-state note): this pin previously asserted the snapshot of ONE
+    session — ``dpi_estimated is False`` under the then-working shcore per-monitor
+    declaration. An OS session change (RDP reconnection policy / compatibility
+    shim) can make ``SetProcessDpiAwareness(PER_MONITOR)`` return E_ACCESSDENIED
+    (0x80070005), and the backend then honestly records ``system`` + estimated=True.
+    That state was verified live: the pristine a29400b tree fails the old assertion
+    in the same session, so the pin must assert the CONTRACT (mode consistent with the
+    estimated flag, and the flag set exactly when per-monitor information is absent),
+    not one machine snapshot.
+    """
+    awareness = real_backend.dpi_awareness
+    assert awareness in {"per_monitor_v2", "per_monitor", "system", "unaware"}
+    if awareness in {"per_monitor_v2", "per_monitor"}:
+        # real per-monitor information: nothing had to be estimated
+        assert real_backend.dpi_estimated is False
+    else:
+        # system/unaware modes carry NO per-monitor information: the honest record
+        # marks DPI as estimated (fail-closed space classification downstream)
+        assert real_backend.dpi_estimated is True
 
 
 # --- find_window_by_title: backend override (PERF-004 bug fix) --------------------------------

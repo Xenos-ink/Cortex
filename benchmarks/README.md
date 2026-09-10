@@ -32,7 +32,7 @@ Schema (all fields required unless noted):
 |---|---|---|
 | `id` | str | unique task id (`tNN-...`) |
 | `category` | enum | one of OSWorld-2.0-aligned categories: `long_horizon_state_tracking`, `hidden_state`, `cross_source_reasoning`, `visual_spatial_precision`, `verification`, `safety_compliance` |
-| `goal` | str | the goal handed to `run_goal` |
+| `goal` | str | the human task statement (recorded per result; the harness drives `computer_execute` per provider step, no loop tool exists) |
 | `fake_runnable` | bool | false = needs a real application (skipped as `requires_env` in `--mode fake`) |
 | `setup` | object | `app`: `notepad` \| `notepad_two` \| `calculator` \| `browser`, plus app params (`file_name`, `bounds`, `decoy_file`, `title_marker`, `title_marker_2`) |
 | `provider.steps` | list | scripted provider steps (see below) |

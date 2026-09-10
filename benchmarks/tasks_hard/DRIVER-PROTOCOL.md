@@ -179,7 +179,8 @@ NAMED `follow_ups_stopped_reason` (`focus_taken_by`, `modal_dialog`, `focus_drif
    launcher's chosen repo root): `start_session` (with `dry_run=false`,
    `require_approval=false` and the task's `allowed_processes` as the process allowlist)
    followed by `computer_observe` / `computer_execute` actions (click / type / keypress /
-   drag / scroll / focus_window / wait), or `run_goal` when the session supports it.
+   drag / scroll / focus_window / wait). (`run_goal` was removed with the internal
+   loop; there is no loop tool — drive every action as a direct `computer_execute`.)
    One session per task run; one client per session.
 3. Wall time is measured **externally** by the launcher (step 2/4 above) — never taken
    from driver claims or session self-timing.

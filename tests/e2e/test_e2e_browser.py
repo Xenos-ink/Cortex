@@ -2,10 +2,12 @@
 
 Setup launches Microsoft Edge (Server 2022 default enterprise browser) with a local HTML
 file (``file:///`` URL, unique marker title, no first-run wizards). The runtime then runs
-a scripted ``run_goal`` whose only interactive action is a ``wait``; its
-``verification_hint="window_state"`` makes the built-in ``WindowStateStrategy`` verify the
-post-action observation's REAL foreground title against the page's ``<title>`` — window
-identity verification from observation fields, no OCR, no pixel diff.
+a direct ``computer_execute`` (``wait`` action) whose ``expected_effect`` carries the page
+marker, which the built-in ``WindowStateStrategy`` verifies against the post-action
+observation's REAL foreground title and the page's ``<title>`` — window identity
+verification from observation fields, no OCR, no pixel diff (RETARGETED, run_goal
+removal: the loop died with run_goal; the window_state verification path is the direct
+path's).
 
 Environment notes (probed live): the Edge window carries a profile suffix
 ("... - Work - Microsoft Edge"), so verification uses contains-matching against the unique
@@ -16,6 +18,11 @@ arrangement therefore waits on the UNIQUE per-run page-title marker (never on th
 launcher PID alone) and identity is asserted against the window's REAL owning pid read
 via Win32. Cleanup closes exactly the hwnd found and kills only the launched tree (a
 handoff launcher is already dead or a childless stub — never the user's browser).
+
+Window-isolation doctrine (D6, R-8): the page marker is run-UNIQUE
+(``w32.unique_window_token``) and the wait goes through the marker-only attach path
+(``wait_for_marked_window``), so the user's own Edge window can never match; teardown
+closes exactly the found marker hwnd (exact-hwnd close, not a title match).
 """
 
 from __future__ import annotations
@@ -39,7 +46,10 @@ EDGE_CANDIDATES = (
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
 )
-PAGE_TITLE_MARKER = "E2E Browser Verification Page 7391"
+# D6: run-UNIQUE page-title marker (legacy static marker "E2E Browser Verification
+# Page 7391" was shared across runs; the token makes this run's window unambiguous
+# and un-collidable with any user Edge window). The legacy string stays searchable.
+PAGE_TITLE_MARKER = f"E2E Browser Verification Page {w32.unique_window_token('page7391')}"
 
 
 def find_edge() -> str | None:
@@ -68,12 +78,19 @@ def edge_app(deadline: w32.Deadline, page_url: str):
     )
     hwnd: int | None = None
     try:
-        # Unique per-run page marker, NOT the launcher pid: with an Edge singleton
-        # already running, the launcher hands off and exits before the window opens.
-        hwnd = w32.wait_for_window(deadline, title_needle=PAGE_TITLE_MARKER, timeout_s=45.0)
+        # D6: attach by the run-UNIQUE page-title marker via the marker-only path —
+        # with an Edge singleton already running, the launcher hands off and exits
+        # before the window opens, AND the user's own Edge window (different title)
+        # is invisible to this wait by construction.
+        hwnd = w32.wait_for_marked_window(deadline, PAGE_TITLE_MARKER, timeout_s=45.0)
+        assert PAGE_TITLE_MARKER.casefold() in w32.window_text(hwnd).casefold(), (
+            w32.window_text(hwnd)
+        )
         yield proc, hwnd
     finally:
         if hwnd is not None:
+            # close_window is exact-hwnd (D6): closes only OUR marker window, never
+            # any other same-name Edge window.
             w32.close_window(hwnd, wait_s=8.0)
         if proc.poll() is None:  # launcher still alive (no handoff): our tree, kill it
             w32.kill_process_tree(proc.pid)
@@ -128,17 +145,17 @@ def test_browser_local_page_window_state_verification(
             assert observation["coordinate_space"] == "verified_passthrough", observation
 
             response = asyncio.run(
-                server.run_goal(session_id, f"Verify the local page {PAGE_TITLE_MARKER!r} is open")
+                server.computer_execute(
+                    session_id, "wait", delta=1, expected_effect=PAGE_TITLE_MARKER
+                )
             )
             if evidence is not None:
                 evidence.record(
-                    "run_goal",
+                    "computer_execute(wait)",
                     ok=response.get("ok"),
-                    termination=response.get("termination_reason"),
                 )
-            assert response["termination_reason"] == "completed", response
-            first = response["results"][0]
-            verification = first["verification"]
+            verification = response["verification"]
+            assert response["ok"] is True, response
             assert verification["outcome"] == "verified", verification
             assert verification["verification_method"] == "window_state", verification
             assert PAGE_TITLE_MARKER.casefold() in verification["note"].casefold() or any(

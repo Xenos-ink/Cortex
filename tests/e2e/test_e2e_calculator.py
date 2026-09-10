@@ -45,10 +45,21 @@ def calculator_app(deadline: w32.Deadline):
     that exits immediately and re-launches the real binary as ``win32calc.exe`` — so the
     suite launches ``win32calc.exe`` directly, making the tracked PID the actual window
     owner. If a future build replaces it with a store app this test fails visibly here.
+
+    D6 window isolation: the classic Calculator window title cannot carry a run
+    token, so attach here is PID-scoped — ``launch_gui`` matches class ``CalcFrame``
+    AND the pid of the process WE started, which the user's own Calculator instance
+    (a different pid) can never satisfy. Every subsequent identity assertion in the
+    tests pins hwnd == the launched pid's window, so input can only land in ours.
     """
     if not os.path.exists(WIN32CALC):
         pytest.skip(f"classic Calculator binary not present: {WIN32CALC}")
-    proc, hwnd = w32.launch_gui(deadline, [WIN32CALC], window_class=w32.CALC_WINDOW_CLASS, timeout_s=30.0)
+    proc, hwnd = w32.launch_gui(
+        deadline, [WIN32CALC], window_class=w32.CALC_WINDOW_CLASS, timeout_s=30.0
+    )
+    # D6 pin at launch time: the window belongs to OUR pid (never the user's calc).
+    assert w32.window_pid(hwnd) == proc.pid, (hwnd, proc.pid)
+    assert w32.window_class(hwnd) == w32.CALC_WINDOW_CLASS, w32.window_class(hwnd)
     try:
         yield proc, hwnd
     finally:
@@ -78,25 +89,10 @@ def test_calculator_clicks_and_display_verification(
         assert w32.focus_window(hwnd), "could not focus Calculator"
         grid = w32.calc_button_grid(hwnd)
         display_strategy = rt.CalcDisplayPredicateStrategy(hwnd)
-        provider = rt.E2EScriptedProvider(
-            [
-                rt.step(rt.click(*grid["7"], expected_effect="calc_display_equals:7",
-                                 reason="click digit 7 (grounded from live button grid)"),
-                        verification_hint="predicate"),
-                rt.step(rt.click(*grid["*"], expected_effect="calc_display_equals:7",
-                                 reason="click multiply — display unchanged; pixel diff cannot verify this"),
-                        verification_hint="predicate"),
-                rt.step(rt.click(*grid["6"], expected_effect="calc_display_equals:6",
-                                 reason="click digit 6"),
-                        verification_hint="predicate"),
-                rt.step(rt.click(*grid["="], expected_effect="calc_display_equals:42",
-                                 reason="click equals"),
-                        verification_hint="predicate"),
-                rt.done("7*6 computed and verified"),
-            ]
-        )
+        # RETARGETED (run_goal removal): no scripted provider — the loop is gone; every
+        # step below is a direct computer_execute click with its own expected_effect.
         session_id, bundle = make_session(
-            provider=provider,
+            provider=rt.E2EScriptedProvider([rt.done("unused on the direct path")]),
             dry_run=False,
             require_approval=False,
             allowed_processes=["win32calc.exe"],
@@ -131,7 +127,10 @@ def test_calculator_clicks_and_display_verification(
             assert direct["verification"]["verification_method"] == "calc_display", direct["verification"]
             assert w32.calc_display_value(hwnd) == "7", w32.calc_display_values(hwnd)
 
-            # --- clear via computer_execute, then compute through run_goal --------------
+            # --- clear via computer_execute, then compute via direct calls ---------------
+            # RETARGETED (run_goal removal): the loop died with run_goal; each scripted
+            # step below is now a direct computer_execute click, verified per call by
+            # the injected display-predicate strategy (the same verification pipeline).
             cleared = asyncio.run(
                 server.computer_execute(
                     session_id,
@@ -145,24 +144,32 @@ def test_calculator_clicks_and_display_verification(
             assert cleared.get("ok") is True, cleared
             assert w32.calc_display_value(hwnd) == "0", w32.calc_display_values(hwnd)
 
-            response = asyncio.run(server.run_goal(session_id, "Compute 7*6 in Calculator"))
-            if evidence is not None:
-                evidence.record(
-                    "run_goal",
-                    ok=response.get("ok"),
-                    termination=response.get("termination_reason"),
-                    steps=response.get("step_count"),
+            for label, key, expected in (
+                ("7", "7", "calc_display_equals:7"),
+                ("*", "*", "calc_display_equals:7"),
+                ("6", "6", "calc_display_equals:6"),
+                ("=", "=", "calc_display_equals:42"),
+            ):
+                clicked = asyncio.run(
+                    server.computer_execute(
+                        session_id,
+                        "click",
+                        x=grid[key][0],
+                        y=grid[key][1],
+                        approved=True,
+                        expected_effect=expected,
+                    )
                 )
-
-            assert response["termination_reason"] == "completed", response
-            results = response["results"]
-            # 4 click results + the provider-declared "done" completion result.
-            assert len(results) == 5, results
-            for result in results[:4]:
-                verification = result["verification"]
-                assert verification["outcome"] == "verified", verification
-                assert verification["verification_method"] == "calc_display", verification
-            assert results[4]["verification"]["verification_method"] == "provider_done", results[4]
+                if evidence is not None:
+                    evidence.record(
+                        f"computer_execute(click {label})",
+                        ok=clicked.get("ok"),
+                        verification=clicked.get("verification"),
+                    )
+                assert clicked.get("ok") is True, clicked
+                verification = clicked["verification"]
+                assert verification["outcome"] == "verified", (label, verification)
+                assert verification["verification_method"] == "calc_display", (label, verification)
             assert display_strategy.calls[-1]["display"] == "42", display_strategy.calls
             assert w32.calc_display_value(hwnd) == "42", w32.calc_display_values(hwnd)
 
@@ -176,11 +183,12 @@ def test_calculator_clicks_and_display_verification(
                     True,
                     "screenshot diff alone cannot verify this state transition",
                 )
-                evidence.assert_that("run_goal computed 7*6=42 with all steps verified", True)
+                evidence.assert_that("direct computer_execute clicks computed 7*6=42, every step verified", True)
                 evidence.assert_that("independent Win32 display read == 42", True)
                 evidence.add_extra("button_grid", {k: list(v) for k, v in grid.items()})
                 evidence.add_extra("display_strategy_calls", display_strategy.calls)
-                evidence.add_extra("metrics", response.get("metrics"))
+                # (metrics snapshot died with run_goal's response; per-click
+                # verification outcomes are recorded above and in the audit excerpt.)
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
@@ -197,21 +205,9 @@ def test_calculator_division_precision(
         assert w32.focus_window(hwnd), "could not focus Calculator"
         grid = w32.calc_button_grid(hwnd)
         display_strategy = rt.CalcDisplayPredicateStrategy(hwnd)
-        provider = rt.E2EScriptedProvider(
-            [
-                rt.step(rt.click(*grid["1"], expected_effect="calc_display_equals:1",
-                                 reason="click digit 1"), verification_hint="predicate"),
-                rt.step(rt.click(*grid["/"], expected_effect="calc_display_equals:1",
-                                 reason="click divide (no visual change)"), verification_hint="predicate"),
-                rt.step(rt.click(*grid["8"], expected_effect="calc_display_equals:8",
-                                 reason="click digit 8"), verification_hint="predicate"),
-                rt.step(rt.click(*grid["="], expected_effect="calc_display_equals:0.125",
-                                 reason="click equals"), verification_hint="predicate"),
-                rt.done("1/8 computed and verified"),
-            ]
-        )
+        # RETARGETED (run_goal removal): direct calls, no scripted provider (see above).
         session_id, bundle = make_session(
-            provider=provider,
+            provider=rt.E2EScriptedProvider([rt.done("unused on the direct path")]),
             dry_run=False,
             require_approval=False,
             allowed_processes=["win32calc.exe"],
@@ -219,12 +215,27 @@ def test_calculator_division_precision(
         with_verifier(session_id, bundle, display_strategy)
         try:
             observe(evidence, session_id, "before")
-            response = asyncio.run(server.run_goal(session_id, "Compute 1/8 in Calculator"))
-            assert response["termination_reason"] == "completed", response
-            for result in response["results"][:-1]:  # last entry is the provider "done" marker
-                verification = result["verification"]
-                assert verification["outcome"] == "verified", verification
-                assert verification["verification_method"] == "calc_display", verification
+            # RETARGETED (run_goal removal): direct calls; each click verified per call.
+            for label, key, expected in (
+                ("1", "1", "calc_display_equals:1"),
+                ("/", "/", "calc_display_equals:1"),
+                ("8", "8", "calc_display_equals:8"),
+                ("=", "=", "calc_display_equals:0.125"),
+            ):
+                clicked = asyncio.run(
+                    server.computer_execute(
+                        session_id,
+                        "click",
+                        x=grid[key][0],
+                        y=grid[key][1],
+                        approved=True,
+                        expected_effect=expected,
+                    )
+                )
+                assert clicked.get("ok") is True, (label, clicked)
+                verification = clicked["verification"]
+                assert verification["outcome"] == "verified", (label, verification)
+                assert verification["verification_method"] == "calc_display", (label, verification)
             assert w32.calc_display_value(hwnd) == "0.125", w32.calc_display_values(hwnd)
 
             if evidence is not None:

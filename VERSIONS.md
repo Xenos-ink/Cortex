@@ -69,6 +69,141 @@ fixed, red-teamed, and validated live on Kimi Code + GLM-5V driving MS Paint.
 - **Wire schemas:** Optional parameters advertise type-array forms instead of `anyOf`
   (runtime validation semantics unchanged; `limits` still fail-closed strict).
 
+## Unreleased
+
+### Fixed
+
+- **D6 desktop-safety gating of the real-input E2E suite (mission 056, R-8)** — plain
+  `pytest tests` runs used to execute the real-Windows E2E tests whenever
+  `CUMCP_RUN_E2E` leaked into the environment (an agent "full suite" run did exactly
+  that and typed `e2e-typed-7391 quick brown fox` into a Notepad window the USER had
+  open — wrong-window attach). The gate is now a loud, fail-closed contract pinned by
+  tests: e2e-marked tests SKIP BY DEFAULT with a skip reason that states the exact
+  opt-in (`CUMCP_RUN_E2E=1 python -m pytest tests/e2e`) and WARNs that opting in
+  drives real keyboard/mouse input on the live desktop; only the exact variable name
+  AND exact value `1` enable it (`true`/`yes`/`on`/`2` and any
+  `E2E_*`/`REAL*`/`DESKTOP*` variable stay closed — proven against leakage).
+
+### Changed
+
+- **Unique-window isolation in the E2E suite (D6 wrong-window defense)** — e2e app
+  tests can no longer attach to anything they did not launch themselves. Notepad
+  instances are launched with scratch files whose names embed a run-unique token
+  (`cumcp-e2e-<pid>-<n>-<ts>`, so the window title carries it) and attach goes through
+  a marker-only helper (`attach_window_by_unique_title`) that treats the user's own
+  same-app windows as invisible: zero marker matches fail loudly (TimeoutError, never
+  a fallback attach), ambiguous matches raise. Calculator attach is PID-scoped to the
+  process the suite launched; the browser page title embeds the same run-unique token.
+  Teardown is hardened to close exactly what was opened (exact-hwnd `close_window`
+  instead of a class/title re-search; `kill_process_tree` stays pid-scoped). All
+  pinned WITHOUT real input in `tests/test_r8_pins.py` (41 pins: gate fail-closed
+  matrix, marker-only attach with stubbed enumeration, exact-hwnd teardown,
+  marker-presence checks). Standard suite: 1195 passed / 7 skipped (the 7 skips are
+  the gated e2e tests with the loud reason).
+
+### Performance
+
+- **R-5 mechanical per-action speed (mission 056)** — the direct-action pipeline now
+  runs one full capture instead of three on the steady-state path, and verification
+  diffs raw frames instead of re-decoding the PNG it just watched get encoded.
+  Live audit reconstruction (4 kimi sessions, n=20 actions) showed each direct
+  action paid THREE full captures (direct_request + validate + post_action,
+  p50 132–174 ms each) plus a two-PNG-decode pixel diff (p50 101 ms); the honest
+  live baseline was ~428 ms mechanical per action (excluding the host's own observe
+  calls), ~582 ms including them — not the 125 ms figure previously reported.
+  Changes, all verification-semantics-preserving:
+  - **Identity-probe-guarded validate reuse** — a DIRECT action whose premise was
+    captured in the same tool call and is still inside the freshness window
+    (`CORTEX_VALIDATE_REUSE_MS`, default 1500; `0` restores full re-capture) runs a
+    capture-free identity probe (monitors + foreground window + coordinate space —
+    exactly the dimensions the validator's staleness check consumes; ~0.8 ms measured)
+    instead of re-capturing the identical screen. NO drift → the premise is reused
+    (audited truthfully: `phase=validate, reused=True, duration=0.0`); ANY drift →
+    the probe becomes the validate observation and the P0-H `STALE_OBSERVATION`
+    rejection + single re-observe recovery fire exactly as before. Queued
+    follow-ups NEVER reuse (their premise is a previous item's post-action capture);
+    backends without the probe keep the full validate capture.
+  - **Raw-frame verification fast path** — the backend stashes the capture-time RGB
+    frame on the Observation (private `_frame`, never serialized); the pixel-diff
+    tier and the FocusChange digest corroboration use it directly instead of
+    base64+PNG-decoding both sides (two ~20–36 ms decodes per verification → 0).
+    No stash / one-sided stash / size-mismatched stash falls back to the exact
+    legacy decode; verdicts and evidence are byte-identical (pinned).
+  - **One-histogram diff math** — the screen-wide mean is derived from the diff's
+    own 768-bin histogram instead of a second full-frame `ImageStat` pass; bit-
+    identical values (pinned against the historical computation), thresholds
+    (`STRONG_PIXEL_DELTA=40`, `STRONG_CHANGE_MIN_PIXELS=50`,
+    `DEFAULT_DIFF_THRESHOLD=1.0`) untouched.
+  - **Outbound JPEG from the raw frame** — `_bound_outbound_image` accepts the
+    capture frame and skips re-decoding the just-encoded PNG; ladder outputs are
+    byte-identical (pinned), internal PNG untouched.
+  - **Persistent mss capture instance** — one held instance per backend (DIB stays
+    allocated) instead of a fresh `mss.MSS()` per grab; any grab failure drops the
+    instance fail-safe. `CORTEX_INTERNAL_FRAME_REUSE=0` disables the frame/payload
+    stashes (pure legacy path).
+  - **Identical-pixel payload dedupe** — a capture whose raw bytes are byte-identical
+    to the previous capture reuses the previous PNG payload verbatim (PNG
+    determinism: identical pixels → identical bytes; digests/staleness unaffected).
+  - **`CORTEX_PNG_COMPRESS_LEVEL`** (0–9, default unset = PIL's own = today's bytes)
+    — opt-in encode/size trade for mechanical throughput.
+  Measured on the mission desktop (real capture, input stubbed): per-action p50
+  198.5 ms paced (was ~428 ms live), verification p50 101→33.7 ms, observe p50
+  ~70–98 ms, identity probe 0.8 ms. The remaining floor is two GDI BitBlt
+  captures (~40 ms each, hardware-bound) + two lossless PNG encodes (~27–80 ms on
+  noisy content) + one full-frame diff (~30 ms) — reaching the 52 ms bar would
+  require removing a mandatory capture or the lossless internal format, both
+  verification-semantics changes this wave is forbidden to make. Back-to-back
+  host calls still wait behind `min_screenshot_interval_ms=250` (contractual).
+  Suite: 1131 passed / 7 skipped (1109 baseline + 22 R-5 pins in
+  `tests/test_r5_speed_optimization.py`).
+
+### Changed
+
+- **The `run_goal` tool family is REMOVED** — `run_goal`, `create_subtask`,
+  `list_subtasks`, `run_subtask`, and `get_session_progress` no longer exist; the
+  server now exposes exactly five deterministic tools (`start_session`,
+  `computer_observe`, `computer_screenshot`, `computer_execute`, `stop_session`).
+  The internal autonomous loop (an internal LLM/vision decide phase deciding one
+  action per model call) was removed because the server is driven exclusively by a
+  host agent making direct tool calls with a real model — the loop doubled the
+  failure surface and was the sole home of two confirmed defects: an unset
+  `VISION_API_KEY` surfacing as an in-loop HTTP 401 instead of a clean typed error,
+  and an unbounded ~500 KB screenshot payload serialized as text inside loop
+  results. Both defect classes are nullified by the removal. Every direct
+  `computer_execute` call passes through the identical grounding, validation,
+  risk, approval, execution, and verification pipeline, so the per-action
+  guarantees are unchanged; loop-only semantics (per-call approval budget,
+  in-run bounded recovery/re-decide, `completion_evidence="model_declared"`
+  labeling) are replaced by per-call `approved=True`, typed failure outcomes
+  surfaced to the host, and host-decided completion on evidenced `verified`
+  outcomes. The sealed checkpoint/resume machinery survives on
+  `start_session(resume_from_checkpoint=…)`; the subtask-orchestration modules
+  and their domain rules remain pinned by unit tests but are no longer reachable
+  from any tool. Tests: loop-only suites removed, shared-behavior suites
+  retargeted to the five-tool surface (not weakened); E2E and benchmark runner
+  retargeted to direct calls. Full suite: 1096 passed, 7 skipped (the gated
+  real-Windows E2E tests), zero failures.
+
+**Compatibility notes:** BREAKING for any host that still called `run_goal`,
+`create_subtask`, `list_subtasks`, `run_subtask`, or `get_session_progress` —
+those calls now fail with "Unknown tool"; hosts must drive actions through
+`computer_observe`/`computer_execute` (the documented direct-control pattern).
+No surviving tool changed name, parameters, or response shape; the wire-schema
+wins from v0.5.5 (content-block executes, flat type-array optionals, no
+`outputSchema` on the block tools) are intact.
+
+- **Docstring re-teaching for misclassification-prone models (L1-NEW-1):** live
+  evidence showed the default non-vision model READ the `image_delivery` teaching,
+  understood it, then self-misclassified ("my host is multimodal") and died on the
+  default image mode anyway. The `start_session` tool description (and
+  `computer_observe`'s cross-pointer) now teach the model to judge by what it
+  RECEIVES (text-only inputs → `image_delivery="text"`, required; unsure → "text";
+  text mode never crashes any model — a vision model only loses screenshot pixels)
+  instead of asking it to classify itself; README/ARCHITECTURE document
+  `CORTEX_IMAGE_DELIVERY=text` in the MCP server `env` block as the deterministic
+  fallback for hosts whose default model cannot view images. Wording only — the
+  D1 mechanism, defaults, and precedence are unchanged.
+
 
 ## v0.5.0 (2026-09-07) — RELEASED (performance & effectiveness)
 

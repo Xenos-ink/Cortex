@@ -1,27 +1,31 @@
 """Benchmark runner for computer-use-mcp (harness only — NO score claims).
 
 Executes task definitions (``tasks/*.yaml``) through the server tool surface
-(``start_session`` → ``run_goal`` → ``stop_session``) with a deterministic scripted
-provider strategy. Two modes:
+(``start_session`` → ``computer_execute`` → ``stop_session``). RETARGETED (run_goal
+removal): the internal decide/recovery loop is gone, so the runner now plays the host —
+it resolves each scripted provider step to a grounded action and issues it as ONE
+``computer_execute`` call, observing the verification outcome per action. Two modes:
 
 - ``--mode fake`` (default): every task runs against :class:`FakeWorldBackend`
-  (see ``fakeworld.py``) — the full closed loop (observation → grounding → validation
-  → risk → execution → re-observe → verification → recovery) executes for real; only
+  (see ``fakeworld.py``) — the full direct pipeline (observation → grounding →
+  validation → risk → execution → re-observe → verification) executes for real; only
   the desktop is simulated. No GUI required.
 - ``--mode env``: tasks run against real applications on THIS Windows box (Notepad,
   classic Calculator, Edge on a local page) via :mod:`appwin` lifecycles.
 
-A real vision-model provider plugs in later by replacing :class:`RunnerProvider`; the
-per-task metrics (grounding, verification, recovery, safety, actions/task, latencies)
-are collected identically either way. Output: ``results/<run_id>.json`` plus a printed
-summary table. Every artifact carries the disclaimer: HARNESS VALIDATION, NOT SCORES.
+A real vision-model provider plugs in later by replacing :class:`DirectCallDriver`'s
+resolution stage; the per-task metrics (grounding, verification, safety, actions/task,
+latencies) are collected identically either way. Output: ``results/<run_id>.json`` plus
+a printed summary table. Every artifact carries the disclaimer: HARNESS VALIDATION,
+NOT SCORES.
 
-Verification doctrine for task authors: in ``env`` mode the runtime's default strategy
-chain is used, so provider steps must use ``verification_hint`` values of
-``visual_change`` (stated ``expected_effect``) or ``window_state``; ``expected_text``
-and ``predicate`` hints require perception strategies that only exist in the E2E suite.
-The task-level ``verification`` predicate (evaluated by the runner against real window
-text / files / display values) carries the semantic check in every mode.
+Verification doctrine for task authors: the runtime's default strategy chain is used
+per ``computer_execute`` call, so provider steps should state ``expected_effect``
+values the default chain can decide (``visual_change`` screenshots, ``window_state``
+title needles on keypress/focus_window steps); ``expected_text`` and ``predicate``
+hints require perception strategies that only exist in the E2E suite. The task-level
+``verification`` predicate (evaluated by the runner against real window text / files /
+display values) carries the semantic check in every mode.
 """
 
 from __future__ import annotations
@@ -249,18 +253,17 @@ class StepResolver:
         )
 
 
-class RunnerProvider:
-    """Deterministic scripted provider implementing the pinned E4 surface.
-
-    Hook steps run at their position (on the decide call that would return the next
-    action step); action steps become decisions. This is the seam where a real vision
-    provider would plug in for measured benchmark runs.
+class DirectCallDriver:
+    """Host-side step driver (RETARGETED, run_goal removal): resolves each scripted
+    provider step to a grounded action and issues it as ONE ``computer_execute`` call,
+    consuming the verification outcome per action. Hook steps run at their position —
+    the same mid-flight fault window the loop's decide-time hooks used. This is the
+    seam where a real vision provider would ground measured benchmark actions.
     """
 
     def __init__(self, task: TaskSpec, resolver: StepResolver) -> None:
         self.task = task
         self.resolver = resolver
-        self.decide_calls = 0
         self.hooks: dict[int, dict[str, Any]] = {}
         self.action_steps: list[dict[str, Any]] = []
         for step in task.provider_steps:
@@ -269,39 +272,121 @@ class RunnerProvider:
             else:
                 self.action_steps.append(step)
 
-    async def decide_full(self, goal: str, observation: Any, history: list[str]) -> Any:
-        from types import SimpleNamespace
+    async def run(self, session_id: str) -> dict[str, Any]:
+        """Execute every action step as one direct computer_execute call.
 
-        index = self.decide_calls
-        self.decide_calls += 1
-        hook = self.hooks.get(index)
-        if hook is not None:
-            self.resolver.world.run_hook(hook)
-        if index >= len(self.action_steps):
-            raise RuntimeError(f"provider script exhausted for task {self.task.id!r}")
-        step = self.action_steps[index]
-        if step["type"] == "done":
-            decision = SimpleNamespace(status="done", action=None, summary=step.get("summary", "done"))
-            return SimpleNamespace(
-                decision=decision, expected_effect=None, verification_hint=None,
-                suspicious_content=None, redactions_applied=[],
+        Returns a loop-shaped summary for the metrics collector: ``results`` carries
+        one entry per action (ok / action / verification as the tool returned them),
+        ``termination_reason`` is derived from the LAST action's outcome, and
+        ``step_count`` counts executed host actions. The loop's auto-recovery is gone;
+        a failed action ENDS the task (the harness records the miss honestly — the
+        host-driver contract the five-tool surface exposes to every consumer).
+        """
+        results: list[dict[str, Any]] = []
+        executed = 0
+        termination = "completed"
+        last_payload: dict[str, Any] = {}
+        for index, step in enumerate(self.action_steps):
+            hook = self.hooks.get(index)
+            if hook is not None:
+                self.resolver.world.run_hook(hook)
+            if step["type"] == "done":
+                break  # scripted completion marker: nothing further to execute
+            observation = None
+            if any(
+                s.get("from_observation")
+                for s in [step]
+            ):
+                observation = self._observe(session_id)
+            action = self.resolver.resolve(step, observation)
+            payload = await self._execute(session_id, action, step)
+            last_payload = payload
+            ok = bool(payload.get("ok"))
+            results.append(
+                {
+                    "ok": ok,
+                    "action": {
+                        "action": getattr(action.action, "value", action.action),
+                        "point": getattr(action, "point", None),
+                        "grounding": getattr(action, "grounding", None) or {},
+                    },
+                    "verification": payload.get("verification") or {},
+                    "message": payload.get("message", ""),
+                }
             )
-        action = self.resolver.resolve(step, observation)
-        decision = SimpleNamespace(status="action", action=action, summary=step.get("reason", ""))
-        return SimpleNamespace(
-            decision=decision,
-            expected_effect=action.expected_effect,
-            verification_hint=step.get("verification_hint"),
-            suspicious_content=None,
-            redactions_applied=[],
-        )
+            executed += 1
+            if not ok:
+                # A refused/failed action ends the host script: map the typed outcome
+                # to the loop-era termination vocabulary the collector understands.
+                termination = self._termination_for(payload)
+                break
+        return {
+            "ok": termination == "completed",
+            "results": results,
+            "step_count": executed,
+            "termination_reason": termination,
+            "last_payload": last_payload,
+            "metrics": None,  # filled by the collector from the real bundle
+        }
 
-    async def decide(self, goal: str, observation: Any, history: list[str]) -> Any:
-        envelope = await self.decide_full(goal, observation, history)
-        return envelope.decision
+    def _observe(self, session_id: str) -> Any:
+        import json as _json
 
-    def judge_change(self, before_b64: str, after_b64: str, expected_effect: str) -> dict[str, Any]:
-        return {"outcome": "uncertain", "confidence": 0.0, "reason": "no judge in benchmark harness"}
+        from computer_use_mcp import server as srv
+
+        response = srv.computer_observe(session_id)
+        if isinstance(response, list):  # [TextContent, ImageContent]
+            return _json.loads(response[0].text).get("observation")
+        if isinstance(response, dict):
+            return response.get("observation", response)
+        return response
+
+    async def _execute(self, session_id: str, action: GroundedAction, step: dict[str, Any]) -> dict[str, Any]:
+        import json as _json
+
+        from computer_use_mcp import server as srv
+
+        kwargs: dict[str, Any] = {}
+        if action.point is not None:
+            kwargs["x"] = action.point.x
+            kwargs["y"] = action.point.y
+        if action.text:
+            kwargs["text"] = action.text
+        if action.keys:
+            kwargs["keys"] = list(action.keys)
+        if action.action == "wait" or getattr(action.action, "value", action.action) == "wait":
+            kwargs["delta"] = action.delta or 1
+        if action.expected_effect:
+            kwargs["expected_effect"] = action.expected_effect
+        response = await srv.computer_execute(session_id, str(getattr(action.action, "value", action.action)), **kwargs)
+        if isinstance(response, list):  # executed shape: [TextContent, ImageContent]
+            return _json.loads(response[0].text)
+        return response
+
+    @staticmethod
+    def _termination_for(payload: dict[str, Any]) -> str:
+        """Map a refused direct call to the loop-era termination vocabulary."""
+        error = str(payload.get("error", "") or "")
+        # Safety denials carry {"ok": False, "message": <policy reason>} with no error
+        # field; requires_approval is a separate approval_required shape. The
+        # collector cross-checks blocked_safety against the safety_block COUNTER and
+        # zero execution events, so this mapping cannot fake a "blocked as expected".
+        if error == "limit_exceeded":
+            return "limit_exceeded"
+        if error == "digest_surprise":
+            return "digest_surprise"
+        if "requires_approval" in payload:
+            return "approval_required"
+        verification = payload.get("verification") or {}
+        if verification.get("outcome") == "failed":
+            return "failed_verification"
+        if error in {"action_error"}:
+            return "failed_execution"
+        if "reasons" in payload:
+            return "rejected"
+        # Plain {"ok": False, "message": ...} with no verification: the safety gate
+        # (blocked_safety) is the remaining direct-path producer of this shape.
+        return "blocked_safety"
 
 
 # --- worlds -------------------------------------------------------------------------------------
@@ -575,7 +660,7 @@ class BenchmarkRunner:
         scratch_dir = self.results_dir / "scratch" / f"{self.run_id}_{task.id}"
         scratch_dir.mkdir(parents=True, exist_ok=True)
         world: Any = FakeWorld() if self.mode == "fake" else RealWorld()
-        provider = RunnerProvider(task, StepResolver(self.mode, world))
+        driver = DirectCallDriver(task, StepResolver(self.mode, world))
         result: dict[str, Any] = {
             "task": task.id,
             "category": task.category,
@@ -595,7 +680,6 @@ class BenchmarkRunner:
                 return result
             backend = world.backend if self.mode == "fake" else LocalComputerBackend()
             server._backend_factory = lambda: backend  # type: ignore[method-assign]
-            server._provider_factory = lambda: provider  # type: ignore[method-assign]
             response = server.start_session(
                 dry_run=False,
                 require_approval=False,
@@ -606,8 +690,12 @@ class BenchmarkRunner:
                 result["error"] = f"start_session failed: {response}"
                 return result
             session_id = str(response["session_id"])
-            run_response = asyncio.run(server.run_goal(session_id, task.goal))
+            run_response = asyncio.run(driver.run(session_id))
             bundle = server._get_bundle(session_id)
+            # The real session metrics ride on the bundle (the loop response used to
+            # carry them); hand them to the collector in the same shape.
+            metrics_snapshot = bundle.metrics.snapshot()
+            run_response["metrics"] = metrics_snapshot
             result.update(self._collect(task, run_response, bundle, session_id, world, scratch_dir))
             server.stop_session(session_id)
             return result
@@ -653,8 +741,6 @@ class BenchmarkRunner:
         for item in results:
             action = item.get("action") or {}
             verification = item.get("verification") or {}
-            if action.get("action") == "done" and verification.get("verification_method") == "provider_done":
-                continue  # provider completion marker, not a verified action
             outcome = verification.get("outcome", "other")
             verification_counts[outcome if outcome in verification_counts else "other"] += 1
             grounding = action.get("grounding") or {}

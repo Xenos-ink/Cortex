@@ -167,15 +167,15 @@ released version is `pyproject.toml`.
 
 ### R-08 Internal-loop multi-action decide batching
 
-- **Status:** RESEARCH-DEFERRED.
-- **Problem:** the internal `run_goal` loop decides one action per model call. Multi-
-  action decide batching was descoped in perf-004 because no `VISION_API_KEY` was
-  configured to measure it; the host-path `follow_ups` batching shipped instead.
-  UFO2 reported 13.30 → 7.40 steps/task for this technique.
-- **Approach:** enable internal decide batching when a provider key is configured;
-  keep single-action behavior as the fallback when the provider rejects batches.
+- **Status:** OBSOLETE (the internal `run_goal` loop was removed by user order —
+  there is no internal decide phase to batch; host-path `follow_ups` batching is the
+  surviving batching mechanism and remains fully supported).
+- **Problem:** (historical) the internal `run_goal` loop decided one action per model
+  call. Multi-action decide batching was descoped in perf-004 because no
+  `VISION_API_KEY` was configured to measure it; the host-path `follow_ups` batching
+  shipped instead. UFO2 reported 13.30 → 7.40 steps/task for this technique.
 - **Evidence:** (QA: perf-004 evidence — architecture research digest, adoption #1).
-- **Accept:** measured steps/task reduction on a live provider.
+- **Accept:** n/a — resolved by removal.
 
 ### R-09 Pre-downscale capture option
 

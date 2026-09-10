@@ -183,6 +183,36 @@ _TOLERANT_UNCERTAIN_ACTIONS = frozenset({ActionType.WAIT})
 #: Cap on the per-agent map of action_id -> suspicious provider content (D3).
 _SUSPICIOUS_CONTENT_CAP = 200
 
+# --- R-5 mechanical-speed knobs (ORVEX-CORTEX-056-LIVEFIX) -----------------------------------
+#: Env knob name: ``CORTEX_VALIDATE_REUSE_MS`` — the freshness window (milliseconds)
+#: within which a DIRECT action's premise capture (taken at the start of this very
+#: tool call) is reused as the validate-phase observation instead of re-capturing the
+#: identical screen microseconds later. The window is the staleness guard: past it the
+#: pipeline re-captures exactly as before. ``0`` disables the reuse (legacy behavior).
+#: Queued follow-ups NEVER reuse: their premise is a previous item's post-action
+#: capture (genuinely older), so the fresh validate capture — and the strict
+#: digest-surprise probe — keep running for every queued item.
+VALIDATE_REUSE_MS_ENV = "CORTEX_VALIDATE_REUSE_MS"
+
+#: Default reuse window (ms). Generous relative to the microseconds of pure
+#: computation between the direct_request capture and the validate point (grounding +
+#: guard binding only — no input is dispatched between them), yet bounded.
+_VALIDATE_REUSE_MS_DEFAULT = 1500.0
+
+
+def _validate_reuse_window_ms() -> float:
+    """Resolve the R-5 validate-reuse freshness window (0 disables; garbage -> default)."""
+    import os
+
+    raw = os.environ.get(VALIDATE_REUSE_MS_ENV)
+    if raw is None or not raw.strip():
+        return _VALIDATE_REUSE_MS_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _VALIDATE_REUSE_MS_DEFAULT
+    return value if value >= 0 else _VALIDATE_REUSE_MS_DEFAULT
+
 
 def _image_to_base64(image: Image.Image) -> str:
     """Encode a PIL image as base64 PNG for the provider judge callback."""
@@ -523,6 +553,10 @@ class ComputerUseAgent:
                     self.stop_token.ensure_live()
                 waited += _SCREENSHOT_POLL_SECONDS
         observation = self.observation.capture()
+        try:  # R-5: capture-time freshness clock for the validate-phase reuse window
+            observation._captured_monotonic = time.perf_counter()
+        except Exception:  # noqa: BLE001 - PrivateAttr stamping must never break capture
+            pass
         if gated:
             self.enforcer.record_screenshot()
         else:
@@ -2246,7 +2280,63 @@ class ComputerUseAgent:
 
             # T8 mechanism (i): arm the focus binding from an allowlisted observation.
             self._bind_guard_from_observation(observation)
-            current = self._observe("validate")
+            # R-5 (W1) validate-phase capture sharing: a DIRECT action's premise was
+            # captured at the start of THIS tool call (nothing but pure computation has
+            # run since — grounding + guard binding, zero input dispatched), so when it
+            # is still inside the freshness window the premise IS the current screen and
+            # re-capturing the identical frame is pure latency. The sharing is GUARDED
+            # by a cheap identity probe (monitors + foreground window + coordinate
+            # space — the exact dimensions the validator's staleness check consumes; no
+            # pixels): no drift means the premise still describes the screen and is
+            # reused (audited truthfully: phase="validate", reused=True, duration 0.0);
+            # ANY drift, a stale premise, a queued follow-up (whose premise is a
+            # PREVIOUS item's post-action capture), or a backend without the probe
+            # falls back to the fresh validate capture below exactly as before.
+            premise_captured_at = getattr(observation, "_captured_monotonic", 0.0)
+            reuse_window_ms = _validate_reuse_window_ms()
+            current: Observation | None = None
+            probe_used = False
+            if (
+                source_observation is None
+                and not strict_digest
+                and reuse_window_ms > 0.0
+                and premise_captured_at > 0.0
+                and (time.perf_counter() - premise_captured_at) * 1000.0 <= reuse_window_ms
+            ):
+                probe = self.backend.identity_probe(observation)
+                if probe is not None:
+                    probe_used = True
+                    drift = self.validator._staleness_drift(observation, probe)
+                    if drift is None:
+                        current = observation
+                        self.metrics.incr("observation_reuse")
+                        self._audit(
+                            "observation",
+                            observation=current,
+                            result="ok",
+                            duration_ms=0.0,
+                            phase="validate",
+                            reused=True,
+                        )
+                    else:
+                        # Real drift (window/process/monitor/space): feed the probe to
+                        # the validator as the current observation so the P0-H
+                        # STALE_OBSERVATION rejection + single re-observe recovery run
+                        # with fresh identity — never execute against a drifted premise.
+                        current = probe
+                        self.metrics.incr("identity_probe_drift")
+                        self._audit(
+                            "observation",
+                            observation=current,
+                            result="ok",
+                            duration_ms=0.0,
+                            phase="validate",
+                            reused=True,
+                            probe=True,
+                            drift=drift,
+                        )
+            if current is None:
+                current = self._observe("validate")
             if strict_digest and not digest_matches(observation, current):
                 # PERF-004 C7: post-action DIGEST SURPRISE — the queued action's premise
                 # (the previous item's fresh post-action capture) no longer matches the
@@ -2550,6 +2640,10 @@ class ComputerUseAgent:
                 verification_confidence=verification.confidence,
                 interference_events=post_events or None,
             )
+            try:  # R-5 (W4): the post-action frame rides along for outbound bounding
+                outcome.result._frame = getattr(after, "_frame", None)
+            except Exception:  # noqa: BLE001 - never break the executed path
+                pass
             return outcome, after
         except TaskStopped:
             raise

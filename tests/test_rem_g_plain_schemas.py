@@ -43,18 +43,15 @@ from test_controller_integration import (
 from computer_use_mcp import server
 from computer_use_mcp.state import SessionRegistry
 
-#: The 10 MCP tools exposed on the stdio boundary (fixed contract).
+#: The FIVE deterministic MCP tools exposed on the stdio boundary (fixed contract).
+# AMENDED (run_goal removal): the internal-loop family (run_goal, run_subtask,
+# create_subtask, list_subtasks, get_session_progress) is deleted from the surface.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
     "computer_observe",
     "computer_screenshot",
     "computer_execute",
-    "run_goal",
-    "create_subtask",
-    "list_subtasks",
-    "run_subtask",
-    "get_session_progress",
 )
 
 
@@ -147,14 +144,14 @@ def _payload(response: Any) -> dict[str, Any]:
 
 
 def test_pin_a_no_anyof_in_any_tool_input_schema(fresh_server: Any) -> None:
-    """No property on ANY of the 10 tools' advertised inputSchemas uses "anyOf".
+    """No property on ANY of the five tools' advertised inputSchemas uses "anyOf".
 
     The pre-REM-G wire schema advertised every Optional parameter as
     {"anyOf": [{...}, {"type": "null"}], "default": null} — the exact form the
     live client-side validator rejected. This pin walks the FULL inputSchema of
     each tool (nested, including $defs) through the REAL FastMCP tool metadata.
     """
-    assert len(ALL_TOOLS) == 10  # the fixed tool surface
+    assert len(ALL_TOOLS) == 5  # the fixed five-tool surface (run_goal removed)
     total_hits: list[str] = []
     for name in ALL_TOOLS:
         schema = _meta(name).arg_model.model_json_schema()
@@ -169,24 +166,30 @@ def test_pin_a_flattened_shapes_and_defaults(fresh_server: Any) -> None:
     Every previously-rejected Optional parameter advertises the plain union form
     ({"type": ["integer", "null"]}, {"type": ["array", "null"], ...}) AND still
     carries "default": null — the omission semantics remote callers rely on.
+    D5 (ORVEX-CORTEX-056-LIVEFIX, F-3 work order WO-1..WO-4) WIDENED the four
+    live-friction classes (x/y/x2/y2, keys, follow_ups, allowed_processes/
+    allowed_windows) to also admit "string" (and "object" for follow_ups) — the
+    client-side ajv validator rejected those shapes pre-flight, making the REM-F
+    server-side coercions unreachable from the host. Still flat type-arrays, no
+    anyOf; runtime validation is byte-identical.
     """
     props = _meta("computer_execute").arg_model.model_json_schema()["properties"]
     expected: dict[str, dict[str, Any]] = {
-        "x": {"type": ["integer", "null"], "default": None},
-        "y": {"type": ["integer", "null"], "default": None},
-        "x2": {"type": ["integer", "null"], "default": None},
-        "y2": {"type": ["integer", "null"], "default": None},
+        "x": {"type": ["integer", "string", "null"], "default": None},
+        "y": {"type": ["integer", "string", "null"], "default": None},
+        "x2": {"type": ["integer", "string", "null"], "default": None},
+        "y2": {"type": ["integer", "string", "null"], "default": None},
         "text": {"type": ["string", "null"], "default": None},
         "expected_effect": {"type": ["string", "null"], "default": None},
         "target": {"type": ["string", "null"], "default": None},
         "include_screenshot_after": {"type": ["boolean", "null"], "default": None},
         "keys": {
-            "type": ["array", "null"],
+            "type": ["array", "string", "null"],
             "items": {"type": "string"},
             "default": None,
         },
         "follow_ups": {
-            "type": ["array", "null"],
+            "type": ["array", "object", "string", "null"],
             "items": {"type": "object", "additionalProperties": True},
             "default": None,
         },
@@ -200,7 +203,7 @@ def test_pin_a_flattened_shapes_and_defaults(fresh_server: Any) -> None:
     start_props = _meta("start_session").arg_model.model_json_schema()["properties"]
     for name in ("allowed_processes", "allowed_windows"):
         flat = start_props[name]
-        assert flat.get("type") == ["array", "null"], (name, flat)
+        assert flat.get("type") == ["array", "string", "null"], (name, flat)
         assert flat.get("items") == {"type": "string"}, (name, flat)
         assert flat.get("default") is None, (name, flat)
         assert "anyOf" not in flat, (name, flat)
@@ -208,13 +211,12 @@ def test_pin_a_flattened_shapes_and_defaults(fresh_server: Any) -> None:
     assert limits_flat.get("type") == ["object", "null"], limits_flat
     assert limits_flat.get("default") is None, limits_flat
     assert "anyOf" not in limits_flat, limits_flat
-
-    depends_flat = _meta("create_subtask").arg_model.model_json_schema()["properties"][
-        "depends_on"
-    ]
-    assert depends_flat.get("type") == ["array", "null"], depends_flat
-    assert depends_flat.get("items") == {"type": "string"}, depends_flat
-    assert depends_flat.get("default") is None, depends_flat
+    # D1 (ORVEX-CORTEX-056-LIVEFIX): the trailing-optional image_delivery param
+    # reuses the NullableStr alias — flat type-array, default null, no anyOf.
+    delivery_flat = start_props["image_delivery"]
+    assert delivery_flat.get("type") == ["string", "null"], delivery_flat
+    assert delivery_flat.get("default") is None, delivery_flat
+    assert "anyOf" not in delivery_flat, delivery_flat
 
 
 async def test_pin_a_flatten_is_not_widening_runtime_schema(fresh_server: Any) -> None:

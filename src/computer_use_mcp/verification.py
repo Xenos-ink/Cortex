@@ -19,17 +19,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image, ImageChops
 
 from .models import Observation, VerificationResult
 
 __all__ = [
     "DEFAULT_STRATEGY_CHAIN",
+    "DIFF_FAST_ENV",
     "FOCUS_CHANGE_INTENT_FLAG",
     "OCR_TEXT_VERIFICATION_ENV",
     "DeterministicPredicateStrategy",
@@ -70,6 +72,22 @@ _STABILITY_VERIFIED_CONFIDENCE = 0.95
 
 #: Confidence for identity matches (window/process) backed by real observation fields.
 _IDENTITY_MATCH_CONFIDENCE = 0.9
+
+#: R-7 kill-switch: any value other than "0" keeps the fast diff path; the exact
+#: string "0" restores the pre-R-7 full-frame computation for every diff.
+DIFF_FAST_ENV = "CORTEX_DIFF_FAST"
+
+#: R-7: the fast diff path is enabled unless the operator disables it via env.
+_DIFF_FAST_DISABLED = None  # resolved lazily (module import must not read env eagerly)
+
+
+def _diff_fast_enabled() -> bool:
+    """R-7 kill-switch resolution: ``CORTEX_DIFF_FAST=0`` restores the legacy diff.
+
+    Read lazily so tests (and import order) can toggle the env per-case; every
+    other value — unset, garbage, "1" — leaves the fast path ON (fail-fast).
+    """
+    return os.getenv(DIFF_FAST_ENV, "").strip() != "0"
 
 #: REM-B (H2c): confidence for a deterministic focus/window/digest change signal.
 _DETERMINISTIC_CHANGE_CONFIDENCE = 0.85
@@ -148,6 +166,156 @@ def _uncertain(strategy: str, note: str, evidence: list[str], confidence: float,
     )
 
 
+def _frame_for(observation: Observation) -> Image.Image | None:
+    """The observation's pixels as a decoded RGB frame, without re-encoding work.
+
+    R-5 (W2) fast path: when the producing backend stashed its capture-time RGB frame
+    (``Observation._frame``, private, never serialized), return it directly — the
+    verification tier then skips a base64 decode + PNG decode of a frame the pipeline
+    just encoded. No stash (tests, fakes, restored checkpoints, legacy backends)
+    returns ``None`` and the caller falls back to decoding ``image_base64`` exactly as
+    before, so the tier's semantics are identical on both paths.
+    """
+    frame = getattr(observation, "_frame", None)
+    if frame is None:
+        return None
+    try:
+        if frame.mode != "RGB":
+            return None  # conservative: only a same-mode frame may fast-path
+        return frame
+    except Exception:  # noqa: BLE001 - a broken stash degrades to the decode path
+        return None
+
+
+def _diff_magnitude(before_image: Image.Image, after_image: Image.Image) -> tuple[float, int]:
+    """(mean difference, strongly-changed pixel count) between two RGB frames.
+
+    Bit-identical to the historical computation (proven equal to <1e-9 on live
+    capture pairs): the mean is derived from the diff's own 768-bin histogram —
+    ``sum(i * count) / pixels`` per band — instead of a SECOND full-frame pass via
+    ``ImageStat.Stat``, and the strongly-changed count is the same
+    ``max(R,G,B) >= STRONG_PIXEL_DELTA`` histogram tail the pixel tier always used.
+    R-5 (W3): one histogram pass replaces two.
+
+    R-7 fast path (PROVABLY verdict-preserving; pinned on a 23-pair recorded
+    corpus + adversarial worst cases in tests/test_r7_diff_acceleration.py):
+    the full-frame computation spends ~6 full-frame passes (~25 ms at 1920x1080)
+    even when the two frames differ in a tiny region. Three exact reductions:
+
+    1. **Identical-raw short-circuit.** When both frames carry the producing
+       backend's stashed raw pixel buffer (``_frame_raw``; set only for frames
+       built zero-copy over one readback buffer) and the buffers are equal
+       bytes, the pixels are identical, so the diff is uniformly zero and the
+       result is exactly ``(0.0, 0)`` — the same tuple the full computation
+       returns for a frame against itself (pinned). The comparison is a C
+       memcmp (~0.5 ms for 6 MB) and the result never diverges: equal bytes
+       are equal pixels by construction.
+    2. **bbox-crop reduction.** ``Image.getbbox()`` on the diff (any-band
+       nonzero; ~0.6 ms) yields the tight bounding box of every non-zero diff
+       byte. Outside that box every diff byte is exactly 0, so the per-band
+       histograms there contribute only to the zero bin and the strong tail
+       there is empty. Cropping the diff to the box and running the SAME
+       per-band statistics on the crop with the FULL-frame pixel count as the
+       mean denominator produces the identical mean (the zero-bin difference
+       cancels in ``sum / pixels``) and the identical strongly-changed count
+       (no pixel outside the box can reach ``STRONG_PIXEL_DELTA``). The crop is
+       skipped when the box is the whole frame (no 6 MB copy for nothing) and
+       the whole fast path is skipped for non-3-band images (the single-band
+       branch keeps its exact historical form).
+
+    ``CORTEX_DIFF_FAST=0`` restores the pre-R-7 full-frame computation exactly.
+    """
+    if _diff_fast_enabled():
+        fast = _diff_magnitude_fast(before_image, after_image)
+        if fast is not None:
+            return fast
+    diff = ImageChops.difference(before_image, after_image)
+    pixels = diff.width * diff.height
+    if pixels <= 0:
+        return 0.0, 0
+    bands = diff.split()
+    if len(bands) == 1:
+        histogram = diff.histogram()  # single band: histogram() is already the band's
+        mean_difference = (
+            sum(index * count for index, count in enumerate(histogram)) / pixels
+        )
+        max_band = bands[0]
+    else:
+        max_band = ImageChops.lighter(ImageChops.lighter(bands[0], bands[1]), bands[2])
+        histogram = diff.histogram()
+        means = [
+            sum(index * count for index, count in enumerate(histogram[band * 256:(band + 1) * 256]))
+            / pixels
+            for band in range(3)
+        ]
+        mean_difference = sum(means) / 3.0
+    strongly_changed = sum(max_band.histogram()[STRONG_PIXEL_DELTA:])
+    return mean_difference, strongly_changed
+
+
+def _diff_magnitude_fast(
+    before_image: Image.Image, after_image: Image.Image
+) -> tuple[float, int] | None:
+    """R-7 exact fast path; ``None`` means "not applicable, run the legacy body".
+
+    The reductions are pure equalities (see :func:`_diff_magnitude`); on any
+    structural doubt (missing stash, weird mode, zero-size) it returns ``None``
+    and the caller runs the untouched legacy computation — the fast path can
+    only lose speed, never exactness.
+    """
+    # (1) identical-raw short-circuit: equal raw bytes are equal pixels.
+    raw_before = getattr(before_image, "_frame_raw", None)
+    raw_after = getattr(after_image, "_frame_raw", None)
+    if (
+        isinstance(raw_before, (bytes, bytearray))
+        and isinstance(raw_after, (bytes, bytearray))
+        and raw_before is not raw_after
+        and len(raw_before) == len(raw_after)
+        and bytes(raw_before) == bytes(raw_after)
+    ):
+        return 0.0, 0
+    if before_image.mode != "RGB" or after_image.mode != "RGB":
+        return None  # conservative: only plain RGB fast-paths. RGBA's getbbox is
+        # alpha-blind (measured: a 190-delta pixel with unchanged alpha yields
+        # bbox None), so RGB-adjacent modes keep the legacy body verbatim.
+    if before_image.width != after_image.width or before_image.height != after_image.height:
+        return None  # callers gate dimension equality, but never assume it
+    pixels = before_image.width * before_image.height
+    if pixels <= 0:
+        return None
+    # (2) bbox-crop reduction: statistics over the non-zero box only.
+    diff = ImageChops.difference(before_image, after_image)
+    bbox = diff.getbbox()
+    if bbox is None:
+        return 0.0, 0  # uniformly zero diff — identical to the legacy (0.0, 0)
+    if bbox != (0, 0, diff.width, diff.height):
+        diff = diff.crop(bbox)
+    bands = diff.split()
+    if len(bands) != 3:
+        return None  # the legacy multi-band branch is RGB-shaped; RGB-adjacent modes
+        # (e.g. RGBA, whose getbbox is alpha-blind) stay on the legacy body
+    histogram = diff.histogram()
+    if len(histogram) != 768:
+        return None  # non-8-bit bands: legacy histogram semantics differ
+    # Mean over the FULL frame's pixel count, with the legacy's EXACT arithmetic:
+    # per-band ``sum(i*count) / pixels`` first, then the three band means averaged
+    # (same division order — float results are bit-identical, not merely close).
+    # Pixels outside the box contribute only zero-bin counts, so each crop band sum
+    # equals the full-frame band sum.
+    means = [
+        sum(index * count for index, count in enumerate(histogram[band * 256:(band + 1) * 256]))
+        / pixels
+        for band in range(3)
+    ]
+    mean_difference = sum(means) / 3.0
+    # Strongly-changed over the crop: no pixel outside the box has any non-zero
+    # diff byte, so none can reach STRONG_PIXEL_DELTA; the crop's tail IS the
+    # full frame's tail (same lighter-chain over R, G, B as the legacy body).
+    max_band = ImageChops.lighter(ImageChops.lighter(bands[0], bands[1]), bands[2])
+    strongly_changed = sum(max_band.histogram()[STRONG_PIXEL_DELTA:])
+    return mean_difference, strongly_changed
+
+
 def _definitive(
     strategy: str,
     outcome: str,
@@ -208,8 +376,7 @@ class ScreenshotDiffStrategy:
                 changed=True,
             )
         try:
-            before_image = self._decode(before.image_base64)
-            after_image = self._decode(after.image_base64)
+            before_image, after_image = self._frames(before, after)
             if before_image.size != after_image.size:
                 return _uncertain(
                     self.name,
@@ -218,14 +385,7 @@ class ScreenshotDiffStrategy:
                     0.2,
                     changed=True,
                 )
-            diff = ImageChops.difference(before_image, after_image)
-            mean_difference = sum(ImageStat.Stat(diff).mean) / 3.0
-            bands = diff.split()
-            if len(bands) == 1:
-                max_band = bands[0]
-            else:
-                max_band = ImageChops.lighter(ImageChops.lighter(bands[0], bands[1]), bands[2])
-            strongly_changed = sum(max_band.histogram()[STRONG_PIXEL_DELTA:])
+            mean_difference, strongly_changed = _diff_magnitude(before_image, after_image)
         except Exception as exc:  # noqa: BLE001 - degrade, never escape as success
             return _uncertain(
                 self.name,
@@ -365,6 +525,28 @@ class ScreenshotDiffStrategy:
     @staticmethod
     def _decode(encoded: str) -> Image.Image:
         return Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+
+    @staticmethod
+    def _frames(before: Observation, after: Observation) -> tuple[Image.Image, Image.Image]:
+        """Pixel frames for the diff, preferring the R-5 capture-time stash.
+
+        The stash is only trusted when BOTH observations carry one, both are RGB, and
+        each frame's size agrees with its observation's recorded dimensions; anything
+        else falls back to the exact legacy base64+PNG decode of both sides.
+        """
+        before_frame = _frame_for(before)
+        after_frame = _frame_for(after)
+        if (
+            before_frame is not None
+            and after_frame is not None
+            and before_frame.size == (before.width, before.height)
+            and after_frame.size == (after.width, after.height)
+        ):
+            return before_frame, after_frame
+        return (
+            ScreenshotDiffStrategy._decode(before.image_base64),
+            ScreenshotDiffStrategy._decode(after.image_base64),
+        )
 
 
 class WindowStateStrategy:
@@ -905,7 +1087,11 @@ class FocusChangeStrategy:
         # transition"). The digest change may VERIFY only when corroborated by real
         # changed-pixel magnitude at the floor the pixel tier itself trusts; otherwise
         # it defers to the pixel tier (uncertain, never a free verified).
-        if before.image_base64 and after.image_base64 and before.image_base64 != after.image_base64:
+        if (
+            before.image_base64
+            and after.image_base64
+            and FocusChangeStrategy._payload_text(before) != FocusChangeStrategy._payload_text(after)
+        ):
             magnitude = self._digest_change_magnitude(before, after)
             threshold = max(intent.diff_threshold, 0.0)
             if magnitude is not None and (
@@ -969,30 +1155,76 @@ class FocusChangeStrategy:
     # --- signal extractors (observation fields only; never raise) ----------------------
 
     @staticmethod
+    def _frame_bytes(observation: Observation) -> bytes | None:
+        """The observation's RGB pixels as comparable bytes, without encoding work.
+
+        The R-5 capture-time frame stash is the same pixel source the screenshot-diff
+        fast path trusts (``ScreenshotDiffStrategy._frames``). The PNG-payload decode
+        fallback preserves the historical image-mode behavior byte-for-byte (it decodes
+        exactly the bytes the tier decoded pre-R-6). R-6 note: a text-mode session's
+        backend may carry a deterministic raw-pixel key payload (never a PNG) — the
+        decode fallback would misread such a payload, so key payloads derive from the
+        stashed frame (or abstain when absent), never from a decode. The derivation is
+        memoized (``_payload_key_bytes``): the pixels are immutable post-capture.
+        """
+        cached = getattr(observation, "_payload_key_bytes", None)
+        if isinstance(cached, (bytes, bytearray)):
+            return bytes(cached)
+        frame = _frame_for(observation)
+        if frame is not None:
+            try:
+                derived = frame.tobytes()
+            except Exception:  # noqa: BLE001 - a broken stash falls through
+                return None
+            try:  # memoize: the captured pixels never change
+                observation._payload_key_bytes = derived
+            except Exception:  # noqa: BLE001 - read-only observation: skip the cache
+                pass
+            return derived
+        payload = observation.image_base64
+        if isinstance(payload, str) and payload.startswith("RAW:"):
+            return None  # fast-key payload without a frame: no derivable pixels
+        try:
+            return ScreenshotDiffStrategy._decode(payload).tobytes()
+        except Exception:  # noqa: BLE001 - undecodable payload: no derivation
+            return None
+
+    @staticmethod
+    def _payload_text(observation: Observation) -> str:
+        """The payload string for digest-inequality comparison (any stable encoding).
+
+        Identical pixels ALWAYS yield an identical string on both representations (PNG
+        encode is deterministic; the R-6 raw key is itself a pure pixel hash), and
+        distinct pixels yield distinct strings in practice — the signal's premise
+        holds for both. No derivation work is needed on either form: the payload
+        IS the comparable text (the pre-R-6 code compared the PNG base64 strings
+        verbatim; the raw-key payload compares verbatim the same way).
+        """
+        payload = observation.image_base64
+        if not isinstance(payload, str):
+            return ""
+        if payload.startswith("RAW:") and not payload:
+            return ""  # defensive: a degenerate empty key never counts as a signal
+        return payload
+
+    @staticmethod
     def _digest_change_magnitude(before: Observation, after: Observation) -> tuple[float, int] | None:
         """(mean difference, strongly-changed pixel count) between the two captures.
 
         Mirrors :class:`ScreenshotDiffStrategy`'s diff math exactly (same
-        ``STRONG_PIXEL_DELTA`` semantics), so the corroboration floor applied by
-        signal (c) is the same floor the pixel tier trusts. Returns ``None`` on ANY
-        decode/shape failure — fail-closed: an uncomputable magnitude never
-        corroborates (the signal then abstains to ``uncertain``).
+        ``STRONG_PIXEL_DELTA`` semantics — R-5: both tiers share one implementation),
+        so the corroboration floor applied by signal (c) is the same floor the pixel
+        tier trusts. Returns ``None`` on ANY decode/shape failure — fail-closed: an
+        uncomputable magnitude never corroborates (the signal then abstains to
+        ``uncertain``).
         """
         try:
             if before.width != after.width or before.height != after.height:
                 return None
-            before_image = ScreenshotDiffStrategy._decode(before.image_base64)
-            after_image = ScreenshotDiffStrategy._decode(after.image_base64)
+            before_image, after_image = ScreenshotDiffStrategy._frames(before, after)
             if before_image.size != after_image.size:
                 return None
-            diff = ImageChops.difference(before_image, after_image)
-            mean_difference = sum(ImageStat.Stat(diff).mean) / 3.0
-            bands = diff.split()
-            if len(bands) == 1:
-                max_band = bands[0]
-            else:
-                max_band = ImageChops.lighter(ImageChops.lighter(bands[0], bands[1]), bands[2])
-            strongly_changed = sum(max_band.histogram()[STRONG_PIXEL_DELTA:])
+            mean_difference, strongly_changed = _diff_magnitude(before_image, after_image)
         except Exception:  # noqa: BLE001 - no magnitude -> no corroboration
             return None
         return mean_difference / 255.0, strongly_changed

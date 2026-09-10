@@ -163,14 +163,13 @@ lower than a human would. The compensating controls are the approval defaults
 
 ## 5. Approval semantics
 
-- **Budget**: `run_goal(approve_next_action=True)` grants exactly one approval per
-  call (`approval_budget = 1`); the server-side callback decrements it. The grant is
-  bound to the approved action **instance id**, so bounded recovery retries of that
-  same instance do not re-consume the budget; a new distinct action after exhaustion
-  is denied fail-closed and reported with `requires_approval: true`.
-- **Direct calls**: `computer_execute(approved=True)` authorizes that single call's
-  action when the policy requires approval (`approval_required` otherwise). CRITICAL
-  actions are never cleared by this flag (see below).
+- **Per-call authorization (the five-tool surface)**: `computer_execute(approved=True)`
+  authorizes that single call's action when the policy requires approval
+  (`approval_required` otherwise). CRITICAL actions are never cleared by this flag
+  (see below). (Historical: the removed `run_goal` loop additionally granted exactly
+  one approval per call via `approve_next_action=True`, bound to the approved action
+  instance id so its recovery retries did not re-consume it — the loop, its budget,
+  and its in-run recovery were removed by user order.)
 - **Explicit authorization flow**: `SafetyPolicy.evaluate(..., authorized=True)`
   exists for CRITICAL actions, to be set only by a caller that obtained explicit
   human authorization through a mechanism the model cannot reach. **No MCP tool
@@ -247,11 +246,13 @@ lower than a human would. The compensating controls are the approval defaults
   redacted wholesale. The in-memory event is not mutated; the JSONL file is guaranteed
   secret-free (covered by an audit-log secret-scan test).
 - **Redaction on the tool response path (F2, defense in depth)**: `computer_execute`
-  and `run_goal` responses pass through `_redact_result_payload` before leaving the
-  server — `message`, `action.text`, `action.reason`, `verification.note`, and every
+  responses pass through `_redact_result_payload` before leaving the server —
+  `message`, `action.text`, `action.reason`, `verification.note`, and every
   `verification.evidence` entry are redacted. The audit sink and the provider payload
-  were already enforced; the response (which echoes provider-proposed strings back to
-  the calling client) is no longer the one surface that bypasses redaction.
+  were already enforced; the response (which echoes proposed strings back to the
+  calling client) is no longer the one surface that bypasses redaction. (The removed
+  `run_goal` response path shared this enforcement; nothing was weakened by its
+  removal.)
 - **No secret logging**: provider request bodies are never logged; the API key exists
   only inside the Authorization header construction — never in exceptions, messages,
   or logs. `TaskState.action_history` stores secret-free summaries (typed text
@@ -351,9 +352,14 @@ lower than a human would. The compensating controls are the approval defaults
    strategies are graceful-degradation stubs. `text_predicate` verification is inert
    without OCR data.
 4. **Single-monitor E2E only.** A real-Windows E2E suite exists (`tests/e2e/`, gated
-   behind `CUMCP_RUN_E2E=1`; Notepad, `win32calc.exe`, Edge on a local page) and
+   behind `CUMCP_RUN_E2E=1` — the D6 fail-closed gate skips those tests in every
+   plain `pytest tests` run and warns that opting in drives real input on the live
+   desktop; Notepad, `win32calc.exe`, Edge on a local page) and
    passed on the reference box, but the box is single-monitor: multi-monitor logic is
-   covered only by unit tests with fake monitor sets.
+   covered only by unit tests with fake monitor sets. E2E window isolation (D6):
+   the suite launches its own app instances with run-unique window tokens and
+   attaches only through marker-only enumeration, so it cannot attach to or type
+   into a window the user has open.
 5. **Risk classification is heuristic.** Regex + context matching (English + limited
    Arabic) is not semantic understanding; novel phrasings may under-classify.
    Compensations: approval-by-default for interactive actions, allowlists, bounded
@@ -587,7 +593,7 @@ restores.
 | Dead dependency branch, replan exhausted | `UNRECOVERABLE` termination — no continuation with unknown correctness | `long_running.run_pending_subtasks` |
 | Session budget exhausted (duration/actions/model calls/steps/subtasks) | typed `SessionBudgetExceeded` → audited fail-closed termination | `limits.SessionBudgetTracker` |
 | Health check UNSAFE | epoch invalidated + run stops (`blocked_safety`); never auto-executes | `long_running._boundary_health` |
-| Planner unavailable or plan rejected | typed `planner_unavailable` / `plan_rejected` (+ codes); nothing created; session stays usable for manual `create_subtask` | `long_running.plan_from_llm` |
+| Planner unavailable or plan rejected | typed `planner_unavailable` / `plan_rejected` (+ codes); nothing created (historical: the manual `create_subtask` fallback died with the removed tools) | `long_running.plan_from_llm` (module retained; not reachable from tools) |
 
 
 ### 11.10 Interference Guard (T8): protection upgrades, same doctrine

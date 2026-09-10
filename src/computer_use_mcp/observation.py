@@ -40,8 +40,13 @@ def digest_matches(first: Observation, second: Observation) -> bool:
     in the payload is still current. A mismatch only proves pixels changed — identity
     may still hold (benign flicker) and is then decided by the validator's identity
     staleness check.
+
+    R-5 fast path: the same Observation object trivially carries its own payload, so
+    the identity check short-circuits before comparing multi-hundred-KB strings. This
+    is exactly the case the validate-phase capture sharing produces (the premise IS
+    the current observation) — the proof is identity, not a re-comparison.
     """
-    return first.image_base64 == second.image_base64
+    return first is second or first.image_base64 == second.image_base64
 
 
 #: Character budget for the ``text_summary`` line (bounded, cache-friendly text).

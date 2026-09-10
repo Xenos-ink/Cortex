@@ -10,8 +10,17 @@ these helpers exist only for ARRANGEMENT and ASSERTION of real-world state:
 - enumerating Calculator button grids and mapping labels to screen coordinates;
 - deterministic window moves (MoveWindow) for fault injection (never drag simulation).
 
-DPI doctrine: Win32 rect reads in this module must be in PHYSICAL pixels to match the
-runtime's capture space (verified_passthrough on this box at 125% scaling). The
+Window-isolation doctrine (D6, R-8): this suite must NEVER attach to, focus, type
+into, or close a window it did not itself launch. Every helper that finds a window
+by name therefore goes through :func:`attach_window_by_unique_title`, which matches
+ONLY windows whose title carries the run's UNIQUE marker (and, when given, whose
+PID is one this suite launched). A same-application window without the marker — the
+user's own open Notepad, for example — is INVISIBLE to the attach path: it is never
+returned, so a wrong-window attach fails loudly instead of typing into the user's
+text. Teardown closes/kill exactly the launched process tree / found-marker hwnd.
+
+DPI doctrine: Win32 rect reads in this module must be in PHYSICAL pixels to match
+the runtime's capture space (verified_passthrough on this box at 125% scaling). The
 per-monitor-v2 awareness call is therefore LAZY (:func:`ensure_dpi_awareness`, invoked
 by the conftest autouse fixture and by rect-sensitive entry points) — importing this
 module has NO global side effect. Rationale (E6 finding D10): a process-global
@@ -27,6 +36,7 @@ import contextlib
 import ctypes
 import ctypes.wintypes as wt
 import json
+import os
 import subprocess
 import time
 from collections.abc import Callable
@@ -42,6 +52,7 @@ WM_GETTEXTLENGTH = 0x000E
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 _DPI_AWARENESS_DONE = False
+_WINDOW_TOKEN_COUNTER = 0
 
 
 def observe_tool_metadata(response: Any) -> dict[str, Any]:
@@ -97,6 +108,8 @@ user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.RECT)]
 user32.GetWindowRect.restype = wt.BOOL
 user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
 user32.IsWindowVisible.restype = wt.BOOL
+user32.IsWindow.argtypes = [ctypes.c_void_p]
+user32.IsWindow.restype = wt.BOOL
 user32.MoveWindow.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.BOOL]
 user32.MoveWindow.restype = wt.BOOL
 user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
@@ -208,6 +221,95 @@ def find_windows(
     return [hwnd for hwnd in top_level_windows() if matches(hwnd)]
 
 
+def find_marked_windows(
+    unique_marker: str,
+    *,
+    pid: int | None = None,
+    class_name: str | None = None,
+) -> list[int]:
+    """Find visible top-level windows carrying the run's UNIQUE title marker (D6).
+
+    This is the ONLY sanctioned window-search primitive for attach (focusing,
+    typing, closing) in this suite. Unlike :func:`find_windows`, a window whose
+    title lacks the marker is INVISIBLE here even when its class/pid match — the
+    user's own open Notepad/Calculator/Edge window can never be returned, because
+    it cannot carry this run's marker. Callers that need to inspect windows they
+    did not launch must not exist.
+    """
+    return find_windows(pid=pid, class_name=class_name, title_needle=unique_marker)
+
+
+def _reject_ambiguous_windows(
+    hwnds: list[int],
+    what: str,
+    unique_marker: str,
+) -> None:
+    """Fail closed when more than one marker-carrying window matches.
+
+    Two windows with the same marker should be impossible (marker is run-unique),
+    but a wrong-window discipline that silently picks the first match is exactly
+    what D6 exists to prevent — so ambiguity is a loud error, never a guess.
+    """
+    if len(hwnds) > 1:
+        titles = [window_text(hwnd) for hwnd in hwnds]
+        raise RuntimeError(
+            f"ambiguous attach for {what}: {len(hwnds)} windows carry marker "
+            f"{unique_marker!r} ({titles}); refusing to pick one blindly."
+        )
+
+
+def wait_for_marked_window(
+    deadline: Deadline,
+    unique_marker: str,
+    *,
+    pid: int | None = None,
+    class_name: str | None = None,
+    timeout_s: float = 30.0,
+) -> int:
+    """Poll for a window carrying the run's unique title marker; fail loudly otherwise.
+
+    D6 wrong-window defense: matches ONLY marker-carrying windows (see
+    :func:`find_marked_windows`); a user's pre-existing same-application window is
+    never a candidate, so a failure to launch/find OUR instance surfaces as a
+    TimeoutError instead of silently attaching to the user's window. Raises
+    RuntimeError on ambiguous matches (more than one marker window).
+    """
+    expiry = time.monotonic() + timeout_s
+    while time.monotonic() < expiry:
+        deadline.check(f"marked window marker~={unique_marker}")
+        found = find_marked_windows(unique_marker, pid=pid, class_name=class_name)
+        if found:
+            _reject_ambiguous_windows(found, "wait_for_marked_window", unique_marker)
+            return found[0]
+        time.sleep(0.25)
+    raise TimeoutError(
+        f"No marker-carrying window appeared within {timeout_s}s "
+        f"(marker={unique_marker!r}, pid={pid}, class={class_name}). The test's OWN "
+        "instance never showed up; a same-app window WITHOUT the marker (e.g. the "
+        "user's own) is deliberately invisible to this wait."
+    )
+
+
+def attach_window_by_unique_title(
+    deadline: Deadline,
+    unique_marker: str,
+    *,
+    pid: int | None = None,
+    class_name: str | None = None,
+    timeout_s: float = 30.0,
+) -> int:
+    """Attach (focus-target lookup) STRICTLY to the test's own unique-marker window.
+
+    D6 pin target: this is the attach helper every e2e app-launch path must use.
+    It rejects non-marker windows BY CONSTRUCTION (the enumeration predicate requires
+    the marker in the title) and fails closed on zero or ambiguous matches — it can
+    never hand back a window the suite did not itself title with this run's marker.
+    """
+    return wait_for_marked_window(
+        deadline, unique_marker, pid=pid, class_name=class_name, timeout_s=timeout_s
+    )
+
+
 def wait_for_window(
     deadline: Deadline,
     *,
@@ -308,14 +410,27 @@ def focus_window(hwnd: int, attempts: int = 5) -> bool:
 
 
 def close_window(hwnd: int, wait_s: float = 5.0) -> bool:
-    """Politely close a window with WM_CLOSE; returns True when it is gone."""
+    """Politely close EXACTLY this hwnd with WM_CLOSE; returns True when it is gone.
+
+    D6 hardening: the old implementation polled ``find_windows(class_name=...,
+    title_needle=...)`` — same class AND same title as the target — which could
+    observe some OTHER window (the user's own, restored under the same title) and
+    misreport. The check is now window-identity-exact: this specific hwnd must
+    stop being a visible window. Only ever called with an hwnd this suite found via
+    its unique marker (or an enum the suite itself launched).
+    """
     user32.PostMessageW(hwnd, WM_CLOSE, None, None)
     expiry = time.monotonic() + wait_s
     while time.monotonic() < expiry:
-        if not find_windows(class_name=window_class(hwnd), title_needle=window_text(hwnd)):
+        if not window_exists(hwnd):
             return True
         time.sleep(0.2)
-    return not find_windows(class_name=window_class(hwnd), title_needle=window_text(hwnd))
+    return not window_exists(hwnd)
+
+
+def window_exists(hwnd: int) -> bool:
+    """True while hwnd is still a live Win32 window (used by exact-hwnd close waits)."""
+    return bool(user32.IsWindow(hwnd))
 
 
 def kill_process_tree(pid: int) -> None:
@@ -408,6 +523,11 @@ def launch_gui(
     The Popen handle is the ONLY cleanup authority: cleanup kills exactly this process
     tree. For stub launchers (calc.exe) prefer launching the real binary directly so the
     tracked PID owns the window.
+
+    D6 discipline: ``title_contains`` must be (or contain) the run's UNIQUE window
+    token when the app titles its window from its file/URL — the hwnd is then found
+    via the marker-only path (:func:`wait_for_marked_window`), so the wait can never
+    latch onto the user's own same-application window.
     """
     ensure_dpi_awareness()  # physical-pixel waits/rects (lazy, E6 finding D10)
     proc = subprocess.Popen(argv)
@@ -423,6 +543,22 @@ def launch_gui(
         kill_process_tree(proc.pid)
         raise
     return proc, hwnd
+
+
+def unique_window_token(prefix: str = "cumcp-e2e") -> str:
+    """Run-unique window token for D6 window isolation.
+
+    Every app instance this suite opens carries this token in its window title
+    (Notepad: the scratch FILENAME; Edge: the page <title>; Calculator: cannot set
+    a title, so attach there is PID+class scoped to the process WE launched — see
+    test_e2e_calculator.py). The token embeds pid, wall time AND a per-call counter,
+    making a collision with any user window (or a second call in the same
+    millisecond) impossible; markers logged to evidence let a user find and delete
+    stray text from a past polluted run (search for the token).
+    """
+    global _WINDOW_TOKEN_COUNTER
+    _WINDOW_TOKEN_COUNTER += 1
+    return f"{prefix}-{os.getpid()}-{_WINDOW_TOKEN_COUNTER:03d}-{int(time.time() * 1000) % 100000000}"
 
 
 def wait_until(deadline: Deadline, predicate: Callable[[], bool], what: str, timeout_s: float = 15.0) -> None:

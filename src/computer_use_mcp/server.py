@@ -1,8 +1,14 @@
-"""MCP server wiring: 6 tools, bounded session registry, kill path, audit, limits.
+"""MCP server wiring: 5 deterministic tools, bounded session registry, kill path, audit, limits.
 
-Compatibility contract (master-mission section 6, binding):
+Compatibility contract (master-mission section 6, binding, as amended 2026-09 by user
+order — the run_goal family is REMOVED PERMANENTLY):
 
-- The 6 tool names, stdio transport, and parameter positions are preserved; signatures
+- The exposed tool surface is exactly FIVE deterministic tools: ``start_session``,
+  ``stop_session``, ``computer_observe``, ``computer_screenshot``,
+  ``computer_execute``. The internal-LLM-loop family (``run_goal``, ``run_subtask``,
+  ``create_subtask``, ``list_subtasks``, ``get_session_progress``) is deleted — the
+  host model drives the tools directly; no model-decides loop remains in Cortex.
+- Tool names, stdio transport, and parameter positions are preserved; signatures
   gain TRAILING OPTIONAL params only (``start_session(..., allowed_processes=None,
   limits=None)``, ``computer_execute(..., expected_effect=None, include_screenshot_after=None,
   follow_ups=None)``).
@@ -16,13 +22,9 @@ Compatibility contract (master-mission section 6, binding):
   client-asserted MODEL confidence for a direct caller action; grounding confidence,
   staleness, risk classification, approval, and verification apply independently.
   ``include_screenshot_after=False`` (additive) omits the heavy
-  ``screenshot_after_base64`` from the response; omitted/None keeps the legacy payload.
+  ``screenshot_after_base64`` from the response; omitted or None keeps the legacy payload.
   ``follow_ups`` (additive, max 5) queues actions that each pass the FULL independent
   pipeline; the queue stops at the first failure — zero bypass.
-- ``run_goal`` keeps exactly ``approval_budget = 1`` per call when
-  ``approve_next_action=True``; bounded recovery retries of the same approved action
-  instance do not re-consume budget; a new distinct action after exhaustion is denied
-  fail-closed with ``requires_approval`` in the response.
 - ``stop_session`` keeps its signature/return shape; it now arms the thread-safe
   StopToken kill path and audits stop + emergency_stop.
 - ``start_session`` succeeds with no API key (provider construction is lazy at the first
@@ -35,6 +37,18 @@ Compatibility contract (master-mission section 6, binding):
   coercions PRE-validation — the advertised schemas stay "integer"/"array", the
   downstream internal models stay strict, and garbage still fails typed.
   ``limits`` is deliberately NOT made tolerant (fail-closed numeric contract).
+
+- Image delivery (ORVEX-CORTEX-056-LIVEFIX, D1, trailing optional):
+  ``start_session(..., image_delivery=None)`` — "image" (default) keeps real image
+  blocks; "text" suppresses every OUTBOUND image block so non-vision models stay
+  alive (one ImageContent in their history kills the provider request with a 400).
+  The start_session docstring teaches judging by WHAT THE MODEL RECEIVES (not
+  self-identity): text inputs → pass "text" (required); unsure → "text" (a vision
+  model in text mode only loses pixels, a text-only model in image mode dies).
+  Precedence: param > env ``CORTEX_IMAGE_DELIVERY`` (fail-safe: only exact
+  "text"/"image" honored, garbage/unset → "image") > default "image"; an invalid
+  param value fails closed with ``invalid_image_delivery`` BEFORE any session is
+  created; ``include_screenshot_after`` can only remove bytes, never re-add them.
 
 Test/extension seam (for E6/E7): the module-level ``_backend_factory`` and
 ``_provider_factory`` callables are invoked once per ``start_session``; tests monkeypatch
@@ -78,40 +92,19 @@ from .checkpoint_manager import (
 from .context_manager import ContextManager
 from .interference import parse_interference
 from .limits import LimitEnforcer, LimitExceeded, Limits
-from .long_running import (
-    LongRunningError,
-    LongRunningRuntime,
-    PlannerUnavailableError,
-    RuntimeBusyError,
-    SubtaskNotRunnableError,
-)
+from .long_running import LongRunningRuntime
 from .models import (
     MAX_FOLLOW_UPS,
     ActionSpec,
-    ExecutionResult,
     GroundedAction,
     SessionState,
-    SubtaskStatus,
 )
 from .observation import observation_text_summary
-from .plan_validator import PlanRejectedError
 from .provider import OpenAICompatibleVisionProvider
 from .redaction import redact_text
 from .resume_manager import ResumeBundle, ResumeManager, ResumeRefusalError
 from .safety import SafetyPolicy
 from .state import SessionContext, SessionLimitExceeded, SessionRegistry, TaskStopped
-from .subtask_manager import (
-    DependencyCycleError,
-    InvalidSubtaskError,
-    InvalidTransitionError,
-    SelfDependencyError,
-    SubtaskAlreadyExistsError,
-    SubtaskError,
-    SubtaskLimitExceeded,
-    SubtaskNotReadyError,
-    UnknownDependencyError,
-    UnknownSubtaskError,
-)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -448,7 +441,73 @@ def _result_image_max_bytes() -> int:
     return int(kb * 1024)
 
 
-def _bound_outbound_image(data_b64: str) -> tuple[str, str]:
+# --- D1 image delivery (ORVEX-CORTEX-056-LIVEFIX) --------------------------------------------
+# A NON-VISION model receiving ONE ImageContent block anywhere in the session
+# history gets the ENTIRE provider request rejected with a 400 ('content' must
+# be a string) — the turn dies and every later turn replays the poisoned image.
+# The delivery mode must therefore be decided BEFORE the first image is emitted
+# (start_session is the earliest and natural point) and may not be re-enabled
+# per-call afterwards (``include_screenshot_after`` can only REMOVE bytes, never
+# add them back). Precedence (F-2 confirmed no client→server model-identity
+# signal exists on kimi 0.42.0): start_session param > env > default "image".
+
+#: Env knob name: ``CORTEX_IMAGE_DELIVERY`` — "text" makes ALL sessions text-mode
+#: by default (deterministic fallback for users whose default model is
+#: non-vision); "image" restores pixel delivery. Fail-safe: ONLY exact (trimmed,
+#: case-insensitive) "text"/"image" are honored; unset/empty/garbage → "image"
+#: (today's status quo — a typo can never arm the killer accidentally).
+IMAGE_DELIVERY_ENV = "CORTEX_IMAGE_DELIVERY"
+
+#: The bounded constant note shipped in every text-mode response (D1).
+IMAGE_DELIVERY_TEXT_NOTE = "image_delivery=text: screenshot suppressed (non-vision-safe); metadata only"
+
+
+def _normalize_image_delivery_param(value: Any) -> str | None:
+    """REM-F tolerant normalization of the ``image_delivery`` param.
+
+    None → None (caller resolves via env/default); a string is trimmed +
+    casefolded and accepted when it equals "image" or "text". Anything else
+    raises a teaching ValueError — a typo silently meaning "image" would re-arm
+    the D1 killer, so garbage is REJECTED fail-closed, never defaulted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in ("image", "text"):
+            return normalized
+    raise ValueError(
+        f"image_delivery must be \"image\" or \"text\" (got {value!r}). "
+        "Pass \"text\" if you cannot view images (non-vision model); "
+        "\"image\" if you can."
+    )
+
+
+def _resolve_image_delivery(explicit: str | None) -> str:
+    """Resolve the effective delivery mode: param > env > default "image".
+
+    The env layer mirrors ``CORTEX_ATTACH_OR_LAUNCH`` parsing (fail-safe): only
+    exact trimmed/casefolded "text"/"image" are honored; unset/empty/garbage
+    falls back to "image" — the env knob can save text sessions but can never
+    silently blind vision sessions. Single seam: a FUTURE host/protocol
+    model-identity signal (none exists today — F-2 verdict) slots in between
+    the param and env layers with a one-branch change.
+    """
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(IMAGE_DELIVERY_ENV, "").strip().casefold()
+    if raw in ("text", "image"):
+        return raw
+    return "image"
+
+
+def _session_image_delivery(bundle: "_SessionBundle") -> str:
+    """The session's effective image delivery mode (default "image")."""
+    mode = bundle.extra.get("image_delivery")
+    return "text" if mode == "text" else "image"
+
+
+def _bound_outbound_image(data_b64: str, frame: Any = None) -> tuple[str, str]:
     """Return ``(base64, mimeType)`` for the OUTBOUND copy, under the size budget.
 
     H7: the outbound PNG travels as-is while it fits the budget; an oversized PNG is
@@ -457,6 +516,13 @@ def _bound_outbound_image(data_b64: str) -> tuple[str, str]:
     never touched: captures, verification pixel-diff, and checkpoints keep PNG exactly
     as today. Degradation (PIL failure) returns the original — an oversized real image
     beats none.
+
+    R-5 (W4): ``frame`` may carry the observation's capture-time RGB frame (the
+    backend's private stash). When the PNG is over budget the JPEG ladder then starts
+    from that frame instead of re-decoding the PNG that was just encoded; the ladder's
+    outputs are byte-identical (same source pixels, same qualities/scales), and a
+    PNG-under-budget payload is returned untouched on both paths. The ``frame``
+    argument never changes the INTERNAL bytes — only the outbound copy's encode cost.
     """
     try:
         decoded = base64.b64decode(data_b64, validate=True)
@@ -465,10 +531,17 @@ def _bound_outbound_image(data_b64: str) -> tuple[str, str]:
     if len(decoded) <= _result_image_max_bytes():
         return data_b64, "image/png"
     try:
-        image = Image.open(io.BytesIO(decoded))
-        image.load()
-        if image.mode not in ("RGB", "L"):
-            image = image.convert("RGB")
+        if (
+            frame is not None
+            and isinstance(frame, Image.Image)
+            and frame.mode in ("RGB", "L")
+        ):
+            image = frame.copy()  # independent object: the ladder mutates via resize
+        else:
+            image = Image.open(io.BytesIO(decoded))
+            image.load()
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
         # Ladder: JPEG q85, then progressive 0.85 downscale; after exhausting the
         # scale steps, quality descent (85 -> 70 -> 55 -> 40 -> 25) on the smallest
         # frame. The ladder terminates well before pixel collapse; the floor path
@@ -493,7 +566,7 @@ def _bound_outbound_image(data_b64: str) -> tuple[str, str]:
         return data_b64, "image/png"
 
 
-def _execute_response_blocks(response: dict[str, object]) -> list[Any]:
+def _execute_response_blocks(response: dict[str, object], frame: Any = None) -> list[Any]:
     """REM-A H3/H5: executed ``computer_execute`` results as MCP content blocks.
 
     Returns one TextContent (the result JSON with the image blob stripped and the
@@ -502,12 +575,14 @@ def _execute_response_blocks(response: dict[str, object]) -> list[Any]:
     ``computer_observe``. When the caller opted out
     (``include_screenshot_after=False``, honored BEFORE this point) the response
     carries no blob and this yields the text block only — never an empty image.
+    ``frame`` (R-5 W4, optional) is the capture-time RGB frame for the outbound
+    JPEG ladder (skips re-decoding the PNG; byte-identical outputs).
     """
     payload = dict(response)
     data_b64 = payload.pop("screenshot_after_base64", None)
     blocks: list[Any] = []
     if data_b64 is not None:
-        bounded_b64, mime = _bound_outbound_image(str(data_b64))
+        bounded_b64, mime = _bound_outbound_image(str(data_b64), frame=frame)
         payload["image_format"] = mime
         blocks.append(ImageContent(type="image", data=bounded_b64, mimeType=mime))
     return [
@@ -554,11 +629,16 @@ def _parse_limits(limits: dict[str, Any] | None) -> Limits:
 # The live Kimi Code / GLM-5V run proved the pipeline works but the DRIVING MODEL
 # could not pass the strict pydantic schema four times (float coordinates, a
 # follow_ups array shape, an allowed_processes array) and gave up on clicking.
-# These helpers add BOUNDARY tolerance on exactly that class — the advertised tool
-# schemas stay self-describing ("integer" / "array"), the coercion runs
+# These helpers add BOUNDARY tolerance on exactly that class — the coercion runs
 # PRE-validation, and every downstream internal model (GroundedAction, Limits,
 # ActionSpec bounds) stays strict and unchanged. Non-numeric garbage still fails
-# with a clean pydantic-style typed error — this is tolerance, not semantics change.
+# with a clean pydantic-style typed error — this is tolerance, not semantics
+# change. D5 (ORVEX-CORTEX-056-LIVEFIX): the ADVERTISED schemas for the four
+# live-friction classes (x/y/x2/y2, allowed_processes/allowed_windows,
+# follow_ups, keys) are now WIDENED flat type-arrays that also admit the string
+# (and, for follow_ups, object) shapes the client-side validator used to reject
+# before these coercions could ever run; everything else keeps the plain
+# "integer"/"array" advertisement.
 
 
 #: Names of the action-spec fields that carry integer coordinates (used to coerce
@@ -723,6 +803,13 @@ class _PlainJsonSchema:
 
 
 #: The flattened advertised shapes (the only wire-schema change REM-G makes).
+#: D5 (ORVEX-CORTEX-056-LIVEFIX) WIDENED four of them to flat type-arrays that
+#: ALSO admit "string" (and "object" for follow_ups): the live client-side ajv
+#: validator rejected numeric-string coordinates, string allowlists, string/dict
+#: follow_ups, and bare-string keys BEFORE the bytes ever reached Cortex, so the
+#: REM-F server-side coercions for those shapes were unreachable from the host.
+#: The runtime coercions already exist and already reject garbage fail-closed —
+#: this is SCHEMA-WIDENING ONLY (still no anyOf; REM-G pin A holds).
 _PLAIN_NULLABLE_INTEGER = _PlainJsonSchema({"type": ["integer", "null"]})
 _PLAIN_NULLABLE_STRING = _PlainJsonSchema({"type": ["string", "null"]})
 _PLAIN_NULLABLE_BOOLEAN = _PlainJsonSchema({"type": ["boolean", "null"]})
@@ -731,6 +818,22 @@ _PLAIN_NULLABLE_STRING_ARRAY = _PlainJsonSchema(
 )
 _PLAIN_NULLABLE_OBJECT_ARRAY = _PlainJsonSchema(
     {"type": ["array", "null"], "items": {"type": "object", "additionalProperties": True}}
+)
+#: D5 widened shapes (WO-1..WO-4): coordinate scalars admit numeric strings;
+#: allowlist arrays admit comma/space-separated strings; the follow_ups queue
+#: admits JSON-encoded strings and a single wrapped dict; keys admits one bare
+#: key-name string or a JSON-array string. Garbage still fails typed server-side.
+_PLAIN_WIDENED_NULLABLE_COORDINATE = _PlainJsonSchema(
+    {"type": ["integer", "string", "null"]}
+)
+_PLAIN_WIDENED_NULLABLE_STRING_ARRAY = _PlainJsonSchema(
+    {"type": ["array", "string", "null"], "items": {"type": "string"}}
+)
+_PLAIN_WIDENED_NULLABLE_OBJECT_ARRAY = _PlainJsonSchema(
+    {
+        "type": ["array", "object", "string", "null"],
+        "items": {"type": "object", "additionalProperties": True},
+    }
 )
 _PLAIN_NULLABLE_STRING_MAP = _PlainJsonSchema(
     {"type": ["object", "null"], "additionalProperties": True}
@@ -783,14 +886,20 @@ TolerantKeys = Annotated[list[str], BeforeValidator(_coerce_tolerant_keys)]
 #: Optional tool parameter types with FLATTENED advertised schemas (REM-G). Each
 #: composes the EXISTING REM-F tolerant runtime type with the plain-union marker:
 #: runtime validation is byte-identical, only the wire schema loses anyOf.
+#: D5 (WO-1..WO-4) swaps in the WIDENED markers on exactly the four friction
+#: classes observed live (coordinates, allowlists, follow_ups, keys) so the
+#: client-side validator stops rejecting shapes the server already tolerates.
+#: NullableInt keeps the strict integer-only ADVERTISED shape for any non-tool
+#: consumer; the four D5 friction classes use the widened aliases below.
 NullableInt = Annotated[TolerantInt | None, _PLAIN_NULLABLE_INTEGER]
 NullableStr = Annotated[str | None, _PLAIN_NULLABLE_STRING]
 NullableBool = Annotated[bool | None, _PLAIN_NULLABLE_BOOLEAN]
-NullableStrList = Annotated[TolerantStrList | None, _PLAIN_NULLABLE_STRING_ARRAY]
-NullableFollowUps = Annotated[TolerantFollowUps | None, _PLAIN_NULLABLE_OBJECT_ARRAY]
+NullableCoordinate = Annotated[TolerantInt | None, _PLAIN_WIDENED_NULLABLE_COORDINATE]
+NullableStrList = Annotated[TolerantStrList | None, _PLAIN_WIDENED_NULLABLE_STRING_ARRAY]
+NullableFollowUps = Annotated[TolerantFollowUps | None, _PLAIN_WIDENED_NULLABLE_OBJECT_ARRAY]
 NullableStrMap = Annotated[dict[str, Any] | None, _PLAIN_NULLABLE_STRING_MAP]
 NullableNumberMap = Annotated[dict[str, float] | None, _PLAIN_NULLABLE_NUMBER_MAP]
-NullableKeys = Annotated[TolerantKeys | None, _PLAIN_NULLABLE_STRING_ARRAY]
+NullableKeys = Annotated[TolerantKeys | None, _PLAIN_WIDENED_NULLABLE_STRING_ARRAY]
 
 
 def _coerce_follow_up_entry(item: dict[str, Any]) -> dict[str, Any]:
@@ -932,16 +1041,6 @@ def _build_runtime(
     )
 
 
-def _get_or_create_runtime(bundle: _SessionBundle) -> LongRunningRuntime:
-    """Return the session's runtime, creating it lazily on first subtask-tool use."""
-    runtime = bundle.extra.get("long_running")
-    if isinstance(runtime, LongRunningRuntime):
-        return runtime
-    runtime = _build_runtime(bundle, goal=str(bundle.context.task.goal or ""))
-    bundle.extra["long_running"] = runtime
-    return runtime
-
-
 def _current_environment_from_backend(backend: Any) -> dict[str, Any]:
     """Fresh CURRENT environment reading for resume verification (fail-closed on absence).
 
@@ -985,146 +1084,6 @@ def _resume_error_response(exc: Exception, path: str) -> dict[str, object]:
     return payload
 
 
-_SUBTASK_ERROR_CODES: tuple[tuple[type[Exception], str], ...] = (
-    (SubtaskLimitExceeded, "subtask_limit_exceeded"),
-    (UnknownSubtaskError, "unknown_subtask"),
-    (SubtaskAlreadyExistsError, "subtask_already_exists"),
-    (InvalidSubtaskError, "invalid_subtask"),
-    (UnknownDependencyError, "unknown_dependency"),
-    (SelfDependencyError, "self_dependency"),
-    (DependencyCycleError, "dependency_cycle"),
-    (InvalidTransitionError, "invalid_transition"),
-)
-
-
-def _subtask_error_response(exc: Exception) -> dict[str, object]:
-    """Structured, typed error payloads for subtask/orchestration failures."""
-    if isinstance(exc, SubtaskNotReadyError):
-        return {
-            "ok": False,
-            "error": "subtask_not_ready",
-            "message": str(exc),
-            "subtask_id": exc.subtask_id,
-            "unmet_dependencies": list(exc.unmet),
-        }
-    for exc_type, code in _SUBTASK_ERROR_CODES:
-        if isinstance(exc, exc_type):
-            payload: dict[str, object] = {"ok": False, "error": code, "message": str(exc)}
-            subtask_id = getattr(exc, "subtask_id", None)
-            if subtask_id:
-                payload["subtask_id"] = subtask_id
-            return payload
-    long_running_codes: tuple[tuple[type[Exception], str], ...] = (
-        (RuntimeBusyError, "runtime_busy"),
-        (PlannerUnavailableError, "planner_unavailable"),
-        (SubtaskNotRunnableError, "subtask_not_runnable"),
-    )
-    for exc_type, code in long_running_codes:
-        if isinstance(exc, exc_type):
-            return {"ok": False, "error": code, "message": str(exc)}
-    return {"ok": False, "error": type(exc).__name__, "message": str(exc)}
-
-
-def _run_goal_stopped_response(session_id: str, approve_next_action: bool) -> dict[str, object]:
-    """The standard run_goal stopped-session response shape (E6 contract, D1/D2)."""
-    memory = _stopped_sessions.get(session_id, {})
-    stopped_result = ExecutionResult(
-        ok=False,
-        action=GroundedAction(action="done"),
-        message="Session is stopped; run_goal refused (fail-closed stopped-session policy).",
-    )
-    return {
-        "ok": False,
-        "approval_budget_remaining": 1 if approve_next_action else 0,
-        "results": [stopped_result.model_dump()],
-        "session_id": session_id,
-        "task_id": str(memory.get("task_id", "")),
-        "termination_reason": "stopped_by_user",
-        "stopped": True,
-        "requires_approval": False,
-        "step_count": int(memory.get("step_count", 0)),
-        "metrics": memory.get("metrics") or {"counters": {}, "latencies": {}},
-    }
-
-
-async def _run_goal_auto_subtasks(
-    session_id: str, goal: str, approve_next_action: bool
-) -> dict[str, object]:
-    """Long-Running/Multi-Subtask mode of ``run_goal`` (spec section 10, additive).
-
-    Plan (provider -> deterministic validation) -> sequential subtask execution through
-    the EXISTING executor, all within this call's budget semantics; the response keeps
-    the run_goal shape with additive subtask fields. Existing callers (default off) are
-    byte-identical.
-    """
-    try:
-        bundle = _get_live_bundle(session_id)
-    except _StoppedSession:
-        return _run_goal_stopped_response(session_id, approve_next_action)
-    except _UnknownSession as exc:
-        return _error_response(exc)
-    runtime = _get_or_create_runtime(bundle)
-    planned = 0
-    try:
-        runtime.set_goal(goal)
-        entries = await runtime.plan_from_llm(goal)
-        planned = len(entries)
-    except (PlannerUnavailableError, PlanRejectedError) as exc:
-        code = "planner_unavailable" if isinstance(exc, PlannerUnavailableError) else "plan_rejected"
-        payload: dict[str, object] = {
-            "ok": False,
-            "error": code,
-            "message": str(exc)[:2000],
-            "session_id": session_id,
-            "planned_subtasks": 0,
-        }
-        if isinstance(exc, PlanRejectedError):
-            payload["codes"] = list(exc.codes)[:10]
-        return payload
-    try:
-        outcome = await runtime.run_pending_subtasks(approve_next_action=approve_next_action)
-    except RuntimeBusyError as exc:
-        return {"ok": False, "error": "runtime_busy", "message": str(exc), "session_id": session_id}
-    except LimitExceeded as exc:
-        return {
-            "ok": False,
-            "error": "limit_exceeded",
-            "limit": exc.limit_name,
-            "message": str(exc),
-            "session_id": session_id,
-        }
-    task = bundle.agent.task
-    results_payload: list[dict[str, object]] = []
-    for item in outcome.results:
-        results_payload.append(_redact_result_payload(item.model_dump()))
-    if task.status.value == "stopped" and session_id in _bundles:
-        # F7: an internally-armed kill path that terminated this run gets the SAME
-        # bundle hygiene as run_goal (the stop was already audited in-run).
-        _close_stopped_bundle(
-            session_id, bundle, source="run_goal_kill_path", audit_stop_events=False
-        )
-    return {
-        "ok": bool(outcome.ok),
-        "approval_budget_remaining": outcome.approval_budget_remaining,
-        "results": results_payload,
-        "session_id": session_id,
-        "task_id": task.task_id,
-        "termination_reason": outcome.termination_reason,
-        "stopped": bool(
-            outcome.stopped or bundle.state.stopped or task.status.value == "stopped"
-        ),
-        "requires_approval": bool(outcome.requires_approval or bundle.agent.approval_denied),
-        "step_count": bundle.state.step_count,
-        "metrics": bundle.metrics.snapshot(),
-        # Additive long-running fields (existing keys above unchanged).
-        "planned_subtasks": planned,
-        "executed_subtasks": list(outcome.executed),
-        "replan_attempts": outcome.replan_attempts,
-        "detail": outcome.detail[:500],
-        "progress": runtime.progress(),
-    }
-
-
 # --- tools ---------------------------------------------------------------------------------
 
 
@@ -1140,6 +1099,7 @@ def start_session(
     limits: NullableNumberMap = None,
     resume_from_checkpoint: NullableStr = None,
     interference: NullableStrMap = None,
+    image_delivery: NullableStr = None,
 ) -> dict[str, object]:
     """Start a guarded session; per-action approval is enabled by default.
 
@@ -1156,8 +1116,9 @@ def start_session(
 
     REM-F weak-model tolerance: ``allowed_processes``/``allowed_windows`` also accept
     a comma/space-separated STRING ("mspaint.exe, notepad.exe") or a single bare
-    string, coerced to the documented list at the tool boundary only — the
-    advertised schema stays array-of-string and ``limits`` stays STRICT
+    string, coerced to the documented list at the tool boundary only — the advertised
+    schema is the D5-widened flat type-array (array | string | null) so the client-side
+    validator lets those shapes through, and ``limits`` stays STRICT
     (fail-closed numeric contract, untouched).
 
     Interference policy (T8, trailing optional): ``interference`` is a dict of policy
@@ -1173,7 +1134,23 @@ def start_session(
     dependencies, and context are restored, the CURRENT environment is re-verified
     against the checkpoint's expectations (mismatch/invalid checkpoint -> fail-closed
     typed refusal), and approval is FRESH (never resurrected from data). Existing
-    callers that omit the parameter are byte-identical.
+    callers that omit the parameter are byte-identical. The image delivery mode is
+    deliberately NOT checkpointed: a resumed session is a FRESH session governed by
+    THIS call's ``image_delivery`` param (or env/default).
+
+    Image delivery (D1, trailing optional): ``image_delivery`` (optional, "image" or
+    "text", default "image") controls how screenshots come back from
+    computer_observe / computer_execute. JUDGE BY WHAT YOU RECEIVE, not by what
+    you think you are: if your inputs arrive as text only (no image parts), pass
+    image_delivery="text" — REQUIRED, not optional. Text mode never crashes: it
+    returns full metadata (window, cursor, digest, OCR/UI elements, text summary)
+    and never an image block; for a vision model it only costs the screenshot
+    pixels. One image part in a text-only conversation KILLS the whole session
+    PERMANENTLY (the provider rejects the request with a 400 and every later turn
+    replays the poisoned image). UNSURE? Pass "text". Vision models that truly
+    receive images pass "image" (or omit) for real image blocks.
+    Precedence: param > env ``CORTEX_IMAGE_DELIVERY`` ("text"/"image") > default
+    "image"; invalid values are rejected fail-closed (``invalid_image_delivery``).
     """
     try:
         # D9 precedence (documented): the legacy ``max_retries_per_action`` parameter and
@@ -1201,6 +1178,13 @@ def start_session(
         # Fail-closed policy parsing (mirrors ``invalid_limits``): a malformed policy
         # can never silently weaken the protective defaults.
         return {"ok": False, "error": "invalid_interference", "message": str(exc)}
+    # D1: normalize + resolve the image delivery mode BEFORE any session exists so a
+    # bad value leaks no registry slot; a typo silently meaning "image" would re-arm
+    # the non-vision session killer, so garbage is REJECTED fail-closed (REM-F).
+    try:
+        image_mode = _resolve_image_delivery(_normalize_image_delivery_param(image_delivery))
+    except ValueError as exc:
+        return {"ok": False, "error": "invalid_image_delivery", "message": str(exc)}
     # REM-F: normalize the tolerant allowlist shapes for DIRECT callers too (the
     # boundary coercion already produced lists for MCP callers — idempotent here).
     try:
@@ -1246,6 +1230,18 @@ def start_session(
             allowed_processes=allowed_processes or [],
             interference=interference_policy,
         )
+        # R-6 encode-skip: in a text session NO image block is ever emitted (D1), so
+        # the lossless PNG payload exists only to be hashed (digest) and compared
+        # (staleness). Arming ``_raw_payload_keys`` makes the backend produce its
+        # deterministic raw-pixel key instead — byte-for-byte identical semantics for
+        # every consumer (digest, equality, verification fast path), minus the encode.
+        # Guarded on the backend side by ``_raw_key_enabled`` (frame-reuse on AND
+        # ``CORTEX_TEXT_PNG=0``); any other backend simply ignores the attribute.
+        if image_mode == "text":
+            try:
+                backend._raw_payload_keys = True  # noqa: SLF001 - session-owned backend
+            except Exception:
+                logger.debug("backend rejected raw payload keys; text session keeps PNGs")
     except Exception as exc:  # noqa: BLE001 - structured error, no traceback
         _registry.remove(session_id)
         return _error_response(exc)
@@ -1263,6 +1259,7 @@ def start_session(
                 "allowed_processes": list(allowed_processes or []),
                 "max_retries_per_action": max_retries_per_action,
                 "interference_policy": interference_policy,
+                "image_delivery": image_mode,
             },
         )
     try:
@@ -1277,6 +1274,7 @@ def start_session(
                 "allowed_processes": list(allowed_processes or []),
                 "limits": str(limits_obj),
                 "interference": str(interference_policy),
+                "image_delivery": image_mode,
             },
         )
     except Exception:
@@ -1340,8 +1338,12 @@ def start_session(
             "allowed_processes": list(allowed_processes or []),
             "limits": str(limits_obj),
             "task_id": context.task.task_id,
+            # D1: the mode is visible in the transcript right after creation.
+            "image_delivery": image_mode,
         }
     )
+    if image_mode == "text":
+        payload["image_delivery_note"] = IMAGE_DELIVERY_TEXT_NOTE
     payload.update(resume_extra)
     return payload
 
@@ -1399,12 +1401,21 @@ def computer_observe(session_id: str) -> Any:
     changed/unchanged versus the previous observation of this session — never the
     raw base64) and one ImageContent carrying the screenshot itself, so
     vision-capable clients receive it as a real image rather than as text.
-    Error paths still return the structured error dict.
+    In a text-mode session (``start_session(image_delivery="text")`` /
+    ``CORTEX_IMAGE_DELIVERY=text``) this returns ONE text block only (metadata +
+    ``image_delivery`` keys) — never an image block — so non-vision models stay
+    alive; the delivery mode is fixed at start_session (pass image_delivery="text"
+    there if your inputs are text-only). Error paths still return the structured
+    error dict.
     """
     try:
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
+    # D1: text mode suppresses the OUTBOUND image block only — a non-vision model
+    # receiving one ImageContent anywhere in its history gets the whole provider
+    # request rejected with a 400 and the session dies permanently.
+    image_mode = _session_image_delivery(bundle)
     try:
         observation, digest = bundle.agent.observation.capture_with_digest()
     except Exception as exc:  # noqa: BLE001 - structured error, no traceback
@@ -1434,7 +1445,27 @@ def computer_observe(session_id: str) -> Any:
     # observe and execute). The live probe shipped a 1.37 MB PNG block and blew
     # the provider request; the INTERNAL Observation stays PNG untouched below,
     # so pixel-diff, staleness digests, and checkpoints are unaffected.
-    outbound_b64, outbound_mime = _bound_outbound_image(observation.image_base64)
+    if image_mode == "text":
+        # D1 text mode: ONE text block only (metadata + mode keys), never an
+        # ImageContent. Internal capture is UNCHANGED — digest, staleness,
+        # pixel-diff, text_summary, metrics, and audit all keep working above.
+        metadata = {
+            "observation": _bound_observe_lists(observation_dump),
+            "digest": digest,
+            "observation_id": observation.observation_id,
+            "active_app": info.process_name if info is not None else observation.active_window,
+            "image_format": "none",  # truthful: no image block was emitted
+            "image_delivery": "text",
+            "image_delivery_note": IMAGE_DELIVERY_TEXT_NOTE,
+            # PERF-004 C8 (additive): bounded one-line grounding text for weak models.
+            "text_summary": text_summary,
+        }
+        return [TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False))]
+    outbound_b64, outbound_mime = _bound_outbound_image(
+        # R-5 (W4): the capture-time frame (backend stash) skips the PNG re-decode on
+        # the JPEG ladder; absent (fakes/legacy) the path decodes exactly as before.
+        observation.image_base64, frame=getattr(observation, "_frame", None)
+    )
     metadata = {
         "observation": _bound_observe_lists(observation_dump),
         "digest": digest,
@@ -1460,20 +1491,23 @@ def computer_screenshot(session_id: str) -> Any:
 async def computer_execute(
     session_id: str,
     action: str,
-    x: NullableInt = None,
-    y: NullableInt = None,
+    x: NullableCoordinate = None,
+    y: NullableCoordinate = None,
     text: NullableStr = None,
     keys: NullableKeys = None,
     delta: int = 0,
     approved: bool = False,
     expected_effect: NullableStr = None,
-    x2: NullableInt = None,
-    y2: NullableInt = None,
+    x2: NullableCoordinate = None,
+    y2: NullableCoordinate = None,
     target: NullableStr = None,
     include_screenshot_after: NullableBool = None,
     follow_ups: NullableFollowUps = None,
 ) -> Any:
     """Validate and execute one grounded action; approval applies only to this action call.
+
+    session_id is REQUIRED on every call: copy it from start_session's result and
+    reuse it for the whole session.
 
     ACTION VOCABULARY (exact names, from the models enum): click, double_click, drag,
     type, keypress, scroll, wait, done, move, hotkey, focus_window, ensure_app. There is
@@ -1499,10 +1533,11 @@ async def computer_execute(
     REM-F weak-model tolerance (boundary only): integer coordinates also accept
     integral floats (1343.0) and numeric strings ("1343"); NON-INTEGRAL values ROUND
     to the nearest int (a vision model aiming at pixel 1343.7 must not hard-fail).
-    The advertised schema still says "integer"; non-numeric garbage ("left") still
-    fails with a clean typed error. ``follow_ups`` also accepts a JSON-encoded string
-    containing the list, a single dict (wrapped into a one-entry list), and
-    per-entry JSON strings — same fail-closed queue semantics afterwards.
+    The D5-widened advertised schema admits integer | string | null; non-numeric
+    garbage ("left") still fails with a clean typed error. ``follow_ups`` also
+    accepts a JSON-encoded string containing the list, a single dict (wrapped into a
+    one-entry list), and per-entry JSON strings — same fail-closed queue semantics
+    afterwards.
 
     Host-payload opt-out (PERF-004, trailing optional): pass
     ``include_screenshot_after=false`` to OMIT the heavy image block
@@ -1514,6 +1549,9 @@ async def computer_execute(
     outbound only — internal captures stay PNG). Executed responses return MCP
     content blocks (TextContent result JSON + ImageContent post-action screenshot,
     parity with computer_observe); error/rejection/approval shapes stay plain dicts.
+    In a text-mode session (``start_session(image_delivery="text")``) the executed
+    response is the slim dict (no image block, no screenshot bytes, mode keys added)
+    and ``include_screenshot_after`` cannot re-enable images in text mode.
 
     Queued actions (PERF-004, trailing optional): ``follow_ups`` is a list of at most 5
     action specs (same fields as this tool's action parameters, e.g.
@@ -1533,6 +1571,10 @@ async def computer_execute(
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
+    # D1: text mode dominates every executed response shape — include_screenshot_after
+    # can only REMOVE bytes, never re-enable an image (a non-vision model passing
+    # True must not be able to kill its own session).
+    image_mode = _session_image_delivery(bundle)
     if follow_ups is not None:
         # REM-F: normalize the tolerant shapes for DIRECT callers too (the boundary
         # coercion already produced list[dict] for MCP callers — idempotent here:
@@ -1643,297 +1685,19 @@ async def computer_execute(
     # Error/rejection/approval shapes have no image key and stay plain dicts.
     # include_screenshot_after=False was applied above, so the opt-out never enters
     # this branch (H5: no ImageContent, and none nested in follow_up_results).
+    # D1 text mode: the slim dict shape (the opt-out precedent, mode keys added) —
+    # include_screenshot_after can never promote text mode back to image mode.
     if outcome.kind == "executed" and "screenshot_after_base64" in response:
-        return _execute_response_blocks(response)
+        if image_mode == "text":
+            response.pop("screenshot_after_base64", None)
+            response["image_delivery"] = "text"
+            response["image_delivery_note"] = IMAGE_DELIVERY_TEXT_NOTE
+            return response
+        # R-5 (W4): the capture-time frame rides along (never serialized; absent for
+        # legacy results) so the outbound JPEG ladder skips re-decoding the PNG.
+        frame = getattr(result, "_frame", None) if result is not None else None
+        return _execute_response_blocks(response, frame=frame)
     return response
-
-
-@mcp.tool()
-async def run_goal(
-    session_id: str,
-    goal: str,
-    approve_next_action: bool = False,
-    auto_subtasks: bool = False,
-) -> dict[str, object]:
-    """Run the loop; approve_next_action authorizes at most one interactive action in this call.
-
-    Recovery retries of the same approved action instance do not re-consume the budget;
-    a new distinct action after exhaustion is denied fail-closed with ``requires_approval``.
-
-    Long-running additive (trailing optional): ``auto_subtasks=True`` switches to the
-    Multi-Subtask mode — the goal is decomposed by the LLM planner (validated
-    deterministically, fail-closed) and executed as sequential subtasks through the same
-    closed-loop executor. Callers omitting it get byte-identical single-goal behavior.
-    """
-    if auto_subtasks:
-        return await _run_goal_auto_subtasks(session_id, goal, approve_next_action)
-    try:
-        bundle = _get_live_bundle(session_id)
-    except _StoppedSession:
-        # D1 fail-closed: a stopped session runs NOTHING. The response keeps the standard
-        # run_goal shape (E6 contract) with an explicit failed stopped-result entry, so
-        # "ok" is never vacuously true over an empty list (D2).
-        memory = _stopped_sessions.get(session_id, {})
-        stopped_result = ExecutionResult(
-            ok=False,
-            action=GroundedAction(action="done"),
-            message="Session is stopped; run_goal refused (fail-closed stopped-session policy).",
-        )
-        return {
-            "ok": False,
-            "approval_budget_remaining": 1 if approve_next_action else 0,
-            "results": [stopped_result.model_dump()],
-            "session_id": session_id,
-            "task_id": str(memory.get("task_id", "")),
-            "termination_reason": "stopped_by_user",
-            "stopped": True,
-            "requires_approval": False,
-            "step_count": int(memory.get("step_count", 0)),
-            "metrics": memory.get("metrics") or {"counters": {}, "latencies": {}},
-        }
-    except _UnknownSession as exc:
-        return _error_response(exc)
-    approval_budget = 1 if approve_next_action else 0
-
-    def approve_one(_action: GroundedAction, _reason: str) -> bool:
-        nonlocal approval_budget
-        if approval_budget <= 0:
-            return False
-        approval_budget -= 1
-        return True
-
-    try:
-        results = await bundle.agent.run(goal, bundle.state, approval=approve_one)
-    except Exception as exc:  # noqa: BLE001 - structured error, no traceback
-        return _error_response(exc)
-    task = bundle.agent.task
-    termination = task.termination_reason.value if task.termination_reason else None
-    results_payload: list[dict[str, object]] = []
-    for item in results:
-        payload = item.model_dump()
-        # D3: provider-flagged suspicious content travels with its action result.
-        action_payload = payload.get("action") or {}
-        suspicious = bundle.agent.suspicious_contents.get(str(action_payload.get("action_id", "")))
-        if suspicious:
-            payload["suspicious_content"] = suspicious
-        # F3: honest completion marking — provider-declared done is model-asserted.
-        verification_payload = payload.get("verification") or {}
-        if isinstance(verification_payload, dict) and verification_payload.get(
-            "verification_method"
-        ) == "provider_done":
-            payload["completion_evidence"] = "model_declared"
-        # F2: the response path is redacted too (defense in depth).
-        results_payload.append(_redact_result_payload(payload))
-    if task.status.value == "stopped" and session_id in _bundles:
-        # F7: an internally-armed kill path that terminated this run gets the SAME
-        # bundle hygiene as stop_session (the stop was already audited in-run).
-        _close_stopped_bundle(
-            session_id, bundle, source="run_goal_kill_path", audit_stop_events=False
-        )
-    return {
-        # D2: an empty result list is NOT a success (no vacuous all() over []).
-        "ok": bool(results) and all(item.ok for item in results),
-        "approval_budget_remaining": approval_budget,
-        "results": results_payload,
-        "session_id": session_id,
-        "task_id": task.task_id,
-        "termination_reason": termination,
-        "stopped": bool(bundle.state.stopped or task.status.value == "stopped"),
-        "requires_approval": bool(bundle.agent.approval_denied),
-        "step_count": bundle.state.step_count,
-        "metrics": bundle.metrics.snapshot(),
-    }
-
-
-# --- long-running session tools (SubtasksProtocol section 9; additive) ----------------------
-
-
-@mcp.tool()
-def create_subtask(
-    session_id: str,
-    description: str,
-    depends_on: Annotated[list[str] | None, _PLAIN_NULLABLE_STRING_ARRAY] = None,
-) -> dict[str, object]:
-    """Create one manual subtask (spec section 9); fail-closed on invalid graphs.
-
-    Validates the session, the description, and the dependency list (every dependency
-    must already exist, no self-dependency, no cycles, hard cap 50 subtasks). Works
-    without any planner/LLM key.
-    """
-    if depends_on is not None and (
-        isinstance(depends_on, (str, bytes)) or not isinstance(depends_on, (list, tuple))
-    ):
-        # Tool-boundary type gate: a non-iterable (or string) depends_on must surface as
-        # the typed fail-closed error code, never as an escaping TypeError from the MCP
-        # tool (the runtime's list() coercion would raise one).
-        return {
-            "ok": False,
-            "error": "invalid_subtask",
-            "message": "depends_on must be a list of subtask ids (or null); "
-            "refusing a non-iterable value at the tool boundary",
-        }
-    try:
-        bundle = _get_live_bundle(session_id)
-    except (_StoppedSession, _UnknownSession) as exc:
-        return _error_response(exc)
-    runtime = _get_or_create_runtime(bundle)
-    try:
-        subtask = runtime.create_subtask(description, depends_on)
-    except (SubtaskError, LongRunningError) as exc:
-        return _subtask_error_response(exc)
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "subtask": {
-            "subtask_id": subtask.subtask_id,
-            "description": subtask.description,
-            "status": subtask.status.value,
-            "depends_on": list(subtask.depends_on),
-            "created_at": subtask.created_at.isoformat(),
-        },
-        "total_subtasks": len(runtime.subtasks),
-    }
-
-
-@mcp.tool()
-def list_subtasks(session_id: str) -> dict[str, object]:
-    """List all subtasks with statuses as a structured, bounded response.
-
-    Each summary carries bounded scalar fields plus result/recovery COUNTS — never
-    result payloads, never history (spec section 9/19).
-    """
-    try:
-        bundle = _get_live_bundle(session_id)
-    except (_StoppedSession, _UnknownSession) as exc:
-        return _error_response(exc)
-    runtime = _get_or_create_runtime(bundle)
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "total": len(runtime.subtasks),
-        "counts": runtime.counts(),
-        "subtasks": runtime.list_subtasks(),
-    }
-
-
-@mcp.tool()
-async def run_subtask(
-    session_id: str,
-    subtask_id: str,
-    approve_next_action: bool = False,
-) -> dict[str, object]:
-    """Execute exactly ONE ready subtask through the existing closed-loop executor.
-
-    One bounded subtask per MCP call; state and checkpoints persist server-side between
-    calls, so no MCP connection needs to stay open for hours (spec section 9, conflict
-    C7). The subtask can never bypass safety, approval, grounding, validation, the stop
-    token, verification, recovery, or audit. ``approve_next_action`` authorizes at most
-    one interactive action in this call (run_goal budget semantics).
-    """
-    try:
-        bundle = _get_live_bundle(session_id)
-    except (_StoppedSession, _UnknownSession) as exc:
-        return _error_response(exc)
-    runtime = _get_or_create_runtime(bundle)
-    try:
-        outcome = await runtime.run_single_subtask(
-            subtask_id, approve_next_action=approve_next_action
-        )
-    except LimitExceeded as exc:
-        return {
-            "ok": False,
-            "error": "limit_exceeded",
-            "limit": exc.limit_name,
-            "message": str(exc),
-        }
-    except (SubtaskError, LongRunningError) as exc:
-        return _subtask_error_response(exc)
-    task = bundle.agent.task
-    results_payload: list[dict[str, object]] = []
-    for item in outcome.results:
-        results_payload.append(_redact_result_payload(item.model_dump()))
-    if task.status.value == "stopped" and session_id in _bundles:
-        # F7: an internally-armed kill path gets the SAME bundle hygiene (stop audited
-        # in-run already).
-        _close_stopped_bundle(
-            session_id, bundle, source="run_subtask_kill_path", audit_stop_events=False
-        )
-    subtask_snapshot = runtime.subtasks.get(subtask_id)
-    subtask_status = subtask_snapshot.status.value if subtask_snapshot is not None else "unknown"
-    return {
-        "ok": bool(outcome.ok),
-        "session_id": session_id,
-        "subtask_id": subtask_id,
-        "status": subtask_status,
-        "termination_reason": outcome.termination_reason,
-        "requires_approval": bool(outcome.requires_approval),
-        "stopped": bool(
-            outcome.stopped or bundle.state.stopped or task.status.value == "stopped"
-        ),
-        "results": results_payload,
-        "executed_subtasks": list(outcome.executed),
-        "approval_budget_remaining": outcome.approval_budget_remaining,
-        "detail": outcome.detail[:500],
-        "progress": runtime.progress(),
-        "metrics": bundle.metrics.snapshot(),
-    }
-
-
-@mcp.tool()
-def get_session_progress(session_id: str) -> dict[str, object]:
-    """Deterministic progress report: status, percent, counts, elapsed, counters, checkpoint.
-
-    The progress percentage is computed from subtask manager state (completed/total) —
-    never invented. The response is structured and bounded (no history dumps).
-    """
-    try:
-        bundle = _get_live_bundle(session_id)
-    except (_StoppedSession, _UnknownSession) as exc:
-        return _error_response(exc)
-    runtime = bundle.extra.get("long_running")
-    if not isinstance(runtime, LongRunningRuntime):
-        zero_counts = {status.value: 0 for status in SubtaskStatus}
-        budget_like = bundle.metrics.snapshot()["counters"]
-        return {
-            "ok": True,
-            "session_id": session_id,
-            "status": bundle.context.task.status.value,
-            "task_status": bundle.context.task.status.value,
-            "goal": redact_text(str(bundle.context.task.goal or ""))[0][:2_000],
-            "continuation_of": None,
-            "total_subtasks": 0,
-            "completed_subtasks": 0,
-            "progress_percent": 0.0,
-            "counts": zero_counts,
-            "current_subtask_id": None,
-            "elapsed_seconds": round(bundle.enforcer.elapsed_seconds(), 3),
-            "resource_counters": {
-                "actions": int(budget_like.get("action_total", 0)),
-                "model_calls": int(budget_like.get("model_calls", 0)),
-                "steps": int(bundle.state.step_count),
-                "subtasks": 0,
-            },
-            "resource_limits": {
-                "max_session_seconds": bundle.limits.max_session_seconds,
-                "max_session_actions": bundle.limits.max_session_actions,
-                "max_session_model_calls": bundle.limits.max_session_model_calls,
-                "max_session_steps": bundle.limits.max_session_steps,
-                "max_subtasks": bundle.limits.max_subtasks,
-            },
-            "checkpoint": {
-                "has_checkpoint": _checkpoint_manager.has_checkpoint(session_id),
-                "last_trigger": None,
-                "last_checkpoint_at": None,
-            },
-            "replan_attempts_used": 0,
-            "replan_attempts_max": 3,
-        }
-    payload = runtime.progress()
-    payload["ok"] = True
-    payload["task_status"] = bundle.context.task.status.value
-    return payload
-
-
 def main() -> None:
     asyncio.run(mcp.run_stdio_async())
 

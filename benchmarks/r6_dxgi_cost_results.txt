@@ -1,0 +1,20 @@
+# duplication 1920x1080 rotation=1
+  T4 idle grab (timeout 1ms, cached/None)      n=14 p50=   16.2ms mean=   16.5ms max=   30.8ms
+    grab  0:   14.5ms new
+    grab  1:   15.6ms new
+    grab  2:   30.0ms new
+    grab  3:   12.1ms new
+    grab  4:   33.1ms new
+    grab  5:   25.5ms new
+    grab  6:   23.3ms new
+    grab  7:   28.2ms new
+    grab  8:   18.0ms new
+    grab  9:   25.6ms new
+    grab 10:   26.6ms new
+    grab 11:   25.5ms new
+    grab 12:   13.6ms new
+    grab 13:   28.7ms new
+  T2 full readback grab (live screen)          n=14 p50=   25.5ms mean=   22.9ms max=   33.1ms
+#    new=14 timeout=0
+  T3 readback only (Copy+Map+copy, frame held) n=14 p50=   18.6ms mean=   19.3ms max=   27.7ms
+  T5 mss grab + BGRX decode (baseline)         n=14 p50=   53.2ms mean=   54.2ms max=   74.6ms

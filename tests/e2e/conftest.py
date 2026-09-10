@@ -1,9 +1,19 @@
 """E2E suite configuration: marker gate, evidence capture, per-test deadlines.
 
-Skip doctrine (charter): every test marked ``e2e`` runs REAL applications on the live
-desktop and is therefore skipped unless ``CUMCP_RUN_E2E=1``. The standard suite
-(``pytest tests/ -q``) stays green and deterministic without a desktop. The marker is
-registered here (pyproject is not edited) via ``pytest_configure``.
+Skip doctrine (charter, hardened by D6/R-8): every test marked ``e2e`` runs REAL
+applications with REAL keyboard/mouse input on the live desktop — the desktop of
+WHOEVER runs pytest, including a developer's own open Notepad if a test ever
+attaches wrong. The gate is therefore FAIL-CLOSED: e2e-marked tests SKIP unless the
+runner EXPLICITLY opts in with ``CUMCP_RUN_E2E=1`` (exact string "1", no other
+value, no other variable name). The standard suite (``python -m pytest tests -q``)
+stays green, deterministic, and — above all — NEVER moves the user's mouse or types
+into the user's windows. The marker is registered here (pyproject is not edited)
+via ``pytest_configure``.
+
+Opt-in doctrine (D6): the skip reason is LOUD and tells the runner exactly how to
+opt in AND what opting in means (real input on the real desktop — close your own
+work first). Unrelated ``E2E_*`` / ``REAL`` / ``DESKTOP`` variables must NEVER
+enable the gate: only the exact ``CUMCP_RUN_E2E=1`` does.
 
 Evidence doctrine (charter / master-mission 9-J): every e2e test produces, under
 ``evidence/e2e/<test_name>/``:
@@ -51,19 +61,50 @@ if str(E2E_DIR) not in sys.path:
 
 import helpers_win32 as w32
 
+#: The ONE opt-in (D6 fail-closed gate): exact string "1" of this exact variable.
+#: Nothing else enables real-input e2e — not "true"/"yes"/"on"/"2"/"1 " of this
+#: variable, and not any similarly-named E2E_/REAL/DESKTOP variable.
+E2E_OPT_IN_ENV_VAR = "CUMCP_RUN_E2E"
+E2E_OPT_IN_VALUE = "1"
+
+#: LOUD skip reason (D6): tells the runner how to opt in AND warns that opting in
+#: drives REAL keyboard/mouse input on the REAL desktop of whoever runs pytest.
+E2E_SKIP_REASON = (
+    "D6 desktop-safety gate: this e2e test drives REAL keyboard/mouse input on the "
+    "LIVE desktop (it can type into and move windows of REAL applications). It is "
+    "skipped so plain 'pytest tests' NEVER touches the desktop. To run it "
+    "deliberately, opt in per-run with: "
+    f"{E2E_OPT_IN_ENV_VAR}={E2E_OPT_IN_VALUE} python -m pytest tests/e2e "
+    "(PowerShell: $env:CUMCP_RUN_E2E='1') — WARNING: opt in ONLY on a machine/"
+    "desktop you control; close your own work first. No other variable or value "
+    f"(true/yes/on, any E2E_*/REAL*/DESKTOP* name) enables this gate."
+)
+
+
+def e2e_real_input_enabled(environ: dict[str, str] | None = None) -> bool:
+    """Fail-closed gate predicate (pure, unit-pinnable; no test execution needed).
+
+    True ONLY when the exact opt-in variable ``CUMCP_RUN_E2E`` holds the exact
+    string ``"1"`` (no case folding, no whitespace trim, no numeric coercion —
+    anything else, including "1 " or " 1", stays CLOSED). Unrelated variable names
+    (``E2E_REAL_INPUT``, ``RUN_E2E``, ``E2E``, ``REAL_DESKTOP``...) never enable it.
+    """
+    source = os.environ if environ is None else environ
+    return source.get(E2E_OPT_IN_ENV_VAR) == E2E_OPT_IN_VALUE
+
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
-        "markers", "e2e: runs real Windows applications on the live desktop (needs CUMCP_RUN_E2E=1)"
+        "markers",
+        "e2e: runs real Windows applications on the live desktop "
+        f"(REAL input; skipped unless {E2E_OPT_IN_ENV_VAR}={E2E_OPT_IN_VALUE})",
     )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    if os.environ.get("CUMCP_RUN_E2E") == "1":
+    if e2e_real_input_enabled():
         return
-    skip = pytest.mark.skip(
-        reason="e2e test drives real Windows applications; set CUMCP_RUN_E2E=1 to enable"
-    )
+    skip = pytest.mark.skip(reason=E2E_SKIP_REASON)
     for item in items:
         # NOTE: keyword membership would also match the PATH component "e2e" (pytest adds
         # path parts as keywords); the gate must test the registered marker itself.
