@@ -144,103 +144,14 @@ cortex-mcp update  [--repo PATH] [--dry-run]
 
 ### Install and update via an AI agent
 
-You do not have to do any of this by hand. Paste one of the two prompts below into any AI coding agent (ZCode, Claude, Cursor, Kimi, Codex, …) and it will install or update Cortex for you end to end: prerequisites, venv, editable install, MCP wiring for the target host, verification, and a smoke test. Both prompts are self-contained — the agent asks you only for the two things it cannot know (where the repo comes from and which host to wire it into). Both prompts are written entirely in English so any agent can follow them verbatim.
+You do not have to do any of this by hand. Copy one of the two prompts below into any
+MCP-capable agent and it will install or update Cortex for itself end to end: canonical
+clone + venv + editable install, probe verification, and registration in its own MCP
+config (backup first, never overwrite an existing cortex entry). The canonical install
+location is %LOCALAPPDATA%\Cortex on Windows (~/.local/share/cortex elsewhere) and
+verification is one command: `"<venv python>" -m computer_use_mcp.cli probe`.
 
 #### Install prompt
-
-````text
-Your task: install the Cortex MCP server on this machine and wire it into the host application, from start to final verification. Do everything yourself; never ask the user to run any command manually. Ask the user at the start about two things only, if you do not already know them: (1) the repository source — download from GitHub (the default) or an existing local copy at a specific path? (2) which host application to wire the server into (ZCode, Claude Desktop, Cursor, or other). Everything else is fully specified in these instructions; you need no other context.
-
-Step 1 — Check prerequisites:
-- OS: Windows 10, Windows 11, or Windows Server with an active, interactive display session (there is no headless mode — capture and input go through the real desktop).
-- Python 3.11 or newer: check with `py -3.11 --version` or `python --version`. If missing, install the latest 3.11+ from python.org before continuing.
-- git is optional: needed only for the clone method; if it is absent, use the ZIP download.
-
-Step 2 — Obtain the repository:
-```bash
-git clone https://github.com/Xenos-ink/Cortex.git
-cd Cortex
-```
-If git is unavailable: download the ZIP from the repository page (Code → Download ZIP) and extract it. If the user gave you a local path to a copy, use it as is. Treat the full folder path as the reference value C:\path\to\Cortex and substitute it everywhere below (always use absolute paths in configuration files).
-
-Step 3 — Virtual environment and installation:
-```bash
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-```
-- pyproject.toml at the repository root is the reference: the entry point is `computer_use_mcp.server:main`, the install creates the two console scripts `cortex` and `computer-use-mcp`, and the server also runs as a module via `python -m computer_use_mcp.server` — invent no other commands or flags.
-- No optional extras are needed. Only if the user later asks for the development/test tooling: `.\.venv\Scripts\python.exe -m pip install -e ".[dev]"`.
-- Verify the install succeeded:
-```bash
-.\.venv\Scripts\python.exe -c "import computer_use_mcp; print(computer_use_mcp.__version__)"
-```
-
-Step 4 — Wire the MCP server into the host application (both ways):
-The standard server object is the same in every case (replace C:\path\to\Cortex with the real path, and use only the venv's python.exe):
-```json
-{
-  "mcpServers": {
-    "cortex": {
-      "command": "C:\\path\\to\\Cortex\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "computer_use_mcp.server"],
-      "cwd": "C:\\path\\to\\Cortex",
-      "env": {
-        "VISION_BASE_URL": "https://api.openai.com/v1",
-        "VISION_MODEL": "your-vision-model",
-        "VISION_API_KEY": "YOUR_API_KEY"
-      }
-    }
-  }
-}
-```
-Note: the whole `env` block is optional — the five-tool server is deterministic and needs no API key (the vision endpoint is only used by the model-judge verification tier when a call opts into it). If the user did not ask for it, drop `env` or leave it empty.
-
-a) Global configuration (user level — applies to every project):
-- ZCode: the file `%USERPROFILE%\.zcode\cli\config.json`, and the key there is `mcp.servers` (i.e. put the "cortex" object under `mcp.servers`, NOT under `mcpServers`; compatible fallback: `~\.agents\mcp.json` in the `mcpServers` shape above).
-- Claude Desktop: the file `%APPDATA%\Claude\claude_desktop_config.json`, in the `mcpServers` shape as-is.
-- Cursor: the file `%USERPROFILE%\.cursor\mcp.json`, in the `mcpServers` shape as-is.
-
-b) Per-project / agent-level configuration (inside the target project folder):
-- ZCode: `<project>\.zcode\config.json` with the key `mcp.servers` (compatible fallback: `<project>\.agents\mcp.json` in the `mcpServers` shape).
-- Cursor: `<project>\.cursor\mcp.json` in the `mcpServers` shape.
-- Claude Code: `<project>\.mcp.json` in the `mcpServers` shape.
-
-Apply at least the method the user asked for; applying both (global + project) is recommended. If a config file already exists, merge the new "cortex" object into the existing `mcpServers`/`mcp.servers` without deleting any existing server. Respect JSON syntax strictly (double quotes, and doubled backslashes `\\` in Windows paths).
-
-Step 5 — Verification:
-- Restart the host application or reload its MCP connections, then confirm the tools list (tools/list) returns exactly the five Cortex tools: `start_session`, `computer_observe`, `computer_execute`, `stop_session`, `computer_screenshot` (a compatibility alias of `computer_observe`). The internal-loop family (`run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`) was REMOVED in 0.5.5 — if the host still lists any of them, it is running an older install.
-- A secondary command-line boot check: run `.\.venv\Scripts\python.exe -m computer_use_mcp.server` — a stdio server stays waiting on stdin, which is normal; end it once it starts with no import errors, and treat tools/list from the host as the final proof.
-
-Step 6 — Smoke test and notes:
-- With the user's consent, run a short session: `start_session`, then `computer_observe`, then `stop_session`. As of the PERF-004 release the `dry_run` default is `false` (a live session that performs real input) — pass `dry_run: true` explicitly for a validation-only session with no input (its results carry the `DRY-RUN (no input dispatched):` banner). The `require_approval` default remains `true`.
-- A missing `VISION_API_KEY` blocks nothing on the five-tool surface (`start_session`, `computer_observe`, `computer_execute`, `stop_session`); the key matters only for the model-judge verification tier, which raises a clear, typed error if a call actually needs it.
-- Multi-monitor and DPI: coordinates are always given in screenshot space; the server measures per-monitor DPI and classifies the coordinate space; an unverifiable space refuses coordinate input fail-closed. Multi-monitor logic is unit-tested only — on a multi-monitor machine, start with a `dry_run: true` session to check the classification before any live input.
-- If the tools do not appear: check the absolute path to `.venv\Scripts\python.exe` in the config and that the host was restarted after editing it; server logs go to stderr and per-session audit logs live under `%TEMP%\cortex\logs` (default level `LOG_LEVEL=INFO`).
-
-When done: give the user a summary of the repository path, the config file(s) you edited, and the list of Cortex tools that appeared in the host.
-````
-
-#### Update prompt
-
-````text
-Your task: update an existing Cortex MCP server installation on this machine to the latest version with zero loss of data or settings. Ask the user only for the path of the current repository folder if you do not know it (the folder containing pyproject.toml for the computer-use-mcp package).
-
-Step 1 — Check before anything: inside the repository folder run `git status --porcelain`. If local changes exist, destroy nothing and use no force `git reset`/`git checkout`: stash them safely with `git stash push -m "pre-update local changes"` and tell the user they can be restored later with `git stash pop`.
-Step 2 — Fetch the new version: `git pull`. If the original install was not via git (a ZIP copy), re-download the latest ZIP and extract it over the copy while keeping the existing `.venv` folder.
-Step 3 — Refresh dependencies: `.\.venv\Scripts\python.exe -m pip install -e .` (the same command as the original install; it re-resolves dependencies from the updated pyproject.toml).
-Step 4 — Restart: restart the MCP connection in the host application (restart the app or reload the MCP servers) so the connection picks up the new version.
-Step 5 — Re-verify: repeat the full verification — tools/list returns exactly the five Cortex tools (`start_session`, `computer_observe`, `computer_execute`, `stop_session`, `computer_screenshot`), then a short smoke test (`start_session` → `computer_observe` → `stop_session`).
-Step 6 — Version ledger: read VERSIONS.md at the repository root and tell the user what changed in the new version and any Compatibility notes — pay special attention to default-value changes, such as `dry_run` now defaulting to `false` (a live session) as of the PERF-004 release.
-Rollback if needed: if something breaks after the update, return to the previous version listed in VERSIONS.md with `git checkout <tag-or-commit>` then `.\.venv\Scripts\python.exe -m pip install -e .`, then restart the host.
-
-When done: summarize the old and new versions (from pyproject.toml and VERSIONS.md), any local changes you stashed, and the final verification result.
-````
-
-## Installation (agent prompts)
-
-Cortex has one canonical install location: the repository clone and its own `.venv` live together in `%LOCALAPPDATA%\Cortex` on Windows and `~/.local/share/cortex` on every other platform, so any agent that follows these prompts registers the same command path and an existing install is recognizable at a glance. One-line verification for any install: `"<canonical venv python>" -m computer_use_mcp.cli probe` — it prints a single `PROBE PASS` line (exactly the five tools) and exits 0 only then. The two prompts below are self-contained: copy either one into any MCP-capable agent (ZCode, Claude, Cursor, Codex, Kimi, …) and it will install/register/verify itself — CHECK first, clone or fast-forward the canonical dir, build the venv, run the probe, register in its own config without ever overwriting an existing cortex entry, and report.
-
-**Install prompt**
 
 ```text
 You are asked to make the Cortex MCP server available to yourself (this agent). Follow exactly; do not skip the CHECK.
@@ -292,7 +203,14 @@ STEP 4 — REGISTER THE SERVER FOR YOURSELF (your own config, not anyone else's)
   - Back up your config file before you edit it (keep the backup next to it).
   - If a "cortex" entry already exists in it: do NOT overwrite it. Compare it with the
     REGISTRATION BLOCK, report the differences to the user, and ask how to proceed.
-  - If your config file does not exist yet, create it in your agent's documented location.
+  Common config locations and shapes, if your agent is one of these:
+  - ZCode: %USERPROFILE%\.zcode\cli\config.json — the key there is "mcp.servers" (NOT
+    "mcpServers"); compatible fallback: ~\.agents\mcp.json in the "mcpServers" shape.
+  - Claude Desktop: %APPDATA%\Claude\claude_desktop_config.json ("mcpServers" shape).
+  - Cursor: %USERPROFILE%\.cursor\mcp.json ("mcpServers" shape).
+  - Project-level, inside a project folder: <project>\.zcode\config.json,
+    <project>\.cursor\mcp.json, <project>\.mcp.json ("mcpServers" shape).
+  - JSON rules: double quotes only, and double the backslashes in Windows paths ("\\").
 
 STEP 5 — REPORT to the user:
   - the installed version,
@@ -302,7 +220,7 @@ STEP 5 — REPORT to the user:
   - and: restart yourself / your host to load the newly registered server.
 ```
 
-**Update prompt**
+#### Update prompt
 
 ```text
 You are asked to update the Cortex MCP server installation for yourself. Follow exactly; never force.
