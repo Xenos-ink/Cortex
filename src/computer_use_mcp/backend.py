@@ -3720,7 +3720,7 @@ class LocalComputerBackend(ComputerBackend):
         3. Nothing matches -> ``NO_INSTANCE target=... launch=...``. Only when the host
            explicitly authorized server-side launches (``allow_launch=True`` AND the
            session policy ``attach_or_launch.launch == "server"`` — enforced by the
-           caller) AND the process is resolvable is ``os.startfile`` used; the DEFAULT
+           caller) AND the process is resolvable is ``Popen`` used; the DEFAULT
            path never spawns a process.
         """
         from .interference import format_ambiguous_instance, format_no_instance, format_reattached
@@ -3787,27 +3787,56 @@ class LocalComputerBackend(ComputerBackend):
         search) unchanged. The needle is already charset-validated by then, so
         the alias join can never smuggle a path or metacharacter; launching
         through the alias stays a plain ``shell=False`` Popen on the alias path.
+
+        Live evidence: the alias reparse file is
+        named WITH its extension (``WindowsApps\\mspaint.exe``), so a BARE needle
+        ("mspaint") found neither ``WindowsApps\\mspaint`` nor anything via
+        ``which`` and silently degraded to the raw-name fallback (which failed:
+        no mspaint process ever appeared while the NO_INSTANCE message implied a
+        launch policy was honored). Bare names now resolve to the alias exactly
+        like ".exe" names: the alias probe tries ``<needle>`` AND
+        ``<needle>.exe`` (charset-validated either way). The return value is the
+        basename of the spawn target that ACTUALLY started — ``launched=`` in the
+        NO_INSTANCE payload is only ever emitted when a process was really
+        spawned, and names the real executable (a bare "mspaint" launched through
+        the alias reports ``launched=mspaint.exe``).
         """
         process_needle = validate_launch_needle(process_needle)  # raises before any spawn
         resolved = shutil.which(process_needle)
-        spawn_target = resolved if resolved else process_needle
-        if resolved is None and IS_WINDOWS:
-            # REM-E: Windows Store execution alias (%LOCALAPPDATA%\Microsoft\
-            # WindowsApps\<needle>) — a reparse-point symlink into WindowsApps
-            # that which() does not surface. Only the per-user alias dir is
-            # readable; C:\Program Files\WindowsApps is ACL-locked, never probed.
-            localappdata = os.environ.get("LOCALAPPDATA", "")
-            if localappdata:
-                alias_path = os.path.join(
-                    localappdata, "Microsoft", "WindowsApps", process_needle
-                )
-                if os.path.exists(alias_path):
-                    spawn_target = alias_path
+        if resolved:
+            spawn_target: str = resolved
+        else:
+            spawn_target = self._store_alias_path(process_needle) or process_needle
         try:
             subprocess.Popen([spawn_target], shell=False)
-            return process_needle
+            return os.path.basename(spawn_target)
         except Exception:  # noqa: BLE001 - a launch failure degrades to the payload
             return None
+
+    @staticmethod
+    def _store_alias_path(process_needle: str) -> str | None:
+        """The Windows Store execution-alias path for ``process_needle``, or ``None``.
+
+        Tries ``%LOCALAPPDATA%\\Microsoft\\WindowsApps\\<needle>`` and
+        ``<needle>.exe`` (the reparse points are named WITH the extension, so bare
+        names must resolve through the ``.exe`` alias). win32-only; the needle is
+        charset-validated before any caller reaches this, so the join cannot
+        smuggle path separators or metacharacters.
+        """
+        if not IS_WINDOWS:
+            return None
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        if not localappdata:
+            return None
+        alias_dir = os.path.join(localappdata, "Microsoft", "WindowsApps")
+        candidates = [process_needle]
+        if not process_needle.casefold().endswith(".exe"):
+            candidates.append(process_needle + ".exe")
+        for candidate in candidates:
+            alias_path = os.path.join(alias_dir, candidate)
+            if os.path.exists(alias_path):
+                return alias_path
+        return None
 
     def _apply_key_dispatch_gap(self, keys: list[str]) -> None:
         """B3 settle/gap policy: pace terminal-key chords behind the previous dispatch.
@@ -3998,6 +4027,15 @@ class FakeComputerBackend(ComputerBackend):
         self.owned_windows: set[tuple[int, int]] = set()
         self.ensure_app_calls: list[str] = []
         self.launched_processes: list[str] = []
+        # launch-resolution simulation: ``store_aliases`` are casefolded
+        # names resolvable ONLY through the Store execution alias (they launch and
+        # record as "<name>.exe" — the reparse point's real name);
+        # ``launch_unresolvable`` are names that fail to resolve/start (the fake
+        # degrades to the NO_INSTANCE payload WITHOUT a ``launched=`` claim, exactly
+        # like the real soft-failure contract). Both default empty: the launch always
+        # succeeds and records the needle verbatim (pre-058 behavior).
+        self.store_aliases: set[str] = set()
+        self.launch_unresolvable: set[str] = set()
         self._last_key_dispatch: float = 0.0
         self._last_focus_transition: float = 0.0
 
@@ -4114,13 +4152,19 @@ class FakeComputerBackend(ComputerBackend):
                 # REM-C (V-2 F3): same typed validation as the real backend — a
                 # hostile needle is never recorded as spawned and never reaches
                 # ``launched=`` (launch_rejected=LaunchTargetError folds into the
-                # NO_INSTANCE payload instead).
+                # NO_INSTANCE payload instead). An UNRESOLVABLE target
+                # likewise never claims ``launched=`` — the payload stays the bare
+                # NO_INSTANCE probe (no false launch claim); a Store-alias name
+                # launches and records the alias's real ``<name>.exe`` identity.
                 try:
                     validate_launch_needle(process_needle)
                 except LaunchTargetError:
                     return f"{payload} launch_rejected=LaunchTargetError"
-                self.launched_processes.append(process_needle)
-                payload = f"{payload} launched={process_needle}"
+                resolved = self._resolve_fake_launch_target(process_needle)
+                if resolved is None:
+                    return payload
+                self.launched_processes.append(resolved)
+                payload = f"{payload} launched={resolved}"
             return payload
 
         def _doc_matches(candidate: AppWindowCandidate) -> bool:
@@ -4139,6 +4183,22 @@ class FakeComputerBackend(ComputerBackend):
         if unsaved:
             return format_ambiguous_instance(unsaved)
         return format_ambiguous_instance(candidates)
+
+    def _resolve_fake_launch_target(self, process_needle: str) -> str | None:
+        """alias-launch launch-resolution simulation mirroring the real resolution order.
+
+        Returns the NAME the launch records (``None`` = nothing spawned): an
+        unresolvable needle (``launch_unresolvable``, .exe-tolerant) yields ``None``
+        so the NO_INSTANCE payload stays honest; a Store-alias name
+        (``store_aliases``) yields ``<name>.exe`` (the reparse point's real name);
+        everything else keeps the pre-058 default — the needle itself, verbatim.
+        """
+        needle = (process_needle or "").strip().casefold().removesuffix(".exe")
+        if needle in {n.strip().casefold().removesuffix(".exe") for n in self.launch_unresolvable}:
+            return None
+        if needle in {n.strip().casefold().removesuffix(".exe") for n in self.store_aliases}:
+            return needle + ".exe"
+        return process_needle
 
     def set_active_window(self, window: WindowInfo | None) -> None:
         """Swap the fake foreground window (simulates focus change between observations)."""

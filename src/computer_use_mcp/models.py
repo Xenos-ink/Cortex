@@ -364,7 +364,7 @@ class ExecutionResult(BaseModel):
 #: a queued batch is speculative planning (UFO2-style), deliberately small; every entry
 #: still passes the FULL independent pipeline; blocking failures (rejections, safety,
 #: approval, digest surprise) stop the queue while an executed item's uncertain OR
-#: failed verification verdict rides its per-item entry (W-2/057;
+#: failed verification verdict rides its per-item entry (;
 #: ``CORTEX_QUEUE_STRICT_VERIFY=1`` restores stop-on-failed).
 MAX_FOLLOW_UPS = 5
 

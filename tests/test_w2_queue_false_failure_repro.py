@@ -26,9 +26,9 @@ This test mirrors the live batch with a fake backend: a hotkey (ctrl+a) with a
 stated effect executes fine and the screen DOES legitimately change (10 pixels
 at delta 30 -- real change, but deliberately below the diff tier's noise floor:
 mean ~0.033 < 1.0, strongly-changed 0 -- like a caret/selection tint). The batch
-must survive; before the W-2 fix it did not.
+must survive; before the fix it did not.
 
-STATUS (E-1 remediation): GREEN. The W-2 fix (agent.py `_run_action_queue`) makes
+STATUS: GREEN. The fix (agent.py `_run_action_queue`) makes
 the queue CONTINUE past an EXECUTED item whose verification outcome is "failed"
 (the honest failed verdict rides the per-item entry); only genuinely blocking
 conditions (safety rejection, approval requirement, rejection, digest surprise,
@@ -42,6 +42,8 @@ from __future__ import annotations
 import base64
 import io
 from typing import Any
+
+from computer_use_mcp.models import WindowInfo
 
 import pytest
 from PIL import Image
@@ -144,12 +146,15 @@ async def test_follow_ups_batch_survives_false_verification_failure(
         "type",
         "keypress",
     ]
-    # Per-item honesty (W-2 Patch A): the failed item keeps its DEFINITIVE verdict
+    # Per-item honesty : the not-verified item keeps its honest verdict
     # (ok=False + reasons + verification block) in follow_up_results — continuing the
-    # batch never hides the failure.
+    # batch never hides the failure (verdict-honesty: the verdict is now uncertain, not failed).
     failed_entry = payload["follow_up_results"][0]
     assert failed_entry["ok"] is False
-    assert failed_entry["verification_outcome"] == "failed"
+    # verdict-honesty : a sub-threshold screen change with a stated effect is UNCERTAIN
+    # (absent pixels are not proof of absence) - no longer the live session's false
+    # definitive "failed"; it is still never a success.
+    assert failed_entry["verification_outcome"] == "uncertain"
     assert failed_entry["message"]
 
 
@@ -161,7 +166,9 @@ async def test_strict_verify_env_restores_stop_on_failed(
     legacy ``verification_failed`` stop reason. Read lazily per decision — toggleable
     exactly like the CORTEX_DIFF_FAST knob."""
     monkeypatch.setenv("CORTEX_QUEUE_STRICT_VERIFY", "1")
-    backend = SubtleChangeBackend()
+    backend = SubtleChangeBackend(
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App")
+    )
     provider = ScriptedProvider([])
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch,
@@ -174,9 +181,12 @@ async def test_strict_verify_env_restores_stop_on_failed(
     response = await server_execute(
         session_id,
         {
-            "action": "hotkey",
-            "keys": ["ctrl", "a"],
-            "expected_effect": "selection highlight appears",
+            # verdict-honesty : the failing item is a deterministic window_state
+            # expectation that never appears -> definitive failed (a pixel-shaped
+            # stated effect would degrade to uncertain, and uncertain never stops).
+            "action": "keypress",
+            "keys": ["enter"],
+            "expected_effect": "open Calculator",
             "follow_ups": [
                 {"action": "type", "text": "C8C3B2"},
                 {"action": "keypress", "keys": ["enter"]},
@@ -186,6 +196,7 @@ async def test_strict_verify_env_restores_stop_on_failed(
     )
     payload = execute_payload(response)
     assert payload["follow_ups_stopped_reason"] == "verification_failed"
+    assert len(executed_summary(backend)) == 1, "items 2-3 were flushed"
     assert payload["follow_up_results"][0]["verification_outcome"] == "failed"
     assert len(executed_summary(backend)) == 1  # the follow-ups were flushed
     monkeypatch.delenv("CORTEX_QUEUE_STRICT_VERIFY", raising=False)
@@ -239,7 +250,7 @@ async def test_real_dispatch_failure_still_stops_batch(
 async def test_allowlist_rejection_message_names_the_real_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """W-2 Patch B: a process-allowlist rejection no longer arrives stamped with the
+    """ a process-allowlist rejection no longer arrives stamped with the
     generic "Grounding rejected." — the message names the REAL gate (validation /
     process allowlist) and the offending foreground process, exactly the turn-burning
     confusion the live session paid for (it read "grounding" and started decoding

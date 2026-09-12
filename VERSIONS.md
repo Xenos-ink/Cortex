@@ -12,6 +12,64 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
+## v0.5.7 (2026-09-11) — RELEASED (end-to-end speed: window-identity queue batching, half-res action JPEGs, honest alias launches and verdicts)
+
+End-to-end latency analysis showed the driving model's turns dominate wall
+time; this release removes the server-side multipliers: per-action image bytes
+that grew the driver's context, batches halted by ordinary pixel change, and
+turns burned decoding false failures.
+
+### Changed
+
+- **`follow_ups` batches continue while the attached window identity is unchanged
+** —
+  ordinary pixel changes from earlier queue items (drawing, typing,
+  dialogs) no longer stop a batch; each item re-grounds from the fresh post-action
+  capture. The queue still stops on TRUE staleness — the attached window's identity
+  (hwnd/title/bounds) changed or the window closed since the queued premise — plus
+  safety rejection, approval requirement, validator/grounding rejection, dispatch
+  error, or a named interference event. `CORTEX_QUEUE_STRICT_DIGEST=1` restores the
+  v0.5.6 whole-screen premise checks.
+- **Executed-response images default to half-resolution JPEG** — the DEFAULT
+  `computer_execute` response image is a 0.5x JPEG (q60, ~60KB typical at 1080p) so a
+  driving model's context stops growing by a 150-230KB PNG per action. An explicit
+  `include_screenshot_after=true` ships full resolution, and
+  `CORTEX_ACTION_IMAGE_FULL=1` restores full-res defaults. `computer_observe` /
+  `computer_screenshot` and text-mode (`image_delivery="text"`) semantics are
+  unchanged.
+- **Docs re-aligned** — README / ARCHITECTURE / SAFETY now teach the queue-continuation
+  and half-res-image defaults (the pre-0.5.7 text described the old whole-screen
+  digest stop and ~1-2 MB PNG default); an `ensure_app` docstring said `os.startfile`
+  while the code uses `Popen` — fixed.
+
+### Fixed
+
+- **`ensure_app` bare-name resolution and honest `launched=`** — bare app
+  names now resolve to `.exe` / Windows Store execution aliases before spawning, and
+  the `NO_INSTANCE` payload only reports `launched=` when the process actually
+  started (a failed spawn is reported as a failure, never as a launch).
+- **Honest `uncertain` for evidence-free stated effects** — a
+  stated-effect action with no deterministic verification signal and zero/sub-threshold
+  pixel evidence now returns `uncertain` (0.4) instead of a definitive false `failed`
+  ("Expected change was not observed"); the input dispatched and the driver can
+  re-observe instead of retrying blindly.
+
+### Performance
+
+- Context bytes per action drop from a ~150-230KB PNG to a ~60KB half-res JPEG by
+  default; window-identity queue batching lets one model turn cover up to 5 actions
+  without false stops — directly attacking the ~97%-of-wall-time model-turn cost.
+
+### Compatibility notes
+
+- **Default behavior changes:** executed-response images are half-res JPEG unless
+  `include_screenshot_after=true` or `CORTEX_ACTION_IMAGE_FULL=1`; queued batches
+  continue through ordinary pixel change and stop on true window-identity staleness
+  unless `CORTEX_QUEUE_STRICT_DIGEST=1` restores whole-screen premise checks.
+  Safety semantics unchanged: zero-bypass per-item pipeline, safety rejections and
+  named interference events still stop the batch, stop token still checked between
+  items.
+
 ## v0.5.5 (2026-09-09) — RELEASED (three live-usage defect classes + live-host hardening)
 
 Mission ORVEX-CORTEX-055: root-caused from FailedLog.txt (967-line live session),

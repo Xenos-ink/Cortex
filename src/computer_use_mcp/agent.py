@@ -79,10 +79,12 @@ PERF-004 loop-economics doctrines (additive; no gate, guarantee, or audit is rem
   ``follow_ups`` (max :data:`~computer_use_mcp.models.MAX_FOLLOW_UPS`). Every queue
   item passes the FULL independent pipeline exactly like a single action; the queue
   stops on safety rejection, approval requirement, validator/grounding rejection, or
-  post-action DIGEST SURPRISE (a queued item's staleness probe shows the screen
-  changed since the premise it was grounded from — speculative actions never run
-  against a screen nobody has seen). An UNCERTAIN verification does not stop the
-  queue (REM-B: uncertain is not failure), and neither does the ``failed`` verdict
+  post-action PREMISE INVALIDITY (a queued item's staleness probe shows the attached
+  window's identity — hwnd + title + bounds — changed or closed since the premise it
+  was grounded from: true staleness. Ordinary pixel changes from earlier items do NOT
+  stop the batch; ``CORTEX_QUEUE_STRICT_DIGEST=1`` restores the v0.5.6 whole-screen
+  digest stop). An UNCERTAIN verification does not stop the queue
+  (REM-B: uncertain is not failure), and neither does the ``failed`` verdict
   of an EXECUTED item (the input dispatched, the next item re-grounds from
   the fresh post-action capture, and the honest verdict rides the per-item entry;
   ``CORTEX_QUEUE_STRICT_VERIFY=1`` restores the strict stop-on-failed behavior).
@@ -231,6 +233,69 @@ def _queue_strict_verify() -> bool:
     import os
 
     return os.environ.get(QUEUE_STRICT_VERIFY_ENV, "").strip() == "1"
+
+
+# --- queue premise-identity knob -----------------------------------------------------------
+#: Env knob name: ``CORTEX_QUEUE_STRICT_DIGEST`` — set to exactly ``1`` to restore the
+#: v0.5.6 whole-screen digest-surprise stop for QUEUED follow-ups (any pixel change
+#: since the item's premise stops the batch). Default (unset/any other value): the
+#: per-item validity check governs — the attached window's identity (hwnd + title +
+#: bounds) unchanged AND the normal per-item grounding still applying means the item
+#: executes; a changed/closed attached window is true staleness and still stops
+#: (digest_surprise). Live evidence: the whole-screen stop fired on EVERY batch
+#: whose earlier items legitimately changed the screen (drawing/typing), forcing one
+#: full model turn per action. Read lazily at each queue decision (test-toggleable
+#: like CORTEX_DIFF_FAST / CORTEX_QUEUE_STRICT_VERIFY).
+QUEUE_STRICT_DIGEST_ENV = "CORTEX_QUEUE_STRICT_DIGEST"
+
+
+def _queue_strict_digest() -> bool:
+    """Resolve the strict-digest escape hatch (only the exact string ``1`` enables)."""
+    import os
+
+    return os.environ.get(QUEUE_STRICT_DIGEST_ENV, "").strip() == "1"
+
+
+def _queue_window_identity(observation: Observation) -> tuple[Any, ...] | None:
+    """The attached-window identity tuple (hwnd, title, bounds), or ``None``.
+
+    ``None`` means the observation carries NO window identity at all (a backend
+    without identity reporting, or no foreground window) — the caller decides the
+    policy for that case; the identity is never partially compared.
+    """
+    info = observation.active_window_info
+    if info is None:
+        return None
+    return (
+        info.hwnd,
+        info.title or "",
+        tuple(info.bounds) if info.bounds is not None else None,
+    )
+
+
+def _queue_premise_valid(premise: Observation, current: Observation) -> bool:
+    """Per-item queue validity: is this queued item's premise still current?
+
+    Default (``CORTEX_QUEUE_STRICT_DIGEST`` unset): VALID when the attached window's
+    identity (hwnd + title + bounds) is UNCHANGED between the item's premise capture
+    and the fresh validate capture — earlier queue items legitimately change pixels
+    (drawing, typing, dialogs) without invalidating the window the driver is driving.
+    Identity-unavailable asymmetry is true staleness: the attached window CLOSED
+    (premise had identity, current has none) or APPEARED (the reverse) stops the
+    batch. When NEITHER side carries identity (identity-less backends), the legacy
+    whole-screen digest comparison governs so the protection never silently weakens.
+    ``CORTEX_QUEUE_STRICT_DIGEST=1`` restores the v0.5.6 whole-screen digest stop.
+    The response-side digest_surprise concept for the PRIMARY action is untouched.
+    """
+    if _queue_strict_digest():
+        return digest_matches(premise, current)
+    premise_id = _queue_window_identity(premise)
+    current_id = _queue_window_identity(current)
+    if premise_id is None or current_id is None:
+        if premise_id != current_id:
+            return False  # the attached window closed or appeared: true staleness
+        return digest_matches(premise, current)  # identity-less backend: legacy probe
+    return premise_id == current_id
 
 
 def _image_to_base64(image: Image.Image) -> str:
@@ -819,13 +884,18 @@ class ComputerUseAgent:
             process_name = process_name or effect
         elif kind == VerificationKind.VISUAL_CHANGE.value and effect:
             expected_change = True
-            # REM-B (H2c): a CLICK/DOUBLE_CLICK with a stated effect is a
-            # focus-type expectation ("Hex input focused", "Edit colors dialog
-            # opens") far more often than a pixel-threshold one — focusing a field
-            # or opening a dialog sits BELOW the pixel-diff thresholds. Flag the
-            # intent so the deterministic FocusChangeStrategy tier (UIA focused
-            # element / window identity / digest) runs BEFORE the pixel-diff
-            # definitive failure. Other visual-change intents are untouched.
+            # REM-B (H2c): a CLICK/DOUBLE_CLICK with a stated effect is a focus-type
+            # expectation ("Hex input focused") — flag it so the deterministic
+            # FocusChangeStrategy tier (UIA focused element / window identity /
+            # corroborated digest) runs BEFORE the pixel-diff tier.
+            # does NOT widen this flag: FocusChangeStrategy's transition signals stay
+            # click-scoped (generalizing them let a mere window change "verify" a
+            # stated type effect — a false success the fault-injection pin catches).
+            # The D11 doctrine lives in ScreenshotDiffStrategy: ANY intent carrying a
+            # stated expected_effect degrades a zero/sub-threshold diff to
+            # ``uncertain`` instead of a definitive false ``failed`` (keypress Enter
+            # committing a shape with sub-threshold dashed handles). Unstated
+            # expectations are untouched.
             if action.action in {ActionType.CLICK, ActionType.DOUBLE_CLICK}:
                 metadata: dict[str, Any] = {
                     "action_id": action.action_id,
@@ -2098,11 +2168,14 @@ class ComputerUseAgent:
         (no state is shared between items except the fresh post-action observation that
         becomes the next item's grounding source — the observe-reuse doctrine). Stops:
         named interference stops (modal dialog / focus drift), safety rejection,
-        approval requirement, validator rejection, digest surprise, stop token, limit
-        trip, or a missing post-action observation. REM-B (H2b): an item whose
-        verification is UNCERTAIN (no expectation stated / non-visual action the diff
-        cannot judge) does NOT stop the queue — uncertain is not failure — but its
-        per-item result keeps the honest uncertain verdict and ``ok=False``.
+        approval requirement, validator rejection, PREMISE INVALIDITY (the
+        attached window's identity changed or closed since the item's premise — true
+        staleness; ordinary pixel changes from earlier items do not stop the batch, and
+        ``CORTEX_QUEUE_STRICT_DIGEST=1`` restores the v0.5.6 whole-screen digest stop),
+        stop token, limit trip, or a missing post-action observation. REM-B (H2b): an
+        item whose verification is UNCERTAIN (no expectation stated / non-visual action
+        the diff cannot judge) does NOT stop the queue — uncertain is not failure — but
+        its per-item result keeps the honest uncertain verdict and ``ok=False``.
         an EXECUTED item whose verification outcome is ``failed`` also does
         NOT stop the queue by default — the input dispatched and the next item
         re-grounds from the fresh post-action capture; the honest failed verdict rides
@@ -2121,7 +2194,7 @@ class ComputerUseAgent:
         first_outcome: SingleActionOutcome | None = None
         for index, (item, item_effect) in enumerate(queue_items):
             self.stop_token.ensure_live()  # P0-C: kill path checked between queue items
-            strict_digest = index > 0  # follow-ups stop on a post-action digest surprise
+            strict_digest = index > 0  # follow-ups stop on attached-window identity change
             outcome, post = await self._run_single_pipeline(
                 state,
                 item,
@@ -2282,8 +2355,11 @@ class ComputerUseAgent:
         ``source_observation`` (PERF-004 C1 observe reuse) injects the caller's fresh
         post-action capture as the grounding source; ``None`` captures at
         ``direct_request`` (rate-gated, host-driven). ``strict_digest`` (queued
-        follow-ups) turns a staleness-probe digest mismatch into a ``digest_surprise``
-        stop BEFORE executing the speculative action.
+        follow-ups) applies per-item premise validity before executing the
+        speculative item: the attached window's identity (hwnd + title + bounds)
+        changed or closed since the premise -> a ``digest_surprise`` stop
+        (``CORTEX_QUEUE_STRICT_DIGEST=1`` restores the v0.5.6 whole-screen digest
+        comparison; ordinary pixel changes from earlier items no longer stop).
 
         The returned observation is the fresh post-action capture (``None`` when no
         execution happened — dry-run, rejection, stop) so the caller can reuse it.
@@ -2385,11 +2461,28 @@ class ComputerUseAgent:
                         )
             if current is None:
                 current = self._observe("validate")
-            if strict_digest and not digest_matches(observation, current):
-                # PERF-004 C7: post-action DIGEST SURPRISE — the queued action's premise
-                # (the previous item's fresh post-action capture) no longer matches the
-                # screen. Speculative actions never run against a screen nobody has
-                # seen; the queue stops BEFORE executing this item (zero bypass).
+            if strict_digest and not _queue_premise_valid(observation, current):
+                # PERF-004 C7: the queued action's premise is no longer
+                # current. Per-item validity: the attached window's identity (hwnd +
+                # title + bounds) changed or closed since the premise — TRUE
+                # staleness; speculative actions never run against a window nobody is
+                # driving. A mere pixel change (earlier items drew/typed) does NOT
+                # stop the batch anymore; ``CORTEX_QUEUE_STRICT_DIGEST=1`` restores
+                # the legacy whole-screen digest stop.
+                premise_id = _queue_window_identity(observation)
+                current_id = _queue_window_identity(current)
+                if (
+                    premise_id is not None
+                    and current_id is not None
+                    and premise_id != current_id
+                ):
+                    detail = "the attached window's identity changed"
+                elif premise_id is not None and current_id is None:
+                    detail = "the attached window closed"
+                elif premise_id is None and current_id is not None:
+                    detail = "an attached window identity appeared where none was"
+                else:
+                    detail = "the screen changed since the premise (identity-less backend)"
                 self.metrics.incr("digest_surprise")
                 self._audit(
                     "validation",
@@ -2398,17 +2491,19 @@ class ComputerUseAgent:
                     result="digest_surprise",
                     metadata={
                         "reason": (
-                            "Post-action digest surprise: the screen changed since the "
-                            "queued action's premise was captured; the queue stopped."
-                        )
+                            f"Post-action staleness: {detail} since the queued "
+                            "action's premise was captured; the queue stopped."
+                        ),
+                        "premise_window": premise_id,
+                        "current_window": current_id,
                     },
                 )
                 return (
                     SingleActionOutcome(
                         kind="digest_surprise",
                         message=(
-                            "Post-action digest surprise: the screen changed since this "
-                            "queued action's premise was captured; the queue stopped "
+                            f"Post-action staleness: {detail} since this queued "
+                            "action's premise was captured; the queue stopped "
                             "before executing it."
                         ),
                     ),

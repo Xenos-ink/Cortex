@@ -184,24 +184,44 @@ def test_default_thresholds_unchanged():
 
 
 def test_unflagged_visual_change_intent_keeps_legacy_failed():
-    """W-1 scope guard: the SAME sub-threshold evidence on an UNFLAGGED
-    visual-change intent (no ``FOCUS_CHANGE_INTENT_FLAG`` — e.g. a hotkey with a
-    stated effect, a drag/stroke expectation) keeps the EXACT legacy semantics: a
-    definitive ``failed`` with the legacy note and confidence. Only the focus-type
-    (flagged) scope degrades to ``uncertain``."""
+    """verdict-honesty  contract update of the focus-click scope guard.
+
+    The W-1-era pin held that an UNFLAGGED visual-change intent with a stated
+    effect keeps the definitive legacy ``failed``. D11 extends the absent-evidence
+    doctrine to ANY stated effect (flagged or not): a hotkey/keypress expectation
+    with sub-threshold pixel evidence now degrades to ``uncertain`` (0.4) — the
+    live Paint keypress-Enter commit false-failed with a 0.000000 diff. The LEGACY
+    semantics survive verbatim for a BARE change expectation (no described
+    effect): there the pixel change is the whole claim, so absent change is a
+    definitive ``failed`` — real-defect detection is not weakened.
+    """
     engine = VerificationEngine()
-    intent = VerificationIntent(
+    stated = VerificationIntent(
         kind=VerificationKind.VISUAL_CHANGE.value,
         expected_change=True,
         expected_effect="Hex input focused",
         metadata={"action_id": "unflagged-intent", "verification_hint": ""},
     )
-    assert intent.metadata.get(FOCUS_CHANGE_INTENT_FLAG) is None
-    result = engine.verify(intent, _observation(_base_frame()), _observation(_caret_blink_frame()))
-    assert result.outcome == "failed", (
-        f"unflagged visual-change intent lost its legacy failure: outcome={result.outcome!r} "
+    assert stated.metadata.get(FOCUS_CHANGE_INTENT_FLAG) is None
+    result = engine.verify(
+        stated, _observation(_base_frame()), _observation(_caret_blink_frame())
+    )
+    assert result.outcome == "uncertain", (
+        f"stated-effect unflagged intent did not degrade: outcome={result.outcome!r} "
         f"note={result.note!r}"
     )
-    assert result.note == "Expected change was not observed: Hex input focused."
-    assert result.confidence == 0.85  # _EXPECTATION_FAILED_CONFIDENCE, unchanged
+    assert result.confidence == 0.4  # uncertain is never success; ok stays False upstream
     assert result.verification_method == "screenshot_diff"
+    # The bare change expectation (no effect stated) keeps the exact legacy failure.
+    bare = VerificationIntent(
+        kind=VerificationKind.VISUAL_CHANGE.value,
+        expected_change=True,
+        metadata={"action_id": "unflagged-intent", "verification_hint": ""},
+    )
+    legacy = engine.verify(bare, _observation(_base_frame()), _observation(_caret_blink_frame()))
+    assert legacy.outcome == "failed", (
+        f"bare change expectation lost the legacy failure: outcome={legacy.outcome!r}"
+    )
+    assert legacy.note == "Expected change was not observed."
+    assert legacy.confidence == 0.85  # _EXPECTATION_FAILED_CONFIDENCE, unchanged
+    assert legacy.verification_method == "screenshot_diff"

@@ -278,7 +278,7 @@ async def test_ladder_deterministic_tier_returns_before_the_judge(
     assert provider.judge_calls == 0
 
 
-async def test_pixel_diff_tier_fails_judge_intent_before_judge(
+async def test_zero_diff_stated_effect_defers_to_judge_bare_change_fails_before_judge(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = ScriptedBackend(flip=False)  # identical pixels
@@ -290,14 +290,30 @@ async def test_pixel_diff_tier_fails_judge_intent_before_judge(
     agent = server._get_bundle(session_id).agent
     before = backend.observe()
     after = backend.observe()
-    intent = VerificationIntent(
+    # RC-D11 (058): a STATED effect is no longer falsified by a zero diff — the
+    # pixel tier defers (uncertain, absent pixels are not proof of absence) and the
+    # judge adjudicates the defer. The pre-judge falsification contract survives for
+    # a BARE change expectation (no described effect): there the pixel change is the
+    # whole claim, so the diff tier still falsifies before the judge can run.
+    stated = VerificationIntent(
         kind=VerificationKind.MODEL_JUDGE,
         expected_change=True,
         expected_effect="the screen must change",
     )
-    result = await agent._verify(intent, before, after)
-    assert result.outcome == "failed"  # the diff tier falsified the stated expectation...
-    assert provider.judge_calls == 0  # ...so the judge never ran
+    result = await agent._verify(stated, before, after)
+    assert result.outcome == "verified"  # the judge adjudicated the defer
+    assert provider.judge_calls == 1  # the cheap-tier defer reached the judge exactly once
+    provider2 = JudgingProvider([], verdict="verified")
+    session_id2, _b, backend2, _ = make_session(
+        monkeypatch, backend=ScriptedBackend(flip=False), provider=provider2, dry_run=False,
+        require_approval=False, limits=FAST_LIMITS,
+    )
+    agent2 = server._get_bundle(session_id2).agent
+    before2, after2 = backend2.observe(), backend2.observe()
+    bare = VerificationIntent(kind=VerificationKind.MODEL_JUDGE, expected_change=True)
+    bare_result = await agent2._verify(bare, before2, after2)
+    assert bare_result.outcome == "failed"  # the diff tier falsified the bare expectation...
+    assert provider2.judge_calls == 0  # ...so the judge never ran
 
 
 async def test_judge_tier_runs_when_cheap_tiers_uncertain(
@@ -333,21 +349,30 @@ async def test_judge_tier_runs_when_cheap_tiers_uncertain(
 # --- C4: host-payload opt-out ---------------------------------------------------------------------
 
 
-async def test_include_screenshot_after_false_omits_image_keeps_legacy_default(
+async def test_include_screenshot_after_false_omits_image_default_is_half_res_jpeg(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """RC-D10 (058): the DEFAULT executed response ships a HALF-RESOLUTION JPEG so a
+    driving model's per-action context stops growing by 150-230KB PNG per action.
+    ``include_screenshot_after=False`` still omits the image entirely (opt-out
+    unchanged); the explicit ``true`` opt-in ships FULL resolution (its documented
+    meaning); ``CORTEX_ACTION_IMAGE_FULL=1`` restores full-res defaults."""
+    monkeypatch.delenv("CORTEX_ACTION_IMAGE_FULL", raising=False)
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    legacy = await server.computer_execute(session_id, "click", x=15, y=15)
+    default = await server.computer_execute(session_id, "click", x=15, y=15)
     # REM-A H3: executed responses are content blocks (TextContent + ImageContent)
-    # in parity with computer_observe — the image never rides the text channel.
-    assert isinstance(legacy, list) and len(legacy) == 2
-    assert legacy[0].type == "text" and legacy[1].type == "image"
-    legacy_payload = json.loads(legacy[0].text)
-    assert legacy_payload["ok"] is True
-    assert "screenshot_after_base64" not in legacy_payload  # blob never rides text
-    assert base64.b64decode(legacy[1].data, validate=True)[:8] == b"\x89PNG\r\n\x1a\n"
+    # in parity with computer_observe - the image never rides the text channel.
+    assert isinstance(default, list) and len(default) == 2
+    assert default[0].type == "text" and default[1].type == "image"
+    default_payload = json.loads(default[0].text)
+    assert default_payload["ok"] is True
+    assert "screenshot_after_base64" not in default_payload  # blob never rides text
+    # Half-resolution JPEG by default (JPEG SOI marker) + the additive truth marker.
+    assert base64.b64decode(default[1].data, validate=True)[:2] == bytes([0xFF, 0xD8])
+    assert default[1].mimeType == "image/jpeg"
+    assert default_payload["image_scale"] == 0.5
     trimmed = await server.computer_execute(
         session_id, "click", x=25, y=25, include_screenshot_after=False
     )
@@ -357,7 +382,16 @@ async def test_include_screenshot_after_false_omits_image_keeps_legacy_default(
     assert "screenshot_after_base64" not in trimmed  # omitted entirely
     # Everything else survives the opt-out.
     assert trimmed["verification"]["outcome"] in {"verified", "uncertain", "failed"}
-    assert len(executed_summary(backend)) == 2
+    full = await server.computer_execute(
+        session_id, "click", x=35, y=35, include_screenshot_after=True
+    )
+    # The explicit opt-in is the documented FULL-image path: in-budget bytes keep
+    # the original PNG identity (REM-A H7 budget ladder untouched).
+    assert isinstance(full, list) and len(full) == 2
+    png_sig = bytes([0x89]) + b"PNG" + bytes([0x0D, 0x0A, 0x1A, 0x0A])
+    assert base64.b64decode(full[1].data, validate=True)[:8] == png_sig
+    assert full[1].mimeType == "image/png"
+    assert len(executed_summary(backend)) == 3
 
 
 def test_computer_execute_signature_additions_are_trailing_optional() -> None:
@@ -509,12 +543,16 @@ async def test_verification_failure_stops_queue_before_later_items(
 ) -> None:
     """W-2 (057) contract: with CORTEX_QUEUE_STRICT_VERIFY=1 the v0.5.5 stop-on-failed
     behavior is restored — an EXECUTED item with a DEFINITIVE failed verification
-    flushes the remaining items. The failing item is a HOTKEY with a stated effect on
-    the settled (unchanged) screen — an unflagged intent, so the pixel tier's legacy
-    definitive failed verdict stands (a flagged CLICK would degrade to uncertain under
-    the W-1 contract and never stop the queue)."""
+    flushes the remaining items. RC-D11 (058) update: a hotkey with a pixel-shaped
+    stated effect can no longer produce a DEFINITIVE failed (absent pixels degrade
+    to uncertain — the W-2 repro file pins that uncertain does not stop), so the
+    failing item is a keypress whose launch-prefix effect ("open Calculator")
+    promotes the intent to the deterministic window_state tier; the title never
+    appears on the settled screen -> definitive failed."""
     monkeypatch.setenv("CORTEX_QUEUE_STRICT_VERIFY", "1")
-    backend = FlipOnceBackend()
+    backend = FlipOnceBackend(
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App")
+    )
     provider = ScriptedProvider([])
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, backend=backend, provider=provider, dry_run=False,
@@ -526,7 +564,7 @@ async def test_verification_failure_stops_queue_before_later_items(
         x=10,
         y=10,
         follow_ups=[
-            {"action": "hotkey", "keys": ["ctrl", "s"], "expected_effect": "screen must change"},
+            {"action": "keypress", "keys": ["enter"], "expected_effect": "open Calculator"},
             {"action": "click", "x": 30, "y": 30},
         ],
     )
@@ -540,11 +578,15 @@ async def test_executed_failed_verdict_no_longer_stops_queue_by_default(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """W-2 (057) default: an EXECUTED item whose verification definitively failed
-    (unflagged hotkey expectation on the settled screen) no longer flushes the
-    batch — the honest failed verdict rides the per-item entry and the remaining
-    items still run."""
+    no longer flushes the batch — the honest failed verdict rides the per-item
+    entry and the remaining items still run. RC-D11 (058) update: the failing item
+    is a keypress with a launch-prefix effect -> the deterministic window_state
+    tier fails definitively on the settled screen (a pixel-shaped stated effect
+    now degrades to uncertain)."""
     monkeypatch.delenv("CORTEX_QUEUE_STRICT_VERIFY", raising=False)
-    backend = FlipOnceBackend()
+    backend = FlipOnceBackend(
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App")
+    )
     provider = ScriptedProvider([])
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, backend=backend, provider=provider, dry_run=False,
@@ -556,7 +598,7 @@ async def test_executed_failed_verdict_no_longer_stops_queue_by_default(
         x=10,
         y=10,
         follow_ups=[
-            {"action": "hotkey", "keys": ["ctrl", "s"], "expected_effect": "screen must change"},
+            {"action": "keypress", "keys": ["enter"], "expected_effect": "open Calculator"},
             {"action": "click", "x": 30, "y": 30},
         ],
     )

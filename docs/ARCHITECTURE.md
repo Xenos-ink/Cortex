@@ -34,7 +34,7 @@ types — include the wave's additive members).
   `FakeComputerBackend` implements the same contracts for tests and non-Windows import.
 - Python >= 3.11; runtime deps: `mcp`, `pydantic`, `Pillow`, `mss`, `pyautogui` (pyautogui is now the SELECTABLE FALLBACK input engine; the default physical-input path is raw Win32 `SendInput` via stdlib ctypes — PERF-004)
   (win32), `httpx`. No OCR/UIA engines are installed (deliberate non-goal; see §12).
-- Version: `0.5.6` (`__init__.py`; `pyproject.toml` aligned to the same value).
+- Version: `0.5.7` (`__init__.py`; `pyproject.toml` aligned to the same value).
 - PERF-004 release: interference guards, SendInput engine, verification ladder, run-log — see VERSIONS.md and ROADMAP.md.
 - Test/benchmark layout: `tests/` unit+integration (fakes); `tests/e2e/` real-Windows
   E2E gated behind `CUMCP_RUN_E2E=1` (10 tests: 7 desktop + 3 benchmark-harness that
@@ -496,12 +496,19 @@ An invalid action name/payload returns `{ok:false, error:"invalid_action", messa
 whose message TEACHES the exact `ActionType` vocabulary and the closest valid shape
 (PERF-004 C6: `key` → `keypress`, `triple_click` → `double_click`/repeated clicks,
 word hotkey payloads → key names on `keypress`/`hotkey`).
-PERF-004 C4 (trailing optional): `include_screenshot_after=false` OMITS the heavy
-`screenshot_after_base64` from the response; omitted/None keeps the legacy payload.
+PERF-004 C4 (trailing optional): `include_screenshot_after=false` OMITS
+the `screenshot_after_base64` image from the response; the DEFAULT executed-response
+image is a HALF-RESOLUTION JPEG (0.5x, q60 — ~60KB typical at 1080p) so model context
+stops growing by a 150-230KB PNG per action; an explicit `include_screenshot_after=true`
+ships full resolution, and `CORTEX_ACTION_IMAGE_FULL=1` restores full-res defaults
+(`computer_observe`/`computer_screenshot` and text-mode semantics unchanged).
 PERF-004 C7 (trailing optional): `follow_ups` (max 5 `ActionSpec` dicts) queues
-actions that each pass the FULL independent pipeline — the queue stops on safety
-rejection, approval requirement, validator/grounding rejection, or post-action digest
-surprise; an EXECUTED item's uncertain OR failed verification verdict rides its
+actions that each pass the FULL independent pipeline — the queue CONTINUES while the
+attached window identity (hwnd/title/bounds) is unchanged and stops on TRUE staleness
+(attached window closed or its title/bounds changed since the queued premise), safety
+rejection, approval requirement, validator/grounding rejection, or a named interference
+event (`CORTEX_QUEUE_STRICT_DIGEST=1` restores the v0.5.6 whole-screen premise checks);
+an EXECUTED item's uncertain OR failed verification verdict rides its
 per-item entry while the batch continues (`CORTEX_QUEUE_STRICT_VERIFY=1` restores the
 strict stop-on-failed); per-item results arrive in additive `follow_up_results` +
 `follow_ups_stopped_reason`, and a `queue` audit event summarizes the batch (every

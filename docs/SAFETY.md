@@ -131,9 +131,13 @@ no-op sessions; the compensating control is the mandatory `DRY-RUN (no input
 dispatched):` banner on every dry-run result message, so a no-op can never be misread
 as execution). Queued `follow_ups` are ZERO-BYPASS: every queue item runs the full
 independent pipeline (ground → validate → safety → approval semantics → execute →
-verify), the queue stops on a safety rejection, approval requirement, validator/
-grounding rejection, post-action digest surprise, or named interference stop (modal
-dialog / focus drift), the stop token is checked between items, and adversarial tests
+verify), the queue stops on TRUE premise staleness — the attached window's identity
+(hwnd/title/bounds) changed or the window closed since the queued premise
+(`CORTEX_QUEUE_STRICT_DIGEST=1` restores the v0.5.6 whole-screen digest stop; ordinary
+pixel change no longer stops the batch, each item re-grounds from the fresh
+post-action capture) — safety rejection, approval requirement, validator/
+grounding rejection, or named interference stop (modal dialog / focus drift); the
+stop token is checked between items, and adversarial tests
 prove an unsafe item is rejected individually and `stop_session` halts a running
 queue. Default: an EXECUTED item whose verification outcome is `failed` no
 longer flushes later items — the input dispatched, the next item re-grounds from the

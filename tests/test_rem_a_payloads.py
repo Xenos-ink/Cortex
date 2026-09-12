@@ -106,9 +106,11 @@ async def test_computer_execute_returns_content_block_pair(
     text_block, image_block = result
     assert text_block.type == "text"
     assert image_block.type == "image"
-    assert image_block.mimeType == "image/png"
+    # RC-D10 (058): the DEFAULT executed-response image is a HALF-RESOLUTION JPEG
+    # (0.5x, q60) so a driver's per-action context stops growing by 150-230KB PNG.
+    assert image_block.mimeType == "image/jpeg"
     decoded = base64.b64decode(image_block.data, validate=True)
-    assert decoded.startswith(b"\x89PNG\r\n\x1a\n")  # real image bytes
+    assert decoded.startswith(bytes([0xFF, 0xD8]))  # real JPEG bytes (SOI)
     assert backend.executed  # the action really ran
 
     payload = json.loads(text_block.text)
@@ -304,14 +306,21 @@ def _click_action() -> Any:
 async def test_small_png_travels_untouched(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Default behavior: an in-budget PNG keeps PNG bytes and mimeType."""
+    """REM-A H7 retarget (RC-D10/058): the DEFAULT executed-response image is the
+    half-res JPEG, so the in-budget-PNG-passes-untouched contract is pinned on the
+    EXPLICIT full-resolution opt-in (include_screenshot_after=True) — the
+    documented "full image" path whose H7 budget ladder is unchanged."""
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await server.computer_execute(
+        session_id, "click", x=10, y=10, include_screenshot_after=True
+    )
     _text_block, image_block = result
     assert image_block.mimeType == "image/png"
-    assert base64.b64decode(image_block.data, validate=True).startswith(b"\x89PNG")
+    assert base64.b64decode(image_block.data, validate=True).startswith(
+        bytes([0x89]) + b"PNG"
+    )
 
 
 def test_result_image_knob_parsing_is_fail_safe(monkeypatch: pytest.MonkeyPatch) -> None:

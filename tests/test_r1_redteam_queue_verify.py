@@ -104,13 +104,17 @@ def _session(monkeypatch: pytest.MonkeyPatch, backend: Any, **start: Any) -> str
 # --- Attack 1: real-defect detection is preserved ---------------------------------------------
 
 
-async def test_attack1_unflagged_genuine_nonchange_still_definitive_failed(
+async def test_attack1_stated_effect_nonchange_honest_not_success(
     monkeypatch: pytest.MonkeyPatch,
     fresh_server: Any,
 ) -> None:
-    """A hotkey with a stated effect is NOT focus-flagged (only click/double_click
-    are, agent._build_intent). On a screen that genuinely does not change, the
-    legacy DEFINITIVE failed verdict must survive the W-1 degrade untouched."""
+    """Real-defect detection preserved under RC-D11 (058). A hotkey with a
+    pixel-shaped stated effect on a screen that genuinely does not change is NO
+    LONGER a definitive false "failed" (W-1-era semantics): it degrades to
+    ``uncertain`` 0.4 — absent pixels are not proof of absence — but it is NEVER
+    reported as success (ok=False) and the input still dispatched. The DEFINITIVE
+    real-failure verdict survives one tier over: a deterministic window_state
+    expectation that never appears still reports ``failed``."""
     monkeypatch.delenv(QUEUE_ENV, raising=False)
     backend = ScriptedBackend(flip=False)  # every frame identical: no transition, truly
     session_id = _session(monkeypatch, backend)
@@ -123,12 +127,29 @@ async def test_attack1_unflagged_genuine_nonchange_still_definitive_failed(
             "include_screenshot_after": False,
         },
     )
-    assert payload["ok"] is False, payload
+    assert payload["ok"] is False, payload  # uncertain is never success
     verification = payload["verification"]
-    assert verification["outcome"] == "failed", verification
+    assert verification["outcome"] == "uncertain", verification
+    assert abs(verification["confidence"] - 0.4) < 1e-9, verification
     assert verification["changed"] is False
-    assert "not observed" in verification["note"], verification
-    assert backend.executed, "the input still dispatched (failed is about verification)"
+    assert backend.executed, "the input still dispatched (the verdict is about verification)"
+    # The deterministic tier still detects a REAL failure definitively.
+    backend2 = ScriptedBackend(
+        flip=False,
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App"),
+    )
+    session_id2 = _session(monkeypatch, backend2)
+    failed = await _run(
+        session_id2,
+        {
+            "action": "keypress",
+            "keys": ["enter"],
+            "expected_effect": "open Calculator",  # the title never appears
+            "include_screenshot_after": False,
+        },
+    )
+    assert failed["ok"] is False
+    assert failed["verification"]["outcome"] == "failed", failed.get("verification")
 
 
 async def test_attack1b_unflagged_failed_still_stops_batch_under_strict_env(
@@ -138,14 +159,20 @@ async def test_attack1b_unflagged_failed_still_stops_batch_under_strict_env(
     """CORTEX_QUEUE_STRICT_VERIFY=1 restores the v0.5.5 stop: the same genuinely-
     unchanged batch flushes its follow-ups with the legacy stop reason."""
     monkeypatch.setenv(QUEUE_ENV, "1")
-    backend = ScriptedBackend(flip=False)
+    backend = ScriptedBackend(
+        flip=False,
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App"),
+    )
     session_id = _session(monkeypatch, backend)
     payload = await _run(
         session_id,
         {
-            "action": "hotkey",
-            "keys": ["ctrl", "a"],
-            "expected_effect": "selection highlight appears",
+            # RC-D11 (058): the failing item is a deterministic window_state
+            # expectation that never appears -> definitive failed (a pixel-shaped
+            # stated effect would degrade to uncertain and never stop the batch).
+            "action": "keypress",
+            "keys": ["enter"],
+            "expected_effect": "open Calculator",
             "follow_ups": [
                 {"action": "type", "text": "r1"},
                 {"action": "keypress", "keys": ["enter"]},
@@ -214,7 +241,10 @@ async def test_attack2b_middle_verification_failed_but_executed_continues_honest
     executed must not flush the batch, AND its follow_up_results entry must carry
     ok=False + the verification evidence (no silent swallowing)."""
     monkeypatch.delenv(QUEUE_ENV, raising=False)
-    backend = ScriptedBackend(flip=False)
+    backend = ScriptedBackend(
+        flip=False,
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App"),
+    )
     session_id = _session(monkeypatch, backend)
     payload = await _run(
         session_id,
@@ -223,10 +253,13 @@ async def test_attack2b_middle_verification_failed_but_executed_continues_honest
             "x": 10,
             "y": 10,  # primary: no expectation -> uncertain -> continues
             "follow_ups": [
-                {  # middle: stated effect + truly-unchanged screen -> legacy FAILED
-                    "action": "hotkey",
-                    "keys": ["ctrl", "a"],
-                    "expected_effect": "selection highlight appears",
+                {  # middle: deterministic window_state expectation that never
+                    # appears -> definitive FAILED (RC-D11 update: a pixel-shaped
+                    # stated effect would degrade to uncertain, which is not the
+                    # failed-verdict-continues contract this attack pins)
+                    "action": "keypress",
+                    "keys": ["enter"],
+                    "expected_effect": "open Calculator",
                 },
                 {"action": "keypress", "keys": ["enter"]},
             ],
@@ -238,7 +271,7 @@ async def test_attack2b_middle_verification_failed_but_executed_continues_honest
     )
     assert len(executed_summary(backend)) == 3, "the whole batch must dispatch"
     results = payload["follow_up_results"]
-    assert [entry["action_type"] for entry in results] == ["click", "hotkey", "keypress"]
+    assert [entry["action_type"] for entry in results] == ["click", "keypress", "keypress"]
     failed_entry = results[1]
     assert failed_entry["ok"] is False, failed_entry
     assert failed_entry["kind"] == "executed"
@@ -359,14 +392,20 @@ async def test_attack4_knob_values_map_exactly(
         monkeypatch.delenv(QUEUE_ENV, raising=False)
     else:
         monkeypatch.setenv(QUEUE_ENV, raw_value)
-    backend = ScriptedBackend(flip=False)
+    backend = ScriptedBackend(
+        flip=False,
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App"),
+    )
     session_id = _session(monkeypatch, backend)
     payload = await _run(
         session_id,
         {
-            "action": "hotkey",
-            "keys": ["ctrl", "a"],
-            "expected_effect": "selection highlight appears",  # executes, fails honestly
+            # RC-D11 (058): the failing item is a deterministic window_state
+            # expectation that never appears -> definitive failed under strict;
+            # a pixel-shaped stated effect would now degrade to uncertain.
+            "action": "keypress",
+            "keys": ["enter"],
+            "expected_effect": "open Calculator",  # executes, fails honestly
             "follow_ups": [{"action": "type", "text": "r1"}],
             "include_screenshot_after": False,
         },
@@ -389,14 +428,18 @@ async def test_attack4_knob_toggles_lazily_no_leak_between_batches(
     reasons: list[str | None] = []
 
     async def one_batch() -> None:
-        backend = ScriptedBackend(flip=False)
+        backend = ScriptedBackend(
+            flip=False,
+            active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App"),
+        )
         session_id = _session(monkeypatch, backend)
         payload = await _run(
             session_id,
             {
-                "action": "hotkey",
-                "keys": ["ctrl", "a"],
-                "expected_effect": "selection highlight appears",
+                # RC-D11 (058): deterministic window_state failure (never appears).
+                "action": "keypress",
+                "keys": ["enter"],
+                "expected_effect": "open Calculator",
                 "follow_ups": [{"action": "type", "text": "r1"}],
                 "include_screenshot_after": False,
             },

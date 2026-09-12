@@ -334,9 +334,9 @@ Possible outcomes: an executed result (`ok`, `action`, `message`, `verification`
 
 Interference Guard (T8, trailing optional): `interference` is a dict of policy sections for the session's Interference Guard — `focus_guard` (bound-target foreground verification; abort | refocus_then_abort | observe_only), `attach_or_launch` (`ensure_app` attach-before-launch doctrine; the server never launches by default), `dialog_sentinel` (modal-dialog interception with a control list; queued batches halt; `auto_handle` ships EMPTY — no automatic clicks), `focus_continuity` (keyboard-focus verification before/after dispatch; drift aborts or warns), `hotkey_guard` (pre-chord stuck-modifier sweep; abort or opt-in release). Every field is optional with protective defaults; unknown sections/fields are rejected fail-closed (`invalid_interference`). Events (`FOCUS_TAKEN_BY`, `MODAL_DIALOG`, `FOCUS_DRIFTED`, `TARGET_GONE`, `STUCK_MODIFIER`, ...) appear in `reasons` / `interference_events` / verification notes; see docs/ARCHITECTURE.md §16 and docs/SAFETY.md §11.10.
 
-Host-payload opt-out (PERF-004, trailing optional): pass `include_screenshot_after=false` to omit the heavy `screenshot_after_base64` (~1-2 MB) from the response — recommended when you check the outcome via the verification verdict instead of the image (the full image stays available via `computer_observe`). Omitted or `null` keeps the legacy payload unchanged.
+Host-payload opt-out (PERF-004, trailing optional): pass `include_screenshot_after=false` to omit the image block (and any image bytes) from the response — recommended when you check the outcome via the verification verdict instead of the image (the full image stays available via `computer_observe`). The DEFAULT executed-response image is a half-resolution JPEG (0.5x, ~60KB typical at 1080p) to keep model context light; an explicit `include_screenshot_after=true` ships full resolution, and `CORTEX_ACTION_IMAGE_FULL=1` restores full-res defaults. `computer_observe`/`computer_screenshot` and text-mode semantics are unchanged.
 
-Queued actions (PERF-004, trailing optional): `follow_ups` accepts up to 5 action specs (same fields as the tool's action parameters). Each follow-up passes the FULL independent pipeline — grounding, validation, safety, approval semantics, execution, verification — exactly like a single action; the queue stops at the first verification failure, safety rejection, approval requirement, or post-action digest surprise (the screen changed since the queued premise was captured). Per-item results arrive in the additive `follow_up_results` field (bounded, no per-item screenshots) with `follow_ups_stopped_reason` (`null` = every item executed and verified). Batch small related groups and observe after the batch.
+Queued actions (PERF-004, trailing optional): `follow_ups` accepts up to 5 action specs (same fields as the tool's action parameters). Each follow-up passes the FULL independent pipeline — grounding, validation, safety, approval semantics, execution, verification — exactly like a single action; the queue CONTINUES while the attached window identity (hwnd/title/bounds) is unchanged — ordinary pixel changes from earlier items (drawing, typing, dialogs) do not stop it, and each item re-grounds from the fresh post-action capture — and stops on TRUE staleness (the attached window closed or its title/bounds changed since the queued premise) plus safety rejection, approval requirement, validator/grounding rejection, or a named interference event. `CORTEX_QUEUE_STRICT_DIGEST=1` restores the legacy whole-screen premise checking. Per-item results arrive in the additive `follow_up_results` field (bounded, no per-item screenshots) with `follow_ups_stopped_reason` (`null` = every item executed and verified). Batch small related groups and observe after the batch.
 
 **`run_goal` — REMOVED (0.5.5, user order).** The autonomous loop tool and its family (`create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`) no longer exist; the five tools above are the entire surface. The loop's per-action guarantees did not die with it — every `computer_execute` call runs the identical grounding, validation, risk, approval, execution, and verification pipeline, and returns the per-action result (action record, message, verification outcome and evidence) directly to the host. Successive goals are host-side loops of `computer_observe` → `computer_execute`; task completion is the host's decision, made on evidenced `verified` outcomes.
 
@@ -466,7 +466,7 @@ A realistic direct-control session: Notepad is open on the desktop; the agent st
 ]
 ```
 
-The screenshot arrives as a real `image` content block (visible to vision-capable client models); the text block carries only the grounding metadata — the raw base64 never travels as text. `ocr_text` and `ui_elements` are extension-point fields; without an OCR/UIA integration they stay `null` and the runtime grounds by coordinates.
+The screenshot arrives as a real `image` content block (visible to vision-capable client models); the text block carries only the grounding metadata — the raw base64 never travels as text. `computer_observe`/`computer_screenshot` keep the full-resolution PNG shown here; only the executed `computer_execute` response's DEFAULT image is a half-resolution JPEG (full resolution via `include_screenshot_after=true` or `CORTEX_ACTION_IMAGE_FULL=1`). `ocr_text` and `ui_elements` are extension-point fields; without an OCR/UIA integration they stay `null` and the runtime grounds by coordinates.
 
 **3. Type a line and state the expected effect — this is what drives semantic verification:**
 
@@ -520,7 +520,7 @@ The screenshot arrives as a real `image` content block (visible to vision-capabl
     "observation_id": "7a11…",
     "verified": true
   },
-  "screenshot_after_base64": "iVBORw0KGgoAAAANS…",
+  "screenshot_after_base64": "/9j/4AAQSkZJRgABAQ…",
   "retry_count": 0,
   "model_confidence": 1.0,
   "grounding_confidence": 1.0,
@@ -528,7 +528,7 @@ The screenshot arrives as a real `image` content block (visible to vision-capabl
 }
 ```
 
-What happened inside: the typed text was checked against OCR evidence first — none exists without an OCR integration, so the check honestly degraded to `uncertain` — and the documented fallback for direct calls then verified the deterministic visual change. The change was real, so the outcome is `verified` with the pixel evidence attached. Had nothing been typed (a blocked window, a swallowed keystroke), the screen would have stayed identical and the outcome would have been `failed`: "Expected change was not observed." The `risk` field on the action record stays `null`; the enforced risk decision (`low` — plain text into an identified target) lives in the safety audit event.
+What happened inside: the typed text was checked against OCR evidence first — none exists without an OCR integration, so the check honestly degraded to `uncertain` — and the documented fallback for direct calls then verified the deterministic visual change. The change was real, so the outcome is `verified` with the pixel evidence attached. Had nothing been typed (a blocked window, a swallowed keystroke), the screen would have stayed identical and the outcome would have been `failed`: "Expected change was not observed." The `screenshot_after_base64` shown here is the DEFAULT half-resolution JPEG (0.5x, ~60KB typical at 1080p) attached to every executed response; `include_screenshot_after=true` or `CORTEX_ACTION_IMAGE_FULL=1` ships the full-resolution image instead. The `risk` field on the action record stays `null`; the enforced risk decision (`low` — plain text into an identified target) lives in the safety audit event.
 
 **4. Stop the session:**
 

@@ -22,12 +22,16 @@ order — the run_goal family is REMOVED PERMANENTLY):
   client-asserted MODEL confidence for a direct caller action; grounding confidence,
   staleness, risk classification, approval, and verification apply independently.
   ``include_screenshot_after=False`` (additive) omits the heavy
-  ``screenshot_after_base64`` from the response; omitted or None keeps the legacy payload.
-  ``follow_ups`` (additive, max 5) queues actions that each pass the FULL independent
-  pipeline; the queue stops only on genuinely blocking conditions (rejection, safety,
-  approval, digest surprise, dispatch error) — an executed item's uncertain OR failed
-  verification verdict rides its per-item entry while the batch continues (W-2/057;
-  ``CORTEX_QUEUE_STRICT_VERIFY=1`` restores stop-on-failed).
+  ``screenshot_after_base64`` from the response; omitted or None ships the DEFAULT
+  image as a HALF-RESOLUTION JPEG (0.5x q60 — full resolution via an
+  explicit ``include_screenshot_after=true``, ``computer_observe``, or
+  ``CORTEX_ACTION_IMAGE_FULL=1``). ``follow_ups`` (additive, max 5) queues actions
+  that each pass the FULL independent pipeline; the queue stops only on genuinely
+  blocking conditions (rejection, safety, approval, attached-window staleness —
+  ordinary pixel changes from earlier items do not stop it; dispatch
+  error) — an executed item's uncertain OR failed verification verdict rides its
+  per-item entry while the batch continues (``CORTEX_QUEUE_STRICT_VERIFY=1``
+  restores stop-on-failed, ``CORTEX_QUEUE_STRICT_DIGEST=1`` the whole-screen stop).
 - ``stop_session`` keeps its signature/return shape; it now arms the thread-safe
   StopToken kill path and audits stop + emergency_stop.
 - ``start_session`` succeeds with no API key (provider construction is lazy at the first
@@ -569,23 +573,101 @@ def _bound_outbound_image(data_b64: str, frame: Any = None) -> tuple[str, str]:
         return data_b64, "image/png"
 
 
-def _execute_response_blocks(response: dict[str, object], frame: Any = None) -> list[Any]:
+# --- default action-response image weight ---------------------------------------------------
+
+#: Env knob name: ``CORTEX_ACTION_IMAGE_FULL`` — set to exactly ``1`` to restore the
+#: FULL-resolution default action-response image (the pre-0.5.7 behavior). Read lazily
+#: (test-toggleable like ``CORTEX_DIFF_FAST``). Scoped to the executed
+#: ``computer_execute`` response DEFAULT image only: ``computer_observe`` /
+#: ``computer_screenshot`` keep their full-resolution budget path, an explicit
+#: ``include_screenshot_after=true`` always ships full resolution, and D1 text-mode
+#: semantics are untouched (no images either way).
+ACTION_IMAGE_FULL_ENV = "CORTEX_ACTION_IMAGE_FULL"
+
+#: Half-resolution scale and JPEG quality for the DEFAULT executed-response image
+#: (action-image): 0.5 -> 960x540 at 1920x1080, quality ~60 — target <= ~60KB typical so a
+#: driving model's per-action context stops growing by 150-230KB PNG per action.
+_ACTION_IMAGE_SCALE = 0.5
+_ACTION_IMAGE_JPEG_QUALITY = 60
+
+
+def _action_image_full() -> bool:
+    """Resolve the action-image full-res escape hatch (only the exact string ``1`` enables)."""
+    return os.environ.get(ACTION_IMAGE_FULL_ENV, "").strip() == "1"
+
+
+def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str] | None:
+    """Half-resolution JPEG encode of the executed response's default image.
+
+    Downscale 0.5 (LANCZOS) then JPEG quality 60 — 960x540 at 1920x1080. Prefers the
+    capture-time RGB ``frame`` (R-5 W4 stash) over re-decoding the PNG. The REM-A H7
+    outbound budget still governs: an over-budget half-res result runs through
+    :func:`_bound_outbound_image` (which keeps it JPEG and bounded). Returns ``None``
+    on any encode failure so the caller falls back to the full-resolution budget
+    ladder — a degraded real image beats none.
+    """
+    try:
+        if frame is not None and isinstance(frame, Image.Image) and frame.mode in ("RGB", "L"):
+            image = frame.copy()  # independent object: resize must not mutate the stash
+        else:
+            decoded = base64.b64decode(data_b64, validate=True)
+            image = Image.open(io.BytesIO(decoded))
+            image.load()
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        image = image.resize(
+            (
+                max(1, int(image.width * _ACTION_IMAGE_SCALE)),
+                max(1, int(image.height * _ACTION_IMAGE_SCALE)),
+            ),
+            Image.LANCZOS,
+        )
+        buffer = io.BytesIO()
+        # optimize=True: optimal Huffman tables — free ~5-8% on real frames at the
+        # same quality level (context bytes ARE the product here).
+        image.save(buffer, format="JPEG", quality=_ACTION_IMAGE_JPEG_QUALITY, optimize=True)
+        raw = buffer.getvalue()
+        encoded = base64.b64encode(raw).decode("ascii")
+        if len(raw) <= _result_image_max_bytes():
+            return encoded, "image/jpeg"
+        # H7 budget still governs the outbound copy even at half resolution.
+        return _bound_outbound_image(encoded)
+    except Exception:  # noqa: BLE001 - degradation: fall back to the budget ladder
+        logger.debug("half-res action-image encode failed; using the budget ladder", exc_info=True)
+        return None
+
+
+def _execute_response_blocks(response: dict[str, object], frame: Any = None, *, full_resolution: bool = False) -> list[Any]:
     """REM-A H3/H5: executed ``computer_execute`` results as MCP content blocks.
 
     Returns one TextContent (the result JSON with the image blob stripped and the
     outbound format noted) plus one ImageContent carrying the post-action screenshot
-    as a real image block (bounded by :func:`_bound_outbound_image`) — parity with
-    ``computer_observe``. When the caller opted out
-    (``include_screenshot_after=False``, honored BEFORE this point) the response
+    as a real image block — parity with ``computer_observe``. When the caller opted
+    out (``include_screenshot_after=False``, honored BEFORE this point) the response
     carries no blob and this yields the text block only — never an empty image.
-    ``frame`` (R-5 W4, optional) is the capture-time RGB frame for the outbound
-    JPEG ladder (skips re-decoding the PNG; byte-identical outputs).
+    ``frame`` (R-5 W4, optional) is the capture-time RGB frame for the outbound JPEG
+    ladder (skips re-decoding the PNG; byte-identical outputs).
+
+    ``full_resolution=False`` (the DEFAULT — ``include_screenshot_after``
+    omitted) ships the image as a HALF-RESOLUTION JPEG (0.5x, q60; target <= ~60KB
+    typical) so driver context stops growing by a 150-230KB PNG per action.
+    ``full_resolution=True`` (an explicit ``include_screenshot_after=true`` — the
+    documented full-image opt-in — or ``CORTEX_ACTION_IMAGE_FULL=1``) keeps the
+    full-resolution ``_bound_outbound_image`` budget path unchanged.
     """
     payload = dict(response)
     data_b64 = payload.pop("screenshot_after_base64", None)
     blocks: list[Any] = []
     if data_b64 is not None:
-        bounded_b64, mime = _bound_outbound_image(str(data_b64), frame=frame)
+        if full_resolution:
+            bounded_b64, mime = _bound_outbound_image(str(data_b64), frame=frame)
+        else:
+            halved = _half_res_action_image(str(data_b64), frame=frame)
+            if halved is None:
+                bounded_b64, mime = _bound_outbound_image(str(data_b64), frame=frame)
+            else:
+                bounded_b64, mime = halved
+                payload["image_scale"] = _ACTION_IMAGE_SCALE  # additive truth marker
         payload["image_format"] = mime
         blocks.append(ImageContent(type="image", data=bounded_b64, mimeType=mime))
     return [
@@ -1546,28 +1628,40 @@ async def computer_execute(
     ``include_screenshot_after=false`` to OMIT the heavy image block
     (and any image bytes) from this response — recommended for actions whose outcome
     you check via the verification verdict + digest instead of the image (the full
-    image stays available via computer_observe). Omitted or None keeps the default
-    response. Result image budget (REM-A H7): the outbound image is kept under
-    ``CORTEX_RESULT_IMAGE_MAX_KB`` (default 180 KB; oversized PNG re-encodes as JPEG
-    outbound only — internal captures stay PNG). Executed responses return MCP
-    content blocks (TextContent result JSON + ImageContent post-action screenshot,
-    parity with computer_observe); error/rejection/approval shapes stay plain dicts.
-    In a text-mode session (``start_session(image_delivery="text")``) the executed
-    response is the slim dict (no image block, no screenshot bytes, mode keys added)
-    and ``include_screenshot_after`` cannot re-enable images in text mode.
+    image stays available via computer_observe). DEFAULT action responses carry a
+    HALF-SIZE JPEG (0.5x scale, ~60KB typical at 1080p) to keep your context light;
+    ask for ``include_screenshot_after=true`` when FULL resolution is required (the
+    full image stays available via computer_observe/computer_screenshot either way),
+    or set ``CORTEX_ACTION_IMAGE_FULL=1`` to restore full-res defaults. Result image
+    budget (REM-A H7): every outbound image is kept under ``CORTEX_RESULT_IMAGE_MAX_KB``
+    (default 180 KB; oversized PNG re-encodes as JPEG outbound only — internal
+    captures stay PNG). Executed responses return MCP content blocks (TextContent
+    result JSON + ImageContent post-action screenshot, parity with computer_observe);
+    error/rejection/approval shapes stay plain dicts. In a text-mode session
+    (``start_session(image_delivery="text")``) the executed response is the slim dict
+    (no image block, no screenshot bytes, mode keys added) and
+    ``include_screenshot_after`` cannot re-enable images in text mode.
 
     Queued actions (PERF-004, trailing optional): ``follow_ups`` is a list of at most 5
     action specs (same fields as this tool's action parameters, e.g.
     {"action": "click", "x": 10, "y": 20, "expected_effect": "..."}). Each follow-up
     passes the FULL independent pipeline (validate -> safety -> approval semantics ->
-    execute -> verify) exactly like a single action — zero bypass. The queue stops at a
-    safety rejection, approval requirement, validator/grounding rejection, or post-action
-    digest surprise (the screen changed since the queued premise was captured). An
-    UNCERTAIN verification does NOT stop the queue, and neither does a "failed"
-    verification of an EXECUTED item — the keystroke/click physically dispatched, so the
-    honest failed verdict (ok=false) rides that item's entry in follow_up_results while
-    the rest of the batch still runs. Batch small related groups and end the batch with
-    an observation.
+    execute -> verify) exactly like a single action — zero bypass. The queue CONTINUES
+    while the attached window stays the same (ordinary pixel changes from
+    earlier items — drawing, typing, dialogs — do NOT stop it; each item re-grounds
+    from the fresh post-action capture). It stops only on TRUE staleness — the
+    attached window's identity (hwnd/title/bounds) changed or closed since the queued
+    premise — plus safety rejection, approval requirement, validator/grounding
+    rejection, dispatch error, or a named interference event. Practical pattern:
+    commit your in-progress UI state BEFORE switching ribbon tools — e.g. while a
+    Paint shape is in edit mode the ribbon swallows clicks (exactly 0 pixel change),
+    so click once on the canvas to commit the shape, then use the next ribbon tool.
+    ``CORTEX_QUEUE_STRICT_DIGEST=1`` restores the legacy whole-screen stop.
+    An UNCERTAIN verification does NOT stop the queue, and neither does a "failed"
+    verification of an EXECUTED item — the keystroke/click physically dispatched, so
+    the honest failed verdict (ok=false) rides that item's entry in follow_up_results
+    while the rest of the batch still runs. Batch small related groups and end the
+    batch with an observation.
     Per-item results arrive in the additive ``follow_up_results`` field (bounded, no
     per-item screenshots) with ``follow_ups_stopped_reason`` (None = the batch ran to
     completion).
@@ -1700,8 +1794,12 @@ async def computer_execute(
             return response
         # R-5 (W4): the capture-time frame rides along (never serialized; absent for
         # legacy results) so the outbound JPEG ladder skips re-decoding the PNG.
+        # an EXPLICIT include_screenshot_after=true is the documented
+        # full-image opt-in and ships FULL resolution; the DEFAULT (omitted) ships
+        # the half-res JPEG; CORTEX_ACTION_IMAGE_FULL=1 restores full-res defaults.
         frame = getattr(result, "_frame", None) if result is not None else None
-        return _execute_response_blocks(response, frame=frame)
+        full_resolution = include_screenshot_after is True or _action_image_full()
+        return _execute_response_blocks(response, frame=frame, full_resolution=full_resolution)
     return response
 def main() -> None:
     asyncio.run(mcp.run_stdio_async())

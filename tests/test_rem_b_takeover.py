@@ -360,15 +360,24 @@ def test_fix3_definitive_failure_still_stops_queue(
     """The stop softening is UNCERTAIN-only and (since W-2/057) failed-verdict-only
     under the CORTEX_QUEUE_STRICT_VERIFY=1 escape hatch: an EXECUTED item with a
     DEFINITIVE failed verification stops the queue again (zero bypass on real
-    failures). The item is a HOTKEY with a stated effect on a never-changing screen
-    (unflagged intent -> the pixel tier's legacy definitive failed; a flagged CLICK
-    would degrade to uncertain under the W-1 contract)."""
+    failures). RC-D11 (058) update: a hotkey with a pixel-shaped stated effect can
+    no longer produce a DEFINITIVE failed (absent pixels degrade to uncertain), so
+    the failing item is a keypress whose launch-prefix effect ("open Calculator")
+    promotes the intent to the deterministic window_state tier — the window title
+    never appears on the never-changing screen -> definitive failed, the honest
+    real-failure evidence class this stop contract is pinned with."""
 
     class FailDefinitivelyBackend(FakeComputerBackend):
-        """The screen NEVER changes; a stated expected_effect fails definitively."""
+        """The screen NEVER changes and the window title never becomes the expected
+        one; the deterministic window_state tier fails definitively (RC-D11 update:
+        a pixel-shaped stated effect can no longer fail definitively — absent
+        pixels degrade to uncertain — so the deterministic tier carries the pin)."""
 
         def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
+            super().__init__(
+                active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="Main"),
+                **kwargs,
+            )
             self.executes = 0
 
         def execute(self, action: GroundedAction, stop: Any = None, **kwargs: Any) -> str:
@@ -383,10 +392,10 @@ def test_fix3_definitive_failure_still_stops_queue(
         agent.run_single(
             _state(),
             GroundedAction(
-                action="hotkey",
-                keys=["ctrl", "a"],
+                action="keypress",
+                keys=["enter"],
                 confidence=1.0,
-                expected_effect="the dialog opens",
+                expected_effect="open Calculator",
             ),
             follow_ups=[
                 ActionSpec(action="type", text="C8C3B2"),
@@ -409,10 +418,16 @@ def test_fix3_default_queue_continues_past_executed_failed_verdict(
     monkeypatch.delenv("CORTEX_QUEUE_STRICT_VERIFY", raising=False)
 
     class FailDefinitivelyBackend(FakeComputerBackend):
-        """The screen NEVER changes; a stated expected_effect fails definitively."""
+        """The screen NEVER changes and the window title never becomes the expected
+        one; the deterministic window_state tier fails definitively (RC-D11 update:
+        a pixel-shaped stated effect can no longer fail definitively — absent
+        pixels degrade to uncertain — so the deterministic tier carries the pin)."""
 
         def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
+            super().__init__(
+                active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="Main"),
+                **kwargs,
+            )
             self.executes = 0
 
         def execute(self, action: GroundedAction, stop: Any = None, **kwargs: Any) -> str:
@@ -426,10 +441,10 @@ def test_fix3_default_queue_continues_past_executed_failed_verdict(
         agent.run_single(
             _state(),
             GroundedAction(
-                action="hotkey",
-                keys=["ctrl", "a"],
+                action="keypress",
+                keys=["enter"],
                 confidence=1.0,
-                expected_effect="the dialog opens",
+                expected_effect="open Calculator",
             ),
             follow_ups=[
                 ActionSpec(action="type", text="C8C3B2"),
@@ -469,10 +484,12 @@ def test_fix4_click_verifies_via_focused_element_change_not_pixels() -> None:
         expected_change=True,
         expected_effect="Hex input focused",
     )
-    # The plain pixel-diff strategy still fails honestly (unchanged pixels)...
+    # The plain pixel-diff strategy defers honestly on unchanged pixels for a
+    # stated effect (W-1 flagged degrade; RC-D11/058 extended it to any stated
+    # effect — a sub-threshold diff is no-data, not proof of absence)...
     from computer_use_mcp.verification import ScreenshotDiffStrategy
 
-    assert ScreenshotDiffStrategy().verify(intent, before, after).outcome == "failed"
+    assert ScreenshotDiffStrategy().verify(intent, before, after).outcome == "uncertain"
     # ...but the full agent pipeline verifies via the deterministic focus tier.
     backend = FocusTierBackend()
     agent = _queue_agent(backend)

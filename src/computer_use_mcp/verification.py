@@ -345,10 +345,13 @@ class ScreenshotDiffStrategy:
       ``STRONG_PIXEL_DELTA`` or more (mean alone cannot see compact changes such as
       drawn strokes or small controls);
     - ``expected_change=True``: change detected -> ``verified``; none ->
-      ``failed`` — except an intent flagged ``FOCUS_CHANGE_INTENT_FLAG`` (a
-      focus-type click expectation pixels cannot observe), whose not-observed
-      sub-threshold diff degrades to ``uncertain`` (W-1; never success, and a
-      real above-threshold change still ``verified``);
+      ``failed`` — except an intent carrying a stated ``expected_effect``, whose
+      not-observed zero/sub-threshold diff degrades to ``uncertain`` (scoped to
+      flagged clicks; extended to ANY stated effect on any
+      action kind: absent pixel evidence is not proof of absence, and uncertain is
+      never success; a real above-threshold change still ``verified``). A BARE
+      change expectation (``expected_change=True`` with no described effect) keeps
+      the legacy definitive ``failed`` — there the pixel change is the whole claim;
     - ``expected_change=False``: no change detected -> ``verified``; change ->
       ``failed``;
     - ``expected_change=None`` (no expectation stated): change detected ->
@@ -434,29 +437,36 @@ class ScreenshotDiffStrategy:
                     change_confidence,
                     changed=True,
                 )
-            # a flagged focus-type expectation ("Hex input
-            # focused", "Edit colors dialog opens") describes a transition pixels
-            # CANNOT observe. A sub-threshold diff here is the strategy's no-data
-            # case, not proof of absence — the exact evidence class this tier
-            # degrades to ``uncertain`` when no expectation is stated (below).
-            # Emitting a definitive ``failed`` from absent evidence false-failed the
-            # live Paint session (mean 0.000/0.013, strong 0 -> failed) and killed
-            # the follow_ups queue. Doctrine: degrade to ``uncertain`` (never
-            # success); unflagged visual-change intents keep their exact legacy
-            # failure semantics below. Zero extra captures: reuses the diff
-            # computed above (2-capture floor / CORTEX_DIFF_FAST untouched).
-            if intent.metadata.get(FOCUS_CHANGE_INTENT_FLAG):
+            # a stated
+            # expected_effect ("Hex input focused", "Enter commits the shape")
+            # describes a transition the pixel tier often CANNOT observe — focusing a
+            # field, committing a shape with thin dashed handles below the
+            # STRONG_CHANGE_MIN_PIXELS floor, a slow dialog. A zero/sub-threshold diff
+            # here is the strategy's no-data case, not proof of absence — the exact
+            # evidence class this tier degrades to ``uncertain`` when no expectation is
+            # stated (below). Emitting a definitive ``failed`` from absent evidence
+            # false-failed the live Paint sessions (keypress Enter with 0.000000 diff
+            # while the commit succeeded) and killed follow_ups queues. Doctrine: ANY
+            # stated-effect visual-change intent degrades to ``uncertain`` (never
+            # success; ok stays False). The strict legacy failure is kept ONLY for
+            # OBSERVE-style bare change expectations (``expected_change=True`` with NO
+            # described effect) — there, a pixel change is the whole claim, so absent
+            # change IS the failure.
+            if intent.expected_effect:
                 note = (
-                    "No pixel evidence of the stated focus-type expectation"
-                    + (f": {intent.expected_effect}" if intent.expected_effect else "")
-                    + "; focus/dialog transitions are often invisible to the pixel diff."
+                    "No pixel evidence of the stated expectation"
+                    + f": {intent.expected_effect}"
+                    + "; many real transitions (focus, caret, thin handles, slow "
+                    "dialogs) are invisible or sub-threshold to the pixel diff."
                 )
                 return _uncertain(self.name, note + " Uncertain is never success.", evidence, 0.4, changed=False)
-            note = "Expected change was not observed"
-            if intent.expected_effect:
-                note += f": {intent.expected_effect}"
             return _definitive(
-                self.name, "failed", note + ".", evidence, _EXPECTATION_FAILED_CONFIDENCE, changed=False
+                self.name,
+                "failed",
+                "Expected change was not observed.",
+                evidence,
+                _EXPECTATION_FAILED_CONFIDENCE,
+                changed=False,
             )
         if expected is False:
             if not changed:
@@ -518,6 +528,26 @@ class ScreenshotDiffStrategy:
             ),
         ]
         if intent.expected_change is True and mean_difference <= 0.0 and strongly_changed <= 0:
+            if intent.expected_effect:
+                # a DESCRIBED effect on a non-visual intent is the same
+                # absent-evidence class as the visual-change tier — a pixel-identical
+                # screen is not proof the described transition did not occur (typed
+                # text, focus moves, and thin UI changes are invisible to pixels).
+                # Degrade to uncertain so the deterministic/judge tiers decide; the
+                # legacy definitive failure is kept for bare change expectations
+                # (no described effect) where pixels are the whole claim.
+                return _uncertain(
+                    self.name,
+                    (
+                        "The screen is pixel-identical, which is not proof of absence "
+                        "for the stated expectation"
+                        + (f": {intent.expected_effect}.")
+                        + " The pixel tier defers; uncertain is never success."
+                    ),
+                    evidence,
+                    0.4,
+                    changed=False,
+                )
             return _definitive(
                 self.name,
                 "failed",
@@ -1050,13 +1080,16 @@ class FocusChangeStrategy:
     the signal that fired. NO signal showing change leaves the verdict to the
     next tiers — for a flagged intent the screenshot-diff strategy degrades a
     sub-threshold diff to ``uncertain`` (never ``failed`` from absent
-    evidence); unflagged intents keep its exact legacy failure semantics, and it
-    never upgrades a pixel-proven non-change.
+    evidence; the doctrine extends that degrade to ANY stated effect directly in
+    ScreenshotDiffStrategy, WITHOUT widening this tier's scope), and it never
+    upgrades a pixel-proven non-change.
 
     Scope gate: only intents flagged ``{FOCUS_CHANGE_INTENT_FLAG}`` in
     ``intent.metadata`` (set by the controller's ``_build_intent`` for CLICK /
-    DOUBLE_CLICK actions carrying a stated expected effect). Every other
-    visual-change intent — drag, scroll, type, unstated expectations — keeps its
+    DOUBLE_CLICK actions carrying a stated expected effect — deliberately still
+    Scope note: these transition signals must not "verify" a stated effect on
+    other action kinds from window motion alone). Every other visual-change
+    intent — drag, scroll, type, keypress, unstated expectations — keeps its
     exact pre-REM-B tier semantics.
     """
 

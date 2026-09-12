@@ -31,6 +31,7 @@ from test_controller_integration import (
 from computer_use_mcp import server
 from computer_use_mcp.audit import AuditEventType, AuditLogger, Metrics
 from computer_use_mcp.backend import DisplayUnavailableError
+from computer_use_mcp.models import WindowInfo
 from computer_use_mcp.state import SessionRegistry
 
 
@@ -270,18 +271,26 @@ async def test_metrics_snapshot_invariants_after_scripted_runs(
     assert snapshot["latencies"]["execution_ms"]["count"] == 1
     assert snapshot["latencies"]["verification_ms"]["count"] == 1
 
-    # Failing path: invariants still hold on a failed verification (flip=False ->
-    # a stated change expectation is reported failed — never silently OK). The
-    # action is a HOTKEY (an unflagged visual-change intent): a flagged CLICK with a
-    # stated focus-type expectation now degrades to uncertain under the W-1 (057)
-    # contract, so the click would no longer produce the definitive failed verdict
-    # this invariant pin requires.
+    # Failing path: invariants still hold on a failed verification (a stated
+    # window expectation that never appears is reported failed — never silently
+    # OK). RC-D11 (058) update: a HOTKEY with a pixel expectation can no longer
+    # produce a DEFINITIVE failed (any stated effect on a visual-change intent now
+    # degrades to uncertain — absent pixels are not proof of absence), so the
+    # failing action is a keypress whose launch-prefix effect promotes the intent
+    # to the deterministic window_state tier; the window title never appears ->
+    # definitive failed, the honest-failure evidence class this invariant pins.
     sid, bundle, backend, _ = make_session(
-        monkeypatch, backend=ScriptedBackend(flip=False), dry_run=False,
-        require_approval=False, limits=FAST_LIMITS,
+        monkeypatch,
+        backend=ScriptedBackend(
+            flip=False,
+            active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App"),
+        ),
+        dry_run=False,
+        require_approval=False,
+        limits=FAST_LIMITS,
     )
     response = await server.computer_execute(
-        sid, "hotkey", keys=["ctrl", "a"], expected_effect="screen must change"
+        sid, "keypress", keys=["enter"], expected_effect="open Calculator"
     )
     response = _payload(response)
     assert response["ok"] is False

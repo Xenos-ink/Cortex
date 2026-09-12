@@ -119,7 +119,10 @@ def test_f1_caret_blink_digest_change_does_not_verify_click_effect() -> None:
     defer (uncertain). W-1 (057) contract update: the flagged-intent chain now
     degrades to ``uncertain`` (pixels cannot observe a focus transition) instead of
     the old definitive false failure — the core pin (never verified on caret-blink
-    evidence) is unchanged."""
+    evidence) is unchanged. RC-D11 (058) update: a stated effect on ANY intent
+    (flagged or not) now degrades the sub-threshold diff to ``uncertain`` — absent
+    pixels are not proof of absence; uncertain is never success, so the core pin
+    (never verified on caret-blink evidence) is unchanged."""
     before = _observation(_white(), ui_elements=_elements(["canvas"], focused=True))
     after_image = _white()
     after_image.putpixel((32, 24), (0, 0, 0))  # a single dark pixel — a caret
@@ -128,10 +131,11 @@ def test_f1_caret_blink_digest_change_does_not_verify_click_effect() -> None:
     )
     assert before.image_base64 != after.image_base64  # digest DID change (precondition)
     # The pixel tier itself refuses the caret blink as proof of the stated effect
-    # for an UNFLAGGED intent (legacy failure semantics preserved)...
+    # for an UNFLAGGED intent (RC-D11: uncertain, never verified, never "failed"
+    # from absent evidence)...
     assert (
         ScreenshotDiffStrategy().verify(_unflagged_intent("Hex input focused"), before, after).outcome
-        == "failed"
+        == "uncertain"
     )
     strategy = FocusChangeStrategy()
     result = strategy.verify(_focused_intent(), before, after)

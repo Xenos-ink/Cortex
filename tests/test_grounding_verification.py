@@ -976,7 +976,11 @@ def test_engine_expected_text_falls_through_to_diff_tier(
     )
     assert fallback.outcome == "verified"
     assert fallback.verification_method == "screenshot_diff"
-    # Pixel-identical screen: the stated change truly did not occur -> honest failure.
+    # Pixel-identical screen: RC-D11 (058) — a stated effect with zero pixel
+    # evidence degrades to ``uncertain`` (absent pixels are not proof of absence);
+    # ok stays False upstream. The legacy definitive failure is kept for a BARE
+    # change expectation (no described effect) — there the pixel change IS the
+    # whole claim, so absent change is the failure.
     still = engine.verify(
         VerificationIntent(
             kind=VerificationKind.VISUAL_CHANGE,
@@ -986,4 +990,11 @@ def test_engine_expected_text_falls_through_to_diff_tier(
         before,
         _observation("white"),
     )
-    assert still.outcome == "failed"
+    assert still.outcome == "uncertain"
+    assert still.confidence == 0.4
+    bare = engine.verify(
+        VerificationIntent(kind=VerificationKind.VISUAL_CHANGE, expected_change=True),
+        before,
+        _observation("white"),
+    )
+    assert bare.outcome == "failed"  # legacy semantics preserved (real-defect detection)

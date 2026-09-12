@@ -563,19 +563,34 @@ async def test_computer_execute_expected_effect_and_failure_shapes(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id, _bundle, backend, _ = make_session(
-        monkeypatch, backend=ScriptedBackend(flip=False), dry_run=False, require_approval=False,
+        monkeypatch,
+        backend=ScriptedBackend(
+            flip=False,
+            active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App"),
+        ),
+        dry_run=False,
+        require_approval=False,
         limits=FAST_LIMITS,
     )
     effect = await server.computer_execute(
         session_id, "hotkey", keys=["ctrl", "a"], approved=False, expected_effect="the screen changes"
     )
     effect = execute_payload(effect)  # REM-A: executed -> content blocks
-    # A stated expected effect that did not occur is reported failed — never silently
-    # OK. The action is a HOTKEY (unflagged visual-change intent, legacy failure
-    # semantics): a flagged CLICK with a focus-type expectation degrades to uncertain
-    # under the W-1 (057) contract, so it can no longer pin the definitive failure.
+    # A stated expected effect that did not occur is never silently OK. RC-D11 (058)
+    # contract update: with NO pixel evidence the stated effect degrades to
+    # ``uncertain`` (0.4) — the live Paint keypress-Enter commit false-failed with a
+    # 0.000000 diff — but ok stays False (uncertain is never success). The legacy
+    # definitive failure shape is preserved one layer down: a deterministic
+    # window_state expectation that never appears still reports ``failed``.
     assert effect["ok"] is False
-    assert effect["verification"]["outcome"] == "failed"
+    assert effect["verification"]["outcome"] == "uncertain"
+    assert effect["verification"]["verified"] is False
+    deterministic = await server.computer_execute(
+        session_id, "keypress", keys=["enter"], approved=False, expected_effect="open Calculator"
+    )
+    deterministic = execute_payload(deterministic)
+    assert deterministic["ok"] is False
+    assert deterministic["verification"]["outcome"] == "failed"  # real failure stays failed
 
     rejected = await server.computer_execute(session_id, "click", x=8000, y=10)
     assert rejected["ok"] is False
@@ -592,7 +607,10 @@ async def test_computer_execute_expected_effect_and_failure_shapes(
     stopped = await server.computer_execute(session_id, "wait", delta=1)
     assert stopped["ok"] is False
     assert "stopped" in stopped["message"].lower()
-    assert executed_summary(backend) == [("hotkey", None, None)]  # only the first action ran
+    assert executed_summary(backend) == [
+        ("hotkey", None, None),
+        ("keypress", None, None),
+    ]  # only the two expected-effect actions ran
 
 
 async def test_computer_execute_dry_run_never_executes(

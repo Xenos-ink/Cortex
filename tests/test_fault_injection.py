@@ -306,12 +306,16 @@ async def test_unexpected_dialog_classified_with_bounded_recovery(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A dialog spawning during a direct action with an unmet stated effect is
-    reported as a FAILED verification (window-state evidence) — never a silent OK.
+    reported as NOT verified (ok=False) — never a silent OK.
 
     RETARGETED (run_goal removal): the old test exercised the loop's UNEXPECTED_DIALOG
     recovery classification (decide-phase machinery). The surviving direct-path
-    guarantee: the dialog IS detected by the deterministic window-identity tier and
-    the unmet effect is reported failed."""
+    guarantee: the unmet stated effect is never reported as success. RC-D11 (058)
+    contract update: a stated effect with no pixel evidence degrades to
+    ``uncertain`` (ok=False) instead of the old definitive ``failed`` — absent
+    pixels are not proof of absence, and the dialog's window change must not
+    "verify" a type effect (FocusChangeStrategy stays click-scoped)."""
+
     backend = ScriptedBackend(
         flip=False,  # pixels never change -> the stated typed effect cannot be confirmed
         active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="Main"),
@@ -331,8 +335,9 @@ async def test_unexpected_dialog_classified_with_bounded_recovery(
     )
     payload = _executed_payload(response)
 
-    assert payload["ok"] is False  # the stated effect was NOT met — honestly failed
-    assert payload["verification"]["outcome"] == "failed"
+    assert payload["ok"] is False  # the stated effect was NOT met — never a silent OK
+    assert payload["verification"]["outcome"] == "uncertain"  # RC-D11: not a false failed
+    assert payload["verification"]["verified"] is False
     assert executed_summary(backend) == [("type", None, "record name")]  # typed exactly once
 
 
