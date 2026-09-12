@@ -128,6 +128,20 @@ or, from a clone:
 git pull && python -m pip install -e ".[dev]"
 ```
 
+### Install / update with the `cortex-mcp` command
+
+The steps above are automated by a global console script, `cortex-mcp` (equivalently `python -m computer_use_mcp.cli`):
+
+```bash
+cortex-mcp install [--repo PATH] [--agents a,b|all] [--force] [--dry-run]
+cortex-mcp update  [--repo PATH] [--dry-run]
+```
+
+- `install` provisions `<repo>/.venv` (editable install), registers the Cortex MCP server into every recognized agent config file it finds (ZCode, Claude, Cursor, Codex, Kimi), and verifies the served surface with a zero-input stdio probe (exactly the five tools).
+- Guarantees: every config file is backed up before the first write (`<file>.cortex-backup-<timestamp>`), and an existing cortex entry is never overwritten — entries that already match are left untouched, entries that differ are reported and skipped unless `--force` is passed. Manual config editing remains fully supported.
+- `update` fast-forwards the clone to `origin/main` (it aborts cleanly when the branch is not fast-forwardable and never resets), refreshes the editable installs, and re-verifies.
+- The global `cortex-mcp` command is installed best-effort and may require an elevated terminal; without it, use the fallback `python -m computer_use_mcp.cli`.
+
 ### Install and update via an AI agent
 
 You do not have to do any of this by hand. Paste one of the two prompts below into any AI coding agent (ZCode, Claude, Cursor, Kimi, Codex, …) and it will install or update Cortex for you end to end: prerequisites, venv, editable install, MCP wiring for the target host, verification, and a smoke test. Both prompts are self-contained — the agent asks you only for the two things it cannot know (where the repo comes from and which host to wire it into). Both prompts are written entirely in English so any agent can follow them verbatim.

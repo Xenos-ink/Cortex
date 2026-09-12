@@ -12,6 +12,42 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
+## v0.5.8 (2026-09-12) — RELEASED (global `cortex-mcp` CLI: install/update subcommands with no-clobber agent registration)
+
+A single terminal command now performs the whole install/update lifecycle that
+previously required hand-editing each agent's MCP configuration file.
+
+### Added
+
+- **Global `cortex-mcp` terminal command** — a `[project.scripts]` console entry
+  (also runnable as `python -m computer_use_mcp.cli`; stdlib-only CLI) with two
+  subcommands:
+  - **`install`** — provisions `<repo>/.venv` and the editable install, then registers
+    the Cortex MCP server into every recognized agent config file found on the machine
+    (zcode, claude, cursor, codex, kimi). Every file is backed up before the first write
+    (`<file>.cortex-backup-<timestamp>`; an existing backup is never overwritten). An
+    existing cortex entry is never clobbered: entries that already match the target are
+    left untouched (UNCHANGED); entries that differ are reported and skipped
+    (SKIPPED-EXISTS-USE-FORCE) unless `--force` is given. `--dry-run` prints the full
+    plan with zero writes; `--agents a,b` (or `all`) filters the targets. The served
+    surface is verified with a zero-input stdio probe that expects exactly the five
+    tools and no `anyOf`/`$ref` schema tokens.
+  - **`update`** — `git fetch` plus a `--ff-only` merge of `origin/main` (clean abort
+    when the branch is not fast-forwardable — the command never resets), then an
+    editable refresh of both installs, package-version verification before/after, and
+    the same stdio probe.
+
+### Compatibility notes
+
+- Existing cortex registrations are never modified without `--force` — manual setups
+  are preserved (files whose cortex entry differs are not rewritten at all).
+- When a write does happen, the config file is rewritten with standard JSON
+  indentation and the original bytes are backed up first; every unrelated key is
+  preserved.
+- The global console-script refresh targets the system interpreter and is best-effort:
+  without an elevated terminal it prints a warning (the fallback
+  `python -m computer_use_mcp.cli` always works) and never changes the exit code.
+
 ## v0.5.7 (2026-09-11) — RELEASED (end-to-end speed: window-identity queue batching, half-res action JPEGs, honest alias launches and verdicts)
 
 End-to-end latency analysis showed the driving model's turns dominate wall
