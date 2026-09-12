@@ -271,13 +271,17 @@ async def test_metrics_snapshot_invariants_after_scripted_runs(
     assert snapshot["latencies"]["verification_ms"]["count"] == 1
 
     # Failing path: invariants still hold on a failed verification (flip=False ->
-    # a stated change expectation is reported failed — never silently OK).
+    # a stated change expectation is reported failed — never silently OK). The
+    # action is a HOTKEY (an unflagged visual-change intent): a flagged CLICK with a
+    # stated focus-type expectation now degrades to uncertain under the W-1 (057)
+    # contract, so the click would no longer produce the definitive failed verdict
+    # this invariant pin requires.
     sid, bundle, backend, _ = make_session(
         monkeypatch, backend=ScriptedBackend(flip=False), dry_run=False,
         require_approval=False, limits=FAST_LIMITS,
     )
     response = await server.computer_execute(
-        sid, "click", x=10, y=10, expected_effect="screen must change"
+        sid, "hotkey", keys=["ctrl", "a"], expected_effect="screen must change"
     )
     response = _payload(response)
     assert response["ok"] is False

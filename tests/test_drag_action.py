@@ -583,7 +583,8 @@ async def test_computer_execute_drag_out_of_bounds_end_point_rejected(
     )
     result = await server.computer_execute(session_id, "drag", x=10, y=20, x2=5000, y2=70)
     assert result["ok"] is False
-    assert result["message"] == "Grounding rejected."
+    # W-2 (057): the rejection names the real gate (grounding) in the message.
+    assert result["message"].startswith("Action rejected by grounding:")
     assert result["reasons"]
     assert backend.executed == []
 

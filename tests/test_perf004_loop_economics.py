@@ -14,7 +14,10 @@ Covers (each maps to an entry in ``evidence/perf-004/p2/change-log.md``):
 - C5 dry-run default flip + unmistakable banner.
 - C6 teach-in-text: invalid_action rejections carry the exact vocabulary + closest shape.
 - C7 queued ``follow_ups``: full pipeline per item, zero bypass, adversarial stops
-  (unsafe item, verification failure, digest surprise, approval, stop token, cap).
+  (unsafe item, digest surprise, approval, stop token, cap). W-2/057 update: an
+  EXECUTED item's verification "failed" no longer stops the batch by default (the
+  strict ``CORTEX_QUEUE_STRICT_VERIFY=1`` stop is still pinned here); a dispatch
+  error still does.
 - C8 structured observation ``text_summary``.
 
 Everything runs on FakeComputerBackend derivatives (no real input dispatch).
@@ -504,6 +507,13 @@ class FlipOnceBackend(ScriptedBackend):
 async def test_verification_failure_stops_queue_before_later_items(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """W-2 (057) contract: with CORTEX_QUEUE_STRICT_VERIFY=1 the v0.5.5 stop-on-failed
+    behavior is restored — an EXECUTED item with a DEFINITIVE failed verification
+    flushes the remaining items. The failing item is a HOTKEY with a stated effect on
+    the settled (unchanged) screen — an unflagged intent, so the pixel tier's legacy
+    definitive failed verdict stands (a flagged CLICK would degrade to uncertain under
+    the W-1 contract and never stop the queue)."""
+    monkeypatch.setenv("CORTEX_QUEUE_STRICT_VERIFY", "1")
     backend = FlipOnceBackend()
     provider = ScriptedProvider([])
     session_id, _bundle, _backend, _ = make_session(
@@ -516,7 +526,7 @@ async def test_verification_failure_stops_queue_before_later_items(
         x=10,
         y=10,
         follow_ups=[
-            {"action": "click", "x": 20, "y": 20, "expected_effect": "screen must change"},
+            {"action": "hotkey", "keys": ["ctrl", "s"], "expected_effect": "screen must change"},
             {"action": "click", "x": 30, "y": 30},
         ],
     )
@@ -524,6 +534,37 @@ async def test_verification_failure_stops_queue_before_later_items(
     assert response["follow_ups_stopped_reason"] == "verification_failed"
     assert response["follow_up_results"][1]["verification_outcome"] == "failed"
     assert len(executed_summary(backend)) == 2  # items 1-2 ran; item 3 was flushed
+
+
+async def test_executed_failed_verdict_no_longer_stops_queue_by_default(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W-2 (057) default: an EXECUTED item whose verification definitively failed
+    (unflagged hotkey expectation on the settled screen) no longer flushes the
+    batch — the honest failed verdict rides the per-item entry and the remaining
+    items still run."""
+    monkeypatch.delenv("CORTEX_QUEUE_STRICT_VERIFY", raising=False)
+    backend = FlipOnceBackend()
+    provider = ScriptedProvider([])
+    session_id, _bundle, _backend, _ = make_session(
+        monkeypatch, backend=backend, provider=provider, dry_run=False,
+        require_approval=False, limits=FAST_LIMITS,
+    )
+    response = await server.computer_execute(
+        session_id,
+        "click",
+        x=10,
+        y=10,
+        follow_ups=[
+            {"action": "hotkey", "keys": ["ctrl", "s"], "expected_effect": "screen must change"},
+            {"action": "click", "x": 30, "y": 30},
+        ],
+    )
+    response = execute_payload(response)  # REM-A: executed -> content blocks
+    assert response["follow_ups_stopped_reason"] is None  # the batch completed
+    assert response["follow_up_results"][1]["verification_outcome"] == "failed"
+    assert response["follow_up_results"][1]["ok"] is False  # the honest verdict rides
+    assert len(executed_summary(backend)) == 3  # ALL items ran
 
 
 async def test_post_action_digest_surprise_stops_queue(

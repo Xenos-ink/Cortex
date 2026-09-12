@@ -13,14 +13,17 @@ Fixes under test (log-forensics.md H2a/H2b/H2c, confirmed root causes):
   allowed_processes at session start). The gate's DECISION stays fail-closed.
 - Fix 3 (H2b QUEUE-STOP): the follow-up queue CONTINUES past an item whose verification
   outcome is UNCERTAIN (no expectation stated / non-visual action judged unverifiable);
-  named stops, safety rejections, approval requirements, digest surprises, and
-  DEFINITIVE verification failures still stop the queue. Per-item results keep their
-  honest per-item verdicts.
+  named stops, safety rejections, approval requirements, and digest surprises still stop
+  the queue. W-2/057 UPDATE: an EXECUTED item's DEFINITIVE "failed" verification no
+  longer stops the queue by default either (the honest failed verdict rides the per-item
+  entry); CORTEX_QUEUE_STRICT_VERIFY=1 restores the stop-on-failed behavior, and that
+  restored stop is pinned here. Per-item results keep their honest per-item verdicts.
 - Fix 4 (H2c FALSE NEGATIVES): a click with an ``expected_effect`` gets a deterministic
   verification tier (UIA focused-element change, active-window title/process change,
-  observation digest change) BEFORE the pixel-diff definitive failure. A deterministic
-  change signal verifies the click; with no signal and unchanged pixels the existing
-  honest ``failed`` verdict is kept.
+  observation digest change) BEFORE the pixel-diff failure. A deterministic change
+  signal verifies the click; with no signal anywhere the W-1/057 contract degrades the
+  flagged click's verdict to ``uncertain`` (never a false success, never a false
+  failure).
 """
 
 from __future__ import annotations
@@ -351,9 +354,59 @@ def test_fix3_queue_continues_past_uncertain_verification() -> None:
     assert backend.executes == 3
 
 
-def test_fix3_definitive_failure_still_stops_queue() -> None:
-    """The stop softening is UNCERTAIN-only: a DEFINITIVE failed verification still
-    flushes the queue (zero bypass on real failures)."""
+def test_fix3_definitive_failure_still_stops_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stop softening is UNCERTAIN-only and (since W-2/057) failed-verdict-only
+    under the CORTEX_QUEUE_STRICT_VERIFY=1 escape hatch: an EXECUTED item with a
+    DEFINITIVE failed verification stops the queue again (zero bypass on real
+    failures). The item is a HOTKEY with a stated effect on a never-changing screen
+    (unflagged intent -> the pixel tier's legacy definitive failed; a flagged CLICK
+    would degrade to uncertain under the W-1 contract)."""
+
+    class FailDefinitivelyBackend(FakeComputerBackend):
+        """The screen NEVER changes; a stated expected_effect fails definitively."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.executes = 0
+
+        def execute(self, action: GroundedAction, stop: Any = None, **kwargs: Any) -> str:
+            message = super().execute(action, stop)
+            self.executes += 1
+            return message
+
+    monkeypatch.setenv("CORTEX_QUEUE_STRICT_VERIFY", "1")
+    backend = FailDefinitivelyBackend()
+    agent = _queue_agent(backend)
+    outcome = asyncio.run(
+        agent.run_single(
+            _state(),
+            GroundedAction(
+                action="hotkey",
+                keys=["ctrl", "a"],
+                confidence=1.0,
+                expected_effect="the dialog opens",
+            ),
+            follow_ups=[
+                ActionSpec(action="type", text="C8C3B2"),
+                ActionSpec(action="keypress", keys=["enter"]),
+            ],
+        )
+    )
+    assert outcome.follow_ups_stopped_reason == "verification_failed"
+    assert (outcome.follow_up_results or [])[0]["verification_outcome"] == "failed"
+    assert backend.executes == 1  # the follow-ups were flushed
+
+
+def test_fix3_default_queue_continues_past_executed_failed_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W-2 (057) default contract: an EXECUTED item whose verification outcome is
+    definitively ``failed`` no longer flushes the batch — the honest failed verdict
+    rides the per-item entry and the remaining items still run (the strict env knob
+    is left at its default)."""
+    monkeypatch.delenv("CORTEX_QUEUE_STRICT_VERIFY", raising=False)
 
     class FailDefinitivelyBackend(FakeComputerBackend):
         """The screen NEVER changes; a stated expected_effect fails definitively."""
@@ -373,8 +426,8 @@ def test_fix3_definitive_failure_still_stops_queue() -> None:
         agent.run_single(
             _state(),
             GroundedAction(
-                action="click",
-                point={"x": 10, "y": 10},
+                action="hotkey",
+                keys=["ctrl", "a"],
                 confidence=1.0,
                 expected_effect="the dialog opens",
             ),
@@ -384,9 +437,15 @@ def test_fix3_definitive_failure_still_stops_queue() -> None:
             ],
         )
     )
-    assert outcome.follow_ups_stopped_reason == "verification_failed"
-    assert (outcome.follow_up_results or [])[0]["verification_outcome"] == "failed"
-    assert backend.executes == 1  # the follow-ups were flushed
+    assert outcome.kind == "executed"
+    assert outcome.follow_ups_stopped_reason is None  # the batch completed
+    entries = outcome.follow_up_results or []
+    assert len(entries) == 3
+    # Per-item honesty preserved: item 0 records its own DEFINITIVE failed verdict.
+    assert entries[0]["verification_outcome"] == "failed"
+    assert entries[0]["ok"] is False
+    assert [e["action_type"] for e in entries[1:]] == ["type", "keypress"]
+    assert backend.executes == 3
 
 
 # --- Fix 4: deterministic verification tier for focus-type click expectations ---------------
@@ -478,9 +537,13 @@ def test_fix4_click_verifies_via_active_window_title_change() -> None:
     assert "window" in verification.note.casefold()
 
 
-def test_fix4_click_keeps_honest_failed_when_no_signal_anywhere() -> None:
+def test_fix4_click_keeps_honest_verdict_when_no_signal_anywhere() -> None:
     """Honesty preserved: no focus change, no window change, unchanged pixels ->
-    the existing definitive failed verdict stands (never a false success)."""
+    the flagged click's verdict is never a false success. W-1 (057) contract update:
+    with the FocusChangeStrategy signals abstaining, the pixel tier's absent-evidence
+    case now degrades to ``uncertain`` (ok stays False — uncertain is never success)
+    instead of the old definitive false failure; the unflagged legacy ``failed``
+    semantics are pinned in tests/test_w1_focus_click_false_failure.py."""
     backend = FakeComputerBackend()  # nothing ever changes
     agent = _queue_agent(backend)
     outcome = asyncio.run(
@@ -496,7 +559,7 @@ def test_fix4_click_keeps_honest_failed_when_no_signal_anywhere() -> None:
     )
     verification = outcome.result.verification
     assert verification is not None
-    assert verification.outcome == "failed"
+    assert verification.outcome == "uncertain"
     assert outcome.result.ok is False
 
 

@@ -154,7 +154,8 @@ async def test_hallucinated_out_of_bounds_point_never_executed_and_recovered(
     response = await server.computer_execute(session_id, "click", x=8000, y=100)
 
     assert response["ok"] is False
-    assert response["message"] == "Grounding rejected."
+    # W-2 (057): the rejection names the real gate (grounding) in the message.
+    assert response["message"].startswith("Action rejected by grounding:")
     assert executed_summary(backend) == []  # the hallucinated point was NEVER executed
     assert bundle.metrics.snapshot()["counters"]["grounding_failure"] == 1
     events = audit_events(bundle, session_id)
@@ -285,7 +286,8 @@ async def test_resolution_change_mid_task_detected_as_stale(
     payload = _executed_payload(response)
 
     assert payload["ok"] is False, payload
-    assert payload["message"] == "Grounding rejected."
+    # W-2 (057): the rejection names the real gate (staleness) in the message.
+    assert payload["message"].startswith("Action rejected by staleness check:"), payload
     assert any("Stale observation" in reason for reason in payload["reasons"]), payload
     assert executed_summary(backend) == []  # stale coordinates were discarded, not executed
     # The stale detection + re-observe really ran (the revalidate probe fired).

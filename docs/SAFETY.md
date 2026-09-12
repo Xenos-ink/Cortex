@@ -131,10 +131,15 @@ no-op sessions; the compensating control is the mandatory `DRY-RUN (no input
 dispatched):` banner on every dry-run result message, so a no-op can never be misread
 as execution). Queued `follow_ups` are ZERO-BYPASS: every queue item runs the full
 independent pipeline (ground → validate → safety → approval semantics → execute →
-verify), the queue stops at the first verification failure, safety rejection, approval
-requirement, or post-action digest surprise, the stop token is checked between items,
-and adversarial tests prove an unsafe item is rejected individually, a failure mid-queue
-flushes later items, and `stop_session` halts a running queue.
+verify), the queue stops on a safety rejection, approval requirement, validator/
+grounding rejection, post-action digest surprise, or named interference stop (modal
+dialog / focus drift), the stop token is checked between items, and adversarial tests
+prove an unsafe item is rejected individually and `stop_session` halts a running
+queue. Default: an EXECUTED item whose verification outcome is `failed` no
+longer flushes later items — the input dispatched, the next item re-grounds from the
+fresh post-action capture, and the honest failed verdict (ok=False + evidence) rides
+the per-item `follow_up_results` entry; set `CORTEX_QUEUE_STRICT_VERIFY=1` to restore
+the v0.5.5 strict stop-on-failed queue semantics.
 
 Limitation (stated honestly): classification is deterministic pattern + context
 matching (English patterns plus a small Arabic set), not semantic understanding. It is

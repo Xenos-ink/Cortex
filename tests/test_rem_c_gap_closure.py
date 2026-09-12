@@ -116,7 +116,10 @@ def test_f1_caret_blink_digest_change_does_not_verify_click_effect() -> None:
     (caret blink / clock tick) between the captures. The flagged click intent must
     NOT come back ``verified`` from the deterministic tier; the bare digest change is
     sub-threshold flicker the pixel tier deliberately distrusts, so this tier must
-    defer (uncertain) — the engine then honestly fails on the change expectation."""
+    defer (uncertain). W-1 (057) contract update: the flagged-intent chain now
+    degrades to ``uncertain`` (pixels cannot observe a focus transition) instead of
+    the old definitive false failure — the core pin (never verified on caret-blink
+    evidence) is unchanged."""
     before = _observation(_white(), ui_elements=_elements(["canvas"], focused=True))
     after_image = _white()
     after_image.putpixel((32, 24), (0, 0, 0))  # a single dark pixel — a caret
@@ -124,7 +127,8 @@ def test_f1_caret_blink_digest_change_does_not_verify_click_effect() -> None:
         after_image, ui_elements=_elements(["canvas"], focused=True)  # SAME focus
     )
     assert before.image_base64 != after.image_base64  # digest DID change (precondition)
-    # The pixel tier itself refuses the caret blink as proof of the stated effect...
+    # The pixel tier itself refuses the caret blink as proof of the stated effect
+    # for an UNFLAGGED intent (legacy failure semantics preserved)...
     assert (
         ScreenshotDiffStrategy().verify(_unflagged_intent("Hex input focused"), before, after).outcome
         == "failed"
@@ -134,11 +138,12 @@ def test_f1_caret_blink_digest_change_does_not_verify_click_effect() -> None:
     assert result.outcome != "verified", (
         f"a 1-pixel caret blink verified the click effect: {result.outcome} ({result.note})"
     )
-    # Engine-level: the first-definitive-wins chain must not be hijacked either.
+    # Engine-level: the first-definitive-wins chain must not be hijacked either —
+    # and under the W-1 contract a flagged focus expectation degrades, not fails.
     engine = VerificationEngine(judge=None)
     chain = engine.verify(_focused_intent(), before, after)
-    assert chain.outcome == "failed", (
-        f"engine verified a caret-blink-only transition: {chain.outcome} "
+    assert chain.outcome == "uncertain", (
+        f"engine misread a caret-blink-only transition: {chain.outcome} "
         f"({chain.verification_method})"
     )
 
@@ -227,7 +232,9 @@ def test_f1_subthreshold_digest_change_degrades_to_uncertain_not_failed() -> Non
 def test_f1_engine_chain_uncorroborated_digest_defers_to_pixel_tier() -> None:
     """F1 chain pin: the flagged-intent chain on a sub-threshold digest-only change
     lands on the screenshot-diff verdict, not a focus_change verdict (V-2 C11's
-    decisive engine-level test, now inverted)."""
+    decisive engine-level test, now inverted). W-1 (057) contract update: that
+    pixel-tier verdict for a FLAGGED focus expectation is ``uncertain`` (the
+    no-data case), not the old definitive false failure."""
     before = _observation(_white(), ui_elements=_elements(["field"], focused=True))
     after_image = _white()
     after_image.putpixel((32, 24), (0, 0, 0))
@@ -235,7 +242,8 @@ def test_f1_engine_chain_uncorroborated_digest_defers_to_pixel_tier() -> None:
     engine = VerificationEngine(judge=None)
     result = engine.verify(_focused_intent("Edit colors dialog opens"), before, after)
     assert result.verification_method != "focus_change"
-    assert result.outcome == "failed"  # the honest pixel-tier verdict
+    assert result.outcome == "uncertain"  # the honest pixel-tier no-data verdict
+    assert result.outcome != "verified"  # the digest change alone proves nothing
 
 
 # --- F2: signal (a) needs a real focus marker on at least one side -----------------------------
@@ -259,7 +267,10 @@ def test_f2_unfocused_reenumeration_order_change_does_not_verify() -> None:
     )
     engine = VerificationEngine(judge=None)
     chain = engine.verify(_focused_intent(), before, after)
-    assert chain.outcome == "failed"  # pixel tier honestly fails identical pixels
+    # W-1 (057) contract update: identical pixels + flagged focus expectation ->
+    # the pixel tier's no-data case degrades to uncertain (never the old false
+    # failure; never a free verified).
+    assert chain.outcome == "uncertain"  # pixel tier cannot observe a focus change
 
 
 def test_f2_focus_appearing_where_absent_still_verifies() -> None:

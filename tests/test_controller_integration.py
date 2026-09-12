@@ -567,16 +567,21 @@ async def test_computer_execute_expected_effect_and_failure_shapes(
         limits=FAST_LIMITS,
     )
     effect = await server.computer_execute(
-        session_id, "click", x=15, y=15, approved=False, expected_effect="the screen changes"
+        session_id, "hotkey", keys=["ctrl", "a"], approved=False, expected_effect="the screen changes"
     )
     effect = execute_payload(effect)  # REM-A: executed -> content blocks
-    # A stated expected effect that did not occur is reported failed — never silently OK.
+    # A stated expected effect that did not occur is reported failed — never silently
+    # OK. The action is a HOTKEY (unflagged visual-change intent, legacy failure
+    # semantics): a flagged CLICK with a focus-type expectation degrades to uncertain
+    # under the W-1 (057) contract, so it can no longer pin the definitive failure.
     assert effect["ok"] is False
     assert effect["verification"]["outcome"] == "failed"
 
     rejected = await server.computer_execute(session_id, "click", x=8000, y=10)
     assert rejected["ok"] is False
-    assert rejected["message"] == "Grounding rejected."
+    # W-2 (057): the message names the REAL gate (grounding) instead of the generic
+    # "Grounding rejected." stamp.
+    assert rejected["message"].startswith("Action rejected by grounding:")
     assert rejected["reasons"]
 
     invalid = await server.computer_execute(session_id, "teleport")
@@ -587,7 +592,7 @@ async def test_computer_execute_expected_effect_and_failure_shapes(
     stopped = await server.computer_execute(session_id, "wait", delta=1)
     assert stopped["ok"] is False
     assert "stopped" in stopped["message"].lower()
-    assert executed_summary(backend) == [("click", (15, 15), None)]  # only the first action ran
+    assert executed_summary(backend) == [("hotkey", None, None)]  # only the first action ran
 
 
 async def test_computer_execute_dry_run_never_executes(
@@ -813,7 +818,8 @@ async def test_ground_phase_failure_emits_failed_grounding_audit(
     response = await server.computer_execute(session_id, "click", x=5000, y=10)
 
     assert response["ok"] is False
-    assert response["message"] == "Grounding rejected."
+    # W-2 (057): the rejection names the real gate (grounding) in the message.
+    assert response["message"].startswith("Action rejected by grounding:")
     events = audit_events(bundle, session_id)
     grounding_failures = [
         event for event in events if event["event_type"] == "grounding" and event.get("result") == "failed"

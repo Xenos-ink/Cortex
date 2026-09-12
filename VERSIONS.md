@@ -69,15 +69,34 @@ fixed, red-teamed, and validated live on Kimi Code + GLM-5V driving MS Paint.
 - **Wire schemas:** Optional parameters advertise type-array forms instead of `anyOf`
   (runtime validation semantics unchanged; `limits` still fail-closed strict).
 
-## Unreleased
+## v0.5.6 (2026-09-11) — RELEASED (truthful verification & resilient follow_ups batching)
+
+Focus-type clicks with a stated expectation could false-fail when the intended
+transition was invisible to the pixel diff; that false verdict flushed `follow_ups`
+batches; validation rejections carried a generic stamp. All three classes are fixed
+here. This release also ships the v0.5.5 hardening work below (desktop-safe E2E
+gating, run_goal removal, 3x mechanical speed).
 
 ### Fixed
 
-- **D6 desktop-safety gating of the real-input E2E suite (mission 056, R-8)** — plain
+- **False "failed" verification on focus-type clicks** — a focus-type click
+  whose stated `expected_effect` describes a focus/dialog transition is often
+  invisible to the pixel diff; a sub-threshold visual diff now degrades to an honest
+  `uncertain` instead of a definitive false `failed` (legacy semantics preserved for
+  unflagged intents; uncertain is never success, and a real above-threshold change
+  still verifies).
+- **`follow_ups` batches flushed by a false failure** — a queued batch no longer
+  stops on an executed item's verification `failed`: the input dispatched, the next
+  item re-grounds from the fresh post-action capture, and per-item truthful verdicts
+  (ok=False + evidence) are still returned; `CORTEX_QUEUE_STRICT_VERIFY=1` restores
+  the v0.5.5 stop-on-failed behavior.
+- **Generic rejection stamps** — validation rejections name the
+  actual gate (allowlist / staleness / focus) instead of a generic
+  "Grounding rejected." stamp, so weak drivers stop burning turns decoding `reasons`.
+- **Desktop-safety gating of the real-input E2E suite** — plain
   `pytest tests` runs used to execute the real-Windows E2E tests whenever
-  `CUMCP_RUN_E2E` leaked into the environment (an agent "full suite" run did exactly
-  that and typed `e2e-typed-7391 quick brown fox` into a Notepad window the USER had
-  open — wrong-window attach). The gate is now a loud, fail-closed contract pinned by
+  `CUMCP_RUN_E2E` leaked into the environment (for example when the variable leaks into the
+  environment from another tooling process). The gate is now a loud, fail-closed contract pinned by
   tests: e2e-marked tests SKIP BY DEFAULT with a skip reason that states the exact
   opt-in (`CUMCP_RUN_E2E=1 python -m pytest tests/e2e`) and WARNs that opting in
   drives real keyboard/mouse input on the live desktop; only the exact variable name
@@ -86,7 +105,11 @@ fixed, red-teamed, and validated live on Kimi Code + GLM-5V driving MS Paint.
 
 ### Changed
 
-- **Unique-window isolation in the E2E suite (D6 wrong-window defense)** — e2e app
+- **Served tool docs re-taught** — the `computer_execute` description, module
+  docstrings, and SAFETY/ARCHITECTURE behavior text now teach the new queue semantics
+  (uncertain AND executed-failed verdicts continue the batch), the gate-naming
+  rejection messages, and the `CORTEX_QUEUE_STRICT_VERIFY` escape hatch.
+- **Unique-window isolation in the E2E suite** — e2e app
   tests can no longer attach to anything they did not launch themselves. Notepad
   instances are launched with scratch files whose names embed a run-unique token
   (`cumcp-e2e-<pid>-<n>-<ts>`, so the window title carries it) and attach goes through
@@ -96,17 +119,16 @@ fixed, red-teamed, and validated live on Kimi Code + GLM-5V driving MS Paint.
   process the suite launched; the browser page title embeds the same run-unique token.
   Teardown is hardened to close exactly what was opened (exact-hwnd `close_window`
   instead of a class/title re-search; `kill_process_tree` stays pid-scoped). All
-  pinned WITHOUT real input in `tests/test_r8_pins.py` (41 pins: gate fail-closed
+  pinned without real input in `tests/test_r8_pins.py` (gate fail-closed
   matrix, marker-only attach with stubbed enumeration, exact-hwnd teardown,
-  marker-presence checks). Standard suite: 1195 passed / 7 skipped (the 7 skips are
-  the gated e2e tests with the loud reason).
+  marker-presence checks).
 
 ### Performance
 
-- **R-5 mechanical per-action speed (mission 056)** — the direct-action pipeline now
+- **Mechanical per-action speed** — the direct-action pipeline now
   runs one full capture instead of three on the steady-state path, and verification
   diffs raw frames instead of re-decoding the PNG it just watched get encoded.
-  Live audit reconstruction (4 kimi sessions, n=20 actions) showed each direct
+  Per-action profiling showed each direct
   action paid THREE full captures (direct_request + validate + post_action,
   p50 132–174 ms each) plus a two-PNG-decode pixel diff (p50 101 ms); the honest
   live baseline was ~428 ms mechanical per action (excluding the host's own observe
@@ -146,7 +168,7 @@ fixed, red-teamed, and validated live on Kimi Code + GLM-5V driving MS Paint.
     determinism: identical pixels → identical bytes; digests/staleness unaffected).
   - **`CORTEX_PNG_COMPRESS_LEVEL`** (0–9, default unset = PIL's own = today's bytes)
     — opt-in encode/size trade for mechanical throughput.
-  Measured on the mission desktop (real capture, input stubbed): per-action p50
+  Measured on a real desktop (real capture, input stubbed): per-action p50
   198.5 ms paced (was ~428 ms live), verification p50 101→33.7 ms, observe p50
   ~70–98 ms, identity probe 0.8 ms. The remaining floor is two GDI BitBlt
   captures (~40 ms each, hardware-bound) + two lossless PNG encodes (~27–80 ms on
@@ -154,8 +176,7 @@ fixed, red-teamed, and validated live on Kimi Code + GLM-5V driving MS Paint.
   require removing a mandatory capture or the lossless internal format, both
   verification-semantics changes this wave is forbidden to make. Back-to-back
   host calls still wait behind `min_screenshot_interval_ms=250` (contractual).
-  Suite: 1131 passed / 7 skipped (1109 baseline + 22 R-5 pins in
-  `tests/test_r5_speed_optimization.py`).
+ 
 
 ### Changed
 
@@ -181,8 +202,7 @@ fixed, red-teamed, and validated live on Kimi Code + GLM-5V driving MS Paint.
   and their domain rules remain pinned by unit tests but are no longer reachable
   from any tool. Tests: loop-only suites removed, shared-behavior suites
   retargeted to the five-tool surface (not weakened); E2E and benchmark runner
-  retargeted to direct calls. Full suite: 1096 passed, 7 skipped (the gated
-  real-Windows E2E tests), zero failures.
+  retargeted to direct calls.
 
 **Compatibility notes:** BREAKING for any host that still called `run_goal`,
 `create_subtask`, `list_subtasks`, `run_subtask`, or `get_session_progress` —
@@ -203,6 +223,18 @@ wins from v0.5.5 (content-block executes, flat type-array optionals, no
   `CORTEX_IMAGE_DELIVERY=text` in the MCP server `env` block as the deterministic
   fallback for hosts whose default model cannot view images. Wording only — the
   D1 mechanism, defaults, and precedence are unchanged.
+
+**Compatibility notes:** default `follow_ups` queue semantics changed — an
+EXECUTED item whose verification outcome is `failed` no longer stops the batch (the
+honest failed verdict still rides its per-item `follow_up_results` entry); set
+`CORTEX_QUEUE_STRICT_VERIFY=1` to restore the strict stop-on-failed behavior.
+Rejection `message`s now name the actual gate instead of the literal
+"Grounding rejected." — drivers matching that exact string must match the new
+gate-naming messages (`Action rejected by grounding/staleness check/validation/focus
+allowlist: …`); the structured `reasons` payloads are unchanged. Unflagged
+visual-change intents (drag, scroll, type, unstated expectations) keep their exact
+pre-REM-B verification semantics; a flagged focus-type click can now answer
+`uncertain` where it previously false-answered `failed` (never a new success).
 
 
 ## v0.5.0 (2026-09-07) — RELEASED (performance & effectiveness)

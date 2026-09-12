@@ -78,12 +78,14 @@ PERF-004 loop-economics doctrines (additive; no gate, guarantee, or audit is rem
 - **Queued host actions (C7)**: ``run_single`` accepts trailing-optional
   ``follow_ups`` (max :data:`~computer_use_mcp.models.MAX_FOLLOW_UPS`). Every queue
   item passes the FULL independent pipeline exactly like a single action; the queue
-  stops at the first DEFINITIVE verification failure, safety rejection, approval
-  requirement, or post-action DIGEST SURPRISE (a queued item's staleness probe shows
-  the screen changed since the premise it was grounded from — speculative actions
-  never run against a screen nobody has seen). An UNCERTAIN verification does not
-  stop the queue (REM-B: uncertain is not failure) but is reported honestly per
-  item.
+  stops on safety rejection, approval requirement, validator/grounding rejection, or
+  post-action DIGEST SURPRISE (a queued item's staleness probe shows the screen
+  changed since the premise it was grounded from — speculative actions never run
+  against a screen nobody has seen). An UNCERTAIN verification does not stop the
+  queue (REM-B: uncertain is not failure), and neither does the ``failed`` verdict
+  of an EXECUTED item (the input dispatched, the next item re-grounds from
+  the fresh post-action capture, and the honest verdict rides the per-item entry;
+  ``CORTEX_QUEUE_STRICT_VERIFY=1`` restores the strict stop-on-failed behavior).
 """
 
 from __future__ import annotations
@@ -212,6 +214,23 @@ def _validate_reuse_window_ms() -> float:
     except ValueError:
         return _VALIDATE_REUSE_MS_DEFAULT
     return value if value >= 0 else _VALIDATE_REUSE_MS_DEFAULT
+
+
+# --- queue strict-verify knob -------------------------------------------------------------
+#: Env knob name: ``CORTEX_QUEUE_STRICT_VERIFY`` — set to exactly ``1`` to restore the
+#: v0.5.5 stop-on-failed queue semantics (an EXECUTED item whose verification outcome is
+#: ``failed`` stops the batch). Default (unset/any other value): the queue CONTINUES past
+#: an executed item's failed verdict — the input physically dispatched and safety already
+#: admitted it; the honest failed verdict (ok=False + evidence) still rides the per-item
+#: ``follow_up_results`` entry. Read lazily at each queue decision (test-toggleable).
+QUEUE_STRICT_VERIFY_ENV = "CORTEX_QUEUE_STRICT_VERIFY"
+
+
+def _queue_strict_verify() -> bool:
+    """Resolve the strict-verify escape hatch (only the exact string ``1`` enables)."""
+    import os
+
+    return os.environ.get(QUEUE_STRICT_VERIFY_ENV, "").strip() == "1"
 
 
 def _image_to_base64(image: Image.Image) -> str:
@@ -2044,13 +2063,15 @@ class ComputerUseAgent:
         :data:`~computer_use_mcp.models.MAX_FOLLOW_UPS` additional actions after the
         primary action. Each queue item passes the FULL independent pipeline
         (ground -> validate -> safety -> approval semantics -> execute -> verify)
-        exactly like a single action; the queue stops at the first DEFINITIVE
-        verification failure, safety rejection, approval requirement, or
-        post-action digest surprise. An UNCERTAIN verification (no expectation
-        stated / a non-visual action pixels cannot judge) does NOT stop the queue
-        (REM-B H2b) — its per-item entry keeps the honest uncertain verdict.
-        Every executed action emits its own audit events. ``approved``
-        applies to every item (the safety policy evaluates each independently).
+        exactly like a single action; the queue stops at a safety rejection,
+        approval requirement, validator/grounding rejection, or post-action digest
+        surprise. An UNCERTAIN verification (no expectation stated / a non-visual
+        action pixels cannot judge) does NOT stop the queue (REM-B H2b), and
+        neither does the ``failed`` verdict of an EXECUTED item (the
+        honest failed verdict rides the per-item entry while the batch continues;
+        ``CORTEX_QUEUE_STRICT_VERIFY=1`` restores stop-on-failed). Every executed
+        action emits its own audit events. ``approved`` applies to every item (the
+        safety policy evaluates each independently).
         """
         if follow_ups:
             specs = list(follow_ups)[:MAX_FOLLOW_UPS]
@@ -2078,11 +2099,15 @@ class ComputerUseAgent:
         becomes the next item's grounding source — the observe-reuse doctrine). Stops:
         named interference stops (modal dialog / focus drift), safety rejection,
         approval requirement, validator rejection, digest surprise, stop token, limit
-        trip, DEFINITIVE verification failure (``result.ok is False`` with a failed
-        verdict), or a missing post-action observation. REM-B (H2b): an item whose
+        trip, or a missing post-action observation. REM-B (H2b): an item whose
         verification is UNCERTAIN (no expectation stated / non-visual action the diff
         cannot judge) does NOT stop the queue — uncertain is not failure — but its
         per-item result keeps the honest uncertain verdict and ``ok=False``.
+        an EXECUTED item whose verification outcome is ``failed`` also does
+        NOT stop the queue by default — the input dispatched and the next item
+        re-grounds from the fresh post-action capture; the honest failed verdict rides
+        the per-item entry. ``CORTEX_QUEUE_STRICT_VERIFY=1`` restores the v0.5.5
+        stop-on-failed behavior.
         """
         queue_items: list[tuple[GroundedAction, str | None]] = [(action, expected_effect)]
         for spec in follow_ups:
@@ -2143,7 +2168,27 @@ class ComputerUseAgent:
                 )
                 break
             item_verification = outcome.result.verification
-            if not outcome.result.ok and not (
+            # an EXECUTED item whose verification outcome is
+            # "failed" no longer DEFINITIVELY stops the queue. The input physically
+            # dispatched and safety already admitted it; the next item re-grounds from
+            # this item's fresh post-action capture, so nothing speculative ever runs
+            # against an unseen screen. A FALSE failure (sub-threshold focus/caret
+            # change, slow dialog open) must not flush the remaining batch items and
+            # force 1-action-per-call driving. The honest failed verdict (ok=False,
+            # note, evidence) still rides the per-item follow_up_results entry. Every
+            # other stop is untouched: non-executed kinds (rejections, safety denial,
+            # approval requirement, digest surprise, error), named interference stops,
+            # the uncertain carve-out below, and the no-post-observation guard.
+            # CORTEX_QUEUE_STRICT_VERIFY=1 restores the v0.5.5 stop-on-failed behavior
+            # (read lazily; test-toggleable like CORTEX_DIFF_FAST).
+            verification_failed = (
+                not outcome.result.ok
+                and item_verification is not None
+                and item_verification.outcome == "failed"
+            )
+            if verification_failed and not _queue_strict_verify():
+                pass  # continue: the honest failed verdict rides the per-item entry
+            elif not outcome.result.ok and not (
                 item_verification is not None and item_verification.outcome == "uncertain"
             ):
                 stopped_reason = (
@@ -2273,7 +2318,10 @@ class ComputerUseAgent:
                     SingleActionOutcome(
                         kind="rejected",
                         reasons=[f"Grounding failed: {exc}"],
-                        message="Grounding rejected.",
+                        # name the REAL gate in `message` — weak drivers
+                        # read `message` first and a generic "Grounding rejected."
+                        # sent them decoding `reasons` for turns.
+                        message=f"Action rejected by grounding: {str(exc)[:180]}",
                     ),
                     None,
                 )
@@ -2386,7 +2434,8 @@ class ComputerUseAgent:
                         SingleActionOutcome(
                             kind="rejected",
                             reasons=[f"Stale observation and re-grounding failed: {re_ground_error}"],
-                            message="Grounding rejected.",
+                            # name the staleness gate, not a generic stamp.
+                            message=f"Action rejected by staleness check: {str(re_ground_error)[:180]}",
                         ),
                         None,
                     )
@@ -2417,7 +2466,13 @@ class ComputerUseAgent:
                     SingleActionOutcome(
                         kind="rejected",
                         reasons=list(validation.reasons),
-                        message="Grounding rejected.",
+                        # name the REAL gate in `message` — the live
+                        # session's allowlist rejection arrived as a generic
+                        # "Grounding rejected." and cost the driver thinking turns.
+                        message=(
+                            "Action rejected by validation: "
+                            + (str(validation.reasons[0])[:180] if validation.reasons else "grounding failed.")
+                        ),
                     ),
                     None,
                 )
@@ -2441,7 +2496,15 @@ class ComputerUseAgent:
                     SingleActionOutcome(
                         kind="rejected",
                         reasons=list(focus_rejection.reasons),
-                        message="Grounding rejected.",
+                        # the focus-window allowlist gate names itself.
+                        message=(
+                            "Action rejected by focus allowlist: "
+                            + (
+                                str(focus_rejection.reasons[0])[:180]
+                                if focus_rejection.reasons
+                                else "focus gate refused."
+                            )
+                        ),
                     ),
                     None,
                 )

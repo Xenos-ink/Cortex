@@ -345,7 +345,10 @@ class ScreenshotDiffStrategy:
       ``STRONG_PIXEL_DELTA`` or more (mean alone cannot see compact changes such as
       drawn strokes or small controls);
     - ``expected_change=True``: change detected -> ``verified``; none ->
-      ``failed``;
+      ``failed`` — except an intent flagged ``FOCUS_CHANGE_INTENT_FLAG`` (a
+      focus-type click expectation pixels cannot observe), whose not-observed
+      sub-threshold diff degrades to ``uncertain`` (W-1; never success, and a
+      real above-threshold change still ``verified``);
     - ``expected_change=False``: no change detected -> ``verified``; change ->
       ``failed``;
     - ``expected_change=None`` (no expectation stated): change detected ->
@@ -431,6 +434,24 @@ class ScreenshotDiffStrategy:
                     change_confidence,
                     changed=True,
                 )
+            # a flagged focus-type expectation ("Hex input
+            # focused", "Edit colors dialog opens") describes a transition pixels
+            # CANNOT observe. A sub-threshold diff here is the strategy's no-data
+            # case, not proof of absence — the exact evidence class this tier
+            # degrades to ``uncertain`` when no expectation is stated (below).
+            # Emitting a definitive ``failed`` from absent evidence false-failed the
+            # live Paint session (mean 0.000/0.013, strong 0 -> failed) and killed
+            # the follow_ups queue. Doctrine: degrade to ``uncertain`` (never
+            # success); unflagged visual-change intents keep their exact legacy
+            # failure semantics below. Zero extra captures: reuses the diff
+            # computed above (2-capture floor / CORTEX_DIFF_FAST untouched).
+            if intent.metadata.get(FOCUS_CHANGE_INTENT_FLAG):
+                note = (
+                    "No pixel evidence of the stated focus-type expectation"
+                    + (f": {intent.expected_effect}" if intent.expected_effect else "")
+                    + "; focus/dialog transitions are often invisible to the pixel diff."
+                )
+                return _uncertain(self.name, note + " Uncertain is never success.", evidence, 0.4, changed=False)
             note = "Expected change was not observed"
             if intent.expected_effect:
                 note += f": {intent.expected_effect}"
@@ -1027,9 +1048,10 @@ class FocusChangeStrategy:
 
     Any one of (a)/(b) showing change, or a CORROBORATED (c), is DEFINITIVE ``verified`` with a note naming
     the signal that fired. NO signal showing change leaves the verdict to the
-    next tiers — the screenshot-diff strategy keeps its exact existing failure
-    semantics (honesty preserved: this strategy NEVER emits ``failed`` and never
-    upgrades a pixel-proven non-change).
+    next tiers — for a flagged intent the screenshot-diff strategy degrades a
+    sub-threshold diff to ``uncertain`` (never ``failed`` from absent
+    evidence); unflagged intents keep its exact legacy failure semantics, and it
+    never upgrades a pixel-proven non-change.
 
     Scope gate: only intents flagged ``{FOCUS_CHANGE_INTENT_FLAG}`` in
     ``intent.metadata`` (set by the controller's ``_build_intent`` for CLICK /

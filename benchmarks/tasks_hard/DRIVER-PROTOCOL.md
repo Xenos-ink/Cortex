@@ -86,8 +86,9 @@ already returned at connect time (`client.has_capability("follow_ups")`, or sear
 ### Runtime cautions (observed on the pre-fix server)
 
 - Tool-level success is NOT action success: a `computer_execute` result envelope can be
-  ok while the embedded JSON says `"ok": false` (e.g. "Grounding rejected."). Drivers
-  MUST parse the returned JSON's `ok` field, not just the transport result.
+  ok while the embedded JSON says `"ok": false` (e.g. "Action rejected by focus
+  allowlist: …"). Drivers MUST parse the returned JSON's `ok` field, not just the
+  transport result.
 - With `allowed_processes` configured, a `focus_window` action may fail closed ("target
   window could not be resolved ... failing closed") even for an allowlisted app whose
   window the server cannot resolve to the allowlist. Put the target app in the

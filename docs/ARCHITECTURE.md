@@ -34,7 +34,7 @@ types — include the wave's additive members).
   `FakeComputerBackend` implements the same contracts for tests and non-Windows import.
 - Python >= 3.11; runtime deps: `mcp`, `pydantic`, `Pillow`, `mss`, `pyautogui` (pyautogui is now the SELECTABLE FALLBACK input engine; the default physical-input path is raw Win32 `SendInput` via stdlib ctypes — PERF-004)
   (win32), `httpx`. No OCR/UIA engines are installed (deliberate non-goal; see §12).
-- Version: `0.5.5` (`__init__.py`; `pyproject.toml` aligned to the same value).
+- Version: `0.5.6` (`__init__.py`; `pyproject.toml` aligned to the same value).
 - PERF-004 release: interference guards, SendInput engine, verification ladder, run-log — see VERSIONS.md and ROADMAP.md.
 - Test/benchmark layout: `tests/` unit+integration (fakes); `tests/e2e/` real-Windows
   E2E gated behind `CUMCP_RUN_E2E=1` (10 tests: 7 desktop + 3 benchmark-harness that
@@ -485,7 +485,9 @@ path redacted (F2: `message`, `action.text`, `action.reason`, `verification.note
 `verification.evidence` pass `redact_text` before leaving the server — the audit sink
 and provider payload were already enforced; the response was the one remaining
 unredacted surface);
-`rejected`: `{ok:false, message:"Grounding rejected.", reasons:[…]}`
+`rejected`: `{ok:false, message, reasons:[…]}` where `message` names the actual gate
+(grounding / staleness / validation / focus-allowlist, e.g. `Action rejected by focus
+allowlist: …` — never a generic stamp)
 (one automatic re-observe + re-validate happens first on `STALE_OBSERVATION`);
 `safety_denied`: `{ok:false, message}` (includes all CRITICAL blocks);
 `approval_required`: `{ok:false, requires_approval:true, message}`;
@@ -497,9 +499,11 @@ word hotkey payloads → key names on `keypress`/`hotkey`).
 PERF-004 C4 (trailing optional): `include_screenshot_after=false` OMITS the heavy
 `screenshot_after_base64` from the response; omitted/None keeps the legacy payload.
 PERF-004 C7 (trailing optional): `follow_ups` (max 5 `ActionSpec` dicts) queues
-actions that each pass the FULL independent pipeline — the queue stops at the first
-verification failure, safety rejection, approval requirement, or post-action digest
-surprise; per-item results arrive in additive `follow_up_results` +
+actions that each pass the FULL independent pipeline — the queue stops on safety
+rejection, approval requirement, validator/grounding rejection, or post-action digest
+surprise; an EXECUTED item's uncertain OR failed verification verdict rides its
+per-item entry while the batch continues (`CORTEX_QUEUE_STRICT_VERIFY=1` restores the
+strict stop-on-failed); per-item results arrive in additive `follow_up_results` +
 `follow_ups_stopped_reason`, and a `queue` audit event summarizes the batch (every
 item still emits its own per-phase events).
 For `action="drag"`, `x`/`y` are the drag start and `x2`/`y2` the drag end (both

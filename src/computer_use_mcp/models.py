@@ -362,7 +362,10 @@ class ExecutionResult(BaseModel):
 
 #: Hard cap on ``follow_ups`` accepted by one ``computer_execute`` call (PERF-004 C7):
 #: a queued batch is speculative planning (UFO2-style), deliberately small; every entry
-#: still passes the FULL independent pipeline and the queue stops at the first failure.
+#: still passes the FULL independent pipeline; blocking failures (rejections, safety,
+#: approval, digest surprise) stop the queue while an executed item's uncertain OR
+#: failed verification verdict rides its per-item entry (W-2/057;
+#: ``CORTEX_QUEUE_STRICT_VERIFY=1`` restores stop-on-failed).
 MAX_FOLLOW_UPS = 5
 
 

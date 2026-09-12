@@ -24,7 +24,10 @@ order — the run_goal family is REMOVED PERMANENTLY):
   ``include_screenshot_after=False`` (additive) omits the heavy
   ``screenshot_after_base64`` from the response; omitted or None keeps the legacy payload.
   ``follow_ups`` (additive, max 5) queues actions that each pass the FULL independent
-  pipeline; the queue stops at the first failure — zero bypass.
+  pipeline; the queue stops only on genuinely blocking conditions (rejection, safety,
+  approval, digest surprise, dispatch error) — an executed item's uncertain OR failed
+  verification verdict rides its per-item entry while the batch continues (W-2/057;
+  ``CORTEX_QUEUE_STRICT_VERIFY=1`` restores stop-on-failed).
 - ``stop_session`` keeps its signature/return shape; it now arms the thread-safe
   StopToken kill path and audits stop + emergency_stop.
 - ``start_session`` succeeds with no API key (provider construction is lazy at the first
@@ -1557,15 +1560,17 @@ async def computer_execute(
     action specs (same fields as this tool's action parameters, e.g.
     {"action": "click", "x": 10, "y": 20, "expected_effect": "..."}). Each follow-up
     passes the FULL independent pipeline (validate -> safety -> approval semantics ->
-    execute -> verify) exactly like a single action — zero bypass; the queue stops at
-    the first DEFINITIVE verification failure, safety rejection, approval requirement,
-    or post-action digest surprise (the screen changed since the queued premise was
-    captured). An UNCERTAIN verification (no expectation stated / a non-visual
-    action pixels cannot judge) does NOT stop the queue; its per-item entry keeps
-    the honest uncertain verdict. Batch small related groups and end the batch with
+    execute -> verify) exactly like a single action — zero bypass. The queue stops at a
+    safety rejection, approval requirement, validator/grounding rejection, or post-action
+    digest surprise (the screen changed since the queued premise was captured). An
+    UNCERTAIN verification does NOT stop the queue, and neither does a "failed"
+    verification of an EXECUTED item — the keystroke/click physically dispatched, so the
+    honest failed verdict (ok=false) rides that item's entry in follow_up_results while
+    the rest of the batch still runs. Batch small related groups and end the batch with
     an observation.
     Per-item results arrive in the additive ``follow_up_results`` field (bounded, no
-    per-item screenshots) with ``follow_ups_stopped_reason`` (None = all verified).
+    per-item screenshots) with ``follow_ups_stopped_reason`` (None = the batch ran to
+    completion).
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -1638,7 +1643,7 @@ async def computer_execute(
             # T8: rejections carry their SPECIFIC message (e.g. "Focus interference: the
             # OS-focused window is not the session target.") instead of the generic
             # grounding text; the structured event payloads ride in ``reasons``.
-            "message": outcome.message or "Grounding rejected.",
+            "message": outcome.message or "Action rejected (no gate detail available).",
             "reasons": outcome.reasons,
         }
     elif outcome.kind == "safety_denied":
