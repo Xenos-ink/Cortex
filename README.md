@@ -236,6 +236,115 @@ Rollback if needed: if something breaks after the update, return to the previous
 When done: summarize the old and new versions (from pyproject.toml and VERSIONS.md), any local changes you stashed, and the final verification result.
 ````
 
+## Installation (agent prompts)
+
+Cortex has one canonical install location: the repository clone and its own `.venv` live together in `%LOCALAPPDATA%\Cortex` on Windows and `~/.local/share/cortex` on every other platform, so any agent that follows these prompts registers the same command path and an existing install is recognizable at a glance. One-line verification for any install: `"<canonical venv python>" -m computer_use_mcp.cli probe` — it prints a single `PROBE PASS` line (exactly the five tools) and exits 0 only then. The two prompts below are self-contained: copy either one into any MCP-capable agent (ZCode, Claude, Cursor, Codex, Kimi, …) and it will install/register/verify itself — CHECK first, clone or fast-forward the canonical dir, build the venv, run the probe, register in its own config without ever overwriting an existing cortex entry, and report.
+
+**Install prompt**
+
+```text
+You are asked to make the Cortex MCP server available to yourself (this agent). Follow exactly; do not skip the CHECK.
+
+CONSTANTS (resolve them once and substitute everywhere below):
+- CANONICAL DIR (where the repo clone and its .venv live):
+    Windows:  %LOCALAPPDATA%\Cortex
+    Other OS: ~/.local/share/cortex
+  <canonical> below means this directory for your platform; <venv python> means
+  <canonical>\.venv\Scripts\python.exe on Windows or <canonical>/.venv/bin/python otherwise.
+- REPO URL: https://github.com/Xenos-ink/Cortex.git
+- REGISTRATION BLOCK (what you will add to YOUR OWN MCP config in STEP 4):
+    command = "<venv python>"
+    args = ["-m", "computer_use_mcp.server"]
+    cwd = "<canonical>"        (include it only when your config format supports a cwd field)
+
+STEP 1 — CHECK (do this before anything else):
+  a) Does <canonical> with its .venv already exist, and does the probe pass? Run:
+       "<venv python>" -m computer_use_mcp.cli probe
+     PASS prints one line starting with "PROBE PASS" and exits 0.
+  b) Get the installed version (this is the X for the report below). Run:
+       "<venv python>" -c "import computer_use_mcp; print(computer_use_mcp.__version__)"
+  c) Does YOUR OWN MCP config already contain a "cortex" entry whose command points at
+     the canonical <venv python>?
+  If a) and c) are both true: report "already installed and registered (version X)" and
+  STOP. Do not reinstall and do not touch any config file.
+
+STEP 2 — GET THE CODE into the canonical dir:
+  - <canonical> missing: create it by cloning:
+      git clone https://github.com/Xenos-ink/Cortex.git "<canonical>"
+  - <canonical> already present: bring it up to date, fast-forward only:
+      git -C "<canonical>" fetch origin
+      git -C "<canonical>" merge --ff-only origin/main
+    If that merge is not a fast-forward: STOP and tell the user. NEVER run git reset or
+    any --hard command in the canonical dir.
+
+STEP 3 — INSTALL (inside the canonical clone):
+  - If <canonical>/.venv is missing, create it (from inside <canonical>):
+      python -m venv .venv
+  - Refresh the editable install:
+      "<venv python>" -m pip install -e "<canonical>"
+  - Verify with the probe from STEP 1a. It MUST print PASS and list exactly these 5 tools:
+      start_session, stop_session, computer_observe, computer_screenshot, computer_execute
+    If it prints FAIL: report the printed reason to the user and stop.
+
+STEP 4 — REGISTER THE SERVER FOR YOURSELF (your own config, not anyone else's):
+  Add the REGISTRATION BLOCK to YOUR OWN MCP config file, in your own format, at your
+  preferred scope. Rules:
+  - Back up your config file before you edit it (keep the backup next to it).
+  - If a "cortex" entry already exists in it: do NOT overwrite it. Compare it with the
+    REGISTRATION BLOCK, report the differences to the user, and ask how to proceed.
+  - If your config file does not exist yet, create it in your agent's documented location.
+
+STEP 5 — REPORT to the user:
+  - the installed version,
+  - the canonical dir,
+  - the config file you edited (full path),
+  - the probe result (the PASS line),
+  - and: restart yourself / your host to load the newly registered server.
+```
+
+**Update prompt**
+
+```text
+You are asked to update the Cortex MCP server installation for yourself. Follow exactly; never force.
+
+CONSTANTS (identical to the install prompt; resolve once, substitute everywhere):
+- CANONICAL DIR:  Windows: %LOCALAPPDATA%\Cortex   Other OS: ~/.local/share/cortex
+  <canonical> means this directory for your platform; <venv python> means
+  <canonical>\.venv\Scripts\python.exe on Windows or <canonical>/.venv/bin/python otherwise.
+- REPO URL: https://github.com/Xenos-ink/Cortex.git
+- REGISTRATION BLOCK (for reference only — an update does NOT change it):
+    command = "<venv python>"
+    args = ["-m", "computer_use_mcp.server"]
+    cwd = "<canonical>"        (when the config format supports it)
+
+STEP 1 — LOCATE: if <canonical> (or its .venv) is missing there is nothing to update:
+  follow the Install prompt steps instead, and stop after its STEP 5.
+
+STEP 2 — RECORD THE CURRENT STATE, THEN FAST-FORWARD:
+  - Record the version BEFORE. Run:
+      "<venv python>" -m computer_use_mcp.cli probe
+      "<venv python>" -c "import computer_use_mcp; print(computer_use_mcp.__version__)"
+  - Bring the clone up to date, fast-forward only:
+      git -C "<canonical>" fetch origin
+      git -C "<canonical>" merge --ff-only origin/main
+    If that merge is not a fast-forward: STOP and tell the user. NEVER run git reset or
+    any --hard command in the canonical dir.
+
+STEP 3 — REFRESH AND VERIFY:
+  - Refresh the editable install:
+      "<venv python>" -m pip install -e "<canonical>"
+  - Re-run the probe. It MUST print PASS (exactly the 5 tools: start_session,
+    stop_session, computer_observe, computer_screenshot, computer_execute).
+    If it prints FAIL: report the printed reason and stop.
+
+STEP 4 — REPORT to the user:
+  - version BEFORE -> version AFTER (re-run the version command if needed),
+  - the probe result (the PASS line),
+  - a note that the MCP config entry needs NO change (the registration block keeps the
+    same command path),
+  - and: restart yourself / your host to load the update.
+```
+
 ## Running the server
 
 ```bash

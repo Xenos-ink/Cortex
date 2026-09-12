@@ -12,6 +12,28 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
+## v0.5.9 (2026-09-12) — RELEASED (canonical install prompts + probe subcommand)
+
+The served-surface verification becomes a first-class command, and installing
+Cortex becomes a copy-paste operation for any MCP-capable agent.
+
+### Added
+
+- **`cortex-mcp probe` subcommand** — one-command stdio verification of the served
+  surface: it starts the server over stdio, performs the zero-input handshake, and
+  passes only when the served surface is exactly the five tools with no `anyOf`/`$ref`
+  schema tokens, printing a single `PROBE PASS` line and exiting 0; any other shape
+  prints a `PROBE FAIL` line and exits non-zero, so shells, scripts, and agent
+  install prompts can gate on the exit code alone.
+- **"Installation (agent prompts)" documentation** — two self-contained copy-paste
+  prompts (Install / Update) that let any MCP-capable agent install, register itself,
+  and verify Cortex in a single canonical location: `%LOCALAPPDATA%\Cortex` on
+  Windows, `~/.local/share/cortex` on every other platform (repository clone and its
+  own `.venv` live together there, so every agent registers the same command path).
+  The prompts preserve the standing guarantees: an existing cortex registration is
+  never clobbered, every config write is backed up first, and updates are
+  fast-forward-only merges that never reset.
+
 ## v0.5.8 (2026-09-12) — RELEASED (global `cortex-mcp` CLI: install/update subcommands with no-clobber agent registration)
 
 A single terminal command now performs the whole install/update lifecycle that

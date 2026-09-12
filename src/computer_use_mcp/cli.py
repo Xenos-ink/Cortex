@@ -1,6 +1,6 @@
 """``cortex-mcp`` — install/update the Cortex MCP registration into recognized agent configs.
 
-Stdlib only (argparse/json/subprocess/pathlib/shutil/tomllib). Two subcommands:
+Stdlib only (argparse/json/subprocess/pathlib/shutil/tomllib). Three subcommands:
 
 - ``install``: provisions ``<repo>/.venv`` (editable install), refreshes the system-python
   console script (best-effort: without an elevated terminal this only warns), registers the
@@ -13,6 +13,8 @@ Stdlib only (argparse/json/subprocess/pathlib/shutil/tomllib). Two subcommands:
 - ``update``: fast-forwards the repo to ``origin/main`` (clean abort when not
   fast-forward — no reset anywhere), refreshes both editable installs, verifies the
   package version before/after, and re-probes the server.
+- ``probe``: verification only — starts the server once over stdio and checks the tool
+  surface, printing a single ``PROBE PASS``/``PROBE FAIL`` line; exit 0 only on PASS.
 
 The manual registration method stays intact: existing entries that already match are left
 untouched (UNCHANGED); existing entries that differ are reported (SKIPPED-EXISTS-USE-FORCE)
@@ -108,6 +110,17 @@ KNOWN_AGENTS: tuple[AgentSpec, ...] = _default_known_agents()
 def default_repo() -> Path:
     """Repo root = two parents up from this file (src/computer_use_mcp/cli.py)."""
     return Path(__file__).resolve().parents[2]
+
+
+def default_probe_python() -> Path:
+    """Default ``probe --python``: the venv python of the repo this cli lives in.
+
+    Resolved from ``__file__`` parents: ``<repo>/.venv/Scripts/python.exe`` (Windows) or
+    ``<repo>/.venv/bin/python`` elsewhere. Falls back to the running interpreter when the
+    repo venv does not exist.
+    """
+    candidate = _venv_python(default_repo() / ".venv")
+    return candidate if candidate.exists() else Path(sys.executable)
 
 
 def build_registration(repo: Path, venv_python: Path, include_cwd: bool = True) -> dict:
@@ -274,16 +287,19 @@ def probe_server(python_exe: Path | str, cwd: Path, timeout: float = 30.0) -> tu
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
     ]
     stdin_payload = "\n".join(json.dumps(m) for m in messages) + "\n"
-    proc = subprocess.Popen(
-        [str(python_exe), "-m", SERVER_MODULE],
-        cwd=str(cwd),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = subprocess.Popen(
+            [str(python_exe), "-m", SERVER_MODULE],
+            cwd=str(cwd),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        return False, f"cannot start {python_exe}: {exc}"
     try:
         try:
             out, _ = proc.communicate(input=stdin_payload, timeout=timeout)
@@ -617,6 +633,18 @@ def cmd_update(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_probe(args: argparse.Namespace) -> int:
+    """One-shot verification: single-line PASS/FAIL; exit 0 only on PASS."""
+    python_exe = Path(args.python) if args.python else default_probe_python()
+    cwd = Path(args.cwd) if args.cwd else default_repo()
+    ok, detail = probe_server(python_exe, cwd, timeout=float(args.timeout))
+    if ok:
+        print(f"PROBE PASS — 5 tools: {', '.join(sorted(EXPECTED_TOOLS))}")
+        return 0
+    print(f"PROBE FAIL — {detail}")
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cortex-mcp",
@@ -660,6 +688,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="print the plan; run nothing"
     )
     p_update.set_defaults(func=cmd_update)
+
+    p_probe = sub.add_parser(
+        "probe",
+        help="verify an install: start the server once and check the 5-tool surface",
+        epilog=(
+            "Exit code: 0 only on PASS (initialize + tools/list return exactly the 5 tools "
+            "with zero anyOf/$ref in the payload); 1 on any failure (surface mismatch, "
+            "forbidden schema token, timeout, no response). Prints exactly one line."
+        ),
+    )
+    p_probe.add_argument(
+        "--python",
+        default=None,
+        help="python executable to launch the server with "
+        "(default: this repo's .venv python, falling back to the running interpreter)",
+    )
+    p_probe.add_argument(
+        "--cwd",
+        default=None,
+        help="working directory for the server process (default: this repo's root)",
+    )
+    p_probe.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="seconds to wait for the server's tools/list response (default: 30)",
+    )
+    p_probe.set_defaults(func=cmd_probe)
     return parser
 
 
