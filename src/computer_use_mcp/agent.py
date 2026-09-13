@@ -865,7 +865,15 @@ class ComputerUseAgent:
             # a deterministic strategy already reaches a verdict. The kind stays
             # model_judge: when every cheap tier is inconclusive the judge still runs.
             if action.action is ActionType.TYPE:
-                expected_text = effect or action.text
+                # R-01: the deterministic text needle for a TYPE action is the TYPED
+                # TEXT itself — the string that actually lands in the field's value —
+                # not the effect prose. Searching the prose made the deterministic
+                # ui_control_text tier abstain on EVERY stated-effect type action and
+                # escalated them all to the pixel band; searching the typed text lets
+                # the deterministic tier decide (verified when the text is visible in
+                # the window title or a control's name/value) with the pixel tier kept
+                # as the escalation for genuinely invisible content (canvas, grid).
+                expected_text = action.text or effect
             elif action.action is ActionType.MOVE:
                 predicate, predicate_name = _cursor_predicate(action)
             elif action.action in {ActionType.KEYPRESS, ActionType.HOTKEY} and effect:
@@ -877,7 +885,14 @@ class ComputerUseAgent:
             elif action.action is ActionType.FOCUS_WINDOW:
                 window_title = action.target
         if kind == VerificationKind.EXPECTED_TEXT.value:
-            expected_text = effect or action.text
+            # R-01 deterministic-first default for TYPE: the typed text is the primary
+            # needle (see the model-judge branch comment); every other expected-text
+            # source keeps the effect-first preference. The tier's absence verdict is
+            # UNCERTAIN (never failed), so an invisible needle can only escalate.
+            if action.action is ActionType.TYPE:
+                expected_text = action.text or effect
+            else:
+                expected_text = effect or action.text
         elif kind == VerificationKind.WINDOW_STATE.value:
             window_title = window_title or effect
         elif kind == VerificationKind.PROCESS_STATE.value:
@@ -2180,13 +2195,72 @@ class ComputerUseAgent:
         NOT stop the queue by default — the input dispatched and the next item
         re-grounds from the fresh post-action capture; the honest failed verdict rides
         the per-item entry. ``CORTEX_QUEUE_STRICT_VERIFY=1`` restores the v0.5.5
-        stop-on-failed behavior.
+        stop-on-failed behavior. R-18: an item that cannot even be CONVERTED to a
+        :class:`GroundedAction` (target-less ``focus_window``, half-specified ``drag``,
+        1-key ``hotkey``, ...) stops before ANY dispatch with the typed
+        ``invalid_follow_up`` stop — zero items run, no raw pydantic
+        ``ValidationError`` escapes (the MCP boundary maps the same condition onto the
+        teaching ``invalid_action`` rejection).
         """
         queue_items: list[tuple[GroundedAction, str | None]] = [(action, expected_effect)]
-        for spec in follow_ups:
-            queue_items.append(
-                (spec.to_grounded(reason_prefix="MCP follow_up action"), spec.expected_effect)
-            )
+        for position, spec in enumerate(follow_ups, start=1):
+            try:
+                grounded_spec = spec.to_grounded(reason_prefix="MCP follow_up action")
+            except Exception as exc:  # noqa: BLE001 - R-18: never an uncaught ValidationError
+                # The conversion loop precedes the pipeline loop, so NOTHING has
+                # dispatched — the legacy fail-closed effect is preserved exactly;
+                # only the error SURFACE changes: a typed rejected outcome (the server
+                # boundary pre-validates the same condition and answers with the
+                # teaching ``invalid_action`` shape; this guard covers direct
+                # ``run_single`` callers with the same zero-uncaught guarantee).
+                rejection = SingleActionOutcome(
+                    kind="rejected",
+                    reasons=[
+                        (
+                            f"follow_ups[{position}] ({spec.action.value}) is not a "
+                            f"valid action: {exc}"
+                        ),
+                        (
+                            "Valid shapes: focus_window needs a non-empty target window "
+                            "title; drag needs x,y start AND x2,y2 end; hotkey needs 2-12 "
+                            "key names (single keys belong on keypress); move needs x,y; "
+                            "ensure_app needs a non-empty \"process[|doc-token]\" target."
+                        ),
+                    ],
+                    message=(
+                        f"Queue rejected before dispatch: follow_ups[{position}] "
+                        f"({spec.action.value}) is not a valid action: {str(exc)[:180]}"
+                    ),
+                    follow_up_results=[
+                        {
+                            "index": position,
+                            "action_type": spec.action.value,
+                            "kind": "rejected",
+                            "ok": False,
+                            "message": f"{type(exc).__name__}: {str(exc)[:200]}",
+                            "reasons": ["invalid_action"],
+                            "requires_approval": False,
+                            "model_confidence": None,
+                            "grounding_confidence": None,
+                            "verification_confidence": None,
+                        }
+                    ],
+                    follow_ups_stopped_reason="invalid_follow_up",
+                )
+                self._audit(
+                    "queue",
+                    action=action,
+                    result="invalid_follow_up",
+                    metadata={
+                        "items": len(follow_ups) + 1,
+                        "executed": 0,
+                        "stopped_reason": "invalid_follow_up",
+                        "invalid_index": position,
+                        "invalid_action": spec.action.value,
+                    },
+                )
+                return rejection
+            queue_items.append((grounded_spec, spec.expected_effect))
         follow_up_results: list[dict[str, Any]] = []
         stopped_reason: str | None = None
         source_observation: Observation | None = None
