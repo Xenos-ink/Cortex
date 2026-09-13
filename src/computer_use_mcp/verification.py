@@ -10,6 +10,21 @@ strategies degrade to ``uncertain`` when they lack the data to decide, and the e
 combined result for all-uncertain chains is itself ``uncertain``. No code path in this
 module maps ``uncertain`` to ``verified``.
 
+Tier-default doctrine (R-01): the built-in chain is ordered DETERMINISTIC-FIRST —
+predicate, window, process, UI-control-text, focus signals — and the pixel-diff tier
+(:class:`ScreenshotDiffStrategy`) is the AMBIGUOUS-BAND ESCALATION, consulted only
+when every deterministic tier ahead of it is inconclusive (the engine returns the
+first definitive verdict, so a deterministic ``verified``/``failed`` ends the chain
+before pixels run). For ``type`` the default intent is ``expected_text`` decided by
+:class:`UiControlTextStrategy` (window title + control text, needle = the TYPED
+text — see the controller's ``_build_intent``); for ``keypress``/``hotkey`` the
+deterministic default is the launch-prefix ``window_state`` promotion, and a stated
+effect keeps the pixel band honest in the escalation role only: absent/sub-threshold
+evidence degrades to ``uncertain`` (never the historical false ``failed``), a real
+above-floor change still verifies. The focus-change transition signals stay
+CLICK-scoped deliberately: a window/element identity change must never verify a
+non-click effect (an unrelated foreground steal would become a false success).
+
 Confidence doctrine (Goal.md section 6): verification confidence is reported separately
 from model/grounding confidence; each strategy returns its own evidence-grounded value.
 """
