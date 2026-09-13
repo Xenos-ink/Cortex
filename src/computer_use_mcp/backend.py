@@ -916,12 +916,22 @@ TYPE_CHUNK_CHARS = _env_int_in_range("CORTEX_TYPE_CHUNK_CHARS", 64, 1, 4096)
 #: reading too early would mistake queue lag for a drop.
 #: ``CORTEX_TYPE_VERIFY_SETTLE_SECONDS`` overrides (0 disables the wait).
 TYPE_VERIFY_SETTLE_SECONDS = _env_nonnegative_float("CORTEX_TYPE_VERIFY_SETTLE_SECONDS", 0.05)
-#: Landing-lag horizon for the SECOND (trust) read of any non-verified verdict: the
-#: 2026-09-13 live evidence (evidence/v06-006/live-desktop) measured a buffer that was
-#: stale-short at +2.0 s and drained later — a repair decided on such a read
-#: double-applies when the drain lands. Any repair decision therefore waits out this
-#: horizon and requires the two reads to AGREE; disagreement/shrink -> ``unverified``
-#: (which NEVER repairs). ``CORTEX_TYPE_VERIFY_STABILITY_SECONDS`` overrides.
+#: Spacing between the quick reads of the fast verification path (default 0.04 s):
+#: close enough to keep the happy path within the ~150 ms overhead target, far enough
+#: that each read observes a later buffer state. ``CORTEX_TYPE_VERIFY_CONFIRM_GAP_SECONDS``
+#: overrides.
+TYPE_VERIFY_CONFIRM_GAP_SECONDS = _env_nonnegative_float("CORTEX_TYPE_VERIFY_CONFIRM_GAP_SECONDS", 0.04)
+#: Total quick reads the fast path may spend (first read + up to N-1 confirm/poll
+#: reads). The live profile shows read1 at +50 ms is routinely MID-DRAIN (58 of 81
+#: chars); the poll follows the monotone growth until the buffer stabilizes or
+#: completes, instead of paying the 2.5 s horizon on every such action.
+#: ``CORTEX_TYPE_VERIFY_FAST_MAX_READS`` overrides (clamped 2..8).
+TYPE_VERIFY_FAST_MAX_READS = _env_int_in_range("CORTEX_TYPE_VERIFY_FAST_MAX_READS", 4, 2, 8)
+#: Landing-lag horizon — ESCALATION ONLY (fix3): consulted ONLY when the quick pair is
+#: suspicious (shrink/divergence) or agrees on a genuine partial, before any repair
+#: decision. The 2026-09-13 live evidence measured buffers stale-short at +2.0 s that
+#: drained later; a repair decided on such a read double-applies. The happy path never
+#: waits here. ``CORTEX_TYPE_VERIFY_STABILITY_SECONDS`` overrides.
 TYPE_VERIFY_STABILITY_SECONDS = _env_nonnegative_float("CORTEX_TYPE_VERIFY_STABILITY_SECONDS", 2.5)
 #: Repair bound: a dropped suffix is re-dispatched AT MOST ONCE per action, and only
 #: after the double-read-stable buffer PROVED text is missing (verified retype — never
@@ -3815,36 +3825,38 @@ class LocalComputerBackend(ComputerBackend):
         focus_hook: Callable[[], None] | None,
     ) -> str:
         """Dispatch one ``type`` action (R-04): chunked typing + END-OF-ACTION
-        integrity verification with a lag-guarded, duplication-safe verified retype.
+        integrity verification — FAST PATH FIRST, escalation only (fix3).
 
         Legacy path (integrity disabled or empty text) is byte-identical to pre-R-04:
         one engine call for the whole string. Otherwise the text is split into
         ``TYPE_CHUNK_CHARS`` chunks and dispatched chunk-by-chunk (stop token and the
-        T8 focus hook ride every engine dispatch), and verification runs ONCE after
-        the FINAL chunk settles — read-backs are NEVER interleaved mid-dispatch (the
-        2026-09-13 live A/B showed interleaved reads correlate with wrongful retypes:
-        a mid-typing read can be stale-short while the input stack drains late).
+        T8 focus hook ride every engine dispatch, no added gaps), and verification
+        runs ONCE after the FINAL chunk settles — read-backs are NEVER interleaved
+        mid-dispatch.
 
-        Verification policy (against ``expected = normalize(text)``, suffix-diff
-        semantics — pre-existing control content needs NO baseline read):
+        FAST PATH (the happy case pays only quick reads and no horizon): read1 after
+        ``TYPE_VERIFY_SETTLE_SECONDS``, then up to ``TYPE_VERIFY_FAST_MAX_READS`` total
+        quick reads spaced ``TYPE_VERIFY_CONFIRM_GAP_SECONDS`` apart (default 0.05 s).
+        Each later read may EQUAL the previous (stable buffer) or EXTEND it (the
+        previous read was MID-DRAIN: the app had not yet appended the last keystrokes —
+        the profiled live signature is 58 of 81 chars at +50 ms); a monotone extension
+        of a real read is real evidence, not a disagreement. The moment a read ends
+        with the full expected text → ``verified``. Blind reads (``None``) or an
+        agreed EMPTY buffer → ``unverified`` (never repaired).
 
-        - two consecutive reads must AGREE before any value is trusted; a
-          disagreement, a missing read, or a buffer that SHRANK between reads makes
-          the action ``integrity=unverified`` — and unverified NEVER triggers a
-          retype (this is the anti-duplication gate);
-        - the second read of any non-verified verdict is taken after
-          ``TYPE_VERIFY_STABILITY_SECONDS`` — the observed landing-lag horizon — so
-          late-draining input is counted BEFORE any repair decision;
-        - trusted + landed ends with the full expected text → ``verified``;
-        - trusted + landed ends with a proper PREFIX of expected (the measured
-          burst-drop signature) → retype EXACTLY the missing suffix (diffed from the
-          real buffer, mapped back to typed coordinates) ONCE, then re-verify with
-          the same double-read rule; success → ``verified`` with ``healed=<n>``; a
-          confirmed still-wrong buffer raises :class:`TextIntegrityError` (no second
-          repair); an unconfirmable repair reports ``unverified`` honestly;
-        - trusted + non-empty landed that shares no expected-prefix suffix (masked
-          fields, transforming apps) → ``mismatch``; appending would double-apply, so
-          NO repair.
+        SLOW PATH (escalation only — the rare-and-suspicious case pays): a pair that
+        SHRANK or DIVERGED, an agreed genuine PARTIAL (some expected prefix present,
+        suffix missing), or growth that outlives the fast budget is confirmed across
+        ``TYPE_VERIFY_STABILITY_SECONDS`` (the landing-lag horizon) with one more
+        agreeing read before anything else: drain-completed → ``verified`` (no repair
+        ever fired); trusted genuine partial → retype EXACTLY the missing suffix
+        (diffed from the real buffer, mapped back to typed coordinates) ONCE, then a
+        quick re-verify pair; success → ``verified`` with ``healed=<n>``; a confirmed
+        still-wrong buffer raises :class:`TextIntegrityError` (no second repair); an
+        unconfirmable repair reports ``unverified`` honestly. Agreed non-empty buffers
+        that share no expected-prefix suffix (masked fields, transforming apps)
+        resolve to ``mismatch`` — appending would double-apply, so no repair.
+        ``unverified`` NEVER triggers a retype (the anti-duplication gate).
 
         The stop token is checked between chunks, before every read-back, and before
         the retype. The action message gains an additive ``integrity=...`` suffix —
@@ -3876,73 +3888,121 @@ class LocalComputerBackend(ComputerBackend):
             self._engine.type_text(chunk, before_chunk=before_chunk)
             self._last_key_dispatch = time.monotonic()
 
-        # --- end-of-action verification (settled; never mid-dispatch) -------------
+        # --- end-of-action verification: FAST PATH FIRST (bounded drain poll) -----
         if stop is not None:
             stop.ensure_live()
         if TYPE_VERIFY_SETTLE_SECONDS > 0:
             time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
         if stop is not None:
             stop.ensure_live()
-        landed1 = self._read_landed_normalized()
         expected_n = _normalize_landed_text(text)
 
-        def _stable_read() -> str | None:
-            """Second read after the landing-lag horizon; trust requires agreement."""
+        def _quick_read() -> str | None:
+            if TYPE_VERIFY_CONFIRM_GAP_SECONDS > 0:
+                time.sleep(TYPE_VERIFY_CONFIRM_GAP_SECONDS)
+            if stop is not None:
+                stop.ensure_live()
+            return self._read_landed_normalized()
+
+        def _horizon_read() -> str | None:
             if TYPE_VERIFY_STABILITY_SECONDS > 0:
                 time.sleep(TYPE_VERIFY_STABILITY_SECONDS)
             if stop is not None:
                 stop.ensure_live()
             return self._read_landed_normalized()
 
-        if landed1 is not None and landed1.endswith(expected_n):
-            # Fast path: a stale-short read can never PRESENT as a full suffix match,
-            # so a back-to-back confirming read is sufficient trust here.
-            landed2 = self._read_landed_normalized()
-            if landed2 is not None and landed2 == landed1:
+        def _unverified() -> str:
+            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+
+        def _repair_and_recheck(matched: int) -> str:
+            """The ONE verified retype of the exact missing suffix + quick re-verify."""
+            missing = text[_typed_index_for_norm_len(text, matched) :]
+            if stop is not None:
+                stop.ensure_live()  # before the verified retype
+            self._engine.type_text(missing, before_chunk=before_chunk)
+            self._last_key_dispatch = time.monotonic()
+            if TYPE_VERIFY_SETTLE_SECONDS > 0:
+                time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
+            if stop is not None:
+                stop.ensure_live()
+            recheck1 = self._read_landed_normalized()
+            if recheck1 is None:
+                return _unverified()
+            recheck2 = _quick_read()
+            if recheck2 is None or recheck2 != recheck1:
+                # Repair landing UNCONFIRMED: honest "unknown", never a second retype.
+                return _unverified()
+            if recheck2.endswith(expected_n):
+                healed = len(missing)
+                return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=healed)}"
+            raise TextIntegrityError(
+                "typed-text integrity verification failed after one verified retype "
+                f"({len(missing)} retried characters still not landed correctly in the "
+                "focused control); refusing further blind repair. Re-observe and decide."
+            )
+
+        def _resolve_trusted(trusted_n: str) -> str:
+            """Verdict on a horizon-confirmed trusted buffer (escalation outcome)."""
+            if trusted_n.endswith(expected_n):
+                # The drain completed during the horizon; no repair was ever needed.
                 return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
-            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+            if trusted_n == "":
+                return _unverified()
+            matched = _landed_prefix_len(trusted_n, expected_n)
+            if matched == 0:
+                # Masked/transformed/foreign buffer: appending would double-apply.
+                return f"Executed type. {_format_integrity_status(0, total, mismatch=total, unverified=0, healed=0)}"
+            return _repair_and_recheck(matched)
 
-        if landed1 is None:
-            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+        prev = self._read_landed_normalized()
+        if prev is None:
+            return _unverified()
+        if prev.endswith(expected_n):
+            # Rare (dispatch already drained during the settle): single-read match is
+            # accepted only after ONE quick confirming read agrees.
+            confirm = _quick_read()
+            if confirm is not None and confirm == prev:
+                return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
+            return _unverified()
 
-        # Non-verified first read: apply the lag guard BEFORE trusting it (the
-        # wrongful-retype duplication class acted on exactly such reads).
-        landed2 = _stable_read()
-        if landed2 is None or landed2 != landed1:
-            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
-
-        matched = _landed_prefix_len(landed2, expected_n)
-        if matched == len(expected_n):
-            return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
-        if matched == 0 and landed2 != "":
-            # Masked/transformed/foreign buffer: appending would double-apply.
-            return f"Executed type. {_format_integrity_status(0, total, mismatch=total, unverified=0, healed=0)}"
-
-        # Genuine partial: repair with EXACTLY the missing suffix of the typed text.
-        missing = text[_typed_index_for_norm_len(text, matched) :]
-        if stop is not None:
-            stop.ensure_live()  # before the verified retype
-        self._engine.type_text(missing, before_chunk=before_chunk)
-        self._last_key_dispatch = time.monotonic()
-        if TYPE_VERIFY_SETTLE_SECONDS > 0:
-            time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
-        if stop is not None:
-            stop.ensure_live()
-        recheck1 = self._read_landed_normalized()
-        if recheck1 is None:
-            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
-        recheck2 = _stable_read()
-        if recheck2 is None or recheck2 != recheck1:
-            # Repair landing UNCONFIRMED: honest "unknown", never a second retype.
-            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
-        if recheck2.endswith(expected_n):
-            healed = len(missing)
-            return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=healed)}"
-        raise TextIntegrityError(
-            "typed-text integrity verification failed after one verified retype "
-            f"({len(missing)} retried characters still not landed correctly in the "
-            "focused control); refusing further blind repair. Re-observe and decide."
-        )
+        reads_left = TYPE_VERIFY_FAST_MAX_READS - 1
+        escalated = False
+        while reads_left > 0:
+            reads_left -= 1
+            current = _quick_read()
+            if current is None:
+                return _unverified()
+            if current.endswith(expected_n):
+                # read grew monotonically into the full expected text (mid-drain at
+                # first read) — verified, no horizon, no repair.
+                return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
+            if not (current == prev or current.startswith(prev)):
+                escalated = True
+                break  # shrink/divergence: suspicious -> escalation
+            if current == prev and _landed_prefix_len(current, expected_n) > 0:
+                # TWO CONSECUTIVE EQUAL reads on a genuine partial: growth stalled on
+                # a missing suffix (the measured drop signature) — escalate: confirm
+                # across the landing-lag horizon, then the one verified retype.
+                escalated = True
+                break
+            prev = current
+            if current == "":
+                return _unverified()
+            # else: monotone growth or agreed non-matching buffer — keep polling
+            # (pre-existing content may precede a still-pending drain).
+        if escalated:
+            # ESCALATION (suspicious pair or stalled partial): confirm across the
+            # landing-lag horizon before any repair decision. A budget exhaustion on
+            # pure growth is NOT escalated — the buffer is still draining, and the
+            # honest fast answer is unverified (never a repair).
+            trusted_n = _horizon_read()
+            if trusted_n is None:
+                return _unverified()
+            confirm_n = _quick_read()
+            if confirm_n is None or confirm_n != trusted_n:
+                return _unverified()
+            return _resolve_trusted(trusted_n)
+        return _unverified()
 
     def _read_landed_normalized(self) -> str | None:
         """One read-back, normalized; ``None`` when the value is unavailable."""
@@ -4706,18 +4766,25 @@ class FakeComputerBackend(ComputerBackend):
                         message = "Simulated type. " + _format_integrity_status(
                             total, total, mismatch=0, unverified=0, healed=0
                         )
-                    elif matched > 0 or landed_n == "":
+                    elif matched > 0:
                         # Dropped-suffix signature: simulate the verified retype landing
-                        # (repair = exactly the missing suffix, never the whole chunk).
+                        # (repair = exactly the missing suffix; an agreed EMPTY buffer is
+                        # unverified — never repaired — mirroring the fix3 fast path).
                         missing = expected_n[matched:]
                         self.focused_control_value = landed_n + missing
                         message = "Simulated type. " + _format_integrity_status(
                             total, total, mismatch=0, unverified=0, healed=len(missing)
                         )
                     else:
-                        message = "Simulated type. " + _format_integrity_status(
-                            0, total, mismatch=total, unverified=0, healed=0
-                        )
+                        if landed_n == "":
+                            # Agreed empty buffer: unverified, never repaired (fix3).
+                            message = "Simulated type. " + _format_integrity_status(
+                                0, total, mismatch=0, unverified=total, healed=0
+                            )
+                        else:
+                            message = "Simulated type. " + _format_integrity_status(
+                                0, total, mismatch=total, unverified=0, healed=0
+                            )
             self.executed.append(action)  # this branch returns before the shared append
             return message
         elif action.action == "drag":
