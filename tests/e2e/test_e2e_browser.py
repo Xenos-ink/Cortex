@@ -5,8 +5,8 @@ file (``file:///`` URL, unique marker title, no first-run wizards). The runtime 
 a direct ``computer_execute`` (``wait`` action) whose ``expected_effect`` carries the page
 marker, which the built-in ``WindowStateStrategy`` verifies against the post-action
 observation's REAL foreground title and the page's ``<title>`` — window identity
-verification from observation fields, no OCR, no pixel diff (RETARGETED, run_goal
-removal: the loop died with run_goal; the window_state verification path is the direct
+verification from observation fields, no OCR, no pixel diff (RETARGETED, loop
+removal: the loop is gone; the window_state verification path is the direct
 path's).
 
 Environment notes (probed live): the Edge window carries a profile suffix

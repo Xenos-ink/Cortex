@@ -44,8 +44,7 @@ from computer_use_mcp import server
 from computer_use_mcp.state import SessionRegistry
 
 #: The FIVE deterministic MCP tools exposed on the stdio boundary (fixed contract).
-# AMENDED (run_goal removal): the internal-loop family (run_goal, run_subtask,
-# create_subtask, list_subtasks, get_session_progress) is deleted from the surface.
+# AMENDED (loop removal): the internal-loop tool family is deleted from the surface.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
@@ -151,7 +150,7 @@ def test_pin_a_no_anyof_in_any_tool_input_schema(fresh_server: Any) -> None:
     live client-side validator rejected. This pin walks the FULL inputSchema of
     each tool (nested, including $defs) through the REAL FastMCP tool metadata.
     """
-    assert len(ALL_TOOLS) == 5  # the fixed five-tool surface (run_goal removed)
+    assert len(ALL_TOOLS) == 5  # the fixed five-tool surface (loop family removed)
     total_hits: list[str] = []
     for name in ALL_TOOLS:
         schema = _meta(name).arg_model.model_json_schema()

@@ -121,7 +121,7 @@ async def test_rt1_critical_follow_up_never_authorized_by_call_level_approved(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """CRITICAL-pattern queue items stay blocked even when the direct tool call passes
-    ``approved=True`` (operator authorization is only reachable via the run_goal
+    ``approved=True`` (operator authorization is only reachable via the explicit
     approval callback — a host flag can never authorize a CRITICAL action)."""
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
@@ -612,7 +612,7 @@ async def test_rt3_fresh_loop_top_capture_still_trips_fail_closed(
     """The interval gate on FRESH observations is intact: a 60s interval makes the
     next fresh capture trip the wait ceiling (audited fail-closed stop).
 
-    RETARGETED (run_goal removal): the loop-top interval gate used to be exercised
+    RETARGETED (loop removal): the loop-top interval gate used to be exercised
     through the internal LLM loop; the loop is gone, so the direct observe path
     drives the same enforcer instead — after a gated first capture, a second
     back-to-back fresh capture is refused (interval not elapsed), exactly the
@@ -746,7 +746,7 @@ async def test_rt5_subtask_summaries_and_queue_results_are_payload_free(
     """Queue results never carry per-item images even for executed items, and
     checkpoint payloads carry no base64 screenshot bytes.
 
-    RETARGETED (run_goal removal): the subtask-list half exercised the removed
+    RETARGETED (loop removal): the subtask-list half exercised the removed
     ``list_subtasks`` surface; the surviving pins keep the payload-hygiene attack
     (no base64/screenshots in the direct-path payloads that remain: queue results
     and checkpoints)."""
@@ -869,7 +869,7 @@ async def test_rt7_old_client_shapes_accepted_on_the_tool_surface(
 ) -> None:
     """Pre-perf-004 call shapes (no new params) still work on every tool end-to-end.
 
-    AMENDED (run_goal removal): the internal-loop family (run_goal / subtask tools)
+    AMENDED (loop removal): the internal-loop tool family
     is deleted from the surface; the legacy-compatibility sweep now covers exactly
     the five deterministic tools."""
     session_id, _bundle, backend, _ = make_session(

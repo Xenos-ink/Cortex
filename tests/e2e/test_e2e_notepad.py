@@ -3,8 +3,8 @@
 Drives the LIVE desktop through the runtime's own tool surface (``start_session`` ->
 ``computer_observe`` -> ``computer_execute``) — the vision model plays no role (E2E
 validates the RUNTIME: observation → validate → risk → approval → execute → re-observe →
-verify). RETARGETED (run_goal removal): the internal decide/recovery loop died with
-``run_goal``; the five-tool surface executes host-driven actions whose verification
+verify). RETARGETED (loop removal): the internal decide/recovery
+loop is gone; the five-tool surface executes host-driven actions whose verification
 outcome is returned to the host, and whose stale-observation defense is the direct
 path's single automatic re-observe (P0-H).
 
@@ -16,7 +16,7 @@ Acceptance evidence produced here:
   (WM_GETTEXT) — semantic window-text verification, not pixel diff alone.
 - P0-B: moved-window fault on the direct path → the stale click's semantic verification
   fails (WRONG_WINDOW) and the FAILED outcome is returned to the host — the host
-  re-drives from a fresh observation (the loop's automatic re-decide died with run_goal;
+  re-drives from a fresh observation (the loop's automatic re-decide is gone;
   the verification-failure surface is what the host now consumes).
 - P0-H: window switch between capture and validate → ``STALE_OBSERVATION`` rejection →
   the single automatic re-observe + re-grounding; a decoy-focused re-observation is
@@ -170,7 +170,7 @@ def test_notepad_type_semantic_verification(
     deadline: w32.Deadline, e2e_scratch: Path, make_session: Any, with_verifier: Any, evidence: Any
 ) -> None:
     """P0-A: computer_execute types into Notepad; verification reads the REAL Edit control
-    text (RETARGETED, run_goal removal: direct call; the approval path is the explicit
+    text (RETARGETED, loop removal: direct call; the approval path is the explicit
     per-call ``approved=True`` flag the five-tool surface exposes)."""
     token = w32.unique_window_token("typed")
     file_path = e2e_scratch / f"{token}.txt"
@@ -233,10 +233,10 @@ def test_notepad_type_semantic_verification(
 def test_notepad_moved_window_verification_failure_returns_to_host(
     deadline: w32.Deadline, e2e_scratch: Path, make_session: Any, with_verifier: Any, evidence: Any
 ) -> None:
-    """P0-B (RETARGETED, run_goal removal): the target window MOVES after the grounding
+    """P0-B (RETARGETED, loop removal): the target window MOVES after the grounding
     capture; the stale click's semantic verification FAILS (wrong window text) and the
     FAILED outcome is returned to the host in the response — the host, not a loop, sees
-    the miss and re-drives. The loop's bounded auto-re-decide died with run_goal; this
+    the miss and re-drives. The loop's bounded auto-re-decide died with the loop; this
     pins the surviving contract on real Windows: execute → semantic verification → the
     failure is typed, evidenced, and never silently swallowed."""
     token_a = w32.unique_window_token("moved")
@@ -323,14 +323,14 @@ def test_notepad_moved_window_verification_failure_returns_to_host(
 def test_notepad_window_switch_stale_observation(
     deadline: w32.Deadline, e2e_scratch: Path, make_session: Any, with_verifier: Any, evidence: Any
 ) -> None:
-    """P0-H companion (RETARGETED, run_goal removal): the foreground window switches to
+    """P0-H companion (RETARGETED, loop removal): the foreground window switches to
     a decoy before the host grounds its click; the runtime grounds against the DECOY-
     focused observation, executes only what it verified, and the target-title
     expectation fails typed at the window_state layer — the click never types into the
     intended target's coordinates blind. The mid-flight STALE_OBSERVATION rejection +
     single automatic re-observe (P0-H) is pinned hermetically on the direct path in
     tests/test_fault_injection.py (DPI/resolution stale tests) and tests/
-    test_coordinate_pipeline.py; the loop's automatic re-decide died with run_goal."""
+    test_coordinate_pipeline.py; the loop's automatic re-decide is gone."""
     token_a = w32.unique_window_token("target-a")
     token_b = w32.unique_window_token("decoy-b")
     target_path = e2e_scratch / f"{token_a}.txt"

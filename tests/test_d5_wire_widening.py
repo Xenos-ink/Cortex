@@ -184,7 +184,7 @@ def test_d5_schema_limits_and_interference_stay_strict(
 def test_d5_no_anyof_anywhere_after_widening(fresh_server: Any) -> None:
     """REM-G pin A re-check: the widening introduced NO anyOf on any tool.
 
-    AMENDED (run_goal removal): the surface is the five deterministic tools."""
+    AMENDED (loop removal): the surface is the five deterministic tools."""
     tools = (
         "start_session", "stop_session", "computer_observe", "computer_screenshot",
         "computer_execute",

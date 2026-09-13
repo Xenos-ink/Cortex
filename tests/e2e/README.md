@@ -3,7 +3,7 @@
 Live-desktop end-to-end tests for the computer-use-mcp runtime. They drive REAL
 applications (Notepad, classic Calculator, Microsoft Edge on a local page) through the
 runtime's own MCP tool surface (`start_session` → `computer_observe` →
-`computer_execute`) — no vision model, no network. RETARGETED (run_goal removal): the
+`computer_execute`) — no vision model, no network. RETARGETED (loop removal): the
 internal decide/recovery loop is gone; the host drives every action as a direct call.
 What is under test is the RUNTIME pipeline: observation → grounding →
 validation (staleness/allowlists) → risk → approval → execution → re-observe →

@@ -89,7 +89,7 @@ def test_calculator_clicks_and_display_verification(
         assert w32.focus_window(hwnd), "could not focus Calculator"
         grid = w32.calc_button_grid(hwnd)
         display_strategy = rt.CalcDisplayPredicateStrategy(hwnd)
-        # RETARGETED (run_goal removal): no scripted provider — the loop is gone; every
+        # RETARGETED (loop removal): no scripted provider — the loop is gone; every
         # step below is a direct computer_execute click with its own expected_effect.
         session_id, bundle = make_session(
             provider=rt.E2EScriptedProvider([rt.done("unused on the direct path")]),
@@ -128,7 +128,7 @@ def test_calculator_clicks_and_display_verification(
             assert w32.calc_display_value(hwnd) == "7", w32.calc_display_values(hwnd)
 
             # --- clear via computer_execute, then compute via direct calls ---------------
-            # RETARGETED (run_goal removal): the loop died with run_goal; each scripted
+            # RETARGETED (loop removal): the loop died with the loop; each scripted
             # step below is now a direct computer_execute click, verified per call by
             # the injected display-predicate strategy (the same verification pipeline).
             cleared = asyncio.run(
@@ -187,7 +187,7 @@ def test_calculator_clicks_and_display_verification(
                 evidence.assert_that("independent Win32 display read == 42", True)
                 evidence.add_extra("button_grid", {k: list(v) for k, v in grid.items()})
                 evidence.add_extra("display_strategy_calls", display_strategy.calls)
-                # (metrics snapshot died with run_goal's response; per-click
+                # (metrics snapshot died with the loop's response; per-click
                 # verification outcomes are recorded above and in the audit excerpt.)
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
@@ -205,7 +205,7 @@ def test_calculator_division_precision(
         assert w32.focus_window(hwnd), "could not focus Calculator"
         grid = w32.calc_button_grid(hwnd)
         display_strategy = rt.CalcDisplayPredicateStrategy(hwnd)
-        # RETARGETED (run_goal removal): direct calls, no scripted provider (see above).
+        # RETARGETED (loop removal): direct calls, no scripted provider (see above).
         session_id, bundle = make_session(
             provider=rt.E2EScriptedProvider([rt.done("unused on the direct path")]),
             dry_run=False,
@@ -215,7 +215,7 @@ def test_calculator_division_precision(
         with_verifier(session_id, bundle, display_strategy)
         try:
             observe(evidence, session_id, "before")
-            # RETARGETED (run_goal removal): direct calls; each click verified per call.
+            # RETARGETED (loop removal): direct calls; each click verified per call.
             for label, key, expected in (
                 ("1", "1", "calc_display_equals:1"),
                 ("/", "/", "calc_display_equals:1"),

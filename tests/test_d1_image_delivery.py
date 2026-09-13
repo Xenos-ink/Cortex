@@ -13,8 +13,8 @@ decided at start_session (param > env ``CORTEX_IMAGE_DELIVERY`` > default
                 added); include_screenshot_after can never re-enable images;
   screenshot -> inherits via the observe delegation.
 
-AMENDMENT (2026-09-08, R-2 ruling, APPLIED): the run_goal family (run_goal, run_subtask,
-create_subtask, list_subtasks, get_session_progress) is REMOVED PERMANENTLY from
+AMENDMENT (2026-09-08, R-2 ruling, APPLIED): the internal loop tool family is
+REMOVED PERMANENTLY from
 0.5.5 — the text-mode loop pins died with the loop; the direct-path pins below are
 the surviving contract.
 
@@ -360,10 +360,9 @@ async def test_image_mode_opt_out_unchanged(
     assert _all_base64_images(result) == []
 
 
-# --- pins 10/11 (run_goal / run_subtask text-mode loops): REMOVED BY AMENDMENT ------------------
+# --- pins 10/11 (text-mode loop pins): REMOVED BY AMENDMENT ------------------
 # The Commander ruled (2026-09-08, mission record ORVEX-CORTEX-056-LIVEFIX) that the
-# run_goal FAMILY (run_goal, run_subtask, create_subtask, list_subtasks,
-# get_session_progress) is removed permanently from 0.5.5 by wave R-2, leaving the
+# The loop tool family is removed permanently from 0.5.5 by wave R-2, leaving the
 # five deterministic tools. Per the R-1 contract amendment: do NOT build D1 text-
 # mode gating into those paths and do NOT pin them here. The five-tool surface
 # (start_session/stop_session/computer_observe/computer_screenshot/computer_execute)
@@ -412,7 +411,7 @@ async def test_resume_governed_by_fresh_param(
     fresh-session policy — deliberately never checkpointed).
 
     R-2 amendment note: the long-running runtime is armed through the module
-    seam (``_build_runtime``) instead of a subtask TOOL — the run_goal family is
+    seam (``_build_runtime``) instead of a subtask TOOL — the removed loop family is
     removed by R-2 and this wave must not build on it.
     """
     from computer_use_mcp.checkpoint_manager import CheckpointManager

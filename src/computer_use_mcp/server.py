@@ -1,12 +1,11 @@
 """MCP server wiring: 5 deterministic tools, bounded session registry, kill path, audit, limits.
 
 Compatibility contract (master-mission section 6, binding, as amended 2026-09 by user
-order — the run_goal family is REMOVED PERMANENTLY):
+order — the internal-LLM loop tool family is REMOVED PERMANENTLY):
 
 - The exposed tool surface is exactly FIVE deterministic tools: ``start_session``,
   ``stop_session``, ``computer_observe``, ``computer_screenshot``,
-  ``computer_execute``. The internal-LLM-loop family (``run_goal``, ``run_subtask``,
-  ``create_subtask``, ``list_subtasks``, ``get_session_progress``) is deleted — the
+  ``computer_execute``. The internal-LLM loop tool family is deleted — the
   host model drives the tools directly; no model-decides loop remains in Cortex.
 - Tool names, stdio transport, and parameter positions are preserved; signatures
   gain TRAILING OPTIONAL params only (``start_session(..., allowed_processes=None,
