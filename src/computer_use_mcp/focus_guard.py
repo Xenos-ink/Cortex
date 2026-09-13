@@ -62,6 +62,7 @@ from .interference import (
     format_focus_identity_unknown,
     format_focus_taken_by,
     format_modal_dialog,
+    format_reanchor_refused,
     format_stuck_modifier,
     format_target_gone,
 )
@@ -93,6 +94,10 @@ _KEYBOARD_ACTIONS: frozenset[ActionType] = frozenset(
 
 #: Max ui_elements entries summarized into a MODAL_DIALOG payload (bounded).
 _DIALOG_CONTROL_LIST_CAP = 8
+
+#: Max windows remembered in the session's launched/attached surface set (R-20;
+#: bounded memory like the chord log; the current anchor is always a member).
+_MAX_SESSION_SURFACES = 64
 
 
 @dataclass
@@ -175,6 +180,15 @@ class InterferenceGuard:
         self.policy = policy if policy is not None else parse_interference(None)
         self._emit = emit  # audit sink (agent._audit-shaped); failures never break control
         self.bound: WindowInfo | None = None
+        # R-20: the session's launched/attached surface set — every hwnd this session
+        # ever bound (arming observation, focus_window / ensure_app reattach, an
+        # adopted launch). Re-anchoring is restricted to this set and same-process
+        # descendants; everything else is refused with REANCHOR_REFUSED.
+        self._session_surfaces: list[WindowInfo] = []
+        # R-20 launch causality: set at pre-dispatch when THIS action is a chord sent
+        # while the anchor is a launcher/dialog surface (the Win+R "enter" act), and
+        # consumed by the next reanchor decision (one-action causality window).
+        self._pending_keyboard_launch = False
         self._session_chord_keys: list[list[str]] = []
         self._refocus_attempted_for: set[str] = set()
 
@@ -231,10 +245,22 @@ class InterferenceGuard:
         self.rebind(info)
 
     def rebind(self, window: WindowInfo | None) -> None:
-        """(Re-)bind the session target to ``window`` (focus_window / ensure_app reattach)."""
+        """(Re-)bind the session target to ``window`` (focus_window / ensure_app reattach).
+
+        Every bind also joins the window to the session's launched/attached surface
+        set (R-20) — the causal membership future re-anchor decisions consult.
+        """
         if window is None:
             return
         self.bound = window.model_copy() if hasattr(window, "model_copy") else window
+        hwnd = self.bound.hwnd
+        if hwnd is not None:
+            self._session_surfaces = [w for w in self._session_surfaces if w.hwnd != hwnd]
+            self._session_surfaces.append(
+                self.bound.model_copy() if hasattr(self.bound, "model_copy") else self.bound
+            )
+            if len(self._session_surfaces) > _MAX_SESSION_SURFACES:
+                self._session_surfaces.pop(0)
         self._refocus_attempted_for.clear()
         self._audit("bound", f"BOUND target={_describe_target(self.bound)}")
 
@@ -247,49 +273,90 @@ class InterferenceGuard:
             self.rebind(info)
 
     def reanchor_after_success(self, new_window: WindowInfo | None) -> None:
-        """B10 (b): follow the session's OWN verified transitions to a new surface.
+        """B10 (b) + R-20: follow ONLY the session's OWN verified surface transitions.
 
-        Called by the controller ONLY after a VERIFIED successful action. Rules:
+        Called by the controller ONLY after a VERIFIED successful action. Causality
+        rule — the new surface is followable exactly when:
 
-        - same-process surface (the app's own dialog, the shell's Run dialog) ->
-          re-anchor (the transitive same-process launcher doctrine);
-        - the anchor is a launcher/dialog surface (``#32770`` or a configured transient
-          launcher process) and a new app took over -> re-anchor (the launch WE caused);
-        - the anchor is GONE -> re-anchor (dead identities must not pin the session);
-        - anything else (a foreign window took the foreground without one of our
-          verified actions causing it) -> KEEP the anchor, so the next pre-dispatch
-          rejects with FOCUS_TAKEN_BY — the steal protection is untouched.
+        - it is the session's own surface (hwnd already in the launched/attached set
+          every ``rebind`` feeds: arming observation, focus_window / ensure_app
+          reattach, an adopted launch), or
+        - it is a same-process descendant of a session surface (pid match) or an
+          owner-chained dialog of one (GW_OWNER probe), or
+        - it is the outcome of the session's OWN keyboard launch act: a chord
+          dispatched while the anchor was a launcher/dialog surface (the Win+R ->
+          enter -> launched-app doctrine; the one-action marker
+          ``_pending_keyboard_launch``).
 
-        Anchoring still requires a titled window (B10 (c)).
+        EVERYTHING else is refused with the named ``REANCHOR_REFUSED`` payload (audited,
+        annotation-only) and the anchor is KEPT, so the next pre-dispatch rejects with
+        FOCUS_TAKEN_BY — the steal protection is untouched. A DEAD anchor no longer
+        adopts an arbitrary successor (the old anchor-gone rule was R-20's second
+        non-causal hole): the next pre-dispatch reports TARGET_GONE and (by default)
+        unbinds, so the driver reattaches by identity — adoption happens only through
+        the session's own explicit reattach. Anchoring still requires a titled window
+        (B10 (c)).
         """
         bound = self.bound
+        launch_act = self._pending_keyboard_launch
+        self._pending_keyboard_launch = False  # the causality window is one action
         if new_window is None or bound is None:
             return
         if not (new_window.title or "").strip():
             return  # never anchor to an anonymous surface
         if new_window.hwnd is not None and bound.hwnd is not None and new_window.hwnd == bound.hwnd:
             return  # unchanged surface
-        same_process = (
-            new_window.pid is not None
-            and bound.pid is not None
-            and new_window.pid == bound.pid
-        )
-        anchor_is_launcher = (
-            (bound.window_class or "") == "#32770"
-            or any(
-                _exe_basename(bound)
-                == str(pattern).strip().casefold().removesuffix(".exe")
-                for pattern in self.policy.focus_guard.transient_launch_processes
-            )
-        )
-        anchor_gone = False
-        if bound.hwnd is not None:
-            try:
-                anchor_gone = not self.backend.is_window_alive(bound.hwnd)
-            except Exception:  # noqa: BLE001 - a broken probe keeps the anchor
-                anchor_gone = False
-        if same_process or anchor_is_launcher or anchor_gone:
+        if self._in_session_surface_set(new_window):
             self.rebind(new_window)
+            return
+        if launch_act and self._anchor_is_launcher_surface():
+            # The launch WE caused: our chord went into the launcher/dialog anchor and
+            # the new surface took over right after the verified action.
+            self.rebind(new_window)
+            return
+        payload = format_reanchor_refused(bound, new_window)
+        self._audit("reanchor_refused", payload)
+
+    def _in_session_surface_set(self, window: WindowInfo) -> bool:
+        """R-20: ``window`` is in the session's launched/attached set or a descendant.
+
+        Membership: hwnd already bound by this session, pid shared with a session
+        surface (the bound anchor included), or an owner-chain rooting at a session
+        hwnd (cross-process owned dialogs).
+        """
+        surfaces = self._session_surfaces
+        if window.hwnd is not None and any(w.hwnd == window.hwnd for w in surfaces):
+            return True  # previously launched/attached by this session
+        pids = {w.pid for w in surfaces if w.pid is not None}
+        bound = self.bound
+        if bound is not None and bound.pid is not None:
+            pids.add(bound.pid)  # hwnd-less bindings still carry process identity
+        if window.pid is not None and window.pid in pids:
+            return True  # same-process descendant (the app's own dialogs, launcher)
+        if window.hwnd is not None:
+            for surface in surfaces:
+                if surface.hwnd is not None and self._owned_by_surface(window.hwnd, surface.hwnd):
+                    return True  # cross-process owned dialog of a session surface
+        return False
+
+    def _owned_by_surface(self, hwnd: int, ancestor_hwnd: int) -> bool:
+        """The shared GW_OWNER probe, exception-safe (a broken probe keeps refusal)."""
+        try:
+            return bool(self.backend.is_window_owned_by(int(hwnd), int(ancestor_hwnd)))
+        except Exception:  # noqa: BLE001 - a broken probe keeps refusal semantics
+            return False
+
+    def _anchor_is_launcher_surface(self) -> bool:
+        """True when the CURRENT anchor is a dialog / transient-launcher surface."""
+        bound = self.bound
+        if bound is None:
+            return False
+        if (bound.window_class or "") == "#32770":
+            return True
+        return any(
+            _exe_basename(bound) == str(pattern).strip().casefold().removesuffix(".exe")
+            for pattern in self.policy.focus_guard.transient_launch_processes
+        )
 
     # ------------------------------------------------------------------ B10 focus-surface rules
 
@@ -432,6 +499,16 @@ class InterferenceGuard:
         hotkey against a stolen foreground is a MISDELIVERY, not a no-op), then
         STUCK_MODIFIER, then FOCUS_DRIFTED.
         """
+        # R-20 launch causality: the marker names THE PREVIOUS dispatch — clear it
+        # first, then arm it when THIS dispatch is a chord into a launcher/dialog
+        # anchor (the session's own launch act; consumed by the next re-anchor).
+        self._pending_keyboard_launch = False
+        if (
+            action.action in {ActionType.KEYPRESS, ActionType.HOTKEY}
+            and self.armed
+            and self._anchor_is_launcher_surface()
+        ):
+            self._pending_keyboard_launch = True
         if action.action in _GUARD_EXEMPT_ACTIONS:
             return self._verify_stuck_modifiers(action)  # hotkey hygiene applies to chords only
         guard_policy = self.policy.focus_guard

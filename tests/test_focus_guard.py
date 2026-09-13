@@ -511,6 +511,10 @@ def test_reanchor_after_verified_follows_own_launch() -> None:
     backend = FlowBackend()
     guard = InterferenceGuard(backend, parse_interference(None))
     guard.rebind(RUN)  # the anchor is the Run dialog (a launcher surface)
+    # R-20 causality: the session's OWN launch act — a chord dispatched into the
+    # launcher anchor (the Win+R "enter") — precedes the takeover.
+    backend.set_active_window(RUN)
+    guard.verify_pre_dispatch(GroundedAction(action="keypress", keys=["enter"], confidence=1.0))
     guard.reanchor_after_success(NOTEPAD_WIN)  # the app WE launched took over
     assert guard.bound is not None and guard.bound.hwnd == NOTEPAD_WIN.hwnd
 

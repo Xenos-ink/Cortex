@@ -493,27 +493,35 @@ def test_rt2_hwnd_recycle_same_pid_requires_class_and_title_overlap() -> None:
     assert verdict is not None and verdict.blocking  # no title overlap -> rejected
 
 
-def test_rt2_finding_reanchor_from_dialog_anchor_accepts_unrelated_window() -> None:
-    """ATTACK DEMO — FINDING RT2-2 (WEAKENED, bounded).
+def test_rt2_finding_reanchor_from_dialog_anchor_refuses_unrelated_window_r20() -> None:
+    """FINDING RT2-2 CLOSED by R-20 (was: attack demo, adopted-any-foreground).
 
     When the anchor is a #32770 dialog / transient-launcher surface,
-    ``reanchor_after_success`` re-anchors to ANY titled new foreground after a verified
-    action — it verifies the anchor's launcher-ness, not that the NEW window was caused
-    by the session. A foreign app that wins the foreground race right after a verified
-    click becomes the session target (subsequent dispatches then MATCH it).
+    ``reanchor_after_success`` used to re-anchor to ANY titled new foreground after a
+    verified action — an unrelated window that won the foreground race became the
+    session target. Re-anchoring is now causal: without the session's own keyboard
+    launch act (and without set membership / same-process descent) the adoption is
+    REFUSED with the named REANCHOR_REFUSED payload, the anchor is kept, and the next
+    dispatch against the (formerly foreign) window is rejected with FOCUS_TAKEN_BY.
     """
+    events: list[tuple[str, dict[str, Any]]] = []
     backend = GuardBackend()
     dialog_anchor = WindowInfo(
         hwnd=5, pid=500, process_name="explorer.exe", window_class="#32770", title="Run",
     )
+    backend.set_windows([dialog_anchor, TARGET, FOREIGN])  # the anchor is ALIVE
     backend.set_active_window(dialog_anchor)
-    guard = _guard(backend)
+    guard = InterferenceGuard(backend, parse_interference(None), emit=lambda *a, **kw: events.append((kw.get("result", ""), kw.get("metadata", {}))))
     guard.rebind(dialog_anchor)
     backend.set_active_window(FOREIGN)
     guard.reanchor_after_success(FOREIGN)  # the controller calls this after a VERIFIED action
-    assert guard.bound is not None and guard.bound.hwnd == FOREIGN.hwnd  # the finding
-    # the next dispatch now MATCHes the (formerly foreign) window:
-    assert guard.verify_pre_dispatch(_click()) is None
+    assert guard.bound is not None and guard.bound.hwnd == dialog_anchor.hwnd  # anchor KEPT
+    assert any(result == "reanchor_refused" for result, _ in events)
+    # the next dispatch still REJECTS the (formerly adoptable) foreign window:
+    verdict = guard.verify_pre_dispatch(_click())
+    assert verdict is not None and verdict.blocking
+    assert verdict.event.startswith("FOCUS_TAKEN_BY")
+    assert backend.execute_calls == 0
 
 
 def test_rt2_refocus_ambiguity_cannot_redirect_a_dispatch() -> None:

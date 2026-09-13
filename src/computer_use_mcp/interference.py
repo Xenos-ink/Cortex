@@ -56,13 +56,20 @@ __all__ = [
     "format_focus_taken_by",
     "format_modal_dialog",
     "format_no_instance",
+    "format_reanchor_refused",
     "format_reattached",
     "format_stuck_modifier",
     "format_target_gone",
     "parse_interference",
 ]
 
-#: Event names (the driver-facing vocabulary; kept as constants, never magic strings).
+#: Event vocabulary (single parseable strings; the driver-facing vocabulary, kept as
+#: constants, never magic strings): ``FOCUS_TAKEN_BY``, ``FOCUS_DRIFTED``,
+#: ``MODAL_DIALOG``, ``REATTACHED``, ``AMBIGUOUS_INSTANCE``, ``NO_INSTANCE``,
+#: ``STUCK_MODIFIER`` — plus the additive ``FOCUS_IDENTITY_UNKNOWN`` (fail-closed
+#: foreground-identity loss; A12's ``on_identity_unknown: abort`` payload),
+#: ``TARGET_GONE`` (B6 dead-binding report) and ``REANCHOR_REFUSED`` (R-20 causality:
+#: annotation-only refusal to adopt an unrelated foreground as the session anchor).
 FOCUS_TAKEN_BY = "FOCUS_TAKEN_BY"
 FOCUS_DRIFTED = "FOCUS_DRIFTED"
 MODAL_DIALOG = "MODAL_DIALOG"
@@ -72,6 +79,7 @@ NO_INSTANCE = "NO_INSTANCE"
 STUCK_MODIFIER = "STUCK_MODIFIER"
 FOCUS_IDENTITY_UNKNOWN = "FOCUS_IDENTITY_UNKNOWN"
 TARGET_GONE = "TARGET_GONE"
+REANCHOR_REFUSED = "REANCHOR_REFUSED"
 
 #: Fail-closed hint appended to focus-interference rejections (weak-driver guidance).
 REFOCUS_HINT = (
@@ -387,4 +395,28 @@ def format_target_gone(title: str, hwnd: int | None) -> str:
         f"{TARGET_GONE} title={_quote(title)} hwnd={hwnd or 0} "
         "(the bound window no longer exists; re-ground, then reattach by identity "
         "via ensure_app / focus_window)"
+    )
+
+
+def format_reanchor_refused(kept: Any, refused: Any) -> str:
+    """``REANCHOR_REFUSED kept_title='...' kept_hwnd=... refused_title='...' ...`` (R-20).
+
+    The verified action's new foreground is neither in the session's launched/attached
+    set nor a same-process descendant, so the anchor is KEPT and the adoption is
+    refused with this named payload (annotation-only: the next pre-dispatch reports
+    ``FOCUS_TAKEN_BY`` if the foreign window really holds focus; the driver reattaches
+    explicitly via ensure_app / focus_window to make the new surface the target).
+    """
+    refused_process = (
+        getattr(refused, "process_name", None) or getattr(refused, "exe_path", None) or "unknown"
+    )
+    return (
+        f"{REANCHOR_REFUSED} kept_title={_quote(getattr(kept, 'title', ''))} "
+        f"kept_hwnd={getattr(kept, 'hwnd', None) or 0} "
+        f"refused_title={_quote(getattr(refused, 'title', ''))} "
+        f"refused_process={refused_process} "
+        f"refused_hwnd={getattr(refused, 'hwnd', None) or 0} "
+        "(the new foreground is not session-launched/attached and not a same-process "
+        "descendant; the anchor is kept — reattach by identity via ensure_app / "
+        "focus_window to adopt it)"
     )
