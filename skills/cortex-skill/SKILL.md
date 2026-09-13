@@ -21,8 +21,9 @@ After every Cortex result, classify at one glance:
 - **NOT CLEAR** — a `failed`, `uncertain`, or `ok=false` verdict, any rejection, an
   interference event (modal_dialog, focus_drifted, focus_taken_by, stuck_modifier,
   target_gone), an unexpected dialog or UI, an ambiguous target, or `approval_required`.
-  Read the message and reasons, fix exactly the named cause, then resume the fast path.
-  Do not change strategy wholesale over one failure.
+  Read the message and reasons to understand the named cause, obtain fresh
+  evidence when needed, then apply the smallest safe correction, and resume
+  the fast path. Do not change strategy wholesale over one failure.
 
 ## Efficiency defaults
 
@@ -52,8 +53,8 @@ After every Cortex result, classify at one glance:
   re-capture — re-observe, never replay the old coordinates.
 - `uncertain` = dispatched but unproven. Corroborate with one fresh observe or predicate
   when the step matters, then decide. It never means "run it again".
-- `approval_required`: re-send the identical call with `approved=true`; if policy
-  forbids it, stop and report.
+- `approval_required`: if approval is permitted by the host/user policy, re-send
+  the identical call with `approved=true`. Otherwise, stop and report.
 - `integrity` not `verified`, or TextIntegrityError: the text drop is confirmed —
   re-observe the target field; never retype blind.
 
