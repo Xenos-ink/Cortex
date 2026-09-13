@@ -1082,8 +1082,12 @@ class InputEngine(ABC):
         """Reposition the cursor to physical virtual-screen ``(x, y)``."""
 
     @abstractmethod
-    def click(self, x: int, y: int, clicks: int = 1) -> None:
-        """Move to ``(x, y)`` and press/release the left button ``clicks`` times."""
+    def click(self, x: int, y: int, clicks: int = 1, button: str = "left") -> None:
+        """Move to ``(x, y)`` and press/release ``button`` (default left) ``clicks`` times.
+
+        ``button="right"`` (v0.6.0 right_click) presses/releases the right button —
+        unsupported names raise ``ValueError`` (same vocabulary as ``mouse_down``).
+        """
 
     @abstractmethod
     def mouse_down(self, button: str = "left") -> None:
@@ -1156,8 +1160,10 @@ class PyAutoGuiInputEngine(InputEngine):
     def move(self, x: int, y: int) -> None:
         self._perform(lambda: self._pa.moveTo(x, y))
 
-    def click(self, x: int, y: int, clicks: int = 1) -> None:
-        self._perform(lambda: self._pa.click(x, y, clicks=clicks, interval=self.click_interval))
+    def click(self, x: int, y: int, clicks: int = 1, button: str = "left") -> None:
+        self._perform(
+            lambda: self._pa.click(x, y, clicks=clicks, interval=self.click_interval, button=button)
+        )
 
     def mouse_down(self, button: str = "left") -> None:
         self._perform(lambda: self._pa.mouseDown(button=button))
@@ -1265,24 +1271,28 @@ class SendInputEngine(InputEngine):
     def move(self, x: int, y: int) -> None:
         self._send([_mouse_move_event(x, y, _virtual_screen_metrics())])
 
-    def click(self, x: int, y: int, clicks: int = 1) -> None:
+    def click(self, x: int, y: int, clicks: int = 1, button: str = "left") -> None:
         if clicks < 1:
             raise ValueError("clicks must be >= 1")
+        try:
+            down_flag, up_flag = _MOUSE_BUTTON_FLAGS[button]
+        except KeyError as exc:
+            raise ValueError(f"unsupported mouse button: {button!r}") from exc
         metrics = _virtual_screen_metrics()
         if clicks == 1 or self.click_interval <= 0:
             events = [_mouse_move_event(x, y, metrics)]
             for _ in range(clicks):
-                events.append(_mouse_flag_event(_MOUSEEVENTF_LEFTDOWN))
-                events.append(_mouse_flag_event(_MOUSEEVENTF_LEFTUP))
+                events.append(_mouse_flag_event(down_flag))
+                events.append(_mouse_flag_event(up_flag))
             self._send(events)
             return
         self._send([_mouse_move_event(x, y, metrics),
-                    _mouse_flag_event(_MOUSEEVENTF_LEFTDOWN),
-                    _mouse_flag_event(_MOUSEEVENTF_LEFTUP)])
+                    _mouse_flag_event(down_flag),
+                    _mouse_flag_event(up_flag)])
         for _ in range(clicks - 1):
             time.sleep(self.click_interval)
-            self._send([_mouse_flag_event(_MOUSEEVENTF_LEFTDOWN),
-                        _mouse_flag_event(_MOUSEEVENTF_LEFTUP)])
+            self._send([_mouse_flag_event(down_flag),
+                        _mouse_flag_event(up_flag)])
 
     def mouse_down(self, button: str = "left") -> None:
         try:
@@ -3508,14 +3518,17 @@ class LocalComputerBackend(ComputerBackend):
             else:
                 _sleep_for_wait_action(total, stop)
             return f"Executed {action.action}."
-        if action.action in {"click", "double_click"}:
+        if action.action in {"click", "double_click", "right_click"}:
             if action.point is None:
                 raise ValueError("A point is required for click actions")
             physical = self._map_to_physical(action.point.x, action.point.y)
             if stop is not None:
                 stop.ensure_live()
+            # right_click (v0.6.0): one RIGHT-button press at the point (context menu);
+            # same stop-check/single-transform discipline as the left-button clicks.
             clicks = 2 if action.action == "double_click" else 1
-            engine.click(physical[0], physical[1], clicks=clicks)
+            button = "right" if action.action == "right_click" else "left"
+            engine.click(physical[0], physical[1], clicks=clicks, button=button)
         elif action.action == "drag":
             if action.point is None or action.to_point is None:
                 raise ValueError("Both a start point and an end point are required for drag actions")
@@ -4285,9 +4298,11 @@ class FakeComputerBackend(ComputerBackend):
             return f"Simulated {action.action}."
         if self._input_blocked:
             raise InputBlockedError("FakeComputerBackend is configured to block physical input.")
-        if action.action in {"click", "double_click"}:
+        if action.action in {"click", "double_click", "right_click"}:
             if action.point is None:
                 raise ValueError("A point is required for click actions")
+            # right_click parity: the fake performs the identical screenshot->physical
+            # transform a real right-button press would (cursor lands on the point).
             self._cursor_physical = self._map_to_physical(action.point.x, action.point.y)
         elif action.action == "move":
             if action.point is None:

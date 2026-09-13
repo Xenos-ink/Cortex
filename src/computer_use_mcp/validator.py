@@ -61,8 +61,15 @@ __all__ = [
 #: Actions whose execution consumes a screen point and therefore require observation binding.
 #: Drag consumes two points (start ``point`` + end ``to_point``) and binds like click;
 #: MOVE consumes one point (a cursor reposition) and binds like click too.
+#: RIGHT_CLICK consumes one point (a right-button press) and binds exactly like click.
 COORDINATE_ACTIONS: frozenset[ActionType] = frozenset(
-    {ActionType.CLICK, ActionType.DOUBLE_CLICK, ActionType.DRAG, ActionType.MOVE}
+    {
+        ActionType.CLICK,
+        ActionType.DOUBLE_CLICK,
+        ActionType.RIGHT_CLICK,
+        ActionType.DRAG,
+        ActionType.MOVE,
+    }
 )
 
 #: Legacy confidence-floor exemptions, preserved verbatim from the prototype.

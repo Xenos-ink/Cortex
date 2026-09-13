@@ -31,9 +31,11 @@ def test_action_type_members_unchanged() -> None:
     # "drag" was added additively (press-move-release); "move", "hotkey", and
     # "focus_window" were added additively the same way; T8 added "ensure_app"
     # (attach-or-launch probe) the same additive way — the legacy members are unchanged.
+    # v0.6.0 added "right_click" (owner-commissioned context-menu press) the same way.
     assert {member.value for member in ActionType} == {
         "click",
         "double_click",
+        "right_click",
         "drag",
         "type",
         "keypress",

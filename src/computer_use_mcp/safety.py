@@ -430,6 +430,7 @@ class SafetyPolicy:
         elif action.action in {
             ActionType.CLICK,
             ActionType.DOUBLE_CLICK,
+            ActionType.RIGHT_CLICK,
             ActionType.DRAG,
             ActionType.TYPE,
             ActionType.FOCUS_WINDOW,
@@ -518,7 +519,13 @@ class SafetyPolicy:
         if action.action in {ActionType.SCROLL, ActionType.WAIT, ActionType.DONE, ActionType.MOVE}:
             return RiskLevel.LOW, "low_routine_action", self._why("low_routine_action")
 
-        if action.action in {ActionType.CLICK, ActionType.DOUBLE_CLICK, ActionType.DRAG, ActionType.TYPE}:
+        if action.action in {
+            ActionType.CLICK,
+            ActionType.DOUBLE_CLICK,
+            ActionType.RIGHT_CLICK,
+            ActionType.DRAG,
+            ActionType.TYPE,
+        }:
             if not ctx.identity_known:
                 return (
                     RiskLevel.MEDIUM,
@@ -566,7 +573,10 @@ class SafetyPolicy:
 
     def _describe_action(self, action: GroundedAction) -> str:
         kind = action.action.value if hasattr(action.action, "value") else str(action.action)
-        if action.action in {ActionType.CLICK, ActionType.DOUBLE_CLICK} and action.point is not None:
+        if (
+            action.action in {ActionType.CLICK, ActionType.DOUBLE_CLICK, ActionType.RIGHT_CLICK}
+            and action.point is not None
+        ):
             return f"{kind} at screenshot coordinates (x={action.point.x}, y={action.point.y})"
         if (
             action.action == ActionType.DRAG
@@ -592,7 +602,10 @@ class SafetyPolicy:
     def _describe_target(self, action: GroundedAction, ctx: SafetyContext) -> str:
         """Target location: application identity plus coordinates/text \u2014 never bare coordinates."""
         identity = ctx.describe_identity()
-        if action.action in {ActionType.CLICK, ActionType.DOUBLE_CLICK} and action.point is not None:
+        if (
+            action.action in {ActionType.CLICK, ActionType.DOUBLE_CLICK, ActionType.RIGHT_CLICK}
+            and action.point is not None
+        ):
             return f"{identity}, at screenshot coordinates (x={action.point.x}, y={action.point.y})"
         if (
             action.action == ActionType.DRAG

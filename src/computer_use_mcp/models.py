@@ -40,6 +40,10 @@ def _new_id() -> str:
 class ActionType(StrEnum):
     CLICK = "click"
     DOUBLE_CLICK = "double_click"
+    # Owner-commissioned additive sibling of click/double_click (v0.6.0): a single
+    # RIGHT-button press at ``point`` — opens a context menu. Point-bearing and
+    # grounded/validated/risk-classified/verified exactly like click.
+    RIGHT_CLICK = "right_click"
     DRAG = "drag"
     TYPE = "type"
     KEYPRESS = "keypress"
@@ -213,6 +217,17 @@ class GroundedAction(BaseModel):
         """A move needs a target point (screenshot space) — fail closed otherwise."""
         if self.action is ActionType.MOVE and self.point is None:
             raise ValueError("move actions require a point (screenshot space)")
+        return self
+
+    @model_validator(mode="after")
+    def _right_click_requires_point(self) -> GroundedAction:
+        """A right_click needs a target point (screenshot space) — fail closed.
+
+        Same construction contract as click/double_click: a context-menu request
+        without coordinates is malformed and never reaches the backend.
+        """
+        if self.action is ActionType.RIGHT_CLICK and self.point is None:
+            raise ValueError("right_click actions require a point (screenshot space)")
         return self
 
     @model_validator(mode="after")

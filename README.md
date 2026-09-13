@@ -357,6 +357,7 @@ Validates and executes one action through the full pipeline. Supported actions (
 |---|---|---|
 | `click` | `x`, `y` | screenshot coordinates |
 | `double_click` | `x`, `y` | screenshot coordinates |
+| `right_click` | `x`, `y` | screenshot coordinates; one right-button press — opens a context menu |
 | `drag` | `x`, `y`, `x2`, `y2` | start and end point; both required, both screenshot coordinates; grounded and bounds-checked at both endpoints |
 | `move` | `x`, `y` | hover the mouse — repositions the cursor, no click |
 | `type` | `text` | up to 2000 chars, typed character-by-character with stop checks between characters |

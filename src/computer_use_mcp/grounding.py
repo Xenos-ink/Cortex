@@ -54,7 +54,9 @@ __all__ = [
 #: HOTKEY (compound chord), FOCUS_WINDOW (window-title selector), and ENSURE_APP
 #: (T8 process/doc identity selector) are non-spatial too: they carry ``keys`` /
 #: ``target`` instead of coordinates. MOVE is deliberately NOT listed — point-bearing
-#: actions already route to the coordinate strategy automatically.
+#: actions already route to the coordinate strategy automatically. RIGHT_CLICK is
+#: deliberately NOT listed either: it is point-bearing exactly like click (a right
+#: button press at ``point``) and grounds/validates/binds on the same coordinate path.
 NON_SPATIAL_ACTIONS: frozenset[ActionType] = frozenset(
     {
         ActionType.TYPE,
