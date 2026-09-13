@@ -1,7 +1,7 @@
 """Benchmark runner for computer-use-mcp (harness only — NO score claims).
 
 Executes task definitions (``tasks/*.yaml``) through the server tool surface
-(``start_session`` → ``computer_execute`` → ``stop_session``). RETARGETED (run_goal
+(``start_session`` → ``computer_execute`` → ``stop_session``). RETARGETED (loop
 removal): the internal decide/recovery loop is gone, so the runner now plays the host —
 it resolves each scripted provider step to a grounded action and issues it as ONE
 ``computer_execute`` call, observing the verification outcome per action. Two modes:
@@ -254,7 +254,7 @@ class StepResolver:
 
 
 class DirectCallDriver:
-    """Host-side step driver (RETARGETED, run_goal removal): resolves each scripted
+    """Host-side step driver (RETARGETED, loop removal): resolves each scripted
     provider step to a grounded action and issues it as ONE ``computer_execute`` call,
     consuming the verification outcome per action. Hook steps run at their position —
     the same mid-flight fault window the loop's decide-time hooks used. This is the

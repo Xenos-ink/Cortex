@@ -162,7 +162,7 @@ def _redacted(text: Any, limit: int) -> str:
 
 
 class _ApprovalBudget:
-    """The per-call interactive-action approval budget (run_goal semantics: at most 1)."""
+    """The per-call interactive-action approval budget (loop-era semantics: at most 1)."""
 
     def __init__(self, total: int) -> None:
         self.remaining = max(0, int(total))

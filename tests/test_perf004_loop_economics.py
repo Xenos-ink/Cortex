@@ -139,11 +139,11 @@ def _observe_metadata(session_id: str) -> dict[str, Any]:
 async def test_run_loop_reuses_post_action_capture_as_next_loop_top(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """C1 observe reuse SURVIVES the run_goal removal on the direct surface: a queued
+    """C1 observe reuse SURVIVES the loop removal on the direct surface: a queued
     action's grounding reuses the previous item's post-action capture (no new fresh
     capture), and the reuse is audited, never silent.
 
-    RETARGETED (run_goal removal): the loop's loop_top reuse died with the loop; the
+    RETARGETED (loop removal): the loop's loop_top reuse is gone; the
     SAME reuse mechanism lives on in the follow_ups queue (agent._run_action_queue
     passes each post-action capture as the next item's source_observation)."""
     session_id, bundle, backend, _ = make_session(
@@ -174,7 +174,7 @@ async def test_validation_audits_digest_staleness_proof(
 ) -> None:
     """Every direct-action validation audits its staleness proof (digest match).
 
-    RETARGETED (run_goal removal): the direct path drives the same digest-first
+    RETARGETED (loop removal): the direct path drives the same digest-first
     staleness proof the loop used to exercise."""
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
@@ -207,7 +207,7 @@ async def test_run_single_audits_staleness_proof(
 
 
 # --- C2: rate-gate semantics ---------------------------------------------------------------------
-# REMOVED (run_goal removal): the two loop-driven C2 pins (gate-consults-only-fresh-
+# REMOVED (loop removal): the two loop-driven C2 pins (gate-consults-only-fresh-
 # observations, burst-captures-paced-through-the-loop) exercised the internal loop's
 # loop_top capture cadence and died with the loop. The SURVIVING gate semantics on the
 # direct surface are pinned by test_p5_redteam.rt3 (fresh-gate fail-closed + pacing)
@@ -225,7 +225,7 @@ async def test_deterministic_tier_skips_model_judge(
     """C3 on the direct surface: a deterministic-verifiable action NEVER reaches the
     model judge.
 
-    RETARGETED (run_goal removal): the direct path has no provider hint channel
+    RETARGETED (loop removal): the direct path has no provider hint channel
     (verification_hint was a loop-only envelope field), so the model-judge LADDER
     itself is pinned below through the agent seam — same method, same tiers — and
     this test pins the SURVIVING equivalent: a deterministic-verifiable action
@@ -253,7 +253,7 @@ async def test_ladder_deterministic_tier_returns_before_the_judge(
     criteria already reach a verdict resolves at tier "deterministic" — the judge is
     never consulted.
 
-    RETARGETED (run_goal removal): this is the old in-loop pin moved to the agent
+    RETARGETED (loop removal): this is the old in-loop pin moved to the agent
     seam (``_verify_judge_ladder``), the exact method the loop used to call."""
     from computer_use_mcp.verification import VerificationIntent, VerificationKind
 
@@ -322,7 +322,7 @@ async def test_judge_tier_runs_when_cheap_tiers_uncertain(
     """C3 LADDER pin (agent seam, loop-free): a model-judge intent no cheap tier can
     decide falls through to the judge tier and adopts its verdict.
 
-    RETARGETED (run_goal removal): the old in-loop pin, moved to the exact method
+    RETARGETED (loop removal): the old in-loop pin, moved to the exact method
     (``_verify_judge_ladder``) the loop used to call. Pixels differ (ShiftingScreen),
     no deterministic criteria -> the judge runs ONCE and its verdict wins."""
     from computer_use_mcp.verification import VerificationIntent, VerificationKind
@@ -424,7 +424,7 @@ async def test_dry_run_results_carry_unmistakable_banner(
     execute_response = await server.computer_execute(session_id, "wait", delta=1)
     execute_response = execute_payload(execute_response)
     assert execute_response["message"].startswith("DRY-RUN (no input dispatched):")
-    # AMENDED (run_goal removal): the loop's second banner check died with the loop;
+    # AMENDED (loop removal): the loop's second banner check is gone;
     # the direct-surface banner above is the surviving pin (RT6 fuzz in
     # test_p5_redteam covers 25 hostile dry-run shapes).
     assert backend.executed == []  # still a no-op
@@ -825,7 +825,7 @@ async def test_starved_after_capture_routes_past_the_diff_tier(
 ) -> None:
     """A judge intent with a starved (self-comparison) ladder is NOT false-failed at 0.0 diff.
 
-    RETARGETED (run_goal removal): the starved-ladder guarantee is pinned at the
+    RETARGETED (loop removal): the starved-ladder guarantee is pinned at the
     agent seam (``_verify`` with before == after, the SAME observation object) —
     the exact starved shape the loop used to produce via a frozen post-action
     capture. The diff tier is routed past; the judge tier decides."""

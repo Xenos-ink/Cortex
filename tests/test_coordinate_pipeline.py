@@ -207,7 +207,7 @@ async def test_scaled_125_percent_executes_origin_plus_screenshot_times_scale_on
     (100, 200) must execute at (125, 250) — origin + screenshot * scale applied ONCE.
     Before the F1 fix this executed at (156, 312) (scale squared).
 
-    RETARGETED (run_goal removal): computer_execute drives the same
+    RETARGETED (loop removal): computer_execute drives the same
     grounding -> validation -> execution composition; the client-asserted point
     plays the role the provider decision used to play."""
     monitor = MonitorInfo(
@@ -238,7 +238,7 @@ async def test_scaled_150_percent_executes_origin_plus_screenshot_times_scale_on
     """150% DPI (screenshot 1280x720, input 1920x1080): center click at screenshot
     (640, 360) executes at (960, 540) — NOT (1440, 810) as the scale-squared bug did.
 
-    RETARGETED (run_goal removal): computer_execute drives the same composition."""
+    RETARGETED (loop removal): computer_execute drives the same composition."""
     monitor = MonitorInfo(
         id="m", index=0, bounds=(0, 0, 1920, 1080), is_primary=True,
         dpi_scale_x=1.5, dpi_scale_y=1.5,
@@ -266,7 +266,7 @@ async def test_negative_origin_secondary_monitor_executes_origin_plus_screenshot
     monitor origin exactly once — screenshot (960, 540) executes at (-720, -405),
     matching origin + screenshot * scale including both negative offsets.
 
-    RETARGETED (run_goal removal): computer_execute drives the same composition."""
+    RETARGETED (loop removal): computer_execute drives the same composition."""
     monitor = MonitorInfo(
         id="m", index=0, bounds=(-1920, -1080, 1920, 1080), is_primary=True,
         dpi_scale_x=1.25, dpi_scale_y=1.25,
@@ -297,7 +297,7 @@ async def test_unverifiable_coordinate_space_refuses_end_to_end_fail_closed(
     DPI (1920/1000 = 1.92 vs 1.5) is UNVERIFIABLE, grounding refuses fail-closed, and
     NOTHING executes — zero backend inputs, no cursor movement.
 
-    RETARGETED (run_goal removal): computer_execute drives the same composition; the
+    RETARGETED (loop removal): computer_execute drives the same composition; the
     refusal surfaces as the rejected outcome shape instead of an in-loop recovery."""
     monitor = MonitorInfo(
         id="m", index=0, bounds=(0, 0, 1920, 1080), is_primary=True,
@@ -329,7 +329,7 @@ async def test_passthrough_scale_one_applies_no_transform(
     """Verified passthrough space (scale = 1): the executed physical position equals the
     screenshot point exactly — no origin offset beyond (0, 0), no scaling.
 
-    RETARGETED (run_goal removal): computer_execute drives the same composition."""
+    RETARGETED (loop removal): computer_execute drives the same composition."""
     backend = _FlippingScaledBackend(width=1280, height=720)  # default monitor matches
     observation_probe = backend.observe()
     assert observation_probe.coordinate_space is CoordinateSpace.VERIFIED_PASSTHROUGH

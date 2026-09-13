@@ -4,7 +4,7 @@ Status: production-hardening Waves 1–5 landed (including the E6 defect round D
 the red-team fix round F1–F7), followed by the Cortex naming pass, the DRAG action, the
 compact-change verification upgrade, and the move/hotkey/focus_window actions (full
 pipeline support, allowlist-gated focus, deterministic verification), then the
-PERF-004 release, and finally the run_goal-removal wave (user order): the internal
+PERF-004 release, and finally the loop-removal wave (user order): the internal
 autonomous loop and its subtask-orchestration MCP tools are GONE — the server exposes
 exactly five tools (start_session, stop_session, computer_observe, computer_screenshot
 alias, computer_execute); the sealed checkpoint/resume machinery on start_session
@@ -369,16 +369,16 @@ failures never break the control loop (logged, swallowed).
 use by the BLOCKED_UI dismiss path (unknown counters are created dynamically).
 Latencies (bounded 1024-sample deques with
 count/avg/p50/p95/max): `observation_ms`, `model_ms`, `execution_ms`,
-`verification_ms`, `task_ms`. (The removed `run_goal` loop used to return the
+`verification_ms`, `task_ms`. (The removed internal loop used to return the
 snapshot per call; on the five-tool surface the registry is read at the bundle seam.)
 
 ## 10. Backward-compatibility decisions (binding)
 
-1. **Tool surface (AMENDED, run_goal-removal wave)**: the server now exposes exactly
+1. **Tool surface (AMENDED, loop-removal wave)**: the server now exposes exactly
    FIVE tools — `start_session`, `stop_session`, `computer_observe` (+ the
-   `computer_screenshot` alias), `computer_execute`. The internal-loop family
-   (`run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`,
-   `get_session_progress`) was REMOVED by explicit user order (the internal LLM/vision
+   `computer_screenshot` alias), `computer_execute`. The internal-loop tool family
+   was REMOVED by explicit user order
+   (the internal LLM/vision
    loop was the sole home of two confirmed defects and doubled the failure surface;
    the host model drives every action directly). The surviving tools keep their names,
    stdio transport, parameter positions, and response shapes; additions remain
@@ -399,7 +399,7 @@ snapshot per call; on the five-tool surface the registry is read at the bundle s
    Documented degradation: direct calls whose intent is `expected_text` with no OCR
    evidence fall back to the deterministic visual-change check; the outcome still
    comes from evidence and uncertain is never upgraded.
-3. **`run_goal` approval budget — REMOVED with the tool**: the per-call
+3. **The loop-era approval budget — REMOVED with the loop**: the per-call
    `approve_next_action=True` budget semantic died with the loop. The five-tool
    approval surface is `computer_execute(approved=True)`: one call, one action,
    per-call authorization (approval events are audited; a denial or a
@@ -553,9 +553,9 @@ The three newer actions:
   Classified `MEDIUM` (`window_focus_change`) always; verified via deterministic
   `window_state` (active-window title contains the target), never pixels.
 
-**`run_goal` — REMOVED (run_goal-removal wave, user order).** The internal closed-loop
-tool and its family (`create_subtask`, `list_subtasks`, `run_subtask`,
-`get_session_progress`) no longer exist; tools/list returns exactly the five tools.
+**The internal loop tool — REMOVED (loop-removal wave, user order).** The internal closed-loop
+tool and its subtask-tool family no longer exist;
+tools/list returns exactly the five tools.
 The loop's historical guarantees live on in the direct path: every `computer_execute`
 call runs the identical §4 pipeline (grounding, validation, risk, approval, execution,
 verification) and returns the per-action result — action record, message, verification
@@ -612,14 +612,14 @@ per `start_session`; tests monkeypatch them and inspect wiring via `_get_bundle`
 **E2E suite** (`tests/e2e/`, E7): live-desktop tests driving REAL applications
 (Notepad, classic Calculator, Microsoft Edge on a local page) through the runtime's own
 MCP tool surface (`start_session` → `computer_observe` → `computer_execute`; all E2E
-tests were RETARGETED to the five-tool surface in the run_goal-removal wave) — no
+tests were RETARGETED to the five-tool surface in the loop-removal wave) — no
 vision model, no network. 10 tests total:
 
 | Test | What it proves |
 |---|---|
 | `test_notepad_window_identity_observation` | `WindowInfo` hwnd/pid/process/exe/class populated on real Windows (P0-G/I) |
 | `test_notepad_type_semantic_verification` | semantic typing verification on the direct path (P0-A) |
-| `test_notepad_moved_window_verification_failure_returns_to_host` | moved-window fault → typed verification failure returned to the host (P0-B, retargeted: the loop's auto-re-decide died with run_goal) |
+| `test_notepad_moved_window_verification_failure_returns_to_host` | moved-window fault → typed verification failure returned to the host (P0-B, retargeted: the loop's auto-re-decide is gone) |
 | `test_notepad_window_switch_stale_observation` | foreground-switch staleness defense on the direct path (P0-H companion; the mid-flight STALE rejection is pinned hermetically in tests/test_fault_injection.py) |
 | `test_calculator_clicks_and_display_verification` | grounded clicks + display-predicate verification |
 | `test_calculator_division_precision` | precise small-target clicks, verified display value |
@@ -718,9 +718,9 @@ numbers, not performance claims; scores require a real vision-provider run.
 
 ## 15. Long-Running Runtime (orchestration layer)
 
-**STATUS (run_goal-removal wave, user order): the subtask orchestration layer's MCP
-tools were REMOVED** (`run_goal(auto_subtasks=…)`, `create_subtask`, `list_subtasks`,
-`run_subtask`, `get_session_progress`). What SURVIVES in production code and remains
+**STATUS (loop-removal wave, user order): the subtask orchestration layer's MCP
+tools were REMOVED** (the whole loop-era tool family —
+including the auto-subtask entry points). What SURVIVES in production code and remains
 fully wired: the sealed checkpoint/resume machinery (`checkpoint_manager.py`,
 `resume_manager.py`, `context_manager.py`) and the shared `SessionBudgetTracker`
 restoration on `start_session(resume_from_checkpoint=…)` — the §15.6/§15.7 contracts
@@ -777,7 +777,7 @@ is the `set_enforcer` seam (§15.10).
 Data flow of one orchestration step:
 
 ```text
- MCP tool call (historical: run_goal auto_subtasks / run_subtask — REMOVED)
+ MCP tool call (historical: loop-era auto-subtask entry points — REMOVED)
        v
  LongRunningRuntime  (orchestration only)
    |  budget.check_all() .............. shared SessionBudgetTracker (monotonic)
@@ -1064,13 +1064,13 @@ there is no second executor.
 
 ### 15.12 MCP surface, bounded responses, and audit
 
-- **Tools** — REMOVED (run_goal-removal wave): `create_subtask`, `list_subtasks`,
-  `run_subtask`, `get_session_progress` no longer exist on the surface, and
-  `run_goal(auto_subtasks=…)` died with `run_goal`. The one trailing-optional parameter
+- **Tools** — REMOVED (loop-removal wave): the loop-era subtask tools
+  no longer exist on the surface, and
+  the auto-subtask entry points died with the loop. The one trailing-optional parameter
   that survives is `start_session(..., resume_from_checkpoint=None)` (§15.6–§15.7);
   the typed error codes below remain the domain modules' vocabulary (pinned in
   tests/test_subtask_domain.py and tests/test_checkpoint_integrity.py).
-- **Deterministic progress** (historical, with the removed `get_session_progress`
+- **Deterministic progress** (historical, with the removed loop-era progress tool
   tool): the percentage was computed from manager state — `round(100 * completed /
   total, 2)`, 0.0 with zero subtasks — never invented.
 - **Bounded responses** (§19 discipline, retained in the surviving modules):
@@ -1088,7 +1088,7 @@ there is no second executor.
   `resume`, `approval_epoch`, `health_check` (existing 15 types untouched; all metadata
   passes the same write-time redaction).
 - **Degradation without a key**: planner unavailability is a typed, fail-closed
-  degradation — historically the session stayed usable for manual `create_subtask` (no
+  degradation — historically the session stayed usable for manual subtask creation (no
   planner key needed); the context summarizer similarly falls back to its deterministic
   bounded summary (this fallback remains live for the resumed-context path).
 

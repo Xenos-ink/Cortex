@@ -107,10 +107,10 @@ released version is `pyproject.toml`.
 
 ### R-08 Internal-loop multi-action decide batching
 
-- **Status:** OBSOLETE (the internal `run_goal` loop was removed by user order —
+- **Status:** OBSOLETE (the internal autonomous loop was removed by user order —
   there is no internal decide phase to batch; host-path `follow_ups` batching is the
   surviving batching mechanism and remains fully supported).
-- **Problem:** (historical) the internal `run_goal` loop decided one action per model
+- **Problem:** (historical) the internal autonomous loop decided one action per model
   call. Multi-action decide batching was descoped in perf-004 because no
   `VISION_API_KEY` was configured to measure it; the host-path `follow_ups` batching
   shipped instead. UFO2 reported 13.30 → 7.40 steps/task for this technique.

@@ -4,7 +4,7 @@ This file lives in tests/e2e/ but is deliberately NOT marked ``e2e``: it exercis
 fakes (FakeWorldBackend), so it runs in the standard suite and proves the benchmark
 harness end-to-end: every task file parses and validates, the fake-mode direct pipeline
 (``start_session`` -> ``computer_execute`` per scripted step; the runner plays the host —
-RETARGETED, run_goal removal) runs through the real server tool surface (real runtime
+RETARGETED, loop removal) runs through the real server tool surface (real runtime
 code, simulated desktop), and the results JSON has the documented shape. It validates
 the HARNESS — it is not a benchmark score and does not touch real applications.
 """
@@ -67,8 +67,8 @@ def test_runner_fake_mode_full_harness(tmp_path: Path) -> None:
         assert item["verification_outcomes"]["verified"] > 0, (task_id, item)
         assert item["latencies_ms"], task_id
 
-    # The moved-window fault (RETARGETED, run_goal removal): the loop's automatic
-    # recovery/re-decide died with run_goal, so t03's stale first click now FAILS its
+    # The moved-window fault (RETARGETED, loop removal): the loop's automatic
+    # recovery/re-decide died with the loop, so t03's stale first click now FAILS its
     # window_state verification (the fault hook moves the window mid-flight) and the
     # host-driver script stops; the harness records the failed outcome honestly and the
     # FINAL re-grounded click completes the task predicate. The recovery-event counters

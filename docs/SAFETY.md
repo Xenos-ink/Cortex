@@ -175,7 +175,7 @@ lower than a human would. The compensating controls are the approval defaults
 - **Per-call authorization (the five-tool surface)**: `computer_execute(approved=True)`
   authorizes that single call's action when the policy requires approval
   (`approval_required` otherwise). CRITICAL actions are never cleared by this flag
-  (see below). (Historical: the removed `run_goal` loop additionally granted exactly
+  (see below). (Historical: the removed internal loop additionally granted exactly
   one approval per call via `approve_next_action=True`, bound to the approved action
   instance id so its recovery retries did not re-consume it — the loop, its budget,
   and its in-run recovery were removed by user order.)
@@ -260,7 +260,7 @@ lower than a human would. The compensating controls are the approval defaults
   `verification.evidence` entry are redacted. The audit sink and the provider payload
   were already enforced; the response (which echoes proposed strings back to the
   calling client) is no longer the one surface that bypasses redaction. (The removed
-  `run_goal` response path shared this enforcement; nothing was weakened by its
+  internal-loop response path shared this enforcement; nothing was weakened by its
   removal.)
 - **No secret logging**: provider request bodies are never logged; the API key exists
   only inside the Authorization header construction — never in exceptions, messages,
@@ -644,7 +644,7 @@ restores.
 | Dead dependency branch, replan exhausted | `UNRECOVERABLE` termination — no continuation with unknown correctness | `long_running.run_pending_subtasks` |
 | Session budget exhausted (duration/actions/model calls/steps/subtasks) | typed `SessionBudgetExceeded` → audited fail-closed termination | `limits.SessionBudgetTracker` |
 | Health check UNSAFE | epoch invalidated + run stops (`blocked_safety`); never auto-executes | `long_running._boundary_health` |
-| Planner unavailable or plan rejected | typed `planner_unavailable` / `plan_rejected` (+ codes); nothing created (historical: the manual `create_subtask` fallback died with the removed tools) | `long_running.plan_from_llm` (module retained; not reachable from tools) |
+| Planner unavailable or plan rejected | typed `planner_unavailable` / `plan_rejected` (+ codes); nothing created (historical: the manual-subtask fallback died with the removed loop tools) | `long_running.plan_from_llm` (module retained; not reachable from tools) |
 
 
 ### 11.10 Interference Guard (T8): protection upgrades, same doctrine

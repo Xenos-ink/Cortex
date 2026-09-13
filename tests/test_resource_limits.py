@@ -70,7 +70,7 @@ def _payload(result: Any) -> dict[str, Any]:
     return result
 
 
-# --- action / model-call / duration limits (RETARGETED, run_goal removal) ----------------
+# --- action / model-call / duration limits (RETARGETED, loop removal) ----------------
 # The limit classes survive; the enforcement SURFACE for the direct path is pinned
 # via computer_execute (max_actions, screenshot interval) and the enforcer seam
 # (task duration — the loop-top check the loop used to make). Loop-only limit
@@ -108,7 +108,7 @@ async def test_max_task_seconds_limit_trips_cleanly(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     bundle.enforcer._started_monotonic -= 10_000.0  # task "started" 10000s ago
-    # AMENDED (run_goal removal): the loop-top check the loop used to make, pinned at
+    # AMENDED (loop removal): the loop-top check the loop used to make, pinned at
     # the enforcer seam — the same method, the same typed error.
     with pytest.raises(LimitExceeded) as excinfo:
         bundle.enforcer.check_task_duration()
@@ -127,7 +127,7 @@ async def test_screenshot_rate_gate_trips_after_controller_wait_ceiling(
     action's fresh capture arrives within the 60s interval, waits past the 2s
     controller ceiling, and fails closed with an audited typed error.
 
-    RETARGETED (run_goal removal): the old test's loop half (gate-free in-loop
+    RETARGETED (loop removal): the old test's loop half (gate-free in-loop
     cycle) died with the loop."""
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False,
@@ -159,7 +159,7 @@ def test_screenshot_rate_gate_enforces_minimum_interval() -> None:
 
 
 # --- context growth cap ---------------------------------------------------------------------------------
-# REMOVED (run_goal removal): the conversation-context growth cap (max_context_items
+# REMOVED (loop removal): the conversation-context growth cap (max_context_items
 # tripping at the third decide) was loop machinery — the direct path keeps no
 # conversation context. The ContextManager's own bounded-window behavior stays
 # pinned by test_context_manager.py; TaskState history bounds by

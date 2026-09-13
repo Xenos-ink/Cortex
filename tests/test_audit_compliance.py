@@ -1,6 +1,6 @@
 """Wave 4 audit-compliance tests: schema conformance, redaction at the sink, metrics sanity.
 
-Scenarios are driven through the MCP tool surface (``run_goal`` / ``start_session`` /
+Scenarios are driven through the MCP tool surface (``start_session`` /
 ``stop_session``) with fake backends and scripted providers, then the JSONL audit files
 are validated directly:
 
@@ -59,7 +59,7 @@ def _payload(result: Any) -> dict[str, Any]:
 async def _drive_audit_scenarios(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> list[tuple[str, Any]]:
-    """Scripted sessions (RETARGETED to the five-tool surface, run_goal removal)
+    """Scripted sessions (RETARGETED to the five-tool surface, loop removal)
     that together cover every audit event type the direct path can emit."""
     scenarios: list[tuple[str, Any]] = []
 
@@ -159,7 +159,7 @@ async def test_audit_event_types_fields_and_jsonl_conformance(
         "health_check",
     }
     expected -= _LONG_RUNNING_EVENT_TYPES
-    # run_goal removal: the loop-only event types below were emitted exclusively by the
+    # loop removal: the loop-only event types below were emitted exclusively by the
     # internal decide/decide-phase machinery; with the loop gone, no tool path can emit
     # them. Every SURVIVING event type remains fully required here.
     _LOOP_ONLY_EVENT_TYPES = {
@@ -220,7 +220,7 @@ def test_redaction_enforced_at_sink_for_secret_metadata(tmp_path: Any) -> None:
 async def test_redaction_enforced_for_secrets_in_goal_through_runtime(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RETARGETED (run_goal removal): the goal channel died with the loop; the same
+    """RETARGETED (loop removal): the goal channel died with the loop; the same
     sink guarantee is driven through the direct surface — a host-supplied
     ``expected_effect`` carrying secrets is redacted in the audit rows and never
     appears raw in the tool response."""
@@ -252,7 +252,7 @@ async def test_redaction_enforced_for_secrets_in_goal_through_runtime(
 async def test_metrics_snapshot_invariants_after_scripted_runs(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RETARGETED (run_goal removal): counter/latency invariants on the direct path —
+    """RETARGETED (loop removal): counter/latency invariants on the direct path —
     every counter name present, counters add up, latencies recorded; a FAILED
     verification keeps the same invariants (failed verdict never counted as success)."""
     # Happy path: every counter name present, counters add up, latencies recorded.

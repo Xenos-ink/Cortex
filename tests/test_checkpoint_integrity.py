@@ -23,7 +23,7 @@ typed fail-closed refusal) case:
 - Tool boundary: ``SubtaskManager.create`` with a non-iterable (or string)
   ``depends_on`` raises the typed ``InvalidSubtaskError`` instead of escaping a
   TypeError (pinned at the domain seam in ``test_subtask_domain.py``; the MCP
-  ``create_subtask`` tool was removed with the run_goal family and its typed
+  ``create_subtask`` tool was removed with the loop family and its typed
   ``invalid_subtask`` error mapping died with it).
 - Runtime overshoot defense on the five-tool surface:
   ``start_session(resume_from_checkpoint=...)`` restores the sealed counters into the
@@ -336,21 +336,21 @@ async def test_sealed_overshoot_counters_resume_exactly_then_fail_closed_at_run_
     assert restored["actions"] == 10**9 and restored["model_calls"] == 10**9
 
     # The shared budget itself fails closed with the typed error — inflated counters
-    # are DoS-only, never a bypass (RETARGETED, run_goal removal: the loop's per-run
-    # budget consumers died with run_goal; the restored session budget is the
+    # are DoS-only, never a bypass (RETARGETED, loop removal: the loop's per-run
+    # budget consumers died with the loop; the restored session budget is the
     # surviving gate and is exercised here at its own seam).
     with pytest.raises(SessionBudgetExceeded):
         runtime.budget.check_all()
 
 
-# REMOVED (run_goal removal): the MCP create_subtask tool-boundary tests (non-iterable
+# REMOVED (loop removal): the MCP create_subtask tool-boundary tests (non-iterable
 # depends_on -> typed ``invalid_subtask``) died with the tool. The underlying domain rule
 # -- ``SubtaskManager.create`` raises typed ``InvalidSubtaskError`` on string/bytes/non-
 # iterable ``depends_on`` and accepts well-formed dependency lists -- is pinned at the
 # domain seam in ``test_subtask_domain.py`` (test_create_rejects_malformed_dependency_
 # shapes, test_create_rejects_unknown_dependency, test_create_cycle_defense).
 #
-# REMOVED (run_goal removal): the dry-run DECIDE/EXECUTE budget-attribution test drove
+# REMOVED (loop removal): the dry-run DECIDE/EXECUTE budget-attribution test drove
 # the loop (create_subtask -> run_subtask) and its model-call-per-decision semantics
 # were loop-only. The five-tool surface has no decide phase; the dry-run EXECUTE
 # short-circuit (no input, stub result) is pinned on the direct path in

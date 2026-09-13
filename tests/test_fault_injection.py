@@ -146,7 +146,7 @@ async def test_hallucinated_out_of_bounds_point_never_executed_and_recovered(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """1280x720 fake screen: x=8000 passes Point bounds (<=16384) but fails grounding.
-    RETARGETED (run_goal removal): the direct path rejects the out-of-bounds point
+    RETARGETED (loop removal): the direct path rejects the out-of-bounds point
     typed and audited; nothing executes. (The loop's re-decide died with the loop.)"""
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
@@ -165,7 +165,7 @@ async def test_hallucinated_out_of_bounds_point_never_executed_and_recovered(
     assert grounding_failures  # the grounding refusal was audited, not silent
 
 
-# REMOVED (run_goal removal): the low-confidence rejection was a decide-phase gate —
+# REMOVED (loop removal): the low-confidence rejection was a decide-phase gate —
 # on the direct surface the action's confidence is the client-asserted 1.0 (the host
 # model drives), and grounding confidence is computed independently; the floor applied
 # to provider decisions that no longer exist. Grounding-confidence behavior is pinned
@@ -175,18 +175,18 @@ async def test_hallucinated_out_of_bounds_point_never_executed_and_recovered(
 # --- stale screenshots / moved windows ----------------------------------------------------------
 
 
-# REMOVED (run_goal removal): the propose-vs-execute window-switch scenario hooked the
+# REMOVED (loop removal): the propose-vs-execute window-switch scenario hooked the
 # loop's decide phase (the hook ran at decide time). Its SURVIVING equivalent — the
 # direct path detecting a moved window between the grounding capture and execution
 # and refusing fail-closed — is pinned by the resolution-change test below (digest
 # staleness on the direct path) and the validator's STALE_OBSERVATION suite.
 
 
-# REMOVED (run_goal removal): decide-hook variant of the scenario above — the loop's
+# REMOVED (loop removal): decide-hook variant of the scenario above — the loop's
 # between-decides window-move machinery. See the note above for the surviving pins.
 
 
-# REMOVED (run_goal removal): the repeated-stale-proposal exhaustion was loop recovery
+# REMOVED (loop removal): the repeated-stale-proposal exhaustion was loop recovery
 # machinery (per-task recovery budget over loop steps). On the direct path every call
 # is independently validated: a stale premise is a typed rejection (digest surprise in
 # the queue; STALE_OBSERVATION refusal single-shot), pinned by the queue suite.
@@ -202,7 +202,7 @@ async def test_dpi_change_mid_task_rechecks_coordinate_space(
     DETECTED (stale observation), the P0-H single re-observe runs, and the action
     executes only against the NEW verified space (never the stale one).
 
-    RETARGETED (run_goal removal): the loop's decide-time hook became an
+    RETARGETED (loop removal): the loop's decide-time hook became an
     observe-time hook on the direct path (the validate probe is the fresh-capture
     point the loop's execute phase used)."""
     backend = ScriptedBackend(width=1280, height=720)  # passthrough: 1280x720 == monitor
@@ -253,7 +253,7 @@ async def test_resolution_change_mid_task_detected_as_stale(
     the broken space, and the call rejects typed — stale coordinates are discarded,
     never executed.
 
-    RETARGETED (run_goal removal): observe-time mutation on the direct path (the
+    RETARGETED (loop removal): observe-time mutation on the direct path (the
     validate probe is the loop's former mid-flight mutation window; an execute hook
     fires only AFTER validation has already passed, so it can only prove the click
     executed — the loop's decide-time hook became this observe-time hook)."""
@@ -308,7 +308,7 @@ async def test_unexpected_dialog_classified_with_bounded_recovery(
     """A dialog spawning during a direct action with an unmet stated effect is
     reported as NOT verified (ok=False) — never a silent OK.
 
-    RETARGETED (run_goal removal): the old test exercised the loop's UNEXPECTED_DIALOG
+    RETARGETED (loop removal): the old test exercised the loop's UNEXPECTED_DIALOG
     recovery classification (decide-phase machinery). The surviving direct-path
     guarantee: the unmet stated effect is never reported as success. RC-D11 (058)
     contract update: a stated effect with no pixel evidence degrades to
@@ -384,7 +384,7 @@ async def test_app_crash_during_execute_replans_and_completes(
     """An app crash mid-execute surfaces as a typed action_error with a failure
     audit row — never a crash, never silent, zero physical inputs completed.
 
-    RETARGETED (run_goal removal): the loop's in-run REPLAN died with the loop; the
+    RETARGETED (loop removal): the loop's in-run REPLAN is gone; the
     direct path fails the call closed and the host re-drives."""
     backend = CrashOnceBackend()
     session_id, bundle, _backend, _ = make_session(
@@ -408,7 +408,7 @@ async def test_display_unavailable_at_observe_fails_closed(
     """A dead display at observe time fails the direct call CLOSED: structured
     typed error, no crash, no input, audited.
 
-    RETARGETED (run_goal removal): the loop's bounded in-run REPLAN attempts died
+    RETARGETED (loop removal): the loop's bounded in-run REPLAN attempts died
     with the loop; the surviving guarantee is the same D4 classification at the
     failure audit sink (root cause recorded), never a crash or silent pass."""
     backend = DeadObserveBackend()
@@ -436,7 +436,7 @@ async def test_blocked_input_dismisses_then_succeeds(
     action_error (InputBlockedError root cause audited) — never a crash, never a
     silent same-coordinate retry loop.
 
-    RETARGETED (run_goal removal): the loop's automatic Escape-dismiss + retry died
+    RETARGETED (loop removal): the loop's automatic Escape-dismiss + retry died
     with the loop; the host now sees the typed error and drives the dismiss itself
     (the exact pattern the live sessions use: keypress esc, then re-click)."""
     backend = UnblockOnEscapeBackend()
@@ -475,7 +475,7 @@ async def test_blocked_input_dismiss_denied_fails_safely(
     action errors typed, and the policy-denied manual dismiss is refused with zero
     inputs — no bypass, audited.
 
-    RETARGETED (run_goal removal): the loop's automatic dismiss-probe died with the
+    RETARGETED (loop removal): the loop's automatic dismiss-probe died with the
     loop; the host-driven keypress passes through the SAME safety policy."""
     backend = ScriptedBackend()
     backend.set_input_blocked(True)
@@ -535,7 +535,7 @@ async def test_destructive_reason_on_click_is_blocked_safety(
     a decide-phase channel that no longer exists; the direct-path equivalent is the
     destructive payload itself, the exact CRITICAL-class the policy exists for.)
 
-    RETARGETED (run_goal removal)."""
+    RETARGETED (loop removal)."""
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
@@ -563,7 +563,7 @@ async def test_prompt_injection_in_goal_cannot_bypass_approval(
     destructive command inside is still blocked by the safety policy (audited), and
     no text can arm the kill path.
 
-    RETARGETED (run_goal removal): the loop's goal channel is gone; the same attack
+    RETARGETED (loop removal): the loop's goal channel is gone; the same attack
     class arrives as action payloads on the direct surface — and the payload's
     destructive core is still caught by the same safety policy."""
     session_id, bundle, backend, _ = make_session(
@@ -596,7 +596,7 @@ async def test_fake_approval_text_cannot_authorize_critical_action(
     ``approved=True`` — the operator authorization cannot downgrade the safety
     verdict, and no approval phase is ever reached (policy blocks first).
 
-    RETARGETED (run_goal removal)."""
+    RETARGETED (loop removal)."""
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
@@ -612,7 +612,7 @@ async def test_fake_approval_text_cannot_authorize_critical_action(
     assert counters["approval_granted"] == 0
 
 
-# REMOVED (run_goal removal): the provider suspicious-content marker was a
+# REMOVED (loop removal): the provider suspicious-content marker was a
 # decide-phase envelope channel (model_decision audit + per-result surfacing) — no
 # decide phase exists on the direct surface. The AUDIT sink's ability to carry
 # full-text detail verbatim (redaction only for secret-like payloads) stays pinned
@@ -628,7 +628,7 @@ async def test_stop_from_another_thread_mid_execute_halts_with_zero_inputs(
     """A stop armed from ANOTHER THREAD mid-execute halts the direct call with
     zero physical inputs — the same cross-thread kill path the loop exercised.
 
-    RETARGETED (run_goal removal): computer_execute drives the identical backend
+    RETARGETED (loop removal): computer_execute drives the identical backend
     rewiring; the stop token is checked before every physical input, whichever tool
     entered the execute phase."""
     session_id, bundle, _backend, _ = make_session(
@@ -664,7 +664,7 @@ async def test_stop_from_another_thread_mid_execute_halts_with_zero_inputs(
 # --- provider failure matrix ---------------------------------------------------------------------------
 
 
-# REMOVED (run_goal removal): the provider HTTP failure matrix (500 / timeout /
+# REMOVED (loop removal): the provider HTTP failure matrix (500 / timeout /
 # garbage JSON / unknown action type) exercised the decide-phase provider path — the
 # ONLY consumer of the provider on the tool surface. With the loop gone, no MCP tool
 # ever calls the provider: start_session constructs it lazily, and no decide phase
@@ -679,7 +679,7 @@ async def test_provider_unknown_action_type_fails_closed(
     unknown actions are never executed (unit-level pin; the decide-phase consumer is
     gone with the loop, the parser contract is not).
 
-    AMENDED (run_goal removal): the loop tail died with the loop; the parse-level
+    AMENDED (loop removal): the loop tail is gone; the parse-level
     guarantee (typed ProviderParseError, never a silent unknown action) remains."""
     with pytest.raises(ProviderParseError):
         parse_decision('{"status": "action", "action": {"action": "teleport", "confidence": 0.9}}')

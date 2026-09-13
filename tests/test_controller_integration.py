@@ -16,7 +16,7 @@ network, no real provider code. Covered here:
 - limit trips: max_actions, max_model_calls, task duration, screenshot rate;
 - approval budget semantics: single budget, recovery retry does not re-consume, new
   distinct action after exhaustion denied with requires_approval;
-- step_count persistence across run_goal calls;
+- step_count persistence across loop calls;
 - concurrent session isolation;
 - computer_execute confidence semantics + expected_effect verification + legacy shapes.
 """
@@ -262,7 +262,7 @@ async def test_happy_path_click_verified_with_phase_audit_and_metrics(
 ) -> None:
     """Happy path on the direct surface: one approved click, verified, fully audited.
 
-    RETARGETED (run_goal removal): the loop's happy path died with the loop; the
+    RETARGETED (loop removal): the loop's happy path is gone; the
     direct path exercises the SAME phase pipeline (observe -> ground -> validate ->
     safety -> approval -> execute -> verify) and the same audit/metrics counters."""
     session_id, bundle, backend, _ = make_session(
@@ -285,7 +285,7 @@ async def test_happy_path_click_verified_with_phase_audit_and_metrics(
         "execution",
         "verification",
     } <= audit_types(events)
-    # AMENDED (run_goal removal): the direct path audits an "approval" event only on
+    # AMENDED (loop removal): the direct path audits an "approval" event only on
     # the DENIAL shape (requires_approval outcome); a caller-supplied approved=True
     # executes without the approval phase (the denial shape is pinned by the
     # confidence-semantics test below).
@@ -323,7 +323,7 @@ async def test_wait_action_uncertain_verification_is_tolerated(
 ) -> None:
     # Identical screenshots: the wait's visual-change check is uncertain. Documented
     # carve-out: a wait makes no semantic claim, so uncertain continues (never success).
-    # RETARGETED (run_goal removal): direct path, same verifier contract.
+    # RETARGETED (loop removal): direct path, same verifier contract.
     session_id, _bundle, backend, _ = make_session(
         monkeypatch,
         backend=ScriptedBackend(flip=False),
@@ -344,7 +344,7 @@ async def test_wait_action_uncertain_verification_is_tolerated(
     assert executed_summary(backend) == [("wait", None, None)]
 
 # --- recovery paths --------------------------------------------------------------------------
-# REMOVED (run_goal removal): the four in-loop recovery scenarios below exercised the
+# REMOVED (loop removal): the four in-loop recovery scenarios below exercised the
 # internal loop's RECOVER/REDECIDE machinery (stale-coordinates re-decide with NEW
 # provider coordinates, moved-UI re-decide, blocked-UI dismiss + same-instance retry,
 # failed-verification recovery-budget exhaustion) — all loop-exclusive behavior that
@@ -360,7 +360,7 @@ async def test_wait_action_uncertain_verification_is_tolerated(
 #     by test_computer_execute_expected_effect_and_failure_shapes below.
 
 
-# REMOVED (run_goal removal): the loop-provider-failure scenarios (single provider
+# REMOVED (loop removal): the loop-provider-failure scenarios (single provider
 # failure recovered in-loop, persistent provider failure terminating provider_error,
 # model "blocked" decision terminating unrecoverable) were decide-phase loop behavior
 # — there is no decide phase on the direct surface. The provider's own fail-closed
@@ -368,7 +368,7 @@ async def test_wait_action_uncertain_verification_is_tolerated(
 # agent-seam ladder pins in test_perf004_loop_economics.
 
 # --- stop discipline (P0-C) --------------------------------------------------------------------
-# REMOVED (run_goal removal): the two loop-stop scenarios (stop_session between
+# REMOVED (loop removal): the two loop-stop scenarios (stop_session between
 # loop steps; stop mid-execute DURING the loop's type action) drove the loop's
 # between-steps kill path. The SURVIVING stop discipline on the direct surface is
 # pinned by: test_p5_redteam.test_rt4_prestopped_token_blocks_every_action_type_on_the_host_path
@@ -382,7 +382,7 @@ async def test_wait_action_uncertain_verification_is_tolerated(
 # structured action specs, never envelopes with stop fields).
 
 # --- limits (P0-L) ------------------------------------------------------------------------------
-# RETARGETED (run_goal removal): the limit gates are enforced on the direct surface
+# RETARGETED (loop removal): the limit gates are enforced on the direct surface
 # too (enforcer checks run in _run_single_pipeline: check_action/begin_action/
 # check_task_duration; the fresh-capture gate on direct_request). The loop-only
 # variants (max_model_calls, in-loop task duration) died with the loop — no model
@@ -420,7 +420,7 @@ async def test_task_duration_limit_trips_cleanly(
     """The session-duration gate trips typed on the loop-top check — the gate the
     agent's run loop enforced at every step top (``enforcer.check_task_duration``).
 
-    AMENDED (run_goal removal): the loop that carried this gate at its loop-top is
+    AMENDED (loop removal): the loop that carried this gate at its loop-top is
     gone; on the direct surface the gate survives through the ENFORCER's own
     check (pinned here at the exact method the loop used to call — the trip
     behavior, audit, and typed error are identical wherever it is enforced)."""
@@ -444,7 +444,7 @@ async def test_screenshot_rate_limit_trips_cleanly(
     within the interval trips the typed limit_exceeded, audited, nothing further
     executed.
 
-    RETARGETED (run_goal removal): the old test's loop half (gate-free in-loop
+    RETARGETED (loop removal): the old test's loop half (gate-free in-loop
     cycle) died with the loop; the surviving gate on the direct surface is the pin."""
     session_id, bundle, backend, _ = make_session(
         monkeypatch,
@@ -470,7 +470,7 @@ async def test_screenshot_rate_limit_trips_cleanly(
     )
 
 # --- approval budget semantics -------------------------------------------------------------------
-# REMOVED (run_goal removal): the run_goal approval-budget semantics (one budget per
+# REMOVED (loop removal): the loop approval-budget semantics (one budget per
 # CALL consumed across loop steps; a NEW distinct action after exhaustion denied
 # fail-closed) were loop-call semantics. On the direct surface, per-action approval
 # is the caller's explicit ``approved`` flag, pinned by
@@ -483,7 +483,7 @@ async def test_step_count_persists_across_direct_calls(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SessionState/Task step_count accumulates across separate tool calls (the old
-    across-run_goal-calls persistence pin, retargeted to the direct surface)."""
+    across-loop-calls persistence pin, retargeted to the direct surface)."""
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
@@ -505,7 +505,7 @@ async def test_concurrent_sessions_are_isolated(
     """Two sessions driven CONCURRENTLY through the direct surface stay isolated:
     separate backends, task ids, audit files, and zero cross-session events.
 
-    RETARGETED (run_goal removal): the old test ran two loops concurrently; the
+    RETARGETED (loop removal): the old test ran two loops concurrently; the
     direct-path equivalent pins the same isolation invariants."""
     backend_one = ScriptedBackend()
     backend_two = ScriptedBackend()
@@ -707,7 +707,7 @@ async def test_stop_session_removes_bundle_and_blocks_tools(
     execute = await server.computer_execute(session_id, "wait", delta=1)
     assert execute["ok"] is False
     assert execute["error"] == "session_stopped"
-    # AMENDED (run_goal removal): the removed loop tool's stopped-session shape check
+    # AMENDED (loop removal): the removed loop tool's stopped-session shape check
     # died with the loop; every surviving tool fails closed with session_stopped.
 
     again = server.stop_session(session_id)  # idempotent, shape preserved
@@ -770,7 +770,7 @@ async def test_pre_stopped_run_yields_failure_not_vacuous_ok() -> None:
 async def test_suspicious_content_persisted_in_audit_and_results(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """D3 REMOVED-loop half (run_goal removal): provider suspicious-content marking
+    """D3 REMOVED-loop half (loop removal): provider suspicious-content marking
     was decide-phase loop machinery (no decide phase on the direct surface). The
     redaction guarantees that survive are pinned by test_response_path_redacts_*
     below and the audit sink suite in test_audit_compliance."""
@@ -820,7 +820,7 @@ async def test_persistent_observe_failure_terminates_unrecoverable(
 async def test_dismiss_attempt_accounting_invariants(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """D6 REMOVED-loop half (run_goal removal): the in-loop dismiss-then-retry
+    """D6 REMOVED-loop half (loop removal): the in-loop dismiss-then-retry
     accounting was loop recovery machinery. Counter invariants on the direct path
     are pinned by the happy-path and limit tests above (action totals balance)."""
 
@@ -889,7 +889,7 @@ async def test_response_path_redacts_secret_shaped_text(
 ) -> None:
     """F2: the MCP response path is redacted too — no unredacted echo of host text.
 
-    RETARGETED (run_goal removal): the direct surface carries the same guarantee.
+    RETARGETED (loop removal): the direct surface carries the same guarantee.
     A host-supplied ``expected_effect`` with a secret echoes into the verification
     note/evidence — and is REDACTED at the response sink. (A secret-shaped ``type``
     payload is now stopped even earlier, at the safety gate — defense in depth.)"""
@@ -922,7 +922,7 @@ async def test_response_path_redacts_secret_shaped_text(
 async def test_provider_done_is_marked_model_declared(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """F3 REMOVED (run_goal removal): honest model-declared completion marking was a
+    """F3 REMOVED (loop removal): honest model-declared completion marking was a
     decide-phase loop guarantee ("done" from a provider is an assertion, not
     evidence). On the direct surface there is no provider "done" channel at all —
     the host decides when work is complete, and every action it drives is verified
@@ -947,7 +947,7 @@ async def test_internal_kill_path_bundle_hygiene(
     execute = await server.computer_execute(session_id, "wait", delta=1)
     assert execute["ok"] is False
     assert execute["error"] == "session_stopped"
-    # AMENDED (run_goal removal): the removed loop tool's tail check died with the loop.
+    # AMENDED (loop removal): the removed loop tool's tail check died with the loop.
 
     assert session_id not in server._bundles  # same cleanup as stop_session
     assert server._registry.get(session_id) is None

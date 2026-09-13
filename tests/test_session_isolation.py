@@ -50,7 +50,7 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
 async def test_concurrent_sessions_have_zero_state_cross_talk(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RETARGETED (run_goal removal): the direct surface drives two sessions
+    """RETARGETED (loop removal): the direct surface drives two sessions
     concurrently; every isolation invariant below is the same one the loop path
     pinned (distinct stop tokens, per-session state/metrics/audit, disjoint
     observations, zero cross-execution)."""
@@ -109,7 +109,7 @@ async def test_concurrent_sessions_have_zero_state_cross_talk(
 async def test_step_counts_and_histories_stay_per_session(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RETARGETED (run_goal removal): step counts and action histories stay
+    """RETARGETED (loop removal): step counts and action histories stay
     per-session across separate direct calls."""
     sid_one, bundle_one, _, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
@@ -130,7 +130,7 @@ async def test_step_counts_and_histories_stay_per_session(
 
 
 # --- stop isolation ---------------------------------------------------------------------------
-# REMOVED (run_goal removal): the mid-loop stop-isolation scenario (a gated second
+# REMOVED (loop removal): the mid-loop stop-isolation scenario (a gated second
 # decide proving stopping session A never stops a live session-B LOOP) drove the
 # loop's between-steps machinery; its direct replacement is the test below.
 
@@ -166,8 +166,8 @@ async def test_stop_session_a_does_not_stop_session_b(
 
 
 # --- approval isolation ------------------------------------------------------------------------
-# REMOVED (run_goal removal): cross-session APPROVAL-BUDGET isolation was a run_goal
-# call-budget semantic (one budget per run_goal call, consumed across loop steps).
+# REMOVED (loop removal): cross-session APPROVAL-BUDGET isolation was a loop
+# call-budget semantic (one budget per loop call, consumed across loop steps).
 # On the direct surface approval is the per-call ``approved`` flag — structurally
 # per-session (the safety decision runs inside each session's agent), pinned by
 # test_controller_integration.test_computer_execute_confidence_semantics... and by
@@ -230,7 +230,7 @@ async def test_tools_on_a_stopped_session_fail_safe(
     assert sid not in server._bundles
     assert server._registry.get(sid) is None
 
-    # AMENDED (run_goal removal): the removed loop tool's stopped-session shape check
+    # AMENDED (loop removal): the removed loop tool's stopped-session shape check
     # died with the loop; every surviving tool fails closed with session_stopped.
     observe = server.computer_observe(sid)
     assert observe["ok"] is False
@@ -255,7 +255,7 @@ async def test_repeated_session_calls_in_a_loop_never_lose_the_session(
 ) -> None:
     """Repeat the surviving tool calls in a loop: zero unknown_session.
 
-    AMENDED (run_goal removal): get_session_progress was a removed tool; the loop
+    AMENDED (loop removal): get_session_progress was a removed tool; the loop
     now alternates observe + screenshot + execute — the surviving high-frequency
     host call pattern (40 iterations each)."""
     session_id, bundle, _backend, _ = make_session(
