@@ -179,38 +179,39 @@ async def test_rt1_malformed_spec_matrix_fails_closed_before_any_dispatch(
     assert response["ok"] is False and backend.executed == []
 
 
-async def test_rt1_finding_spec_valid_grounded_invalid_items_crash_unstructured(
+async def test_rt1_finding_spec_valid_grounded_invalid_items_typed_rejection(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ATTACK DEMO — FINDING RT1-3 (MEDIUM: contract violation, fail-closed in effect).
+    """ATTACK DEMO — FINDING RT1-3 (MEDIUM) — CLOSED by ROADMAP R-18.
 
-    A queue item that passes ActionSpec parsing but fails GroundedAction validation
-    escapes the server's typed ``invalid_action`` teaching rejection: the pydantic
-    ValidationError from ``ActionSpec.to_grounded()`` propagates UNCAUGHT through the
-    MCP tool. ActionSpec carries NO cross-field validators, so every shape whose rules
-    live only in GroundedAction takes this crash path: focus_window without a target, a
-    half-specified drag, a single-key hotkey. Nothing is dispatched (the queue is built
-    before the loop — zero dispatch, session intact), so this is fail-closed in EFFECT,
-    but the client receives an internal error instead of the designed structured
-    rejection. Routed to the Commander; pinned here so the behavior cannot silently
-    change.
+    ORIGINAL FINDING: a queue item that passed ActionSpec parsing but failed
+    GroundedAction validation escaped the server's typed ``invalid_action`` teaching
+    rejection — the pydantic ValidationError from ``ActionSpec.to_grounded()``
+    propagated UNCAUGHT through the MCP tool (fail-closed in effect: zero dispatch,
+    session intact, but an internal error instead of the structured rejection).
+
+    R-18 DISPOSITION (fixed): the same shapes — focus_window without a target, a
+    target-less ensure_app, a half-specified drag, a single-key hotkey — now return
+    the typed ``invalid_action`` rejection with teach-in-text hints listing the valid
+    shapes; nothing is dispatched and the session stays usable. Zero uncaught
+    ValidationError. Pinned here so the fixed behavior cannot silently regress.
     """
-    from pydantic import ValidationError
-
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    for spec in (
-        {"action": "focus_window"},
-        {"action": "ensure_app"},
-        {"action": "drag", "x": 1, "y": 2},
-        {"action": "hotkey", "keys": ["a"]},
+    for spec, hint_fragment in (
+        ({"action": "focus_window"}, "focus_window requires a non-empty target"),
+        ({"action": "ensure_app"}, "ensure_app requires a non-empty target"),
+        ({"action": "drag", "x": 1, "y": 2}, "BOTH endpoints"),
+        ({"action": "hotkey", "keys": ["a"]}, "2-12 key names"),
     ):
-        with pytest.raises(ValidationError):
-            await server.computer_execute(
-                session_id, "click", x=10, y=10, follow_ups=[spec]
-            )
-    # fail-closed in effect: nothing was dispatched, and the session is still usable
+        response = await server.computer_execute(
+            session_id, "click", x=10, y=10, follow_ups=[spec]
+        )
+        assert response["ok"] is False, f"item accepted: {spec!r}"
+        assert response["error"] == "invalid_action", f"{spec!r}: {response}"
+        assert hint_fragment in " ".join(response["reasons"]), f"{spec!r}: {response}"
+    # fail-closed preserved: nothing was dispatched, and the session is still usable
     assert backend.executed == []
     response = await server.computer_execute(session_id, "click", x=10, y=10)
     response = execute_payload(response)  # REM-A: executed -> content blocks

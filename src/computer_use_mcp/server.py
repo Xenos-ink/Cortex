@@ -1036,12 +1036,51 @@ KEY_NAME_RULE = (
 )
 
 
+def _grounded_shape_hint(text: str) -> str | None:
+    """R-18: the closest valid shape for an ActionSpec-valid but GroundedAction-invalid
+    queue item.
+
+    A follow_ups entry can pass the ActionSpec schema and still fail GroundedAction
+    construction inside the queue (a target-less ``focus_window``, a half-specified
+    ``drag`` with one endpoint missing, a 1-key ``hotkey``, a point-less ``move``, a
+    target-less ``ensure_app``). The validator messages are matched by their stable
+    prefixes so the typed rejection can teach the exact valid shape instead of
+    surfacing a bare pydantic error.
+    """
+    if "drag actions require both point" in text:
+        return (
+            "A drag needs BOTH endpoints: {\"action\": \"drag\", \"x\": <start x>, \"y\": <start y>, "
+            "\"x2\": <end x>, \"y2\": <end y>} — x,y alone (or x2,y2 alone) is rejected."
+        )
+    if "hotkey actions require 2 to 12" in text:
+        return (
+            "A hotkey chord needs 2-12 key names: {\"action\": \"hotkey\", \"keys\": [\"ctrl\", \"a\"]}. "
+            "For a single key use {\"action\": \"keypress\", \"keys\": [\"<key name>\"]}."
+        )
+    if "focus_window actions require a non-empty target" in text:
+        return (
+            "focus_window requires a non-empty target window title: "
+            "{\"action\": \"focus_window\", \"target\": \"<window title>\"}."
+        )
+    if "move actions require a point" in text:
+        return "{\"action\": \"move\", \"x\": <x>, \"y\": <y>} — move needs both coordinates."
+    if "ensure_app actions require a non-empty target" in text:
+        return (
+            "ensure_app requires a non-empty target: {\"action\": \"ensure_app\", "
+            "\"target\": \"<process>\"} or \"<process>|<doc-token>\"."
+        )
+    return None
+
+
 def _teaching_invalid_action(exc: Exception, action: str | None) -> dict[str, object]:
     """Fail-closed ``invalid_action`` response that TEACHES the valid vocabulary.
 
     Session 1 lost full agent turns to schema rejections (``key``, 1-key ``hotkey``
     with a word payload, ``triple_click``). The rejection now always carries the exact
     valid values and, when recognizable, the closest valid shape for what was tried.
+    R-18: the same teaching path covers follow_ups items that pass the ActionSpec
+    schema but fail GroundedAction construction (half-specified ``drag``, 1-key
+    ``hotkey``, target-less ``focus_window``/``ensure_app``, point-less ``move``).
     """
     hints = [KEY_NAME_RULE]
     tried = (action or "").strip().casefold()
@@ -1061,6 +1100,9 @@ def _teaching_invalid_action(exc: Exception, action: str | None) -> dict[str, ob
             "Closest valid shape for a hotkey chord: {\"action\": \"hotkey\", \"keys\": [\"ctrl\", \"a\"]} "
             "(2-12 key names). Closest valid shape for one key: {\"action\": \"keypress\", \"keys\": [\"a\"]}."
         )
+    shape_hint = _grounded_shape_hint(str(exc))
+    if shape_hint is not None:
+        hints.append(shape_hint)
     message = f"{exc} {ACTION_VOCABULARY}"
     return {"ok": False, "error": "invalid_action", "message": message, "reasons": hints}
 
@@ -1665,6 +1707,12 @@ async def computer_execute(
     Per-item results arrive in the additive ``follow_up_results`` field (bounded, no
     per-item screenshots) with ``follow_ups_stopped_reason`` (None = the batch ran to
     completion).
+    An item that is ActionSpec-valid but GroundedAction-invalid (a target-less
+    ``focus_window``, a half-specified ``drag`` with one endpoint missing, a 1-key
+    ``hotkey``, a point-less ``move``, a target-less ``ensure_app``) is rejected at
+    the boundary with the typed ``invalid_action`` error and teach-in-text hints
+    listing the valid shapes — nothing dispatches and the queue never starts (R-18;
+    never a raw pydantic ValidationError).
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -1716,9 +1764,20 @@ async def computer_execute(
             try:
                 # REM-F: tolerate the same weak-model coordinate shapes inside
                 # entries; every strict ActionSpec bound still applies afterwards.
-                specs.append(ActionSpec.model_validate(_coerce_follow_up_entry(item)))
+                spec = ActionSpec.model_validate(_coerce_follow_up_entry(item))
             except Exception as exc:  # noqa: BLE001 - malformed queue item: fail closed
                 return _teaching_invalid_action(exc, str(item.get("action", "")))
+            try:
+                # R-18: an item can be ActionSpec-valid yet GroundedAction-invalid
+                # (target-less focus_window, half-specified drag, 1-key hotkey).
+                # Validate the conversion HERE so the host gets the typed
+                # ``invalid_action`` rejection with teach-in-text hints instead of an
+                # uncaught pydantic ValidationError from inside the queue; the queue
+                # never starts (fail-closed, zero items dispatch — unchanged).
+                spec.to_grounded()
+            except Exception as exc:  # noqa: BLE001 - grounded-shape failure: teach
+                return _teaching_invalid_action(exc, spec.action.value)
+            specs.append(spec)
     try:
         outcome = await bundle.agent.run_single(
             bundle.state,
