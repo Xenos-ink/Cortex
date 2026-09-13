@@ -77,28 +77,34 @@ notes fold into the `## v0.6.0` entry at release.
 
 ### Fixed
 
-- **(R-04) Keystroke-burst resilience: truthful integrity reads + verified
-  end-of-action verification** — `type` is chunk-dispatched (default 64
-  characters, `CORTEX_TYPE_CHUNK_CHARS`) and verified by reading the focused
-  control's value back. The first read path trusted `WM_GETTEXTLENGTH` via
-  `SendMessageTimeoutW`, which mis-reports text length on some desktops (measured:
-  it returned 1 for a 20-character edit) and made the read-back under-report
-  landed text, so a wrongful repair could double-apply. The read is now ONE
-  fixed-buffer `WM_GETTEXT` call (8192-character cap, `SMTO_ABORTIFHUNG` kept),
-  which reports truthfully and also un-truncates the `ui_elements[].value`
-  observation field. Verification runs once at end-of-action: two consecutive
-  reads must agree (the second taken after `CORTEX_TYPE_VERIFY_STABILITY_SECONDS`,
-  default 2.5 s — the landing-lag horizon) before any value is trusted;
-  `unverified` never triggers a repair; a trusted genuine partial is repaired with
-  exactly the missing suffix (once); a confirmed still-wrong buffer fails the
-  action with the typed `TextIntegrityError`, and an unconfirmable repair reports
-  honest `unverified`. The action message gains the additive suffix
-  `integrity=verified|partial|unverified|mismatch(v/total)` (plus `healed=<n>`);
-  `CORTEX_TYPE_INTEGRITY=0` restores the byte-identical legacy path. Live proof on
-  the reference desktop through the served pipeline at defaults: 200 characters
-  across 20 bursts — 20/20 executed, 200/200 characters exact, zero duplication,
-  zero manual fixes — and a 50-action follow_ups chain — 50/50 executed,
-  855/855 characters exact.
+- **(R-04) Keystroke-burst resilience: truthful integrity reads + fast-path-first
+  verification** — `type` is chunk-dispatched (default 64 characters,
+  `CORTEX_TYPE_CHUNK_CHARS`) and verified by reading the focused control's value
+  back. The first read path trusted `WM_GETTEXTLENGTH` via `SendMessageTimeoutW`,
+  which mis-reports text length on some desktops (measured: it returned 1 for a
+  20-character edit) and made the read-back under-report landed text, so a
+  wrongful repair could double-apply. The read is now ONE fixed-buffer
+  `WM_GETTEXT` call (8192-character cap, `SMTO_ABORTIFHUNG` kept), which reports
+  truthfully and also un-truncates the `ui_elements[].value` observation field.
+  Verification is fast-path-first: after a 0.05 s settle it polls up to 4 quick
+  reads 0.04 s apart, accepting mid-drain buffer growth as evidence and returning
+  `verified` the moment a read holds the full expected text; the 2.5 s
+  landing-lag horizon plus the single suffix-diff repair are escalation-only
+  (shrink/divergence/stalled-partial signatures). Blind reads, agreed-empty
+  buffers, and a read budget exhausted while the buffer is still growing report
+  honest `unverified` and never repair; a confirmed still-wrong buffer fails the
+  action with the typed `TextIntegrityError`. The action message gains the
+  additive suffix `integrity=verified|partial|unverified|mismatch(v/total)`
+  (plus `healed=<n>`); `CORTEX_TYPE_INTEGRITY=0` restores the byte-identical
+  legacy path. An intermediate design that paid the horizon on nearly every
+  action measured ~2.9–3.4 s per type action (vs ~0.35–1.0 s on 0.5.9); the fast
+  path resolves it — type-action client latency p50 718 ms (was 3266 ms), within
+  ~150 ms of the 0.5.9 execution phase. Live proof on the reference desktop
+  through the served pipeline at defaults: 200 characters across 20 bursts —
+  20/20 executed, all `verified(10/10)`, 200/200 characters exact, zero
+  duplication, zero manual fixes — and, on that same intermediate state (the
+  fast path does not change chain semantics), a 50-action `follow_ups` chain —
+  50/50 executed, 855/855 characters exact.
 - **(R-05) B5 backslash-type wedge closed as root-caused** — the historical
   >10-minute stall was a one-off window-activation race: the type dispatched while
   the freshly activated Run dialog's thread input queue was still settling. On the
