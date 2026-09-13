@@ -12,10 +12,12 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
-## Unreleased
+## v0.6.0 (2026-09-13, ORVEX-CORTEX-060 — quality, right-click, live D365 proof)
 
-Target: v0.6.0 (mission ORVEX-CORTEX-060). Integrated on `release-v060`; these
-notes fold into the `## v0.6.0` entry at release.
+Quality and reliability across the verification, input, safety, and guard layers,
+plus the owner-commissioned `right_click` action — validated live on the desktop
+and against a Dynamics 365 F&O onebox (sales order, customer, invoice posting,
+employee hire; `right_click` proven in-UI; maintainer-local evidence).
 
 ### Added
 
@@ -98,8 +100,9 @@ notes fold into the `## v0.6.0` entry at release.
   (plus `healed=<n>`); `CORTEX_TYPE_INTEGRITY=0` restores the byte-identical
   legacy path. An intermediate design that paid the horizon on nearly every
   action measured ~2.9–3.4 s per type action (vs ~0.35–1.0 s on 0.5.9); the fast
-  path resolves it — type-action client latency p50 718 ms (was 3266 ms), within
-  ~150 ms of the 0.5.9 execution phase. Live proof on the reference desktop
+  path resolves it — type-action client latency p50 718 ms (the pre-fix candidate
+  measured ~3.2 s on the typing task: formal A/B client-latency p50 3196 ms),
+  within ~150 ms of the 0.5.9 execution phase. Live proof on the reference desktop
   through the served pipeline at defaults: 200 characters across 20 bursts —
   20/20 executed, all `verified(10/10)`, 200/200 characters exact, zero
   duplication, zero manual fixes — and, on that same intermediate state (the
@@ -135,11 +138,25 @@ notes fold into the `## v0.6.0` entry at release.
 
 ### Performance
 
-- Speed-comparison numbers (v0.5.9 vs 0.6.0, same tasks/same driver) are measured
-  in a later mission phase and land here at release from the maintainer evidence
-  tree — no performance numbers are claimed before they exist.
+- **Measured v0.5.9-vs-0.6.0 comparison (scripted deterministic driver, 5
+  composite desktop tasks, 3 interleaved repeats per task per version, driver
+  think time excluded): server-side mechanics at rough parity.** Window-focus
+  switching is ~2.8× faster server-side (S3 server-pipeline p50 46.3→16.4 ms);
+  typing actions pay ~+100 ms for the NEW inline integrity verification (S1
+  client-latency p50 592→690 ms); driver-context bytes per action are at parity
+  (0.99–1.06×). Verdict-driven turn waste is at parity too (driver-faithful
+  retry-loop scenario: 0 policy reactions on either version). Stated plainly:
+  **the measured data does not support a "much faster than 0.5.9" claim — 0.5.x
+  already contained the large speed wins.** 0.6.0's delivery is reliability and
+  capability at equal speed. (Raw per-run artifacts and the medians table live in
+  the maintainer-local `evidence/v06-006/speed/` tree.)
 
 ### Compatibility notes
+
+- **Behavior change worth callers' review:** verification tier defaults changed
+  for `type` (a deterministic field-match now decides where the text is visible;
+  the pixel band escalates only) and `keypress` (launch-prefix `window_state`
+  promotion, pinned).
 
 - The `right_click` action is additive: existing action names, parameters, and
   response shapes are unchanged.
