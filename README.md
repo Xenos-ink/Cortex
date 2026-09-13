@@ -18,7 +18,7 @@ After execution, Cortex re-observes the screen and verifies the action **semanti
 
 The design principle: the goal is not to click the right pixel — it is to reach the intended state and prove that it happened. Every tool response carries an explicit outcome, and every session writes a redacted JSONL audit trail of every pipeline phase.
 
-**As of 0.5.5 the internal autonomous loop is gone.** The `run_goal` tool family (`run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`) was removed by explicit user order: the server is driven exclusively by a host agent making direct tool calls with a real model, which halves the failure surface and removes the two loop-only defects (an unset vision key surfacing as an in-run HTTP 401, and unbounded screenshot text embedded in loop results). The five-tool surface is the whole contract; the loop's guarantees live on because every direct call passes through the identical grounding, validation, risk, approval, execution, and verification pipeline.
+**As of 0.5.5 the internal autonomous loop is gone.** The internal-LLM loop and its tool family were removed by explicit user order: the server is driven exclusively by a host agent making direct tool calls with a real model, which halves the failure surface and removes the two loop-only defects (an unset vision key surfacing as an in-run HTTP 401, and unbounded screenshot text embedded in loop results). The five-tool surface is the whole contract; the loop's guarantees live on because every direct call passes through the identical grounding, validation, risk, approval, execution, and verification pipeline.
 
 ## How it works
 
@@ -263,33 +263,39 @@ STEP 4 — REPORT to the user:
   - and: restart yourself / your host to load the update.
 ```
 
-## Agent skill: cortex-fast (fast-path driving)
+## Agent skill: cortex-skill (fast-path driving)
 
-`cortex-fast` is a small agent skill (one `SKILL.md`, ~60 lines) that teaches any LLM/VLM
-driving Cortex to spend fewer turns: a fast path for verified or obvious steps, one named
+`cortex-skill` is a small agent skill (one `SKILL.md`, ~65 lines) that teaches any LLM/VLM
+driving Cortex to spend fewer turns: a fast path for verified or confirmed steps, one named
 escalation route for everything else. It changes nothing in the server — verification,
 staleness, risk, and approval semantics are fully preserved; the skill only shapes how the
 driving host reacts to results. On invocation it instructs the agent to execute the user's
 request through the Cortex MCP tools (`start_session` → `computer_execute` /
 `computer_observe` → `stop_session`).
 
-Install it side-channel with npx (pulls this repo and runs the bundled installer; no
+Two commands, side-channel via npx (pulls this repo and runs the bundled installer; no
 Python setup required):
 
 ```bash
-npx --yes github:Xenos-ink/Cortex            # installs into every EXISTING user-scope
-                                             # skills dir (~/.zcode/skills, ~/.agents/skills,
-                                             # ~/.claude/skills)
-npx --yes github:Xenos-ink/Cortex -- --all   # also project-scope ./.zcode|agents|claude/skills
-npx --yes github:Xenos-ink/Cortex -- --dir D:\skills   # explicit target (created)
-npx --yes github:Xenos-ink/Cortex -- --list  # plan only, no writes
+npx --yes github:Xenos-ink/Cortex install   # install into EVERY detected user-scope
+                                            # skills dir (~/.zcode/skills, ~/.agents/skills,
+                                            # ~/.claude/skills); if none exists,
+                                            # ~/.zcode/skills is created
+npx --yes github:Xenos-ink/Cortex update    # refresh only dirs where the skill is
+                                            # already installed (backs each up before
+                                            # replacing); report the rest untouched
 ```
 
-`--force` overwrites a differing existing install after backing it up to
-`cortex-fast.cortex-backup-<YYYYmmdd-HHMMSS>` (an existing backup is never overwritten).
-Already-installed identical content reports `UNCHANGED`. The skill lives in the repo at
-`skills/cortex-fast/SKILL.md`; the installer is `skills/install-cortex-skill.mjs`
-(stdlib-only Node ≥ 18, no telemetry, no network).
+- `install` NEVER overwrites: a differing existing install is reported `SKIPPED-EXISTS` —
+  run `update` to refresh it; identical content reports `UNCHANGED`.
+- `update` is the only overwrite path: each existing install is backed up to
+  `cortex-skill.cortex-backup-<YYYYmmdd-HHMMSS>` (an existing backup is never overwritten)
+  before it is replaced; directories without the skill are reported `NOT-INSTALLED (run
+  install)` and left untouched.
+- Bare or unknown arguments print short usage text and exit 1.
+
+The skill lives in the repo at `skills/cortex-skill/SKILL.md`; the installer is
+`skills/install-cortex-skill.mjs` (stdlib-only Node ≥ 18, no telemetry, no network).
 
 ## Running the server
 
@@ -347,13 +353,7 @@ The `env` block is optional — the five-tool server needs no API key (see the m
 - **Per session (model-taught):** the driving model passes `start_session(image_delivery="text")`. The `start_session` tool description teaches the model to judge by what it *receives* (text-only inputs → `text`, required) rather than by what it *thinks it is* — self-misclassification ("my host is multimodal") is the documented failure mode this wording targets. Text mode returns the full metadata payload (window, cursor, digest, OCR/UI elements, `text_summary`) and never an image block; it never crashes any model — a vision model in text mode merely loses the screenshot pixels. `image_delivery="image"` (or omitting the parameter) keeps real image blocks. Invalid values are rejected fail-closed (`invalid_image_delivery`) before any session exists. The mode is deliberately not checkpointed: a resumed session is governed by its own fresh call.
 - **Deterministic (user-set, recommended when the host's default model lacks image input):** set `"CORTEX_IMAGE_DELIVERY": "text"` in the Cortex MCP server entry's `env` block (e.g. Kimi Code's `mcp.json` `env`). This makes every session text-mode by default regardless of model self-assessment, and a vision model can still override per session via the parameter (`param > env > default`). Unset or garbage values fail-safe to `image` — a typo can never blind sessions silently.
 
-## Usage
-
-### Integration pattern: host-driven direct control
-
-**Direct control (the only pattern as of 0.5.5).** The driving agent calls `computer_observe` and `computer_execute` itself: observe, decide what to do, execute one action, read the verification result, repeat. You keep full control of every step and no vision API is needed — but every action still passes through grounding, staleness validation, the risk engine, the approval gate, and semantic verification. The autonomous `run_goal` loop was removed by explicit user order (see [What is Cortex](#what-is-cortex)); when the UI path is not known in advance, the host agent iterates over these tools — the same per-action guarantees apply, with the driving model doing the deciding.
-
-### Tool reference
+## Tool reference
 
 Cortex exposes exactly five MCP tools (`computer_screenshot` is a compatibility alias of `computer_observe`, making the wire surface five distinct names).
 
@@ -408,11 +408,17 @@ Host-payload opt-out (PERF-004, trailing optional): pass `include_screenshot_aft
 
 Queued actions (PERF-004, trailing optional): `follow_ups` accepts up to 5 action specs (same fields as the tool's action parameters). Each follow-up passes the FULL independent pipeline — grounding, validation, safety, approval semantics, execution, verification — exactly like a single action; the queue CONTINUES while the attached window identity (hwnd/title/bounds) is unchanged — ordinary pixel changes from earlier items (drawing, typing, dialogs) do not stop it, and each item re-grounds from the fresh post-action capture — and stops on TRUE staleness (the attached window closed or its title/bounds changed since the queued premise) plus safety rejection, approval requirement, validator/grounding rejection, or a named interference event. `CORTEX_QUEUE_STRICT_DIGEST=1` restores the legacy whole-screen premise checking. Per-item results arrive in the additive `follow_up_results` field (bounded, no per-item screenshots) with `follow_ups_stopped_reason` (`null` = every item executed and verified). Batch small related groups and observe after the batch.
 
-**`run_goal` — REMOVED (0.5.5, user order).** The autonomous loop tool and its family (`create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`) no longer exist; the five tools above are the entire surface. The loop's per-action guarantees did not die with it — every `computer_execute` call runs the identical grounding, validation, risk, approval, execution, and verification pipeline, and returns the per-action result (action record, message, verification outcome and evidence) directly to the host. Successive goals are host-side loops of `computer_observe` → `computer_execute`; task completion is the host's decision, made on evidenced `verified` outcomes.
+**Internal loop tools — REMOVED (0.5.5, user order).** The autonomous loop tool and its subtask-tool family no longer exist; the five tools above are the entire surface. The loop's per-action guarantees did not die with it — every `computer_execute` call runs the identical grounding, validation, risk, approval, execution, and verification pipeline, and returns the per-action result (action record, message, verification outcome and evidence) directly to the host. Successive goals are host-side loops of `computer_observe` → `computer_execute`; task completion is the host's decision, made on evidenced `verified` outcomes.
 
 **`stop_session(session_id)`**
 
 The kill switch. Arms the thread-safe `StopToken` — checked before every physical input, at every loop checkpoint, and inside waits — closes the session, and audits `stop` + `emergency_stop`. Every later tool call on that session id fails closed with `session_stopped`. Idempotent: stopping an already-stopped session returns a normal stop result. Nothing a model outputs can reach the stop setter; decisions are data, not control.
+
+## Usage
+
+### Integration pattern: host-driven direct control
+
+**Direct control (the only pattern as of 0.5.5).** The driving agent calls `computer_observe` and `computer_execute` itself: observe, decide what to do, execute one action, read the verification result, repeat. You keep full control of every step and no vision API is needed — but every action still passes through grounding, staleness validation, the risk engine, the approval gate, and semantic verification. The internal autonomous loop was removed by explicit user order (see [What is Cortex](#what-is-cortex)); when the UI path is not known in advance, the host agent iterates over these tools — the same per-action guarantees apply, with the driving model doing the deciding.
 
 ### How an agent benefits
 
@@ -619,7 +625,7 @@ For a multi-step goal the host repeats step 3 (optionally interleaving `computer
 
 ## Checkpoints and Resume
 
-**As of 0.5.5 the subtask orchestration layer is gone with the loop** (`run_goal(auto_subtasks=…)`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress` were all removed by user order). What survives — and remains fully supported — is the sealed checkpoint/resume machinery on `start_session`: a long-running host session can be stopped and later resumed as a continuation, with its budget counters intact.
+**As of 0.5.5 the subtask orchestration layer is gone with the loop** (the loop-era tool family, the auto-subtask entry points included, was removed by user order). What survives — and remains fully supported — is the sealed checkpoint/resume machinery on `start_session`: a long-running host session can be stopped and later resumed as a continuation, with its budget counters intact.
 
 ### Checkpoints
 
@@ -682,8 +688,26 @@ The host then continues driving the session with `computer_observe` / `computer_
 ### Backward compatibility
 
 - The five tools (`start_session`, `stop_session`, `computer_screenshot`, `computer_observe`, `computer_execute`) keep their names, parameter positions, and response shapes.
-- The removed loop family (`run_goal`, `create_subtask`, `list_subtasks`, `run_subtask`, `get_session_progress`) is gone from tools/list; hosts must drive actions directly — the documented pattern since the loop's guarantees (grounding, validation, risk, approval, verification) wrap every `computer_execute` call.
+- The removed loop tool family is gone from tools/list; hosts must drive actions directly — the documented pattern since the loop's guarantees (grounding, validation, risk, approval, verification) wrap every `computer_execute` call.
 - No existing limit was removed or weakened; the session-level limits above are additive and clamped like the rest. A resume can never reset or enlarge a session counter.
+
+## Safety model
+
+The threat model assumes three things: the model controls a desktop and is treated as a fallible, potentially manipulable proposer — never an authority; screen content is untrusted and can never grant permission; the vision provider sits outside the trust boundary and receives redacted payloads with no capabilities. On top of that: fail-closed defaults everywhere (unknown risk escalates to `CRITICAL`, unverifiable coordinate spaces refuse input, `uncertain` verification routes to recovery, malformed provider output is bounded recovery instead of a crash), bounded autonomy (approval budgets, recovery budgets, nine hard limits), and a redaction-enforced audit trail of every phase.
+
+Full details — risk taxonomy with all pattern categories, fail-closed rules table, approval semantics, kill-path discipline, and the honest residual-risk list: **[docs/SAFETY.md](docs/SAFETY.md)**.
+
+## Limitations
+
+- **Windows-first.** The execution backend targets Windows (PyAutoGUI + Win32). Non-Windows machines can import the package and run the test suite against in-memory fakes, but cannot drive a real desktop.
+- **OCR and UIA are extension-point stubs.** No OCR engine or UIA integration ships. The text-anchor and accessibility grounding strategies refuse (fail-closed), and `text_predicate` verification degrades to `uncertain` — the pipeline degrades gracefully to coordinate grounding, but text-level grounding and verification need that integration built.
+- **No OS-level sandboxing.** Policy, approval, and cancellation are enforced in-process. There is no VM, job object, or AppContainer isolation; if the process itself is compromised, these controls do not contain it, and the only physical backstop is the PyAutoGUI failsafe screen corner.
+- **An interactive desktop session is required.** No headless mode; capture and input go through the real desktop.
+- **Model-based verification is only as good as the configured provider.** A weak vision judge can produce wrong `verified` verdicts. Deterministic strategies run first in the chain, and a judge's `uncertain` is passed through, never upgraded.
+- **Risk classification is pattern + context matching** (English patterns plus a small Arabic term set), not semantic understanding. Novel destructive phrasing in other languages may under-classify; the compensating controls are approval-by-default for interactive actions, allowlists, bounded recovery, and verification.
+- **Screenshot secret redaction is partial.** Text-pattern redaction and explicit-region blur only; secrets visible purely as pixels are not detected.
+- **Multi-monitor logic is unit-tested with fake monitor sets** (100/125/150% DPI); the reference E2E box is single-monitor, so real multi-monitor behavior is not E2E-verified.
+- **The kill switch is cooperative and in-process.** `stop_session` guarantees no further input from this runtime; it is not an OS-level kill switch.
 
 ## Testing
 
@@ -721,29 +745,11 @@ scoring JSONs, bridge transcripts, screenshots — stays local to the maintainer
 machine and is not published; `benchmarks/RUNS.md` and `benchmarks/runs-log.jsonl`
 are local-only (gitignored).
 
-## Safety model
-
-The threat model assumes three things: the model controls a desktop and is treated as a fallible, potentially manipulable proposer — never an authority; screen content is untrusted and can never grant permission; the vision provider sits outside the trust boundary and receives redacted payloads with no capabilities. On top of that: fail-closed defaults everywhere (unknown risk escalates to `CRITICAL`, unverifiable coordinate spaces refuse input, `uncertain` verification routes to recovery, malformed provider output is bounded recovery instead of a crash), bounded autonomy (approval budgets, recovery budgets, nine hard limits), and a redaction-enforced audit trail of every phase.
-
-Full details — risk taxonomy with all pattern categories, fail-closed rules table, approval semantics, kill-path discipline, and the honest residual-risk list: **[docs/SAFETY.md](docs/SAFETY.md)**.
-
-## Architecture
+## Documentation
 
 The module map with verified import graph, the pipeline-to-module mapping, the pinned data contracts (`Observation`, `GroundedAction` lineage, `VerificationResult`), the coordinate-transform invariant, the recovery taxonomy table, the stop-token enforcement story, the limits table, and the audit schema: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
 Planned work per upcoming version — the prioritized improvement backlog (P0/P1/P2, items R-01 … R-20): **[ROADMAP.md](ROADMAP.md)**.
-
-## Limitations
-
-- **Windows-first.** The execution backend targets Windows (PyAutoGUI + Win32). Non-Windows machines can import the package and run the test suite against in-memory fakes, but cannot drive a real desktop.
-- **OCR and UIA are extension-point stubs.** No OCR engine or UIA integration ships. The text-anchor and accessibility grounding strategies refuse (fail-closed), and `text_predicate` verification degrades to `uncertain` — the pipeline degrades gracefully to coordinate grounding, but text-level grounding and verification need that integration built.
-- **No OS-level sandboxing.** Policy, approval, and cancellation are enforced in-process. There is no VM, job object, or AppContainer isolation; if the process itself is compromised, these controls do not contain it, and the only physical backstop is the PyAutoGUI failsafe screen corner.
-- **An interactive desktop session is required.** No headless mode; capture and input go through the real desktop.
-- **Model-based verification is only as good as the configured provider.** A weak vision judge can produce wrong `verified` verdicts. Deterministic strategies run first in the chain, and a judge's `uncertain` is passed through, never upgraded.
-- **Risk classification is pattern + context matching** (English patterns plus a small Arabic term set), not semantic understanding. Novel destructive phrasing in other languages may under-classify; the compensating controls are approval-by-default for interactive actions, allowlists, bounded recovery, and verification.
-- **Screenshot secret redaction is partial.** Text-pattern redaction and explicit-region blur only; secrets visible purely as pixels are not detected.
-- **Multi-monitor logic is unit-tested with fake monitor sets** (100/125/150% DPI); the reference E2E box is single-monitor, so real multi-monitor behavior is not E2E-verified.
-- **The kill switch is cooperative and in-process.** `stop_session` guarantees no further input from this runtime; it is not an OS-level kill switch.
 
 ## Credits and references
 
