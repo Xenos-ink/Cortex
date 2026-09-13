@@ -16,7 +16,7 @@ released version is `pyproject.toml`.
 ## How to use this file
 
 - **Pick items per version.** Each priority group below maps to a target version
-  (P0 → v0.6.0, P1 → v0.7.0, P2 → v0.8.0+). Work through a group top-down; item IDs
+  (P0 → v0.7.0, P1 → v0.7.0, P2 → v0.8.0+). Work through a group top-down; item IDs
   (R-01 …) are stable references — never renumber, only append.
 - **Every item is self-contained.** Each carries a `Status` label, the `Problem`
   (with the concrete symptoms), the suggested `Approach`, an `Evidence` pointer, and
@@ -35,105 +35,45 @@ released version is `pyproject.toml`.
 - **Honesty rule:** record only numbers that exist in the referenced evidence. If a
   measurement is missing, measure it during implementation instead of estimating.
 
-## P0 — v0.6.0 (quality & reliability)
+## P0 — v0.7.0 (safety & guard residuals discovered during v0.6.0)
 
-### R-01 Verification tier defaults: pixel-diff false-negatives on type actions
+### R-21 Safety text-classifier vocabulary gaps (polite destructives + unlabeled secrets)
 
-- **Status:** DISCOVERED-DEFERRED.
-- **Problem:** the pixel-diff verification tier produced false-negatives on `type`
-  actions (verdict `failed` although the effect had landed), which forced chain stops
-  and single-action fallbacks — 40+ occurrences in the internal live validation run.
-- **Approach:** make the deterministic / observe-confirm tier the default for `type`
-  and `keypress`; demote pixel-diff to an ambiguous-band escalation (used only when
-  the deterministic tier is inconclusive).
-- **Evidence:** (QA: perf-004 evidence — live-run progress log and post-fix
-  comparison notes).
-- **Accept:** type chains complete without fallback in a live bridge; zero false-fails
-  in a 50-type loop.
+- **Status:** DISCOVERED-DEFERRED (red-team findings RT-E8-01/02/03, severity
+  MEDIUM each).
+- **Problem:** destructive verbs in polite phrasings type at LOW risk — "please
+  delete the model", "delete the database/table", "please remove the model
+  weights", "wipe the disk now" all pass the safety gate and the classifier;
+  space-separated or abbreviated credential phrasings ("api key: sk-…",
+  "access key: …", "pwd is hunter2", "pass: hunter2x") bypass BOTH the safety
+  gate and secret redaction, so raw secrets can reach the audit JSONL and tool
+  responses; bare token values with no keyword label (ghp_…, xoxb-…, npm_…)
+  match no redaction pattern and no safety marker.
+- **Approach:** extend the token/phrase marker vocabulary and the risk
+  classifier for polite destructive phrasings; add value-shape detection for
+  bearer-token prefixes (ghp_/xoxb-/npm_ families) to redaction. The
+  both-directions rule applies: the benign corpus must still pass AND the true
+  secret/credential corpus must still block — do NOT weaken real protection.
+- **Evidence:** (maintainer-local) `evidence/v06-006/redteam/report.md`
+  (RT-E8-01/02/03; `artifacts/r02_nearmiss_results.json`).
+- **Accept:** the red-team near-miss corpus blocks on both the safety and
+  redaction layers; the R-02 benign corpus still passes unchanged.
 
-### R-02 Safety text-classifier tuning (false positives on benign text)
+### R-22 Re-anchor adoption residual (launch-act widening)
 
-- **Status:** DISCOVERED-DEFERRED.
-- **Problem:** benign strings were rejected as secrets by the safety text heuristic —
-  observed: "black-scholes closed-form formula expository", "binomial option pricing
-  model Cox Ross Rubinstein", "closed form", "call and put prices", and DOI tokens.
-- **Approach:** tune the heuristic against a benign-corpus test suite **while keeping
-  true secret/credential detection**. Both-direction tests are mandatory: the benign
-  corpus must pass AND the secret corpus must still be blocked. Do NOT weaken real
-  protection.
-- **Evidence:** (QA: perf-004 evidence — live-run anomaly log).
-- **Accept:** the benign corpus passes; the secret corpus is still blocked.
-
-### R-03 ensure_app minor bug: empty-title focus_window call
-
-- **Status:** DISCOVERED-DEFERRED.
-- **Problem:** `ensure_app` builds a `focus_window` call with an empty title (A7b
-  finding), which surfaces as a validation error instead of a focused reattach.
-- **Approach:** fix the title resolution in `ensure_app` so the call is only built
-  when a non-empty target exists; fail loudly (typed error) when it cannot resolve.
-- **Evidence:** (QA: perf-004 evidence — still-open findings list).
-- **Accept:** focused reattach completes without a validation error.
-
-### R-04 Keystroke-burst resilience (B13)
-
-- **Status:** DISCOVERED-DEFERRED.
-- **Problem:** the reference machine randomly drops 1–25-character bursts mid-type —
-  observed corrupting editor source once and dropping spreadsheet rows repeatedly
-  during internal live runs.
-- **Approach:** chunked typing + chunk-integrity verification + a *verified retype*
-  policy (retype only after integrity verification fails; never blind-retype).
-- **Evidence:** (QA: perf-004 evidence — live-run anomaly log).
-- **Accept:** 200 typed characters across 20 bursts with disk-verified integrity and
-  zero manual fixes.
-
-### R-05 B5 residual: backslash-type wedge — root-cause or accept
-
-- **Status:** DISCOVERED-DEFERRED.
-- **Problem:** the backslash-type wedge was mitigated (settle handling + watchdog
-  tests) but never root-caused; it is recorded as still-open rather than fixed.
-- **Approach:** re-run the functional probe (reproduction scripts live in the local
-  QA evidence tree); then either close the item with a documented root cause or
-  document it as an accepted risk in the project docs.
-- **Evidence:** (QA: perf-004 evidence — I/O parity report, `keyboard_delivery_gate`
-  key; change log).
-- **Accept:** the item is closed with either a root cause or an explicit
-  accepted-risk note — no silent residue.
-
-### R-18 Follow_ups invalid-item errors are unstructured
-
-- **Status:** DISCOVERED-DEFERRED (red-team finding, severity MEDIUM).
-- **Problem:** queue items that are `ActionSpec`-valid but `GroundedAction`-invalid —
-  a target-less `focus_window`, a half-specified `drag` (one endpoint missing), a
-  1-key `hotkey` — raise an uncaught `ValidationError` inside the `follow_ups` queue.
-  The effect is fail-closed (zero items dispatch) but the host receives an
-  unstructured error instead of a typed rejection.
-- **Approach:** map queue-item validation onto the typed `invalid_action` rejection
-  path, with teach-in-text hints listing the valid shapes.
-- **Evidence:** (QA: perf-004 evidence — red-team report).
-- **Accept:** each malformed class returns a typed rejection listing the valid shapes.
-
-### R-19 FocusGuard hwnd-recycle identity check
-
-- **Status:** DISCOVERED-DEFERRED (red-team finding, severity LOW-MEDIUM).
-- **Problem:** a recycled hwnd now owned by a foreign process matches the bound
-  identity by hwnd equality alone, so the guard can bless the wrong window.
-- **Approach:** verify process/title-class alongside the hwnd at each pre-dispatch
-  check (cheap; the pid is already available in the observation identity).
-- **Evidence:** (QA: perf-004 evidence — red-team report).
-- **Accept:** a recycled-hwnd test dispatches to the new foreign owner →
-  `FOCUS_TAKEN_BY`.
-
-### R-20 Re-anchor causality check for launcher/dialog anchors
-
-- **Status:** DISCOVERED-DEFERRED (red-team finding, severity LOW).
-- **Problem:** re-anchoring from launcher/dialog anchors accepts any titled
-  foreground window without a causality check, so an unrelated foreground window can
-  be adopted as the session anchor.
-- **Approach:** re-anchor only to windows in the session's launched/attached set or
-  to same-process descendants; refuse everything else.
-- **Evidence:** (QA: perf-004 evidence — red-team report).
-- **Accept:** an adversarial foreign-titled window is not adopted as an anchor.
-
+- **Status:** DISCOVERED-DEFERRED (red-team finding RT-E8-05, severity MEDIUM).
+- **Problem:** ANY keypress into a `#32770`/explorer.exe anchor arms R-20's
+  launch-act marker, so the NEXT window — even a foreign-process one — is
+  adopted as the session anchor. The one-action bound holds and the allowlists
+  still gate dispatch, but adoption is wider than R-20's causal intent.
+- **Approach:** tighten launch-act arming (allowlist-bound anchors and/or
+  chord+window-class pairing) without reintroducing the dead-anchor deadlock
+  R-20 removed.
+- **Evidence:** (maintainer-local) `evidence/v06-006/redteam/report.md`
+  (RT-E8-05).
+- **Accept:** a foreign window immediately following a keypress into a
+  `#32770`/explorer.exe anchor is refused as anchor (named `REANCHOR_REFUSED`);
+  R-20's documented positive adoption paths still work.
 ## P1 — v0.7.0 (performance & driver economics)
 
 ### R-06 Driver-economics pack: the "fast-model profile"
