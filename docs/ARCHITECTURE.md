@@ -91,8 +91,8 @@ above is measured from the actual imports.
 | Observation | `backend.py`, `observation.py` | `observation_id`, UTC `timestamp`, `MonitorInfo` (bounds/primary/DPI), `WindowInfo(hwnd,pid,process_name,exe_path,window_class,title,bounds)`, cursor localized to screenshot space, coordinate-space classification |
 | State construction | `state.py` | `TaskState` (goal, subgoal, plan_notes, histories as bounded deques, budgets, termination reason), `StopToken`, `SessionRegistry` (max 4, fail-closed refusal) |
 | Action proposal | `provider.py` | `decide_full` → `ProviderDecision`; five-channel doctrine prompt; strict pydantic parse; fail-closed on any garbage |
-| Perception/Grounding | `grounding.py` | `GroundingRouter` over `GroundingStrategy` implementations: coordinate (real), region descriptor (real), text-anchor (P1 stub), accessibility (P1 stub); fail-closed `UnsupportedGroundingError`. `NON_SPATIAL_ACTIONS` covers type, keypress, **hotkey** (carries `keys`), scroll, wait, done, **focus_window** (carries `target`) — grounded trivially with strategy `none`; point-bearing actions (click/double_click/drag/**move**) route to the coordinate strategy |
-| Action validation | `validator.py` | bounds, confidence floor, coordinate-space refusal, window/process allowlists, staleness + `source_observation_id` binding (`COORDINATE_ACTIONS` = click/double_click/drag/**move** — `move` binds its point like click); `missing_text`/`missing_keys`/`missing_target` (focus_window requires a non-empty `target`) |
+| Perception/Grounding | `grounding.py` | `GroundingRouter` over `GroundingStrategy` implementations: coordinate (real), region descriptor (real), text-anchor (P1 stub), accessibility (P1 stub); fail-closed `UnsupportedGroundingError`. `NON_SPATIAL_ACTIONS` covers type, keypress, **hotkey** (carries `keys`), scroll, wait, done, **focus_window** (carries `target`) — grounded trivially with strategy `none`; point-bearing actions (click/double_click/**right_click**/drag/**move**) route to the coordinate strategy |
+| Action validation | `validator.py` | bounds, confidence floor, coordinate-space refusal, window/process allowlists, staleness + `source_observation_id` binding (`COORDINATE_ACTIONS` = click/double_click/**right_click**/drag/**move** — `move` binds its point like click, and `right_click` binds its point exactly like click); `missing_text`/`missing_keys`/`missing_target` (focus_window requires a non-empty `target`) |
 | Risk classification + policy + approval | `safety.py` | contextual LOW/MEDIUM/HIGH/CRITICAL; approval upgrade never downgraded; CRITICAL blocked pending explicit authorization; structured approval messages |
 | Execution | `backend.py` | `execute(action, stop)` — `StopToken.ensure_live()` before every physical input (per typing chunk / drag segment; the chunk size is engine-selected); interruptible 100 ms-sliced waits |
 | Post-action observation | `observation.py` | fresh capture, new `observation_id`; burst-exempt intra-step capture (PERF-004 C2) that is REUSED as the next loop-top observation (C1) |
@@ -165,7 +165,7 @@ fields yield `None` → `uncertain`, never success); `focus_window` → `window_
 (the active window title must contain `action.target`, case-insensitive — deterministic
 via `active_window_info`, never pixels); `keypress`/`hotkey` whose expected effect
 starts with a launch prefix ("open ", "launch ", "start ", "switch to ", "focus ") →
-`window_state`; everything else (click/double_click/drag/scroll/wait, and hotkey
+`window_state`; everything else (click/double_click/right_click/drag/scroll/wait, and hotkey
 without a launch-prefix effect) → `visual_change`. When an expected effect is stated, a
 change is REQUIRED (unchanged screen = failed); with no stated expectation, pixels
 alone stay ambiguous (identical screen → `uncertain` → recovery).

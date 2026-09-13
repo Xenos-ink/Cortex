@@ -109,17 +109,17 @@ window/process identity escalate to `CRITICAL`.
 | `suspicious_delete_term` | Arabic destructive terms (the words for "delete"/"erase" in Arabic script; exact glyph tokens in safety.py as unicode escapes) in typed text/reason |
 | `keyboard_shortcut_state_change` | keypress/hotkey containing delete/backspace/win/alt/ctrl |
 | `window_focus_change` | `focus_window` — the action brings a different window to the foreground (always MEDIUM; the category is assigned before the drift/routine scans so it is stable). Consequence: subsequent input could land in an unintended application |
-| `unverified_target_application` | click/double-click/drag/type when window/process identity is unknown |
+| `unverified_target_application` | click/double-click/right-click/drag/type when window/process identity is unknown |
 
 **LOW** (routine): `plain_text_entry` (type into an identified target),
-`known_application_interaction` (click/double-click/drag on an identified target),
+`known_application_interaction` (click/double-click/right-click/drag on an identified target),
 `low_routine_action` (keypress/hotkey without state-changing keys, scroll, wait, done,
 move — a cursor reposition with no click),
 `completion` (done marker).
 
 Policy merge rules (`evaluate`): the legacy gates run verbatim first (stopped session,
 step budget, sensitive-typed-text block, state-changing keys — keypress **and hotkey**,
-interactive-action approval defaults — click/double-click/drag/type **and
+interactive-action approval defaults — click/double-click/right-click/drag/type **and
 focus_window**); the classification then fills `risk`/`category`/`reason` and the approval
 requirement is **upgraded, never downgraded**, by risk. `HIGH` → `requires_approval=True`;
 `CRITICAL` → blocked unless `authorized=True` (see §5). `dry_run` semantics are

@@ -1010,13 +1010,14 @@ def _coerce_follow_up_entry(item: dict[str, Any]) -> dict[str, Any]:
 
 # --- teach-in-text action vocabulary (PERF-004 C6) ------------------------------------------
 # The EXACT ActionType vocabulary from models.py (verbatim enum values):
-# click, double_click, drag, type, keypress, scroll, wait, done, move, hotkey,
-# focus_window. There is deliberately NO 'key' and NO 'triple_click' action.
+# click, double_click, right_click, drag, type, keypress, scroll, wait, done, move,
+# hotkey, focus_window. There is deliberately NO 'key' and NO 'triple_click' action.
 
 #: The precise valid action list, taught in tool descriptions and error messages.
 ACTION_VOCABULARY = (
     "Valid actions (exact names): "
-    "click (x,y required), double_click (x,y), drag (x,y start + x2,y2 end, both required), "
+    "click (x,y required), double_click (x,y), right_click (x,y; opens a context menu), "
+    "drag (x,y start + x2,y2 end, both required), "
     "move (x,y), type (text required), keypress (keys=[\"<one key name>\"]), "
     "hotkey (keys=[2-12 key names], e.g. [\"ctrl\",\"a\"]), scroll (delta -20..20), "
     "wait (delta 0..20 seconds), focus_window (target = window title), "
@@ -1055,6 +1056,11 @@ def _teaching_invalid_action(exc: Exception, action: str | None) -> dict[str, ob
         hints.append(
             "You sent action=\"triple_click\", which does not exist. Use action=\"double_click\", "
             "or queue repeated clicks via follow_ups."
+        )
+    elif tried in {"context_menu", "contextmenu", "rightclick", "right-click", "rclick"}:
+        hints.append(
+            f"You sent action=\"{tried}\", which does not exist. The context-menu action is "
+            "action=\"right_click\" with x,y (e.g. {\"action\": \"right_click\", \"x\": 640, \"y\": 360})."
         )
     elif tried in {"keypress", "hotkey"}:
         hints.append(
@@ -1594,8 +1600,9 @@ async def computer_execute(
     session_id is REQUIRED on every call: copy it from start_session's result and
     reuse it for the whole session.
 
-    ACTION VOCABULARY (exact names, from the models enum): click, double_click, drag,
-    type, keypress, scroll, wait, done, move, hotkey, focus_window, ensure_app. There is
+    ACTION VOCABULARY (exact names, from the models enum): click, double_click,
+    right_click, drag, type, keypress, scroll, wait, done, move, hotkey, focus_window,
+    ensure_app. There is
     NO "key" action (single keys use "keypress": {"action": "keypress", "keys": ["ctrl"]})
     and NO "triple_click" (use "double_click" or repeated clicks). "keys" must be KEY
     NAMES ("ctrl", "a", "enter", "esc") — never text or sentences; to type text use
