@@ -438,6 +438,20 @@ lower than a human would. The compensating controls are the approval defaults
     accepted risk: a one-off OS input-stack wedge cannot be made impossible
     in-process; it is bounded by the session watchdog and surfaces as a typed
     failure, never a silent partial dispatch.
+15. **Safety/guard residuals from the v0.6.0 internal red team (bounded, routed).**
+    The red team found no release-blocking issue; the residuals below are
+    pre-existing or bounded and are routed to ROADMAP R-21/R-22 (full repro
+    steps and artifacts in the maintainer-local
+    `evidence/v06-006/redteam/report.md`): destructive verbs in polite phrasings
+    can type at LOW risk (RT-E8-01); space-separated or abbreviated credential
+    phrasings can bypass the safety gate and redaction (RT-E8-02); bare token
+    values without a keyword label (`ghp_`/`xoxb-`/`npm_` shapes) match no
+    redaction pattern (RT-E8-03); zero-width-space tokenizer evasion of the
+    safety gate, with the typed payload itself inert (RT-E8-04); a keypress into
+    a `#32770`/explorer.exe anchor arms the R-20 launch-act marker for one
+    action, so the immediately following window — even foreign-process — can be
+    adopted as the session anchor, bounded by the one-action limit and the
+    allowlists (RT-E8-05).
 
 ## 11. Long-running sessions: new surface, same fail-closed doctrine
 
