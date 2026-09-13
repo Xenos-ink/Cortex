@@ -3713,7 +3713,11 @@ class LocalComputerBackend(ComputerBackend):
 
         1. doc-identity match (when a doc token is given) or any visible window of the
            process (when not) -> focus it via the verified foreground switch ->
-           ``REATTACHED title=... hwnd=...`` — never launches.
+           ``REATTACHED title=... hwnd=...`` — never launches. The focus call is built
+           ONLY from a non-empty title (R-03): an empty-title instance used to surface
+           as a raw focus_window validation error; the resolver now prefers the
+           top-of-Z-order TITLED match and raises the typed :class:`WindowFocusError`
+           when no matched instance can name a focus target.
         2. No identity match but unsaved-candidate windows exist -> the structured
            ``AMBIGUOUS_INSTANCE`` payload (unsaved-work risk; the driver decides) —
            never launches, never closes anything.
@@ -3751,9 +3755,21 @@ class LocalComputerBackend(ComputerBackend):
 
         matches = [item for item in candidates if _doc_matches(item)]
         if matches:
-            window = matches[0].window
+            # R-03 (A7b): build the focus call ONLY from a non-empty title — focusing an
+            # empty-title instance used to construct an invalid focus_window call that
+            # surfaced as a raw validation error instead of a focused reattach. Prefer
+            # the top-of-Z-order TITLED match; when no matched instance can name a
+            # focus target, fail LOUDLY with the typed error (never an empty title).
+            titled = [item for item in matches if (item.window.title or "").strip()]
+            if not titled:
+                raise WindowFocusError(
+                    f"ensure_app resolved {process_needle!r} but all {len(matches)} "
+                    "matched instance(s) have an empty window title; no valid focus "
+                    "target (reattach by identity is unresolvable)"
+                )
+            window = titled[0].window
             self.focus_window_title(window.title)
-            return format_reattached(window.title or target, window.hwnd)
+            return format_reattached(window.title, window.hwnd)
         unsaved = [item for item in candidates if item.unsaved_candidate]
         if unsaved:
             return format_ambiguous_instance(unsaved)
@@ -4176,9 +4192,19 @@ class FakeComputerBackend(ComputerBackend):
 
         matches = [item for item in candidates if _doc_matches(item)]
         if matches:
-            window = matches[0].window
+            # R-03 (A7b), identical to LocalComputerBackend.ensure_app: the focus call
+            # is built ONLY from a non-empty title; prefer the top-of-Z-order TITLED
+            # match; a typed WindowFocusError when no matched instance can name one.
+            titled = [item for item in matches if (item.window.title or "").strip()]
+            if not titled:
+                raise WindowFocusError(
+                    f"ensure_app resolved {process_needle!r} but all {len(matches)} "
+                    "matched instance(s) have an empty window title; no valid focus "
+                    "target (reattach by identity is unresolvable)"
+                )
+            window = titled[0].window
             self.focus_window_title(window.title)
-            return format_reattached(window.title or target, window.hwnd)
+            return format_reattached(window.title, window.hwnd)
         unsaved = [item for item in candidates if item.unsaved_candidate]
         if unsaved:
             return format_ambiguous_instance(unsaved)
