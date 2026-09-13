@@ -1,90 +1,55 @@
 #!/usr/bin/env node
-// install-cortex-skill.mjs — side-install the cortex-fast agent skill.
+// install-cortex-skill.mjs — the `cortex-skill` bin: side-install/refresh the
+// cortex-skill agent skill (fast-path driving for the Cortex computer-use MCP server).
 //
-// Stdlib-only Node >=18 ESM script. Copies the bundled skill (skills/cortex-fast/,
-// resolved relative to this file so it works under `npx` straight from the git
-// checkout) into one or more agent skill directories.
+// Usage:  cortex-skill install | cortex-skill update   (nothing else)
+//
+// The skill source (skills/cortex-skill/) is resolved relative to this file, so the
+// command works under `npx` straight from the git checkout.
 //
 // Status lines follow the repo's cortex-mcp CLI conventions:
-//   [cortex-fast] <path>: INSTALLED
-//   [cortex-fast] <path>: UNCHANGED (identical content)
-//   [cortex-fast] <path>: SKIPPED-EXISTS-USE-FORCE (differing content)
-// An existing skill dir is never clobbered: --force first moves it aside to
-// <name>.cortex-backup-<YYYYmmdd-HHMMSS> (an existing backup is never overwritten).
+//   [cortex-skill] <path>: INSTALLED
+//   [cortex-skill] <path>: UNCHANGED (identical content)
+//   [cortex-skill] <path>: SKIPPED-EXISTS (run `cortex-skill update`)
+//   [cortex-skill] <path>: NOT-INSTALLED (run install)
+// `install` NEVER overwrites. `update` is the only overwrite path: it backs up each
+// existing install to cortex-skill.cortex-backup-<YYYYmmdd-HHMMSS> (an existing backup
+// is never overwritten) before replacing it.
 //
-// No telemetry, no network calls.
+// Stdlib-only Node >=18 ESM. No telemetry, no network calls.
 
 import { readdir, readFile, mkdir, cp, rename } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 
-const SKILL_NAME = "cortex-fast";
+const SKILL_NAME = "cortex-skill";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_SRC = path.join(HERE, SKILL_NAME);
 
 const USER_SCOPE = [".zcode", ".agents", ".claude"].map((d) =>
   path.join(os.homedir(), d, "skills")
 );
-const PROJECT_SCOPE = [".zcode", ".agents", ".claude"].map((d) =>
-  path.join(process.cwd(), d, "skills")
-);
 
 const INSTALLED = "INSTALLED";
 const UNCHANGED = "UNCHANGED";
-const SKIPPED = "SKIPPED-EXISTS-USE-FORCE";
+const SKIPPED = "SKIPPED-EXISTS";
+const NOT_INSTALLED = "NOT-INSTALLED";
 
-const USAGE = `Install the ${SKILL_NAME} agent skill (fast-path driving for the Cortex computer-use MCP server).
+const USAGE = `cortex-skill — install/update the ${SKILL_NAME} agent skill (fast-path driving for the Cortex computer-use MCP server)
 
 Usage:
-  node install-cortex-skill.mjs [flags]
+  cortex-skill install   install into EVERY detected user-scope skills dir
+                         (~/.zcode/skills, ~/.agents/skills, ~/.claude/skills);
+                         if none exists, ~/.zcode/skills is created.
+                         Never overwrites: a differing existing install is
+                         reported SKIPPED-EXISTS (run \`cortex-skill update\`).
+  cortex-skill update    refresh only dirs where ${SKILL_NAME} is already installed;
+                         backs each up to ${SKILL_NAME}.cortex-backup-<timestamp>
+                         before replacing. Dirs without it are reported, not touched.
 
-Targets (default): every EXISTING user-scope skill directory among
-  ~/.zcode/skills, ~/.agents/skills, ~/.claude/skills
-
-Flags:
-  --dir <path>  install into <path>/${SKILL_NAME} (created if missing); overrides detection
-  --all         also target project-scope ./.zcode/skills, ./.agents/skills, ./.claude/skills
-                when they exist
-  --force       overwrite a differing existing skill dir (backs it up first to
-                ${SKILL_NAME}.cortex-backup-<YYYYmmdd-HHMMSS>; never overwrites a backup)
-  --list        print detected targets and the plan; no writes
-  --help        this text
-
-Exit codes: 0 if anything was installed or was already identical; 1 if nothing was.
+No other flags. No telemetry, no network.
 `;
-
-function parseArgs(argv) {
-  const opts = { dir: null, all: false, force: false, list: false, help: false };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "--help" || a === "-h") opts.help = true;
-    else if (a === "--list") opts.list = true;
-    else if (a === "--force") opts.force = true;
-    else if (a === "--all") opts.all = true;
-    else if (a === "--dir") {
-      const v = argv[++i];
-      if (!v || v.startsWith("--")) {
-        console.error("error: --dir requires a path argument");
-        process.exit(2);
-      }
-      opts.dir = path.resolve(v);
-    } else {
-      console.error(`error: unknown argument: ${a} (try --help)`);
-      process.exit(2);
-    }
-  }
-  return opts;
-}
-
-async function exists(p) {
-  try {
-    await readdir(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /** Map of relativePath -> Buffer for every file under dir. */
 async function snapshot(dir) {
@@ -101,6 +66,15 @@ async function snapshot(dir) {
   return out;
 }
 
+async function dirExists(p) {
+  try {
+    await readdir(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function timestamp(d = new Date()) {
   const p = (n) => String(n).padStart(2, "0");
   return (
@@ -113,101 +87,103 @@ async function backupDir(dir) {
   const parent = path.dirname(dir);
   const base = path.basename(dir);
   let target = path.join(parent, `${base}.cortex-backup-${timestamp()}`);
-  for (let n = 2; await exists(target); n++) {
+  for (let n = 2; await dirExists(target); n++) {
     target = path.join(parent, `${base}.cortex-backup-${timestamp()}-${n}`);
   }
   await rename(dir, target);
   return target;
 }
 
+/** Compare an installed skill dir against the source: missing | identical | differs. */
 async function classify(dest) {
   const src = await snapshot(SKILL_SRC);
   let dst;
   try {
     dst = await snapshot(dest);
   } catch {
-    return [INSTALLED, "target created"];
+    return ["missing", "not installed"];
   }
   for (const [rel, buf] of src) {
     const other = dst.get(rel);
-    if (other === undefined) return [INSTALLED, `missing file: ${rel}`];
-    if (!buf.equals(other)) return [SKIPPED, `differing content: ${rel}`];
+    if (other === undefined) return ["differs", `missing file: ${rel}`];
+    if (!buf.equals(other)) return ["differs", `differing content: ${rel}`];
   }
   for (const rel of dst.keys()) {
-    if (!src.has(rel)) return [SKIPPED, `extra file: ${rel}`];
+    if (!src.has(rel)) return ["differs", `extra file: ${rel}`];
   }
-  return [UNCHANGED, "identical content"];
+  return ["identical", "identical content"];
 }
 
-async function installInto(dest, opts) {
-  const label = path.join(dest, SKILL_NAME);
-  const [status, detail] = await classify(label);
-  if (status === UNCHANGED) {
-    console.log(`[${SKILL_NAME}] ${label}: ${UNCHANGED} (${detail})`);
-    return status;
+async function installInto(dir) {
+  const dest = path.join(dir, SKILL_NAME);
+  const [kind, detail] = await classify(dest);
+  if (kind === "identical") {
+    console.log(`[${SKILL_NAME}] ${dest}: ${UNCHANGED} (${detail})`);
+    return UNCHANGED;
   }
-  if (status === SKIPPED && !opts.force) {
-    console.log(`[${SKILL_NAME}] ${label}: ${SKIPPED} (${detail})`);
+  if (kind === "differs") {
+    console.log(
+      `[${SKILL_NAME}] ${dest}: ${SKIPPED} (${detail}; run \`cortex-skill update\`)`
+    );
     return SKIPPED;
   }
-  if (!opts.list) {
-    if (status === SKIPPED) {
-      const backup = await backupDir(label);
-      console.log(`[${SKILL_NAME}] ${label}: existing dir moved to ${backup}`);
-    }
-    await mkdir(path.dirname(label), { recursive: true });
-    await cp(SKILL_SRC, label, { recursive: true });
-  }
-  const verb = opts.list ? "would install" : "installing";
-  console.log(`[${SKILL_NAME}] ${label}: ${opts.list ? "PLAN" : INSTALLED} (${verb}: ${detail})`);
+  await mkdir(dir, { recursive: true });
+  await cp(SKILL_SRC, dest, { recursive: true });
+  console.log(`[${SKILL_NAME}] ${dest}: ${INSTALLED}`);
   return INSTALLED;
 }
 
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  if (opts.help) {
-    process.stdout.write(USAGE);
-    return 0;
+async function updateInto(dir) {
+  const dest = path.join(dir, SKILL_NAME);
+  const [kind, detail] = await classify(dest);
+  if (kind === "missing") {
+    console.log(`[${SKILL_NAME}] ${dest}: ${NOT_INSTALLED} (run install)`);
+    return NOT_INSTALLED;
   }
-  if (!(await exists(SKILL_SRC))) {
+  if (kind === "identical") {
+    console.log(`[${SKILL_NAME}] ${dest}: ${UNCHANGED} (${detail})`);
+    return UNCHANGED;
+  }
+  const backup = await backupDir(dest);
+  console.log(`[${SKILL_NAME}] ${dest}: existing dir moved to ${backup}`);
+  await cp(SKILL_SRC, dest, { recursive: true });
+  console.log(`[${SKILL_NAME}] ${dest}: ${INSTALLED} (refreshed; ${detail})`);
+  return INSTALLED;
+}
+
+function summary(results, verb) {
+  const count = (s) => results.filter((r) => r === s).length;
+  console.log(
+    `summary: ${count(INSTALLED)} installed, ${count(UNCHANGED)} unchanged, ` +
+      `${count(SKIPPED) + count(NOT_INSTALLED)} skipped (${results.length} target${results.length === 1 ? "" : "s"}, ${verb})`
+  );
+}
+
+async function main() {
+  const [cmd] = process.argv.slice(2);
+  if (cmd !== "install" && cmd !== "update") {
+    process.stderr.write(USAGE);
+    return 1;
+  }
+  if (!(await dirExists(SKILL_SRC))) {
     console.error(`error: skill source not found next to this script: ${SKILL_SRC}`);
     return 1;
   }
 
-  let targets;
-  if (opts.dir) {
-    targets = [opts.dir];
-  } else {
-    const scopes = opts.all ? [...USER_SCOPE, ...PROJECT_SCOPE] : USER_SCOPE;
-    const found = [];
-    for (const d of scopes) if (await exists(d)) found.push(d);
-    targets = found;
-    if (opts.list) {
-      for (const d of scopes) {
-        console.log(`target ${d}: ${found.includes(d) ? "detected" : "not present"}`);
-      }
-    }
-  }
-
-  if (targets.length === 0) {
-    console.error(
-      `no existing skill directory detected (looked in ${USER_SCOPE.join(", ")}); ` +
-        `use --dir <path> to choose one.`
-    );
-    return 1;
+  let targets = [];
+  for (const d of USER_SCOPE) if (await dirExists(d)) targets.push(d);
+  if (targets.length === 0 && cmd === "install") {
+    // No user-scope skills dir exists anywhere: bootstrap the primary one.
+    targets = [path.join(os.homedir(), ".zcode", "skills")];
   }
 
   const results = [];
-  for (const t of targets) results.push(await installInto(t, opts));
+  for (const t of targets) {
+    results.push(cmd === "install" ? await installInto(t) : await updateInto(t));
+  }
+  summary(results, cmd);
 
-  const installed = results.filter((r) => r === INSTALLED).length;
-  const unchanged = results.filter((r) => r === UNCHANGED).length;
-  const skipped = results.filter((r) => r === SKIPPED).length;
-  console.log(
-    `summary: ${installed} installed, ${unchanged} unchanged, ${skipped} skipped ` +
-      `(${results.length} target${results.length === 1 ? "" : "s"})`
-  );
-  return installed + unchanged > 0 ? 0 : 1;
+  return results.some((r) => r === INSTALLED || r === UNCHANGED) ? 0 : 1;
 }
 
 process.exit(await main());

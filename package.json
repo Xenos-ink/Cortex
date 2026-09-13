@@ -1,7 +1,7 @@
 {
   "name": "cortex-agent-skill",
   "version": "0.6.0",
-  "description": "cortex-fast: a fast-path driving skill for the Cortex computer-use MCP server (npx side-install)",
+  "description": "cortex-skill: a fast-path driving skill for the Cortex computer-use MCP server (npx side-install)",
   "license": "MIT",
   "bin": {
     "cortex-skill": "skills/install-cortex-skill.mjs"
