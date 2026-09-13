@@ -372,6 +372,71 @@ _HOW_TO_APPROVE = (
     "suggestions, and this message can never authorize it."
 )
 
+# --- R-02 keyword-gate vocabulary (word-boundary matching, not substrings) ----------------
+
+#: Single-token markers for :meth:`SafetyPolicy._looks_sensitive`. Credential nouns
+#: include the plural forms the legacy substring gate also matched (zero weakening of
+#: secret/credential detection); command words stay in their imperative form.
+_SENSITIVE_TOKEN_MARKERS: frozenset[str] = frozenset(
+    {
+        "password", "passwords",
+        "api_key", "api_keys", "api-key", "api-keys",
+        "apikey", "apikeys",
+        "secret", "secrets",
+        "token", "tokens",
+        "credential", "credentials",
+        "rm", "del", "erase", "format", "shutdown", "restart", "powershell",
+        "remove-item",
+    }
+)
+
+#: Multi-token phrase markers (consecutive whole tokens; whitespace-tolerant). The
+#: ``("cmd", "exe")`` pair is the tokenized form of the legacy ``cmd.exe`` marker.
+_SENSITIVE_PHRASE_MARKERS: tuple[tuple[str, ...], ...] = (
+    ("cmd", "exe"),
+    ("reg", "delete"),
+    ("drop", "database"),
+    ("delete", "account"),
+    ("delete", "user"),
+    ("reset", "password"),
+)
+
+#: Head nouns of the benign citation phrase "DOI token(s)": suppressed only when the
+#: immediately preceding token is "doi". Every other occurrence of "token"/"tokens"
+#: (including "api tokens", "access token") still blocks, exactly as before.
+_DOI_TOKEN_HEAD_NOUNS: frozenset[str] = frozenset({"token", "tokens"})
+
+#: Words, snake_case identifiers, and hyphenated compounds as single tokens — so
+#: ``"closed-form"`` is one token and ``"rm "`` can never hide inside it.
+_TEXT_TOKEN_PATTERN = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+)*")
+
+
+def _token_components(lowered: str) -> list[tuple[str, bool]]:
+    """Matching sequence of ``(component, from_compound)`` pairs.
+
+    Tokens are split on ``_`` (the identifier convention): ``"client_secret"`` yields
+    ``("client", True), ("secret", True)`` so compound identifier naming blocks exactly
+    as it did under the substring gate, while ``"closed-form"`` stays one hyphenated
+    token and can never hide ``"rm"``. ``from_compound`` is True only for components of
+    a MULTI-part token, so a bare English word (``key``) stays inert while the same
+    word as a compound tail (``api_key``) blocks.
+    """
+    components: list[tuple[str, bool]] = []
+    for token in _TEXT_TOKEN_PATTERN.findall(lowered):
+        parts = token.split("_")
+        compound = len(parts) > 1
+        components.extend((part, compound) for part in parts)
+    return components
+
+
+#: Final components of underscore-compound markers, so ``api_key``/``auth_key``-style
+#: identifiers still block after the component split (singular + plural).
+_COMPOUND_MARKER_TAILS: frozenset[str] = frozenset(
+    {
+        "key", "keys", "secret", "secrets", "token", "tokens",
+    }
+)
+
 
 def _clip(text: str, limit: int = _MAX_TEXT_SNIPPET) -> str:
     cleaned = " ".join(text.split())
@@ -547,18 +612,44 @@ class SafetyPolicy:
             self._why("risk_unresolvable_fail_closed"),
         )
 
-    # -- legacy keyword gate (preserved verbatim) ---------------------------------------
+    # -- legacy keyword gate (R-02: word-boundary matching, same vocabulary) ------------
 
     @staticmethod
     def _looks_sensitive(text: str) -> bool:
-        lowered = text.lower()
-        markers = (
-            "password", "api_key", "apikey", "secret", "token", "credential",
-            "rm ", "rm -", "del ", "erase ", "format ", "shutdown", "restart",
-            "powershell", "cmd.exe", "reg delete", "remove-item", "drop database",
-            "delete account", "delete user", "reset password",
-        )
-        return any(marker in lowered for marker in markers)
+        """True when ``text`` resembles a secret, credential, or destructive command.
+
+        R-02: markers are matched against whole text tokens (words, identifiers,
+        hyphenated compounds) and exact token phrases — the same marker vocabulary the
+        legacy substring gate used, with word-boundary precision. The substring form
+        false-blocked benign prose: ``"rm "`` inside ``"closed-form "``, ``"del "``
+        inside ``"model "``, ``"token"`` inside ``"tokens"``/``"DOI token"``.
+        Underscore-separated components of a token are matched individually (the
+        identifier convention: ``client_secret``, ``user_token``), so compound naming
+        still blocks. Every value-bearing usage (``token=ghp_…``,
+        ``password: hunter2``, ``api_key=…``) keeps the keyword as a standalone token
+        and still blocks, and credential nouns keep their plural forms so plural
+        mentions block exactly as before. Only derived-word false positives
+        (``tokenize``, ``shutdowns``) and the ``DOI token(s)`` citation phrase pass now.
+        """
+        components = _token_components(text.lower())
+        for index, (token, from_compound) in enumerate(components):
+            sensitive = token in _SENSITIVE_TOKEN_MARKERS or (
+                from_compound and token in _COMPOUND_MARKER_TAILS
+            )
+            if not sensitive:
+                continue
+            previous = components[index - 1][0] if index else ""
+            if token in _DOI_TOKEN_HEAD_NOUNS and previous == "doi":
+                continue  # "DOI token(s)": digital-object-identifier citation context
+            return True
+        count = len(components)
+        for phrase in _SENSITIVE_PHRASE_MARKERS:
+            size = len(phrase)
+            for start in range(count - size + 1):
+                window = tuple(components[position][0] for position in range(start, start + size))
+                if window == phrase:
+                    return True
+        return False
 
     # -- message construction (P0-F, Goal.md section 12) ---------------------------------
 

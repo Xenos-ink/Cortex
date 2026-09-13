@@ -442,15 +442,14 @@ def test_rt2_non_allowlisted_first_observation_never_binds() -> None:
     assert guard.armed is False
 
 
-def test_rt2_finding_hwnd_recycle_to_foreign_process_accepted_by_hwnd_equality() -> None:
-    """ATTACK DEMO — FINDING RT2-1 (WEAKENED, exploitability: rare).
+def test_rt2_finding_hwnd_recycle_to_foreign_process_rejected_r19() -> None:
+    """FINDING RT2-1 CLOSED by R-19 (was: attack demo, accepted-by-hwnd-equality).
 
-    A recycled hwnd value that now belongs to a FOREIGN process passes
-    ``_matches_binding`` by hwnd equality alone (the foreground's pid/class/title are
-    not cross-checked on the equal-hwnd path). Requires the OS to reassign the exact
-    hwnd value to another process's window while the stale binding is held — rare on a
-    live session, but the identity check is provably one-dimensional there. No fix in
-    this wave (read-only mandate); recorded as a finding for the Commander.
+    A recycled hwnd value that now belongs to a FOREIGN process used to pass
+    ``_matches_binding`` by hwnd equality alone. The equal-hwnd path now cross-checks
+    the strongest identity evidence both sides provide (pid > process name > class >
+    title overlap); a foreign owner falls through to the pid-verified rules and the
+    dispatch is refused with FOCUS_TAKEN_BY (corpus: tests/test_r19_hwnd_recycle_identity.py).
     """
     backend = GuardBackend()
     backend.set_active_window(TARGET)
@@ -466,7 +465,9 @@ def test_rt2_finding_hwnd_recycle_to_foreign_process_accepted_by_hwnd_equality()
     backend.set_windows([TARGET, FOREIGN, recycled])
     backend.set_active_window(recycled)
     verdict = guard.verify_pre_dispatch(_click())
-    assert verdict is None  # the guard MATCHES the recycled foreign window (finding)
+    assert verdict is not None and verdict.blocking  # the recycle is REJECTED (fixed)
+    assert verdict.event.startswith("FOCUS_TAKEN_BY")
+    assert backend.execute_calls == 0
 
 
 def test_rt2_hwnd_recycle_same_pid_requires_class_and_title_overlap() -> None:
@@ -493,27 +494,35 @@ def test_rt2_hwnd_recycle_same_pid_requires_class_and_title_overlap() -> None:
     assert verdict is not None and verdict.blocking  # no title overlap -> rejected
 
 
-def test_rt2_finding_reanchor_from_dialog_anchor_accepts_unrelated_window() -> None:
-    """ATTACK DEMO — FINDING RT2-2 (WEAKENED, bounded).
+def test_rt2_finding_reanchor_from_dialog_anchor_refuses_unrelated_window_r20() -> None:
+    """FINDING RT2-2 CLOSED by R-20 (was: attack demo, adopted-any-foreground).
 
     When the anchor is a #32770 dialog / transient-launcher surface,
-    ``reanchor_after_success`` re-anchors to ANY titled new foreground after a verified
-    action — it verifies the anchor's launcher-ness, not that the NEW window was caused
-    by the session. A foreign app that wins the foreground race right after a verified
-    click becomes the session target (subsequent dispatches then MATCH it).
+    ``reanchor_after_success`` used to re-anchor to ANY titled new foreground after a
+    verified action — an unrelated window that won the foreground race became the
+    session target. Re-anchoring is now causal: without the session's own keyboard
+    launch act (and without set membership / same-process descent) the adoption is
+    REFUSED with the named REANCHOR_REFUSED payload, the anchor is kept, and the next
+    dispatch against the (formerly foreign) window is rejected with FOCUS_TAKEN_BY.
     """
+    events: list[tuple[str, dict[str, Any]]] = []
     backend = GuardBackend()
     dialog_anchor = WindowInfo(
         hwnd=5, pid=500, process_name="explorer.exe", window_class="#32770", title="Run",
     )
+    backend.set_windows([dialog_anchor, TARGET, FOREIGN])  # the anchor is ALIVE
     backend.set_active_window(dialog_anchor)
-    guard = _guard(backend)
+    guard = InterferenceGuard(backend, parse_interference(None), emit=lambda *a, **kw: events.append((kw.get("result", ""), kw.get("metadata", {}))))
     guard.rebind(dialog_anchor)
     backend.set_active_window(FOREIGN)
     guard.reanchor_after_success(FOREIGN)  # the controller calls this after a VERIFIED action
-    assert guard.bound is not None and guard.bound.hwnd == FOREIGN.hwnd  # the finding
-    # the next dispatch now MATCHes the (formerly foreign) window:
-    assert guard.verify_pre_dispatch(_click()) is None
+    assert guard.bound is not None and guard.bound.hwnd == dialog_anchor.hwnd  # anchor KEPT
+    assert any(result == "reanchor_refused" for result, _ in events)
+    # the next dispatch still REJECTS the (formerly adoptable) foreign window:
+    verdict = guard.verify_pre_dispatch(_click())
+    assert verdict is not None and verdict.blocking
+    assert verdict.event.startswith("FOCUS_TAKEN_BY")
+    assert backend.execute_calls == 0
 
 
 def test_rt2_refocus_ambiguity_cannot_redirect_a_dispatch() -> None:
@@ -1026,30 +1035,25 @@ class SimpleNamespace:
 
 
 def test_rt9_finding_benign_text_false_positives_quantified_b12() -> None:
-    """FINDING RT9-1 (B12 observation quantified; NO FIX — R-02 deferred to ROADMAP).
+    """FINDING RT9-1: substring false positives CLOSED by R-02 (word-boundary gate).
 
-    Measured false-positive surface of the legacy TYPE secret gate (substring markers,
-    no word boundaries), 18-string benign corpus:
+    Pre-fix measured surface (substring markers, no word boundaries), 18-string
+    benign corpus: 3/18 REJECTED — 'the closed-form solution of the integral'
+    (``'rm '`` inside ``'closed-form '``), 'Closed Form X-4782 application approved'
+    (``'rm '`` inside ``'form '``), "John's password: (none stored here)".
 
-    - 'the closed-form solution of the integral'  -> 'rm ' inside 'closed-form '
-    - 'Closed Form X-4782 application approved'   -> 'rm ' inside 'form '
-    - "John's password: (none stored here)"       -> 'password' with an EMPTY value
-
-    3/18 benign strings are REJECTED as 'secret, credential, or destructive'.
-    The DOI strings do NOT reproduce as FPs in the current tree. The secret net at the
-    gate is narrow (3/10 blocked: the assignment-style markers) — the REDACTION layer
-    compensates for AKIA/JWT/private-key/URL-credentials at the dispatch sink, leaving
-    the GitHub/Slack/Stripe token classes uncovered at BOTH layers (see the redaction
-    test).
+    Post R-02 the two word-boundary false positives PASS (pinned below). The
+    empty-value "password" MENTION remains blocked by the KEYWORD gate by design:
+    that layer is keyword-level (value-agnostic), while the REDACTION layer is
+    value-oriented and passes the same string — the documented division of labor
+    between the two layers (corpora of record in tests/test_r02_text_corpora.py).
     """
     flagged = [t for t in BENIGN_CORPUS if _flagged(_type_decision(t))]
-    assert flagged == [
-        "the closed-form solution of the integral",
-        "Closed Form X-4782 application approved",
-        "John's password: (none stored here)",
-    ]
-    # pinned: exactly 3/18 false positives; every other benign string passes cleanly
-    assert len(flagged) == 3 and len(BENIGN_CORPUS) == 18
+    assert "the closed-form solution of the integral" not in flagged
+    assert "Closed Form X-4782 application approved" not in flagged
+    assert flagged == ["John's password: (none stored here)"]
+    # pinned: 1/18 residual keyword-layer flag, exactly the value-mention case
+    assert len(flagged) == 1 and len(BENIGN_CORPUS) == 18
 
 
 def test_rt9_finding_gate_misses_compensated_by_redaction_except_modern_tokens() -> None:
