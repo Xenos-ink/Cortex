@@ -410,6 +410,34 @@ lower than a human would. The compensating controls are the approval defaults
     instead of retrying blindly. The previously-focused window is **not** restored on a
     refusal; the caller re-observes actual window state and re-decides. Verification is
     deterministic window state, so a refused focus can never be reported as `verified`.
+14. **Typed-text integrity and the backslash-type wedge (input engine).** `type`
+    actions are chunk-dispatched and verified once at end-of-action by reading the
+    focused control's value back (a single fixed-buffer `WM_GETTEXT`, or UIA
+    `Value`). Two consecutive reads must agree before any value is trusted; the
+    trust read is taken after a landing-lag horizon
+    (`CORTEX_TYPE_VERIFY_STABILITY_SECONDS`, default 2.5 s). `unverified` never
+    triggers a repair; a trusted genuine partial is repaired with exactly the
+    missing suffix (once); a confirmed still-wrong buffer fails the action with
+    `TextIntegrityError`. The action message reports
+    `integrity=verified|partial|unverified|mismatch(v/total)[ healed=n]`.
+    `CORTEX_TYPE_INTEGRITY=0` restores the legacy unverified-dispatch path
+    byte-identically. Known limitation: verification depends on the focused
+    control exposing a readable value; controls that cannot expose one (or
+    cross-thread length mis-reporting — worked around in
+    `_window_text_via_message`) degrade to honest `unverified` and never
+    double-apply.
+    **Backslash-type wedge (B5, closed as root-caused).** A 2026-09 one-off stall
+    (>10 min) typing a raw single-backslash path into the Run dialog was a
+    window-activation race: the type dispatched while the freshly activated
+    dialog's thread input queue was still settling. Mitigations shipped: keyboard
+    input paces behind a recent focus transition (`CORTEX_FOCUS_SETTLE_SECONDS`,
+    default 0.3 s) and terminal-key chords pace behind the previous dispatch
+    (`CORTEX_KEY_DISPATCH_GAP`, default 0.05 s); watchdog regression tests pin the
+    incident payload, and the 2026-09-13 re-run completed the exact payload in
+    <0.35 s across engine, Run-dialog, and full-server topologies. Residual
+    accepted risk: a one-off OS input-stack wedge cannot be made impossible
+    in-process; it is bounded by the session watchdog and surfaces as a typed
+    failure, never a silent partial dispatch.
 
 ## 11. Long-running sessions: new surface, same fail-closed doctrine
 

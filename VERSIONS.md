@@ -77,23 +77,28 @@ notes fold into the `## v0.6.0` entry at release.
 
 ### Fixed
 
-- **(R-04) Keystroke-burst resilience: chunked typing with verified integrity** —
-  `type` is chunk-dispatched (default 64 characters, `CORTEX_TYPE_CHUNK_CHARS`)
-  with per-chunk read-back of the focused control's value (UIA Value /
-  `WM_GETTEXT`). The action message gains the additive suffix
-  `integrity=verified|partial|unverified|mismatch(v/total)` (plus `healed=<n>`
-  when a repair delivered characters). A re-dispatch is issued ONLY for a
-  read-back-proven missing suffix, at most once per chunk (verified retype —
-  never blind); a still-wrong repair fails the action with the typed
-  `TextIntegrityError`, and with no readable focused control the action reports
-  `unverified` and never claims success. `CORTEX_TYPE_INTEGRITY=0` restores the
-  byte-identical legacy path. Live smoke on the reference desktop: a 1-character
-  dispatch verified true-positive, and a 50-character burst that the desktop's
-  input stack dropped was detected, healed by exactly one verified retype, and
-  then failed honestly with `TextIntegrityError` (no blind retry). The
-  desktop-level injected-keystroke-drop finding is recorded in the maintainer
-  evidence tree; the formal 200-chars/20-bursts acceptance run is a later
-  mission phase.
+- **(R-04) Keystroke-burst resilience: truthful integrity reads + verified
+  end-of-action verification** — `type` is chunk-dispatched (default 64
+  characters, `CORTEX_TYPE_CHUNK_CHARS`) and verified by reading the focused
+  control's value back. The first read path trusted `WM_GETTEXTLENGTH` via
+  `SendMessageTimeoutW`, which mis-reports text length on some desktops (measured:
+  it returned 1 for a 20-character edit) and made the read-back under-report
+  landed text, so a wrongful repair could double-apply. The read is now ONE
+  fixed-buffer `WM_GETTEXT` call (8192-character cap, `SMTO_ABORTIFHUNG` kept),
+  which reports truthfully and also un-truncates the `ui_elements[].value`
+  observation field. Verification runs once at end-of-action: two consecutive
+  reads must agree (the second taken after `CORTEX_TYPE_VERIFY_STABILITY_SECONDS`,
+  default 2.5 s — the landing-lag horizon) before any value is trusted;
+  `unverified` never triggers a repair; a trusted genuine partial is repaired with
+  exactly the missing suffix (once); a confirmed still-wrong buffer fails the
+  action with the typed `TextIntegrityError`, and an unconfirmable repair reports
+  honest `unverified`. The action message gains the additive suffix
+  `integrity=verified|partial|unverified|mismatch(v/total)` (plus `healed=<n>`);
+  `CORTEX_TYPE_INTEGRITY=0` restores the byte-identical legacy path. Live proof on
+  the reference desktop through the served pipeline at defaults: 200 characters
+  across 20 bursts — 20/20 executed, 200/200 characters exact, zero duplication,
+  zero manual fixes — and a 50-action follow_ups chain — 50/50 executed,
+  855/855 characters exact.
 - **(R-05) B5 backslash-type wedge closed as root-caused** — the historical
   >10-minute stall was a one-off window-activation race: the type dispatched while
   the freshly activated Run dialog's thread input queue was still settling. On the
@@ -101,8 +106,8 @@ notes fold into the `## v0.6.0` entry at release.
   Run-dialog, and full-server topologies; the shipped settle/gap mitigations and
   watchdog regression tests hold. The accepted residual (a one-off OS input-stack
   wedge cannot be made impossible in-process; it is bounded by the watchdog and
-  surfaces as a typed failure, never a hang) is documented in the
-  Known-limitations text that lands in `docs/SAFETY.md` with the release.
+  surfaces as a typed failure, never a hang) is documented in `docs/SAFETY.md`
+  (Known residual risks).
 - **(R-03) `ensure_app` no longer builds an empty-title focus call** — the
   reattach path prefers the top-of-Z-order TITLED match among resolved instances
   and raises the typed `WindowFocusError` when every matched instance has an empty
