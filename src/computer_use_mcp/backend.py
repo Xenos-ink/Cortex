@@ -129,6 +129,11 @@ SENDINPUT_DRAG_STEP_PIXELS = 0  # 0 = the coarse legacy ~40 px interpolation geo
 _SENDINPUT_FACTORY_DRAG_STEP_PAUSE = 0.001  # L1-NEW-2 live default: ~1 ms per segment
 _SENDINPUT_FACTORY_DRAG_STEP_PIXELS = 8  # L1-NEW-2 live default: ~8 px per segment
 _SENDINPUT_CHUNK_EVENTS = 1000  # max events per SendInput call (typing chunks)
+#: Control text via WM_GETTEXT is read with ONE fixed-buffer call (see
+#: ``_window_text_via_message``): the buffer must span the WHOLE control text because
+#: WM_GETTEXT returns text from the START — the R-04 integrity verifier compares the
+#: buffer's TAIL against the typed text.
+_WINDOW_TEXT_MAX_CHARS = 8192
 _WHEEL_DELTA = 120
 
 # --- UIA semantic read bounds (PERF-004; research digest Q3) --------------------------------
@@ -906,18 +911,42 @@ TYPE_INTEGRITY_ENABLED = _env_bool("CORTEX_TYPE_INTEGRITY", True)
 #: can corrupt before it is detected. 64 chars ≈ one SendInput batch per chunk at the
 #: default event budget.
 TYPE_CHUNK_CHARS = _env_int_in_range("CORTEX_TYPE_CHUNK_CHARS", 64, 1, 4096)
-#: Settle before the post-chunk integrity read-back: SendInput returns when events are
-#: ACCEPTED by the input stack, not when the target app has processed them — reading
-#: too early would mistake queue lag for a drop. ``CORTEX_TYPE_VERIFY_SETTLE_SECONDS``
-#: overrides (0 disables the wait, not the verification).
+#: Settle before the post-dispatch integrity read-back: SendInput returns when events
+#: are ACCEPTED by the input stack, not when the target app has processed them —
+#: reading too early would mistake queue lag for a drop.
+#: ``CORTEX_TYPE_VERIFY_SETTLE_SECONDS`` overrides (0 disables the wait).
 TYPE_VERIFY_SETTLE_SECONDS = _env_nonnegative_float("CORTEX_TYPE_VERIFY_SETTLE_SECONDS", 0.05)
-#: Repair bound: a dropped suffix is re-dispatched AT MOST ONCE per chunk, and only
-#: after the read-back PROVED text is missing (verified retype — never blind). A second
-#: failure raises :class:`TextIntegrityError` instead of looping.
+#: Landing-lag horizon for the SECOND (trust) read of any non-verified verdict: the
+#: 2026-09-13 live evidence (evidence/v06-006/live-desktop) measured a buffer that was
+#: stale-short at +2.0 s and drained later — a repair decided on such a read
+#: double-applies when the drain lands. Any repair decision therefore waits out this
+#: horizon and requires the two reads to AGREE; disagreement/shrink -> ``unverified``
+#: (which NEVER repairs). ``CORTEX_TYPE_VERIFY_STABILITY_SECONDS`` overrides.
+TYPE_VERIFY_STABILITY_SECONDS = _env_nonnegative_float("CORTEX_TYPE_VERIFY_STABILITY_SECONDS", 2.5)
+#: Repair bound: a dropped suffix is re-dispatched AT MOST ONCE per action, and only
+#: after the double-read-stable buffer PROVED text is missing (verified retype — never
+#: blind). A confirmed still-wrong buffer raises :class:`TextIntegrityError`.
 TYPE_MAX_RETYPES_PER_CHUNK = 1
 #: Control types whose value is ALWAYS exposed by both read paths when the control is
 #: readable — a ``None`` value on these means the control is EMPTY, not unreadable.
 _ALWAYS_VALUED_CONTROL_TYPES = frozenset({"Edit", "Document"})
+
+
+def _landed_prefix_len(landed_n: str, expected_n: str) -> int:
+    """Longest prefix of ``expected_n`` that the real buffer ``landed_n`` ENDS WITH.
+
+    Suffix-diff semantics (fix2 redesign): typed text lands at the control's tail, so
+    the buffer's TAIL is matched against the expected text's prefixes and NO baseline
+    read is needed — pre-existing control content is simply tolerated. ``k ==
+    len(expected_n)`` means fully landed; ``k > 0`` is the measured dropped-burst
+    signature (repair = exactly ``expected[k:]``); ``k == 0`` with a NON-empty buffer
+    means nothing of ours is recognizable (masked/transformed/foreign — appending
+    would double-apply, so that class is never repaired).
+    """
+    for k in range(len(expected_n), -1, -1):
+        if landed_n.endswith(expected_n[:k]):
+            return k
+    return 0
 
 
 def _normalize_landed_text(value: str) -> str:
@@ -1827,15 +1856,30 @@ def _window_child_chain(parent: int, *, limit: int) -> list[int]:
     return chain
 
 
-def _window_text_via_message(hwnd: int, max_chars: int = 256) -> str:
-    """Control text via WM_GETTEXT (SendMessageTimeoutW, abort-if-hung); '' on failure."""
+def _window_text_via_message(hwnd: int, max_chars: int = _WINDOW_TEXT_MAX_CHARS) -> str:
+    """Control text via WM_GETTEXT (SendMessageTimeoutW, abort-if-hung); '' on failure.
+
+    FIX2 (2026-09-13, evidence `evidence/v06-006/eng-input/fix2/fix2_readtest.json`):
+    the previous two-call sequence (WM_GETTEXTLENGTH to size the buffer, then
+    WM_GETTEXT) returned ONE character for a 20-character edit on the reference
+    desktop — the cross-thread ``WM_GETTEXTLENGTH`` answer via ``SendMessageTimeoutW``
+    mis-reports the length there (the same query via blocking ``SendMessageW``
+    returns 20, and a fixed-buffer ``WM_GETTEXT`` returns the full text). That
+    mis-measurement made the R-04 integrity read-back see false-short buffers,
+    triggering wrongful retypes whose text then REALLY landed — the double-apply
+    duplication the integrated-RC live proofs caught (buffers like
+    ``#00 alpha 0. end00 alpha 0. end``). The read now uses ONE WM_GETTEXT call with
+    a fixed generous buffer (WM_GETTEXT truncates safely at the buffer size and
+    reports the chars copied), and the cap default is large enough that edit-control
+    reads return the WHOLE text — the tail comparison in the integrity verifier
+    depends on it (WM_GETTEXT returns text from the START of the buffer).
+
+    Window-class side effect: none (read-only query, abort-if-hung on a hung target).
+    """
     if not IS_WINDOWS or _user32 is None or not hwnd:
         return ""
     try:
-        length = int(_user32.SendMessageTimeoutW(ctypes.c_void_p(hwnd), _WM_GETTEXTLENGTH, 0, 0, _SMTO_ABORTIFHUNG, _SENDMESSAGE_TIMEOUT_MS, None) or 0)
-        if length <= 0:
-            return ""
-        size = min(length, max_chars) + 1
+        size = max_chars + 1
         buffer = ctypes.create_unicode_buffer(size)
         result = ctypes.c_size_t(0)
         copied = int(_user32.SendMessageTimeoutW(
@@ -3770,29 +3814,41 @@ class LocalComputerBackend(ComputerBackend):
         stop: StopToken | None,
         focus_hook: Callable[[], None] | None,
     ) -> str:
-        """Dispatch one ``type`` action (R-04): chunked typing + integrity verification.
+        """Dispatch one ``type`` action (R-04): chunked typing + END-OF-ACTION
+        integrity verification with a lag-guarded, duplication-safe verified retype.
 
         Legacy path (integrity disabled or empty text) is byte-identical to pre-R-04:
         one engine call for the whole string. Otherwise the text is split into
-        ``TYPE_CHUNK_CHARS`` chunks; after each chunk the focused control's value is
-        read back via :meth:`read_focused_control_value` and compared against the
-        accumulated expectation (any pre-existing control content is read as the
-        baseline first). Outcomes per chunk:
+        ``TYPE_CHUNK_CHARS`` chunks and dispatched chunk-by-chunk (stop token and the
+        T8 focus hook ride every engine dispatch), and verification runs ONCE after
+        the FINAL chunk settles — read-backs are NEVER interleaved mid-dispatch (the
+        2026-09-13 live A/B showed interleaved reads correlate with wrongful retypes:
+        a mid-typing read can be stale-short while the input stack drains late).
 
-        - match → verified;
-        - landed is a strict prefix of the expectation (the measured drop signature:
-          the tail of the burst never landed) → the missing suffix is re-dispatched
-          ONCE — a VERIFIED retype (scope and reason come from the read-back, never a
-          blind loop) — then re-read; success heals, a second failure raises
-          :class:`TextIntegrityError`;
-        - anything else (transforming apps, masked fields, unrelated content) → NO
-          repair (appending could double-apply); the chunk is reported ``mismatch``;
-        - unreadable → reported ``unverified``; never claimed as verified.
+        Verification policy (against ``expected = normalize(text)``, suffix-diff
+        semantics — pre-existing control content needs NO baseline read):
+
+        - two consecutive reads must AGREE before any value is trusted; a
+          disagreement, a missing read, or a buffer that SHRANK between reads makes
+          the action ``integrity=unverified`` — and unverified NEVER triggers a
+          retype (this is the anti-duplication gate);
+        - the second read of any non-verified verdict is taken after
+          ``TYPE_VERIFY_STABILITY_SECONDS`` — the observed landing-lag horizon — so
+          late-draining input is counted BEFORE any repair decision;
+        - trusted + landed ends with the full expected text → ``verified``;
+        - trusted + landed ends with a proper PREFIX of expected (the measured
+          burst-drop signature) → retype EXACTLY the missing suffix (diffed from the
+          real buffer, mapped back to typed coordinates) ONCE, then re-verify with
+          the same double-read rule; success → ``verified`` with ``healed=<n>``; a
+          confirmed still-wrong buffer raises :class:`TextIntegrityError` (no second
+          repair); an unconfirmable repair reports ``unverified`` honestly;
+        - trusted + non-empty landed that shares no expected-prefix suffix (masked
+          fields, transforming apps) → ``mismatch``; appending would double-apply, so
+          NO repair.
 
         The stop token is checked between chunks, before every read-back, and before
-        every retype; the per-dispatch ``before_chunk`` hook (stop + T8 focus
-        continuity) still rides every engine call. The action message gains an additive
-        ``integrity=...`` suffix — the prefix stays ``Executed type.``.
+        the retype. The action message gains an additive ``integrity=...`` suffix —
+        the prefix stays ``Executed type.``.
         """
         text = action.text
         if stop is not None:
@@ -3814,108 +3870,84 @@ class LocalComputerBackend(ComputerBackend):
             return "Executed type."
 
         total = len(text)
-        baseline_n: str | None = None
-        baseline_raw = self.read_focused_control_value()
-        if baseline_raw is not None:
-            baseline_n = _normalize_landed_text(baseline_raw)
-        verified = mismatch_chars = unverified_chars = healed = 0
-        typed = 0
         for chunk in _split_type_chunks(text, TYPE_CHUNK_CHARS):
             if stop is not None:
                 stop.ensure_live()  # between chunks (existing discipline)
             self._engine.type_text(chunk, before_chunk=before_chunk)
-            typed += len(chunk)
             self._last_key_dispatch = time.monotonic()
-            if TYPE_VERIFY_SETTLE_SECONDS > 0:
-                time.sleep(TYPE_VERIFY_SETTLE_SECONDS)  # let the target drain the keys
+
+        # --- end-of-action verification (settled; never mid-dispatch) -------------
+        if stop is not None:
+            stop.ensure_live()
+        if TYPE_VERIFY_SETTLE_SECONDS > 0:
+            time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
+        if stop is not None:
+            stop.ensure_live()
+        landed1 = self._read_landed_normalized()
+        expected_n = _normalize_landed_text(text)
+
+        def _stable_read() -> str | None:
+            """Second read after the landing-lag horizon; trust requires agreement."""
+            if TYPE_VERIFY_STABILITY_SECONDS > 0:
+                time.sleep(TYPE_VERIFY_STABILITY_SECONDS)
             if stop is not None:
-                stop.ensure_live()  # before the read-back/retype decision
-            verdict, landed_n = self._verify_typed_landed(baseline_n, text[:typed])
-            if verdict == "verified":
-                verified += len(chunk)
-                continue
-            if verdict == "unverified":
-                unverified_chars += len(chunk)
-                continue
-            if verdict != "dropped":
-                mismatch_chars += len(chunk)  # mismatch: repair would be unsafe
-                continue
-            # Dropped suffix: one verified retype of EXACTLY the missing characters.
-            missing = self._missing_suffix(baseline_n, text[:typed], landed_n)
-            if stop is not None:
-                stop.ensure_live()  # before the verified retype
-            self._engine.type_text(missing, before_chunk=before_chunk)
-            self._last_key_dispatch = time.monotonic()
-            if TYPE_VERIFY_SETTLE_SECONDS > 0:
-                time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
-            recheck_verdict, _recheck_landed = self._verify_typed_landed(baseline_n, text[:typed])
-            if recheck_verdict == "verified":
-                verified += len(chunk)
-                healed += len(missing)
-                continue
-            if recheck_verdict == "unverified":
-                # The repair dispatched but its landing is UNCONFIRMED (read-back
-                # unavailable): honest "unknown" — never claimed verified, and no
-                # second blind retype to "make sure".
-                unverified_chars += len(chunk)
-                continue
-            raise TextIntegrityError(
-                "typed-text integrity verification failed after one verified retype "
-                f"({len(missing)} retried characters still not landed correctly in the "
-                "focused control); refusing further blind repair. Re-observe and decide."
-            )
-        assert verified + mismatch_chars + unverified_chars == total
-        suffix = _format_integrity_status(
-            verified,
-            total,
-            mismatch=mismatch_chars,
-            unverified=unverified_chars,
-            healed=healed,
+                stop.ensure_live()
+            return self._read_landed_normalized()
+
+        if landed1 is not None and landed1.endswith(expected_n):
+            # Fast path: a stale-short read can never PRESENT as a full suffix match,
+            # so a back-to-back confirming read is sufficient trust here.
+            landed2 = self._read_landed_normalized()
+            if landed2 is not None and landed2 == landed1:
+                return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
+            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+
+        if landed1 is None:
+            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+
+        # Non-verified first read: apply the lag guard BEFORE trusting it (the
+        # wrongful-retype duplication class acted on exactly such reads).
+        landed2 = _stable_read()
+        if landed2 is None or landed2 != landed1:
+            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+
+        matched = _landed_prefix_len(landed2, expected_n)
+        if matched == len(expected_n):
+            return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
+        if matched == 0 and landed2 != "":
+            # Masked/transformed/foreign buffer: appending would double-apply.
+            return f"Executed type. {_format_integrity_status(0, total, mismatch=total, unverified=0, healed=0)}"
+
+        # Genuine partial: repair with EXACTLY the missing suffix of the typed text.
+        missing = text[_typed_index_for_norm_len(text, matched) :]
+        if stop is not None:
+            stop.ensure_live()  # before the verified retype
+        self._engine.type_text(missing, before_chunk=before_chunk)
+        self._last_key_dispatch = time.monotonic()
+        if TYPE_VERIFY_SETTLE_SECONDS > 0:
+            time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
+        if stop is not None:
+            stop.ensure_live()
+        recheck1 = self._read_landed_normalized()
+        if recheck1 is None:
+            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+        recheck2 = _stable_read()
+        if recheck2 is None or recheck2 != recheck1:
+            # Repair landing UNCONFIRMED: honest "unknown", never a second retype.
+            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+        if recheck2.endswith(expected_n):
+            healed = len(missing)
+            return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=healed)}"
+        raise TextIntegrityError(
+            "typed-text integrity verification failed after one verified retype "
+            f"({len(missing)} retried characters still not landed correctly in the "
+            "focused control); refusing further blind repair. Re-observe and decide."
         )
-        return f"Executed type. {suffix}"
 
     def _read_landed_normalized(self) -> str | None:
         """One read-back, normalized; ``None`` when the value is unavailable."""
         raw = self.read_focused_control_value()
         return None if raw is None else _normalize_landed_text(raw)
-
-    def _verify_typed_landed(self, baseline_n: str | None, typed_prefix: str) -> tuple[str, str | None]:
-        """Compare the read-back against ``baseline + typed_prefix`` (normalized).
-
-        Returns ``(verdict, landed_n)`` where ``landed_n`` is the normalized read-back
-        (``None`` when unavailable). Verdicts: ``"verified"``, ``"unverified"`` (no
-        read-back possible), ``"dropped"`` (landed text is a strict PREFIX of the
-        expectation — the measurable drop signature), or ``"mismatch"`` (anything
-        else; not repairable by appending).
-        """
-        if baseline_n is None:
-            return ("unverified", None)
-        landed_n = self._read_landed_normalized()
-        if landed_n is None:
-            return ("unverified", None)
-        expected_n = baseline_n + _normalize_landed_text(typed_prefix)
-        if landed_n == expected_n:
-            return ("verified", landed_n)
-        if expected_n.startswith(landed_n):
-            return ("dropped", landed_n)
-        return ("mismatch", landed_n)
-
-    def _missing_suffix(self, baseline_n: str | None, typed_prefix: str, landed_n: str | None) -> str:
-        """The not-yet-landed characters of ``typed_prefix`` (original coordinates).
-
-        ``landed_n`` may be ``None`` (the confirm read failed after a ``dropped``
-        verdict): the retype then covers the WHOLE typed prefix, which is still the
-        read-back-derived scope — conservative, never speculative.
-        """
-        if baseline_n is None:
-            return typed_prefix
-        if landed_n is None:
-            return typed_prefix
-        consumed = len(landed_n) - len(baseline_n)
-        if consumed <= 0:
-            return typed_prefix
-        index = _typed_index_for_norm_len(typed_prefix, consumed)
-        return typed_prefix[index:]
 
     def _drag_waypoints(self, start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
         """Stroke waypoints for one drag (engine-selected policy).
@@ -4669,16 +4701,18 @@ class FakeComputerBackend(ComputerBackend):
                     )
                 else:
                     expected_n = _normalize_landed_text(action.text)
-                    if landed_n == expected_n:
+                    matched = _landed_prefix_len(landed_n, expected_n)
+                    if matched == len(expected_n):
                         message = "Simulated type. " + _format_integrity_status(
                             total, total, mismatch=0, unverified=0, healed=0
                         )
-                    elif expected_n.startswith(landed_n):
-                        # Dropped-suffix signature: simulate the verified retype landing.
-                        missing_units = len(expected_n) - len(landed_n)
-                        self.focused_control_value = expected_n
+                    elif matched > 0 or landed_n == "":
+                        # Dropped-suffix signature: simulate the verified retype landing
+                        # (repair = exactly the missing suffix, never the whole chunk).
+                        missing = expected_n[matched:]
+                        self.focused_control_value = landed_n + missing
                         message = "Simulated type. " + _format_integrity_status(
-                            total, total, mismatch=0, unverified=0, healed=missing_units
+                            total, total, mismatch=0, unverified=0, healed=len(missing)
                         )
                     else:
                         message = "Simulated type. " + _format_integrity_status(
