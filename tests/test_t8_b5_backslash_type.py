@@ -102,8 +102,18 @@ def test_follow_ups_chain_with_backslash_path_type_runs_to_completion() -> None:
 
 
 @pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="Real Win32 dispatch requires Windows.")
-def test_real_dispatch_of_backslash_path_completes_under_a_second(real_backend: LocalComputerBackend) -> None:
-    """REAL dispatch: the incident payload typed into Notepad completes < 1 s."""
+def test_real_dispatch_of_backslash_path_completes_under_a_second(
+    real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REAL dispatch: the incident payload typed into Notepad completes < 1 s.
+
+    R-04 note: integrity verification is disabled for THIS test (monkeypatched) — it
+    pins the B5 STALL verdict (the action must RETURN promptly), not landed-text
+    integrity, which has its own suite (tests/test_r04_type_integrity.py). On a
+    reference machine whose input stack drops keystrokes, an integrity-raising type
+    would fail here for reasons unrelated to B5.
+    """
+    monkeypatch.setattr(backend_module, "TYPE_INTEGRITY_ENABLED", False)
     result: dict[str, object] = {"done": False, "error": None}
 
     def worker() -> None:
