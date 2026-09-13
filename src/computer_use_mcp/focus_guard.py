@@ -370,12 +370,44 @@ class InterferenceGuard:
             for pattern in self.policy.focus_guard.transient_launch_processes
         )
 
+    def _hwnd_identity_consistent(self, foreground: WindowInfo, bound: WindowInfo) -> bool:
+        """R-19: the equal-hwnd match is honored ONLY when identity still corroborates.
+
+        The OS recycles hwnd VALUES: a recycled hwnd can belong to a FOREIGN process,
+        so hwnd equality alone must never bless the foreground (red-team finding
+        RT2-1). The strongest identity evidence BOTH sides provide decides, strongest
+        first: pid, then process name, then window class, then title overlap. A field
+        unknown on either side is skipped; when NO field is comparable, the hwnd is
+        the only evidence available and stands (legacy single-probe case).
+        """
+        if foreground.pid is not None and bound.pid is not None:
+            return foreground.pid == bound.pid
+        foreground_process = _exe_basename(foreground)
+        bound_process = _exe_basename(bound)
+        if foreground_process and bound_process:
+            return foreground_process == bound_process
+        foreground_class = (foreground.window_class or "").strip()
+        bound_class = (bound.window_class or "").strip()
+        if foreground_class and bound_class:
+            return foreground_class == bound_class
+        return _titles_overlap(foreground.title, bound.title)
+
     def _matches_binding(self, foreground: WindowInfo) -> bool:
         """MATCH or MATCH-ADJACENT per A12 mechanism (i) — dispatch may proceed."""
         bound = self.bound
         if bound is None:  # pragma: no cover - callers keep the dormant guard exempt
             return True
-        if foreground.hwnd is not None and bound.hwnd is not None and foreground.hwnd == bound.hwnd:
+        # R-19 (RT2-1 closure): hwnd VALUES are recycled by the OS — the equal-hwnd
+        # match is honored only when the process/class/title identity still
+        # corroborates it (_hwnd_identity_consistent). A recycled hwnd owned by a
+        # foreign process fails the cross-check and falls through to the pid-verified
+        # rules below, rejecting with FOCUS_TAKEN_BY.
+        if (
+            foreground.hwnd is not None
+            and bound.hwnd is not None
+            and foreground.hwnd == bound.hwnd
+            and self._hwnd_identity_consistent(foreground, bound)
+        ):
             return True
         # hwnd recycle: same pid + class + overlapping title (conservative recovery).
         if (

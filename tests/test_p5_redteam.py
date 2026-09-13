@@ -441,15 +441,14 @@ def test_rt2_non_allowlisted_first_observation_never_binds() -> None:
     assert guard.armed is False
 
 
-def test_rt2_finding_hwnd_recycle_to_foreign_process_accepted_by_hwnd_equality() -> None:
-    """ATTACK DEMO — FINDING RT2-1 (WEAKENED, exploitability: rare).
+def test_rt2_finding_hwnd_recycle_to_foreign_process_rejected_r19() -> None:
+    """FINDING RT2-1 CLOSED by R-19 (was: attack demo, accepted-by-hwnd-equality).
 
-    A recycled hwnd value that now belongs to a FOREIGN process passes
-    ``_matches_binding`` by hwnd equality alone (the foreground's pid/class/title are
-    not cross-checked on the equal-hwnd path). Requires the OS to reassign the exact
-    hwnd value to another process's window while the stale binding is held — rare on a
-    live session, but the identity check is provably one-dimensional there. No fix in
-    this wave (read-only mandate); recorded as a finding for the Commander.
+    A recycled hwnd value that now belongs to a FOREIGN process used to pass
+    ``_matches_binding`` by hwnd equality alone. The equal-hwnd path now cross-checks
+    the strongest identity evidence both sides provide (pid > process name > class >
+    title overlap); a foreign owner falls through to the pid-verified rules and the
+    dispatch is refused with FOCUS_TAKEN_BY (corpus: tests/test_r19_hwnd_recycle_identity.py).
     """
     backend = GuardBackend()
     backend.set_active_window(TARGET)
@@ -465,7 +464,9 @@ def test_rt2_finding_hwnd_recycle_to_foreign_process_accepted_by_hwnd_equality()
     backend.set_windows([TARGET, FOREIGN, recycled])
     backend.set_active_window(recycled)
     verdict = guard.verify_pre_dispatch(_click())
-    assert verdict is None  # the guard MATCHES the recycled foreign window (finding)
+    assert verdict is not None and verdict.blocking  # the recycle is REJECTED (fixed)
+    assert verdict.event.startswith("FOCUS_TAKEN_BY")
+    assert backend.execute_calls == 0
 
 
 def test_rt2_hwnd_recycle_same_pid_requires_class_and_title_overlap() -> None:
