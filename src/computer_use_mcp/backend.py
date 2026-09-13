@@ -496,6 +496,22 @@ class FocusDriftError(BackendError):
     """
 
 
+class TextIntegrityError(BackendError):
+    """Typed text failed chunk-integrity verification and one verified retype did not
+    restore it (R-04).
+
+    Raised ONLY after the read-back (focused-control value via the existing
+    UIA/``WM_GETTEXT`` path) showed a dropped suffix, the missing suffix was re-dispatched
+    once, and the re-read STILL disagrees with the expected accumulated text. A second
+    repair attempt would be blind (it re-sends text without knowing why the first landed
+    short — the B3/B8 double-submit doctrine forbids that), so the action fails honestly
+    with the landed-vs-expected evidence instead. The target's text content is left
+    EXACTLY as observed — no deletion or cursor surgery is attempted (app-agnostic
+    repair is out of scope by design). Recovery hint: re-observe, then let the DRIVER
+    decide (retype in place, clear the field first, or abandon).
+    """
+
+
 class LaunchTargetError(BackendError):
     """An ``ensure_app`` launch target (process needle) failed launch validation.
 
@@ -878,6 +894,101 @@ KEY_DISPATCH_GAP_SECONDS = _env_nonnegative_float("CORTEX_KEY_DISPATCH_GAP", 0.0
 #: ``CORTEX_FOCUS_SETTLE_SECONDS`` overrides (0 disables). Re-dispatch of the dropped
 #: keys is deliberately NOT automatic (a re-issued Enter can double-submit).
 FOCUS_TRANSITION_SETTLE_SECONDS = _env_nonnegative_float("CORTEX_FOCUS_SETTLE_SECONDS", 0.3)
+
+# --- R-04 keystroke-burst resilience: chunked typing + integrity verification ---------------
+#: Master switch for typed-text integrity verification (default ON). ``0``/``off``
+#: restores the exact pre-R-04 behavior (single whole-string dispatch, no read-back,
+#: plain ``Executed type.`` message). ``CORTEX_TYPE_INTEGRITY`` overrides.
+TYPE_INTEGRITY_ENABLED = _env_bool("CORTEX_TYPE_INTEGRITY", True)
+#: Backend-level typing chunk size in characters (``CORTEX_TYPE_CHUNK_CHARS``). Each
+#: chunk is dispatched as one engine call and verified against the focused control's
+#: read-back value before the next chunk is sent, bounding how much text a burst drop
+#: can corrupt before it is detected. 64 chars ≈ one SendInput batch per chunk at the
+#: default event budget.
+TYPE_CHUNK_CHARS = _env_int_in_range("CORTEX_TYPE_CHUNK_CHARS", 64, 1, 4096)
+#: Settle before the post-chunk integrity read-back: SendInput returns when events are
+#: ACCEPTED by the input stack, not when the target app has processed them — reading
+#: too early would mistake queue lag for a drop. ``CORTEX_TYPE_VERIFY_SETTLE_SECONDS``
+#: overrides (0 disables the wait, not the verification).
+TYPE_VERIFY_SETTLE_SECONDS = _env_nonnegative_float("CORTEX_TYPE_VERIFY_SETTLE_SECONDS", 0.05)
+#: Repair bound: a dropped suffix is re-dispatched AT MOST ONCE per chunk, and only
+#: after the read-back PROVED text is missing (verified retype — never blind). A second
+#: failure raises :class:`TextIntegrityError` instead of looping.
+TYPE_MAX_RETYPES_PER_CHUNK = 1
+#: Control types whose value is ALWAYS exposed by both read paths when the control is
+#: readable — a ``None`` value on these means the control is EMPTY, not unreadable.
+_ALWAYS_VALUED_CONTROL_TYPES = frozenset({"Edit", "Document"})
+
+
+def _normalize_landed_text(value: str) -> str:
+    """Normalize a control's read-back value for comparison against typed text.
+
+    Apps store a typed Enter (``\\n`` → VK_RETURN) as ``\\r\\n`` (edit controls), so
+    both sides are folded to bare ``\\n`` before comparison. Everything else is compared
+    verbatim (a masked/password field will NOT normalize to the typed text — that is
+    correct: such fields report ``mismatch`` and are never "repaired").
+    """
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _split_type_chunks(text: str, size: int) -> list[str]:
+    """Split ``text`` into backend-level typing chunks of at most ``size`` code points.
+
+    Python strings are code-point sequences, so a chunk boundary can never separate a
+    UTF-16 surrogate pair: an astral character is ONE element here, and the engine's
+    ``_text_to_key_units`` (which performs the UTF-16 surrogate encoding for
+    ``KEYEVENTF_UNICODE``) always emits an astral character's down+up pair within
+    whichever chunk contains it. ``size < 1`` or empty text yields a single
+    empty/whole chunk respectively (an empty text is a legacy no-op upstream).
+    """
+    if size < 1 or len(text) <= size:
+        return [text]
+    return [text[start : start + size] for start in range(0, len(text), size)]
+
+
+def _typed_index_for_norm_len(text: str, norm_len: int) -> int:
+    """Index into ``text`` whose normalized prefix has exactly ``norm_len`` code units.
+
+    Maps a read-back-derived length (normalized ``\\r\\n`` counting) back onto the
+    ORIGINAL typed text so a repair re-dispatches exactly the typed characters that are
+    still missing. Clamps to ``len(text)``.
+    """
+    if norm_len <= 0:
+        return 0
+    count = 0
+    index = 0
+    while index < len(text) and count < norm_len:
+        if text[index] == "\r" and index + 1 < len(text) and text[index + 1] == "\n":
+            index += 2  # typed CRLF is ONE normalized unit
+        else:
+            index += 1
+        count += 1
+    return index
+
+
+def _format_integrity_status(
+    verified: int, total: int, *, mismatch: int, unverified: int, healed: int
+) -> str:
+    """Additive action-message suffix summarizing one ``type`` dispatch's integrity.
+
+    Statuses: ``verified`` (every chunk's read-back matched), ``partial`` (some chunks
+    matched, some could not be read), ``unverified`` (no read-back was possible — never
+    claimed as verified), ``mismatch`` (at least one chunk's read-back disagreed and was
+    not repairable by the bounded verified retype). ``healed`` reports characters
+    delivered by a successful verified retype.
+    """
+    if mismatch:
+        status = "mismatch"
+    elif unverified >= total:
+        status = "unverified"
+    elif unverified:
+        status = "partial"
+    else:
+        status = "verified"
+    suffix = f"integrity={status}({verified}/{total})"
+    if healed:
+        suffix += f" healed={healed}"
+    return suffix
 
 
 def _virtual_screen_metrics() -> tuple[int, int, int, int]:
@@ -2824,8 +2935,6 @@ class _DxgiDuplicator:
         ``_FIRST_FRAME_TIMEOUT_MS`` budget (bounded to the cold start; steady-state
         keeps the fast 8 ms timeout and returns the cached frame on idle).
         """
-        import ctypes
-
         img = self._acquire(timeout_ms)
         if img is None and self._last_img is None:
             img = self._acquire(self._FIRST_FRAME_TIMEOUT_MS)
@@ -3359,6 +3468,42 @@ class LocalComputerBackend(ComputerBackend):
             return (None, None)
         return (ocr_text or None, ui_elements or None)
 
+    def read_focused_control_value(self) -> str | None:
+        """R-04 integrity read-back: the focused control's value, or ``None``.
+
+        Reuses the existing semantic read path (UIA ``Value`` property, or the
+        Win32 ``WM_GETTEXT`` fallback) -- the same read that feeds
+        ``ui_elements`` -- scoped to the FOCUSED element only. ``None`` means the
+        value CANNOT be verified right now (no reader, read failed, control exposes
+        no value); callers must degrade honestly and must never treat ``None`` as a
+        match or as evidence of a drop (no verified retype on an unreadable target).
+        The read is also tolerant of a partially-initialized backend (no reader
+        attribute at all, e.g. ``__new__``-built test doubles): that degrades to
+        ``None`` (unverified) instead of breaking typing.
+
+        Empty-versus-unreadable: both readers collapse an empty value to ``None``, but
+        an Edit/Document control ALWAYS exposes its value when readable, so a ``None``
+        value on such a control means the control is EMPTY (returned as ``''``) -- not
+        unreadable. Any other control type without a value stays ``None`` (unverified;
+        never verified against, never repaired).
+        """
+        reader = getattr(self, "_semantic_reader", None)
+        if reader is None or not reader.available:
+            return None
+        try:
+            snapshot = reader.read()
+        except Exception:  # noqa: BLE001 - a broken reader must never break typing
+            return None
+        focused = snapshot.get("focused") if isinstance(snapshot, dict) else None
+        if not isinstance(focused, dict):
+            return None
+        value = focused.get("value")
+        if isinstance(value, str):
+            return value
+        if focused.get("control_type") in _ALWAYS_VALUED_CONTROL_TYPES:
+            return ""
+        return None
+
     def _dxgi_grab(self, width: int, height: int) -> Image.Image | None:
         """R-6: Desktop Duplication grab of the primary output; None = use mss.
 
@@ -3576,21 +3721,7 @@ class LocalComputerBackend(ComputerBackend):
         elif action.action == "type":
             if action.text is None:
                 raise ValueError("Text is required for type actions")
-            if stop is not None:
-                stop.ensure_live()
-            self._apply_focus_settle()  # B8 settle after a recent focus transition
-            before_chunk: Callable[[], None] | None = stop.ensure_live if stop is not None else None
-            if focus_hook is not None:
-                # T8 mechanism iv: the focus-continuity probe piggybacks the per-chunk
-                # cadence AFTER the stop-token hook (stop discipline keeps precedence).
-                def _chained() -> None:
-                    if stop is not None:
-                        stop.ensure_live()
-                    focus_hook()
-
-                before_chunk = _chained
-            engine.type_text(action.text, before_chunk=before_chunk)
-            self._last_key_dispatch = time.monotonic()
+            return self._execute_type(action, stop, focus_hook)
         elif action.action == "keypress":
             if not action.keys:
                 raise ValueError("At least one key is required")
@@ -3632,6 +3763,159 @@ class LocalComputerBackend(ComputerBackend):
         else:
             raise UnsupportedActionError(f"Unsupported action: {action.action}")
         return f"Executed {action.action}."
+
+    def _execute_type(
+        self,
+        action: GroundedAction,
+        stop: StopToken | None,
+        focus_hook: Callable[[], None] | None,
+    ) -> str:
+        """Dispatch one ``type`` action (R-04): chunked typing + integrity verification.
+
+        Legacy path (integrity disabled or empty text) is byte-identical to pre-R-04:
+        one engine call for the whole string. Otherwise the text is split into
+        ``TYPE_CHUNK_CHARS`` chunks; after each chunk the focused control's value is
+        read back via :meth:`read_focused_control_value` and compared against the
+        accumulated expectation (any pre-existing control content is read as the
+        baseline first). Outcomes per chunk:
+
+        - match → verified;
+        - landed is a strict prefix of the expectation (the measured drop signature:
+          the tail of the burst never landed) → the missing suffix is re-dispatched
+          ONCE — a VERIFIED retype (scope and reason come from the read-back, never a
+          blind loop) — then re-read; success heals, a second failure raises
+          :class:`TextIntegrityError`;
+        - anything else (transforming apps, masked fields, unrelated content) → NO
+          repair (appending could double-apply); the chunk is reported ``mismatch``;
+        - unreadable → reported ``unverified``; never claimed as verified.
+
+        The stop token is checked between chunks, before every read-back, and before
+        every retype; the per-dispatch ``before_chunk`` hook (stop + T8 focus
+        continuity) still rides every engine call. The action message gains an additive
+        ``integrity=...`` suffix — the prefix stays ``Executed type.``.
+        """
+        text = action.text
+        if stop is not None:
+            stop.ensure_live()
+        self._apply_focus_settle()  # B8 settle after a recent focus transition
+        before_chunk: Callable[[], None] | None = stop.ensure_live if stop is not None else None
+        if focus_hook is not None:
+            # T8 mechanism iv: the focus-continuity probe piggybacks the per-chunk
+            # cadence AFTER the stop-token hook (stop discipline keeps precedence).
+            def _chained() -> None:
+                if stop is not None:
+                    stop.ensure_live()
+                focus_hook()
+
+            before_chunk = _chained
+        if not TYPE_INTEGRITY_ENABLED or not text:
+            self._engine.type_text(text, before_chunk=before_chunk)
+            self._last_key_dispatch = time.monotonic()
+            return "Executed type."
+
+        total = len(text)
+        baseline_n: str | None = None
+        baseline_raw = self.read_focused_control_value()
+        if baseline_raw is not None:
+            baseline_n = _normalize_landed_text(baseline_raw)
+        verified = mismatch_chars = unverified_chars = healed = 0
+        typed = 0
+        for chunk in _split_type_chunks(text, TYPE_CHUNK_CHARS):
+            if stop is not None:
+                stop.ensure_live()  # between chunks (existing discipline)
+            self._engine.type_text(chunk, before_chunk=before_chunk)
+            typed += len(chunk)
+            self._last_key_dispatch = time.monotonic()
+            if TYPE_VERIFY_SETTLE_SECONDS > 0:
+                time.sleep(TYPE_VERIFY_SETTLE_SECONDS)  # let the target drain the keys
+            if stop is not None:
+                stop.ensure_live()  # before the read-back/retype decision
+            verdict, landed_n = self._verify_typed_landed(baseline_n, text[:typed])
+            if verdict == "verified":
+                verified += len(chunk)
+                continue
+            if verdict == "unverified":
+                unverified_chars += len(chunk)
+                continue
+            if verdict != "dropped":
+                mismatch_chars += len(chunk)  # mismatch: repair would be unsafe
+                continue
+            # Dropped suffix: one verified retype of EXACTLY the missing characters.
+            missing = self._missing_suffix(baseline_n, text[:typed], landed_n)
+            if stop is not None:
+                stop.ensure_live()  # before the verified retype
+            self._engine.type_text(missing, before_chunk=before_chunk)
+            self._last_key_dispatch = time.monotonic()
+            if TYPE_VERIFY_SETTLE_SECONDS > 0:
+                time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
+            recheck_verdict, _recheck_landed = self._verify_typed_landed(baseline_n, text[:typed])
+            if recheck_verdict == "verified":
+                verified += len(chunk)
+                healed += len(missing)
+                continue
+            if recheck_verdict == "unverified":
+                # The repair dispatched but its landing is UNCONFIRMED (read-back
+                # unavailable): honest "unknown" — never claimed verified, and no
+                # second blind retype to "make sure".
+                unverified_chars += len(chunk)
+                continue
+            raise TextIntegrityError(
+                "typed-text integrity verification failed after one verified retype "
+                f"({len(missing)} retried characters still not landed correctly in the "
+                "focused control); refusing further blind repair. Re-observe and decide."
+            )
+        assert verified + mismatch_chars + unverified_chars == total
+        suffix = _format_integrity_status(
+            verified,
+            total,
+            mismatch=mismatch_chars,
+            unverified=unverified_chars,
+            healed=healed,
+        )
+        return f"Executed type. {suffix}"
+
+    def _read_landed_normalized(self) -> str | None:
+        """One read-back, normalized; ``None`` when the value is unavailable."""
+        raw = self.read_focused_control_value()
+        return None if raw is None else _normalize_landed_text(raw)
+
+    def _verify_typed_landed(self, baseline_n: str | None, typed_prefix: str) -> tuple[str, str | None]:
+        """Compare the read-back against ``baseline + typed_prefix`` (normalized).
+
+        Returns ``(verdict, landed_n)`` where ``landed_n`` is the normalized read-back
+        (``None`` when unavailable). Verdicts: ``"verified"``, ``"unverified"`` (no
+        read-back possible), ``"dropped"`` (landed text is a strict PREFIX of the
+        expectation — the measurable drop signature), or ``"mismatch"`` (anything
+        else; not repairable by appending).
+        """
+        if baseline_n is None:
+            return ("unverified", None)
+        landed_n = self._read_landed_normalized()
+        if landed_n is None:
+            return ("unverified", None)
+        expected_n = baseline_n + _normalize_landed_text(typed_prefix)
+        if landed_n == expected_n:
+            return ("verified", landed_n)
+        if expected_n.startswith(landed_n):
+            return ("dropped", landed_n)
+        return ("mismatch", landed_n)
+
+    def _missing_suffix(self, baseline_n: str | None, typed_prefix: str, landed_n: str | None) -> str:
+        """The not-yet-landed characters of ``typed_prefix`` (original coordinates).
+
+        ``landed_n`` may be ``None`` (the confirm read failed after a ``dropped``
+        verdict): the retype then covers the WHOLE typed prefix, which is still the
+        read-back-derived scope — conservative, never speculative.
+        """
+        if baseline_n is None:
+            return typed_prefix
+        if landed_n is None:
+            return typed_prefix
+        consumed = len(landed_n) - len(baseline_n)
+        if consumed <= 0:
+            return typed_prefix
+        index = _typed_index_for_norm_len(typed_prefix, consumed)
+        return typed_prefix[index:]
 
     def _drag_waypoints(self, start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
         """Stroke waypoints for one drag (engine-selected policy).
@@ -4051,6 +4335,12 @@ class FakeComputerBackend(ComputerBackend):
         self.launch_unresolvable: set[str] = set()
         self._last_key_dispatch: float = 0.0
         self._last_focus_transition: float = 0.0
+        # R-04 integrity read-back injection: the fake focused control's value.
+        # ``None`` (default) = "cannot verify" — type actions report
+        # ``integrity=unverified`` exactly like the real backend with no readable
+        # control; a string is compared against the typed text (CRLF-normalized,
+        # same policy as the real backend, including the simulated prefix repair).
+        self.focused_control_value: str | None = None
 
     def set_windows(self, windows: list[WindowInfo]) -> None:
         """Replace the fake top-level window list (first entry = top of Z-order)."""
@@ -4338,6 +4628,38 @@ class FakeComputerBackend(ComputerBackend):
                 stop.ensure_live()
             self._apply_focus_settle()
             self._last_key_dispatch = time.monotonic()  # B3 clock parity
+            if not action.text or not TYPE_INTEGRITY_ENABLED:
+                message = "Simulated type."
+            else:
+                total = len(action.text)
+                landed_n = (
+                    _normalize_landed_text(self.focused_control_value)
+                    if self.focused_control_value is not None
+                    else None
+                )
+                if landed_n is None:
+                    message = "Simulated type. " + _format_integrity_status(
+                        0, total, mismatch=0, unverified=total, healed=0
+                    )
+                else:
+                    expected_n = _normalize_landed_text(action.text)
+                    if landed_n == expected_n:
+                        message = "Simulated type. " + _format_integrity_status(
+                            total, total, mismatch=0, unverified=0, healed=0
+                        )
+                    elif expected_n.startswith(landed_n):
+                        # Dropped-suffix signature: simulate the verified retype landing.
+                        missing_units = len(expected_n) - len(landed_n)
+                        self.focused_control_value = expected_n
+                        message = "Simulated type. " + _format_integrity_status(
+                            total, total, mismatch=0, unverified=0, healed=missing_units
+                        )
+                    else:
+                        message = "Simulated type. " + _format_integrity_status(
+                            0, total, mismatch=total, unverified=0, healed=0
+                        )
+            self.executed.append(action)  # this branch returns before the shared append
+            return message
         elif action.action == "drag":
             if action.point is None or action.to_point is None:
                 raise ValueError("Both a start point and an end point are required for drag actions")

@@ -199,11 +199,29 @@ def test_parity_double_click(
     assert _sendinput_move_points(fake_user32) == [(30, 45)]
 
 
+class _UnavailableReader:
+    """Deterministic semantic-reader stand-in: available, but every read fails.
+
+    R-04 keeps the parity matrix hermetic — the integrity read-back must not touch the
+    real desktop's focused control; an unavailable read degrades to ``unverified`` on
+    BOTH engine paths identically (never a false ``verified``).
+    """
+
+    available = True
+
+    def read(self) -> None:
+        return None
+
+    def warm(self) -> bool:
+        return True
+
+
 @WINDOWS_ONLY
 def test_parity_type(real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch) -> None:
     action = GroundedAction(confidence=1.0, action="type", text="hi")
+    monkeypatch.setattr(real_backend, "_semantic_reader", _UnavailableReader())
     pa_calls, fake_user32, pa_msg, si_msg = _run_both(real_backend, monkeypatch, action)
-    assert pa_msg == si_msg == "Executed type."
+    assert pa_msg == si_msg == "Executed type. integrity=unverified(0/2)"
     assert pa_calls == [("write", "h"), ("write", "i")]
     keys = [
         event["scan"]
