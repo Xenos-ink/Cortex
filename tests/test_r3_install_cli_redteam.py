@@ -24,8 +24,8 @@ from __future__ import annotations
 
 import ast
 import json
-import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -549,26 +549,51 @@ def test_r3_a5_toml_existing_section_via_register_agent_force_untouched(tmp_path
 # ===========================================================================
 
 
+class _FakeStdin:
+    def __init__(self):
+        self.written = ""
+        self.closed = False
+
+    def write(self, text):
+        self.written += text
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
 class _FakeProc:
+    """Stream-based fake child: stdin records writes, stdout is a line iterator.
+
+    There is deliberately NO ``communicate`` — the probe must not use it
+    (``communicate(input=...)`` closes the child's stdin right after writing,
+    which race-cancels the server's in-flight tools/list handling).
+    ``raise_timeout=True`` models a stubborn child that never answers while its
+    stdout stays open (the generator only ends once the probe kills it).
+    """
+
     def __init__(self, stdout="", raise_timeout=False, poll_value=0):
-        self._stdout = stdout
-        self._raise_timeout = raise_timeout
+        self.stdin = _FakeStdin()
+        self.killed = False
         self._poll_value = poll_value
         self.kill_count = 0
-        self.drain_called = False  # set on any communicate() that RETURNS (i.e. post-kill drain)
+        self._hang = raise_timeout
+        self._lines = stdout.splitlines(keepends=True)
+        self.stdout = self._iter_stdout()
 
-    def communicate(self, input=None, timeout=None):
-        if self._raise_timeout:
-            self._raise_timeout = False
-            raise subprocess.TimeoutExpired(cmd="probe", timeout=timeout)
-        self.drain_called = True
-        return self._stdout, ""
+    def _iter_stdout(self):
+        yield from self._lines
+        while self._hang and not self.killed:
+            time.sleep(0.01)  # child alive, stdout open, no further data
 
     def poll(self):
         return self._poll_value
 
     def kill(self):
         self.kill_count += 1
+        self.killed = True
 
 
 def _probe_stdout(tools):
@@ -613,7 +638,9 @@ def test_r3_a6_probe_timeout_kills_child_even_if_unreaped(monkeypatch, tmp_path)
     assert ok is False
     assert "timed out" in detail
     assert proc.kill_count >= 1, "child must be killed on timeout"
-    assert proc.drain_called, "output pipe must be drained (communicate) after kill"
+    # Reader-side drain is handled by the probe's stdout reader thread, which the
+    # kill terminates and the probe joins before returning (no communicate drain).
+    assert proc.killed, "hanging fake stdout must be terminated by the kill"
 
 
 def test_r3_a6_probe_missing_initialize_reason(monkeypatch, tmp_path):
@@ -715,6 +742,8 @@ def test_r3_a8_cli_imports_stdlib_only():
         "shutil",
         "subprocess",
         "sys",
+        "threading",
+        "time",
         "tomllib",
         "collections.abc",
         "dataclasses",

@@ -3,15 +3,18 @@
 Non-e2e: the probe subprocess is stubbed with an injectable fake ``Popen`` (same pattern
 as the C059 cli tests) — no real server, no real venv, no network, no agent configs.
 Covers the single-line PASS/FAIL output, exit codes via ``main()``, the failure modes
-(4-tool surface, anyOf token, timeout kill), subprocess argument forwarding, and the
-default ``--python``/``--cwd`` resolution.
+(4-tool surface, anyOf token, timeout kill, child exit without a tools/list response),
+the stdin-open request discipline (the probe must NOT close the child's stdin before the
+responses arrive — closing it early race-cancels the server's in-flight tools/list
+handling and loses responses from a healthy server), subprocess argument forwarding,
+and the default ``--python``/``--cwd`` resolution.
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
+import time
 from pathlib import Path
 
 from computer_use_mcp import cli
@@ -22,20 +25,49 @@ from computer_use_mcp import cli
 # ---------------------------------------------------------------------------
 
 
-class _FakeProc:
-    def __init__(self, stdout="", raise_timeout=False):
-        self._stdout = stdout
-        self._raise_timeout = raise_timeout
-        self.killed = False
+class _FakeStdin:
+    def __init__(self):
+        self.written = ""
+        self.closed = False
 
-    def communicate(self, input=None, timeout=None):
-        if self._raise_timeout:
-            self._raise_timeout = False  # second call (post-kill drain) returns
-            raise subprocess.TimeoutExpired(cmd="probe", timeout=timeout)
-        return self._stdout, ""
+    def write(self, text):
+        self.written += text
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeProc:
+    """Stream-based fake child: stdin records writes, stdout is a line iterator.
+
+    There is deliberately NO ``communicate`` — the probe must not use it
+    (``communicate(input=...)`` closes the child's stdin right after writing,
+    which is exactly the race the streaming probe fixed).
+    """
+
+    def __init__(self, stdout="", hang=False, delay_before_tools=0.0):
+        self.stdin = _FakeStdin()
+        self.killed = False
+        self._hang = hang
+        self._delay = delay_before_tools
+        self._lines = stdout.splitlines(keepends=True)
+        self.stdout = self._iter_stdout()
+
+    def _iter_stdout(self):
+        tools_seen = False
+        for line in self._lines:
+            if self._delay and not tools_seen and '"id": 2' in line:
+                time.sleep(self._delay)  # responses arrive late; stdin stays open
+            tools_seen = tools_seen or '"id": 2' in line
+            yield line
+        while self._hang and not self.killed:
+            time.sleep(0.01)  # child alive, stdout open, no further data
 
     def poll(self):
-        return 0
+        return None  # appears alive so the probe must kill() it
 
     def kill(self):
         self.killed = True
@@ -106,15 +138,15 @@ def test_probe_fail_anyof_token_exits_one(monkeypatch, tmp_path, capsys):
 
 
 def test_probe_timeout_kills_child_and_exits_one(monkeypatch, tmp_path, capsys):
-    proc = _FakeProc(raise_timeout=True)
+    proc = _FakeProc(hang=True)  # child alive, stdout open, never answers
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: proc)
     rc = cli.main(
-        ["probe", "--python", "python", "--cwd", str(tmp_path), "--timeout", "5"]
+        ["probe", "--python", "python", "--cwd", str(tmp_path), "--timeout", "1"]
     )
     out = capsys.readouterr().out
     assert rc == 1
     assert proc.killed is True
-    assert out.splitlines() == ["PROBE FAIL — probe timed out after 5s"]
+    assert out.splitlines() == ["PROBE FAIL — probe timed out after 1s"]
 
 
 def test_probe_unstartable_python_prints_single_fail_line(monkeypatch, tmp_path, capsys):
@@ -152,20 +184,35 @@ def test_probe_forwards_python_cwd_and_server_module(monkeypatch, tmp_path):
     assert calls["kwargs"]["cwd"] == str(cwd)
 
 
-def test_probe_forwards_timeout_to_communicate(monkeypatch, tmp_path):
-    seen: dict = {}
-
-    class _Proc(_FakeProc):
-        def communicate(self, input=None, timeout=None):
-            seen["timeout"] = timeout
-            return _stdout_for(_all_tools()), ""
-
-    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: _Proc())
-    rc = cli.main(
-        ["probe", "--python", "python", "--cwd", str(tmp_path), "--timeout", "3"]
-    )
+def test_probe_writes_all_requests_and_holds_stdin_open(monkeypatch, tmp_path):
+    proc = _FakeProc(_stdout_for(_all_tools()))
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: proc)
+    rc = cli.main(["probe", "--python", "python", "--cwd", str(tmp_path)])
     assert rc == 0
-    assert seen["timeout"] == 3.0
+    assert '"id": 1' in proc.stdin.written  # initialize
+    assert "notifications/initialized" in proc.stdin.written
+    assert '"id": 2' in proc.stdin.written  # tools/list
+    assert proc.stdin.closed is True  # closed only during teardown, after the verdict
+
+
+def test_probe_survives_delayed_tools_list_response(monkeypatch, tmp_path):
+    # A healthy server whose tools/list response arrives late: the probe must keep
+    # stdin open and keep reading until both responses land (the EOF race fix).
+    proc = _FakeProc(_stdout_for(_all_tools()), delay_before_tools=0.3)
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: proc)
+    rc = cli.main(["probe", "--python", "python", "--cwd", str(tmp_path)])
+    assert rc == 0
+
+
+def test_probe_child_exit_without_tools_list_response_fails_typed(monkeypatch, tmp_path, capsys):
+    # Child answered initialize, then exited: typed tools/list failure, no timeout.
+    stdout = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "x"}}) + "\n"
+    proc = _FakeProc(stdout)
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: proc)
+    rc = cli.main(["probe", "--python", "python", "--cwd", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert out.splitlines() == ["PROBE FAIL — no tools/list response from server"]
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ injectable fake ``Popen``).
 from __future__ import annotations
 
 import json
-import subprocess
+import time
 import tomllib
 from pathlib import Path
 
@@ -313,20 +313,43 @@ def test_registration_has_no_cwd_for_claude_cursor_codex():
 # ---------------------------------------------------------------------------
 
 
-class _FakeProc:
-    def __init__(self, stdout="", raise_timeout=False):
-        self._stdout = stdout
-        self._raise_timeout = raise_timeout
-        self.killed = False
+class _FakeStdin:
+    def __init__(self):
+        self.written = ""
+        self.closed = False
 
-    def communicate(self, input=None, timeout=None):
-        if self._raise_timeout:
-            self._raise_timeout = False  # second call (post-kill drain) returns
-            raise subprocess.TimeoutExpired(cmd="probe", timeout=timeout)
-        return self._stdout, ""
+    def write(self, text):
+        self.written += text
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeProc:
+    """Stream-based fake child: stdin records writes, stdout is a line iterator.
+
+    There is deliberately NO ``communicate`` — the probe must not use it
+    (``communicate(input=...)`` closes the child's stdin right after writing,
+    which race-cancels the server's in-flight tools/list handling).
+    """
+
+    def __init__(self, stdout="", raise_timeout=False):
+        self.stdin = _FakeStdin()
+        self.killed = False
+        self._hang = raise_timeout  # a child that never answers: stdout stays open
+        self._lines = stdout.splitlines(keepends=True)
+        self.stdout = self._iter_stdout()
+
+    def _iter_stdout(self):
+        yield from self._lines
+        while self._hang and not self.killed:
+            time.sleep(0.01)  # child alive, stdout open, no further data
 
     def poll(self):
-        return 0
+        return None  # appears alive so the probe must kill() it
 
     def kill(self):
         self.killed = True

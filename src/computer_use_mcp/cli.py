@@ -29,6 +29,8 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -265,12 +267,43 @@ def toml_register(path: Path, registration: dict, force: bool) -> tuple[str, Pat
 # ---------------------------------------------------------------------------
 
 
+def _parse_probe_responses(lines: list[str]) -> tuple[bool, list[str] | None]:
+    """Extract the initialize ack and the tools/list result from response lines."""
+    init_ok = False
+    tools: list[str] | None = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("id") == 1 and "result" in msg:
+            init_ok = True
+        if msg.get("id") == 2 and isinstance(msg.get("result"), dict):
+            tools = [
+                t.get("name", "") for t in msg["result"].get("tools", []) if isinstance(t, dict)
+            ]
+    return init_ok, tools
+
+
 def probe_server(python_exe: Path | str, cwd: Path, timeout: float = 30.0) -> tuple[bool, str]:
     """Start the MCP server over stdio and verify the exposed tool surface.
 
     Sends initialize + initialized + tools/list; requires exactly
     ``EXPECTED_TOOLS`` and zero ``anyOf``/``$ref`` tokens in the payload.
     Returns ``(ok, detail)``; the child process is always killed.
+
+    The requests are written with stdin held OPEN and the responses are read
+    incrementally from stdout until both arrive (or ``timeout``). Closing stdin
+    right after writing (the previous ``communicate(input=...)`` shape) makes the
+    server's stdio reader hit EOF and race-cancel an in-flight tools/list
+    handler, intermittently losing the response from a healthy server (observed
+    as flaky ``PROBE FAIL — no tools/list response``); a real host never closes
+    stdin that early, and neither does the probe anymore.
     """
     messages = [
         {
@@ -300,35 +333,52 @@ def probe_server(python_exe: Path | str, cwd: Path, timeout: float = 30.0) -> tu
         )
     except OSError as exc:
         return False, f"cannot start {python_exe}: {exc}"
+
+    collected: list[str] = []
+    reader_done = threading.Event()
+
+    def _read_stdout() -> None:
+        try:
+            collected.extend(proc.stdout)
+        except (OSError, ValueError):
+            pass
+        finally:
+            reader_done.set()
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+    timed_out = False
     try:
         try:
-            out, _ = proc.communicate(input=stdin_payload, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            return False, f"probe timed out after {timeout:.0f}s"
+            proc.stdin.write(stdin_payload)
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            pass  # a child that died early surfaces through the read side below
+        deadline = time.monotonic() + timeout
+        while True:
+            init_ok, tools = _parse_probe_responses(collected)
+            if init_ok and tools is not None:
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            if reader_done.is_set():
+                # child exited before answering; collected is final — stop early
+                break
+            time.sleep(0.02)
     finally:
         if proc.poll() is None:
             proc.kill()
-    payload = out or ""
-    init_ok = False
-    tools: list[str] | None = None
-    for line in payload.splitlines():
-        line = line.strip()
-        if not line:
-            continue
         try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("id") == 1 and "result" in msg:
-            init_ok = True
-        if msg.get("id") == 2 and isinstance(msg.get("result"), dict):
-            tools = [
-                t.get("name", "") for t in msg["result"].get("tools", []) if isinstance(t, dict)
-            ]
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        reader.join(timeout=2.0)
+    if timed_out:
+        return False, f"probe timed out after {timeout:.0f}s"
+    payload = "".join(collected)
+    init_ok, tools = _parse_probe_responses(collected)
     if not init_ok:
         return False, "no initialize response from server"
     if tools is None:
