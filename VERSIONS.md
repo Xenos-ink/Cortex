@@ -12,6 +12,8 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
+## Unreleased
+
 ## v0.5.9 (2026-09-12) — RELEASED (canonical install prompts + probe subcommand)
 
 The served-surface verification becomes a first-class command, and installing
