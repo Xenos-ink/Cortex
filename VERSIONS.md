@@ -14,6 +14,139 @@ Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
 ## Unreleased
 
+Target: v0.6.0 (mission ORVEX-CORTEX-060). Integrated on `release-v060`; these
+notes fold into the `## v0.6.0` entry at release.
+
+### Added
+
+- **`right_click` action** — a smooth right-button click at screenshot coordinates
+  that opens a real context menu, through the same fail-closed pipeline as every
+  action: point-bearing grounding, validator bounds + `source_observation_id`
+  binding, risk classification with the click family (LOW
+  `known_application_interaction`; MEDIUM `unverified_target_application` when
+  identity unknown), backend dispatch with the same stop-check/settle discipline
+  (all three input engines resolve the right-button down/up flag pair; typed
+  `unsupported mouse button` error for anything else), the `visual_change`
+  verification default exactly like click, fake-backend parity, teaching text
+  (`right_click (x,y; opens a context menu)` plus a context-menu hint in the
+  invalid-action rejection), README/ARCHITECTURE/SAFETY documentation, 41 unit
+  tests, and a default-skipped live E2E context-menu test — proven live on a real
+  desktop twice: the Win32 `#32768` menu window owned by the launched Notepad
+  appeared and closed on ESC, and the post-action screenshot shows the open edit
+  context menu.
+
+### Changed
+
+- **(R-01) Deterministic verification decides `type` actions** — the root defect
+  behind the pixel-tier false-negatives is fixed: the deterministic
+  `ui_control_text` tier now receives the TYPED TEXT as its needle (it previously
+  received the effect prose, which never appears in a control value, so the
+  deterministic tier structurally abstained on every stated-effect type action and
+  everything escalated to the pixel band). Typing now verifies deterministically
+  from the field value/title whenever the text is visible; absent evidence still
+  degrades to `uncertain` (never the historical false `failed`), and the pixel
+  band acts only as the ambiguous-band escalation. Keypress/hotkey keep the
+  launch-prefix `window_state` promotion (pinned), and focus-change identity
+  signals stay click-scoped (pinned — an unrelated foreground steal must never
+  verify a type effect).
+- **(R-18) GroundedAction-invalid `follow_ups` items return typed rejections** —
+  a target-less `focus_window`, half-specified `drag`, or 1-key `hotkey` no longer
+  raises an uncaught `ValidationError`: the server boundary pre-validates every
+  queue item and answers with the teaching `invalid_action` shape (valid-shape
+  hints), fail-closed with zero dispatches; the agent-level queue guard adds the
+  typed `invalid_follow_up` outcome for direct `run_single` callers. Queue
+  stop/continue semantics are otherwise unchanged.
+- **(R-02) Safety keyword gate tuned to word boundaries, both directions** —
+  `_looks_sensitive` now tokenizes text instead of raw substring matching:
+  hyphenated compounds stay single tokens (`closed-form` can never hide `rm`),
+  identifier compounds split into components (`client_secret` still blocks),
+  credential markers carry singular and plural forms, phrase markers (`cmd exe`,
+  `reg delete`, `drop database`, `reset password`, …) match consecutive whole
+  tokens, and `token(s)` is skipped only in the `doi`-citation context. The
+  observed benign corpus (all five ROADMAP strings and the DOI variants) passes
+  while the secret/credential corpus still blocks — pinned on both the safety and
+  redaction layers; redaction patterns are unchanged.
+- **(R-20) Re-anchor is causal** — a verified action's foreground window is
+  adopted as the new anchor ONLY when it is a session-launched/attached surface, a
+  same-process descendant (or an owner-chained dialog of one), or the outcome of
+  the session's own keyboard launch act; everything else is refused with the new
+  named `REANCHOR_REFUSED` audit event (annotation-only — the anchor is kept, so
+  the next pre-dispatch rejects with `FOCUS_TAKEN_BY`). The old
+  `anchor_gone → re-anchor to anything` rule is removed: a dead anchor unbinds
+  via `TARGET_GONE` so the driver reattaches explicitly.
+
+### Fixed
+
+- **(R-04) Keystroke-burst resilience: chunked typing with verified integrity** —
+  `type` is chunk-dispatched (default 64 characters, `CORTEX_TYPE_CHUNK_CHARS`)
+  with per-chunk read-back of the focused control's value (UIA Value /
+  `WM_GETTEXT`). The action message gains the additive suffix
+  `integrity=verified|partial|unverified|mismatch(v/total)` (plus `healed=<n>`
+  when a repair delivered characters). A re-dispatch is issued ONLY for a
+  read-back-proven missing suffix, at most once per chunk (verified retype —
+  never blind); a still-wrong repair fails the action with the typed
+  `TextIntegrityError`, and with no readable focused control the action reports
+  `unverified` and never claims success. `CORTEX_TYPE_INTEGRITY=0` restores the
+  byte-identical legacy path. Live smoke on the reference desktop: a 1-character
+  dispatch verified true-positive, and a 50-character burst that the desktop's
+  input stack dropped was detected, healed by exactly one verified retype, and
+  then failed honestly with `TextIntegrityError` (no blind retry). The
+  desktop-level injected-keystroke-drop finding is recorded in the maintainer
+  evidence tree; the formal 200-chars/20-bursts acceptance run is a later
+  mission phase.
+- **(R-05) B5 backslash-type wedge closed as root-caused** — the historical
+  >10-minute stall was a one-off window-activation race: the type dispatched while
+  the freshly activated Run dialog's thread input queue was still settling. On the
+  re-run the exact incident payload completes in <0.35 s across engine,
+  Run-dialog, and full-server topologies; the shipped settle/gap mitigations and
+  watchdog regression tests hold. The accepted residual (a one-off OS input-stack
+  wedge cannot be made impossible in-process; it is bounded by the watchdog and
+  surfaces as a typed failure, never a hang) is documented in the
+  Known-limitations text that lands in `docs/SAFETY.md` with the release.
+- **(R-03) `ensure_app` no longer builds an empty-title focus call** — the
+  reattach path prefers the top-of-Z-order TITLED match among resolved instances
+  and raises the typed `WindowFocusError` when every matched instance has an empty
+  title, instead of surfacing a raw validation error or silently reattaching
+  unfocused (identical in the real and fake backends).
+- **(R-19) FocusGuard verifies identity beyond the hwnd** — the equal-hwnd
+  pre-dispatch branch now cross-checks pid → process name → window class → title
+  overlap (the strongest identity evidence both sides provide decides); a recycled
+  hwnd owned by a foreign process fails the check, falls through to the
+  pid-verified rules, and rejects with `FOCUS_TAKEN_BY`.
+- **`cortex-mcp probe` no longer intermittently fails against a healthy server** —
+  the probe closed the child's stdin immediately after writing its three requests,
+  and the server's EOF handling could race-cancel the in-flight tools/list
+  response (pre-existing since v0.5.9; A/B loops showed 2/8 failures at the v0.5.9
+  baseline and at the integration HEAD alike). The probe now reads the responses
+  with stdin held open, like a real host; verdict strings, exit codes, argv/cwd
+  forwarding, and the exact-tool-set plus schema-token checks are unchanged
+  (10/10 stable probe runs observed post-fix).
+
+### Performance
+
+- Speed-comparison numbers (v0.5.9 vs 0.6.0, same tasks/same driver) are measured
+  in a later mission phase and land here at release from the maintainer evidence
+  tree — no performance numbers are claimed before they exist.
+
+### Compatibility notes
+
+- The `right_click` action is additive: existing action names, parameters, and
+  response shapes are unchanged.
+- `type` responses gain the additive `integrity=...` suffix, and a new typed
+  failure class (`TextIntegrityError`, a `BackendError`) exists for confirmed
+  unhealable drops — drivers should re-observe and decide, never retry blindly.
+- Stated-effect `type` actions can now return `verified` via the deterministic
+  field match where they previously escalated to the pixel band; absent evidence
+  remains `uncertain` (no new failures, no false successes).
+- Malformed `follow_ups` items return the typed `invalid_action` rejection with
+  valid-shape hints instead of an unstructured error; nothing dispatches in that
+  case, exactly as before.
+- New guard audit event `REANCHOR_REFUSED` (annotation-only, never a queue stop
+  reason); `FOCUS_TAKEN_BY` semantics unchanged.
+- The safety keyword-gate tuning is precision-only: derived words and DOI
+  citations pass, and every value-bearing secret usage still blocks (both
+  directions pinned by tests).
+
 ## v0.5.9 (2026-09-12) — RELEASED (canonical install prompts + probe subcommand)
 
 The served-surface verification becomes a first-class command, and installing
