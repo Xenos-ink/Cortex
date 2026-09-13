@@ -263,6 +263,34 @@ STEP 4 — REPORT to the user:
   - and: restart yourself / your host to load the update.
 ```
 
+## Agent skill: cortex-fast (fast-path driving)
+
+`cortex-fast` is a small agent skill (one `SKILL.md`, ~60 lines) that teaches any LLM/VLM
+driving Cortex to spend fewer turns: a fast path for verified or obvious steps, one named
+escalation route for everything else. It changes nothing in the server — verification,
+staleness, risk, and approval semantics are fully preserved; the skill only shapes how the
+driving host reacts to results. On invocation it instructs the agent to execute the user's
+request through the Cortex MCP tools (`start_session` → `computer_execute` /
+`computer_observe` → `stop_session`).
+
+Install it side-channel with npx (pulls this repo and runs the bundled installer; no
+Python setup required):
+
+```bash
+npx --yes github:Xenos-ink/Cortex            # installs into every EXISTING user-scope
+                                             # skills dir (~/.zcode/skills, ~/.agents/skills,
+                                             # ~/.claude/skills)
+npx --yes github:Xenos-ink/Cortex -- --all   # also project-scope ./.zcode|agents|claude/skills
+npx --yes github:Xenos-ink/Cortex -- --dir D:\skills   # explicit target (created)
+npx --yes github:Xenos-ink/Cortex -- --list  # plan only, no writes
+```
+
+`--force` overwrites a differing existing install after backing it up to
+`cortex-fast.cortex-backup-<YYYYmmdd-HHMMSS>` (an existing backup is never overwritten).
+Already-installed identical content reports `UNCHANGED`. The skill lives in the repo at
+`skills/cortex-fast/SKILL.md`; the installer is `skills/install-cortex-skill.mjs`
+(stdlib-only Node ≥ 18, no telemetry, no network).
+
 ## Running the server
 
 ```bash
