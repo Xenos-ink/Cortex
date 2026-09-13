@@ -512,7 +512,7 @@ def test_pyautogui_engine_call_vocabulary() -> None:
     assert pa.PAUSE == 0.1  # configurable
     assert pa.calls == [
         ("moveTo", 3, 4),
-        ("click", 5, 6, ("clicks", 2), ("interval", 0.08)),
+        ("click", 5, 6, ("clicks", 2), ("interval", 0.08), ("button", "left")),
         ("mouseDown", "left"),
         ("mouseUp", "left"),
         ("hotkey", "ctrl", "s"),
@@ -550,7 +550,7 @@ def test_recording_engine_matches_engine_contract() -> None:
     engine.scroll(1)
     assert engine.calls == [
         ("move", 1, 2),
-        ("click", 1, 2, 2),
+        ("click", 1, 2, 2, "left"),
         ("mouse_down", "left"),
         ("mouse_up", "left"),
         ("type_text", "x"),

@@ -30,8 +30,8 @@ class RecordingEngine(InputEngine):
     def move(self, x: int, y: int) -> None:
         self.calls.append(("move", x, y))
 
-    def click(self, x: int, y: int, clicks: int = 1) -> None:
-        self.calls.append(("click", x, y, clicks))
+    def click(self, x: int, y: int, clicks: int = 1, button: str = "left") -> None:
+        self.calls.append(("click", x, y, clicks, button))
 
     def mouse_down(self, button: str = "left") -> None:
         self.down = True
