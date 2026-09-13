@@ -1025,30 +1025,25 @@ class SimpleNamespace:
 
 
 def test_rt9_finding_benign_text_false_positives_quantified_b12() -> None:
-    """FINDING RT9-1 (B12 observation quantified; NO FIX — R-02 deferred to ROADMAP).
+    """FINDING RT9-1: substring false positives CLOSED by R-02 (word-boundary gate).
 
-    Measured false-positive surface of the legacy TYPE secret gate (substring markers,
-    no word boundaries), 18-string benign corpus:
+    Pre-fix measured surface (substring markers, no word boundaries), 18-string
+    benign corpus: 3/18 REJECTED — 'the closed-form solution of the integral'
+    (``'rm '`` inside ``'closed-form '``), 'Closed Form X-4782 application approved'
+    (``'rm '`` inside ``'form '``), "John's password: (none stored here)".
 
-    - 'the closed-form solution of the integral'  -> 'rm ' inside 'closed-form '
-    - 'Closed Form X-4782 application approved'   -> 'rm ' inside 'form '
-    - "John's password: (none stored here)"       -> 'password' with an EMPTY value
-
-    3/18 benign strings are REJECTED as 'secret, credential, or destructive'.
-    The DOI strings do NOT reproduce as FPs in the current tree. The secret net at the
-    gate is narrow (3/10 blocked: the assignment-style markers) — the REDACTION layer
-    compensates for AKIA/JWT/private-key/URL-credentials at the dispatch sink, leaving
-    the GitHub/Slack/Stripe token classes uncovered at BOTH layers (see the redaction
-    test).
+    Post R-02 the two word-boundary false positives PASS (pinned below). The
+    empty-value "password" MENTION remains blocked by the KEYWORD gate by design:
+    that layer is keyword-level (value-agnostic), while the REDACTION layer is
+    value-oriented and passes the same string — the documented division of labor
+    between the two layers (corpora of record in tests/test_r02_text_corpora.py).
     """
     flagged = [t for t in BENIGN_CORPUS if _flagged(_type_decision(t))]
-    assert flagged == [
-        "the closed-form solution of the integral",
-        "Closed Form X-4782 application approved",
-        "John's password: (none stored here)",
-    ]
-    # pinned: exactly 3/18 false positives; every other benign string passes cleanly
-    assert len(flagged) == 3 and len(BENIGN_CORPUS) == 18
+    assert "the closed-form solution of the integral" not in flagged
+    assert "Closed Form X-4782 application approved" not in flagged
+    assert flagged == ["John's password: (none stored here)"]
+    # pinned: 1/18 residual keyword-layer flag, exactly the value-mention case
+    assert len(flagged) == 1 and len(BENIGN_CORPUS) == 18
 
 
 def test_rt9_finding_gate_misses_compensated_by_redaction_except_modern_tokens() -> None:
