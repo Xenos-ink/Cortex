@@ -74,6 +74,21 @@ released version is `pyproject.toml`.
 - **Accept:** a foreign window immediately following a keypress into a
   `#32770`/explorer.exe anchor is refused as anchor (named `REANCHOR_REFUSED`);
   R-20's documented positive adoption paths still work.
+
+### R-23 Zero-width/space tokenizer evasion of the safety text classifier
+
+- **Status:** DISCOVERED-DEFERRED (red-team finding RT-E8-04; the typed payload
+  itself is inert in the flagged repro).
+- **Problem:** zero-width/space characters can split the destructive tokens the
+  safety text classifier matches on, evading the gate entirely (tokenizer-level
+  evasion of the safety text classifier).
+- **Approach:** normalize (strip/map zero-width and confusable whitespace)
+  before classifier matching, keeping the benign corpus passing unchanged.
+- **Evidence:** redteam report RT-E8-04 (maintainer-local
+  `evidence/v06-006/redteam/report.md`).
+- **Accept:** zero-width/space-obfuscated destructive payloads classify at the
+  same risk as their plain counterparts; the benign corpus still passes unchanged.
+
 ## P1 — v0.7.0 (performance & driver economics)
 
 ### R-06 Driver-economics pack: the "fast-model profile"
@@ -130,18 +145,6 @@ released version is `pyproject.toml`.
 - **Evidence:** (QA: perf-004 evidence — Win32 research digest, deferred item).
 - **Accept:** contract extension documented and reviewed; capture option ships only
   with verifiable coordinate integrity preserved.
-
-### R-10 DXGI Desktop Duplication capture
-
-- **Status:** RESEARCH-DEFERRED.
-- **Problem:** `mss` captures through GDI; DXGI Desktop Duplication could lower the
-  capture floor (studied ceiling ≤ 25 ms gain) but requires high-risk D3D11+COM
-  plumbing via dependency-free ctypes.
-- **Approach:** implement behind an internal engine switch with capture-parity tests
-  against the `mss` baseline; replace the default only after parity is proven.
-- **Evidence:** (QA: perf-004 evidence — Win32 research digest).
-- **Accept:** capture parity demonstrated plus a measured gain before any replacement
-  of the `mss` default.
 
 ## P2 — v0.8.0+ (capability & effectiveness)
 

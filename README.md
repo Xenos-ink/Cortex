@@ -12,7 +12,7 @@
 
 ## What is Cortex
 
-Cortex is a Model Context Protocol (MCP) server that gives AI agents a safe, verifiable way to operate a Windows desktop. An agent connects over stdio and gets five deterministic tools — start a guarded session, capture the screen, execute a single action (click, double-click, drag, move, type, keypress, hotkey, scroll, wait, focus_window), take a raw screenshot, stop everything at any moment. Between the proposal and the physical input, Cortex runs a fixed pipeline: it grounds the action against a fresh observation, validates it (staleness, allowlists, coordinate integrity), classifies its risk, requests approval when policy requires it, and only then executes through a stop-checked backend.
+Cortex is a Model Context Protocol (MCP) server that gives AI agents a safe, verifiable way to operate a Windows desktop. An agent connects over stdio and gets five deterministic tools — start a guarded session, capture the screen, execute a single action (click, double-click, right-click, drag, move, type, keypress, hotkey, scroll, wait, focus_window, ensure_app, done), take a raw screenshot, stop everything at any moment. Between the proposal and the physical input, Cortex runs a fixed pipeline: it grounds the action against a fresh observation, validates it (staleness, allowlists, coordinate integrity), classifies its risk, requests approval when policy requires it, and only then executes through a stop-checked backend.
 
 After execution, Cortex re-observes the screen and verifies the action **semantically**: did the intended state transition actually occur? Every verification ends in an explicit outcome — `verified`, `failed`, or `uncertain` — and `uncertain` is never treated as success. The driving agent (the host) reads the outcome and re-drives from a fresh observation when a step fails — a moved window, an unexpected dialog, a stale screen are all surfaced as typed outcomes with evidence, never retried blindly inside the server.
 
@@ -60,7 +60,7 @@ The design principle: the goal is not to click the right pixel — it is to reac
 
 **Re-observe.** A fresh post-action capture is taken and returned with the result (as a real image block, or omitted with `include_screenshot_after=false` when the caller checks the verification verdict instead). PERF-004 rate-gate economics carry over to the direct surface: the `min_screenshot_interval_ms` rate gate (default 250 ms) protects FRESH observations — host-driven observes and the per-call grounding capture — while intra-call verification captures (the staleness probe, the post-action capture) are burst-exempt but still recorded, so session-wide capture volume stays enforced and bounded. The staleness check itself is digest-first: the grounding source's pixel digest is compared with the fresh pre-execution capture's digest (a pixel-identical capture proves identity drift impossible), and the full identity validation still decides — a digest mismatch is a hint, never a verdict.
 
-**Semantic verification.** A chain of six strategies answers "did the intended transition happen?" with `verified` / `failed` / `uncertain`. The first definitive outcome wins; an all-uncertain chain combines into `uncertain`; no code path upgrades `uncertain` to success (asserted by a dedicated test). The comparison baseline is always the observation the action was grounded from. For model-judge intents a cheap-first ladder applies: deterministic window/process/text/predicate strategies derived from the action intent run first, the pixel-diff supporting check second, and the provider model judge ONLY when both cheap tiers are inconclusive — a deterministic verdict always skips the judge.
+**Semantic verification.** A chain of eight strategies answers "did the intended transition happen?" with `verified` / `failed` / `uncertain`. The first definitive outcome wins; an all-uncertain chain combines into `uncertain`; no code path upgrades `uncertain` to success (asserted by a dedicated test). The comparison baseline is always the observation the action was grounded from. For model-judge intents a cheap-first ladder applies: deterministic window/process/text/predicate strategies derived from the action intent run first, the pixel-diff supporting check second, and the provider model judge ONLY when both cheap tiers are inconclusive — a deterministic verdict always skips the judge.
 
 **Recovery.** Failures classify into a 12-value taxonomy and surface to the host as typed outcomes with evidence (the loop-era bounded auto-recovery was removed with the loop; the host drives retries from fresh observations — the same coordinates are never retried blindly). Authentication prompts always fail safely; credentials are never auto-typed.
 
@@ -114,7 +114,7 @@ Verify the install:
 python -c "import computer_use_mcp; print(computer_use_mcp.__version__)"
 ```
 
-The package installs two console scripts, `cortex` and `computer-use-mcp`, which start the stdio MCP server. Running one blocks while it waits for MCP traffic on stdin — that is what a stdio server does; configure it in an MCP client instead of running it interactively (next section).
+The package installs three console scripts — `cortex`, `computer-use-mcp`, and `cortex-mcp`. The first two start the stdio MCP server; `cortex-mcp` is the CLI entry point. Running one blocks while it waits for MCP traffic on stdin — that is what a stdio server does; configure it in an MCP client instead of running it interactively (next section).
 
 **Updating**
 
@@ -265,7 +265,7 @@ STEP 4 — REPORT to the user:
 
 ## Agent skill: cortex-skill (fast-path driving)
 
-`cortex-skill` is a small agent skill (one `SKILL.md`, ~65 lines) that teaches any LLM/VLM
+`cortex-skill` is a small agent skill (one `SKILL.md`, 69 lines) that teaches any LLM/VLM
 driving Cortex to spend fewer turns: a fast path for verified or confirmed steps, one named
 escalation route for everything else. It changes nothing in the server — verification,
 staleness, risk, and approval semantics are fully preserved; the skill only shapes how the
@@ -344,6 +344,7 @@ The `env` block is optional — the five-tool server needs no API key (see the m
 | `CORTEX_PNG_COMPRESS_LEVEL` | Opt-in PNG encode/size trade for capture throughput: `0`–`9` PIL compress level (default unset = PIL's own level = the historical bytes). `1` measured ~21.6 ms vs ~27 ms per 1920×1080 frame at ~+45% size. Internal pipeline only; the outbound image budget (`CORTEX_RESULT_IMAGE_MAX_KB`, default 180 KB) is unaffected. |
 | `CORTEX_CAPTURE` | Capture backend: `blt` (default, the GDI/BitBlt mss pipeline) or `dxgi` — pure-ctypes DXGI Desktop Duplication (~26–43 ms vs ~53–90 ms per 1920×1080 capture on the mission desktop, no new dependency). Any other value degrades to `blt`. Fail-open by contract: a duplication that cannot be created (RDP/protected session, a second live duplicator in the process) or fails mid-session (device lost, lock screen) permanently falls back to the mss path for the session — the fast path can only speed captures up, never fail one. Idle-desktop semantics: duplication yields a frame only when the compositor changed something; on timeout the last frame (still current) is returned, and a cold duplication's first frame is fetched with a one-shot ~60 ms retry. |
 | `CORTEX_TEXT_PNG` | `1` keeps real PNG payloads in **text-delivery sessions** (`image_delivery="text"`), disabling the R-6 encode-skip: by default a text session's captures carry a deterministic raw-pixel key (`RAW:<sha256>;WxH`) instead of a lossless PNG nobody will ever see — the key serves the digest and staleness comparisons byte-faithfully (identical pixels → identical key) and verification keeps reading the capture-time RGB frame, so no verification semantics change. Default off (= fast keys in text sessions). |
+| `CORTEX_QUEUE_STRICT_VERIFY` | `1` (read by the server/agent at queue-dispatch time) restores the strict stop-on-failed queue semantics: a queued `follow_ups` batch halts at the first EXECUTED item whose verification outcome is `failed`. Default off — the honest failed verdict (`ok: false` + evidence) rides that item's `follow_up_results` entry while the remaining items still run, each re-grounding from the fresh post-action capture. |
 | `LOG_LEVEL` | Server log level (default `INFO`). |
 
 ### Non-vision models (image delivery)
@@ -394,6 +395,7 @@ Validates and executes one action through the full pipeline. Supported actions (
 | `scroll` | `delta` | -20..20 |
 | `wait` | `delta` (seconds) | capped at 10 s, sliced at 100 ms so a stop lands immediately |
 | `focus_window` | `target` | window title (max 200 chars); brings the matching window to the foreground |
+| `ensure_app` | `target` | `process` or `process\|doc-token` — attach-or-launch probe: focuses an EXISTING instance (`REATTACHED`), refuses an ambiguous one (`AMBIGUOUS_INSTANCE`), and reports no match (`NO_INSTANCE`); with the default `launch="server"` policy a `NO_INSTANCE` for an allowlisted target launches the process server-side (`CORTEX_ATTACH_OR_LAUNCH=driver` restores never-launch) |
 | `done` | — | completion marker |
 
 When either allowlist is configured (`start_session(allowed_processes=…)` / `allowed_windows=…`), a `focus_window` target is resolved and checked against **both** before any foregrounding call — the backend never runs on a disallowed target. Process allowlist: a target whose process is outside the list is refused (`process_not_allowed`), and so is a target that cannot be resolved (`process_identity_unavailable`). Window-title allowlist: a target whose title is outside the list is refused (`window_not_allowed`), and a target that cannot be resolved is refused there too (`window_identity_unavailable`). All four rejections are fail-closed.
@@ -455,14 +457,16 @@ Every verification produces an outcome in `{verified, failed, uncertain}`:
 
 Without a stated expectation, pixels alone stay ambiguous: an identical screen or a sub-threshold change yields `uncertain`, not a free success.
 
-The six strategies in the default chain (first definitive outcome wins):
+The eight strategies in the default chain (first definitive outcome wins):
 
 | Strategy | `verified` means | Without data |
 |---|---|---|
 | `deterministic_predicate` | a caller-supplied predicate returned `True` over (before, after) | no predicate → `uncertain` |
 | `window_state` | the active window title (and/or bounds change) matches the stated expectation | no window identity → `uncertain` |
 | `process_state` | the foreground process name (`.exe`-tolerant) and/or pid matches | no process identity → `uncertain` |
+| `ui_control_text` | deterministic window/UI-control text evidence — the expected text appears in the window title or a control's `name`/`value`; the deciding tier for `type` actions per R-01 | no window/UI-control text → `uncertain` |
 | `text_predicate` | the expected text appears in the OCR regions of the after-observation | no OCR → `uncertain` |
+| `focus_change` | deterministic focus/window/digest signals confirm a stated-effect click's focus transition (a focus change often moves no measurable pixels) | no focus/window/digest data → `uncertain` |
 | `screenshot_diff` | pixels changed consistently with the stated expectation — mean pixel difference ≥ 1.0, **or** ≥ 50 strongly-changed pixels (per-channel delta ≥ 40), so compact changes such as thin strokes and small controls verify even when the screen-wide mean barely moves | decode failure → `uncertain` |
 | `model_visual` | a configured vision judge (the OpenAI-compatible provider) confirmed the transition | no judge → `uncertain` |
 
@@ -498,7 +502,7 @@ A realistic direct-control session: Notepad is open on the desktop; the agent st
   "allowed_windows": [],
   "pending_approval_token": null,
   "allowed_processes": ["notepad.exe"],
-  "limits": "Limits(max_task_seconds=900.0, max_actions=50, max_retries_per_action=1, max_recovery_per_action=2, max_recovery_per_task=6, max_model_calls=60, min_screenshot_interval_ms=250, max_context_items=50, max_sessions=4)",
+  "limits": "Limits(max_task_seconds=900.0, max_actions=50, max_retries_per_action=1, max_recovery_per_action=2, max_recovery_per_task=6, max_model_calls=60, min_screenshot_interval_ms=250, max_context_items=50, max_sessions=4, max_session_seconds=14400.0, max_session_actions=2000, max_session_model_calls=500, max_session_steps=500, max_subtasks=50, context_summarize_every=25, approval_epoch_seconds=1800.0, approval_epoch_actions=50, health_check_interval=600.0)",
   "task_id": "9b1d…"
 }
 ```
@@ -663,6 +667,8 @@ The `limits` dict on `start_session` carries the long-running session fields (va
 | `max_session_steps` | 500 | 1..500 | loop steps across the session |
 | `max_subtasks` | 50 | 1..50 | subtask ceiling (checkpoint cross-check bound) |
 | `context_summarize_every` | 25 | 1..500 | steps between context compressions |
+| `approval_epoch_seconds` | 1800 (30 min) | 60..86400 | reserved — wall-clock half of the loop-era approval-epoch expiry |
+| `approval_epoch_actions` | 50 | 1..1000 | reserved — interactive-action half of the loop-era approval-epoch expiry |
 | `health_check_interval` | 600 (10 min) | 60..3600 | minimum spacing between boundary health checks |
 
 **Honest status (v0.6.0): these fields are accepted and validated — exactly the same
@@ -712,7 +718,7 @@ Full details — risk taxonomy with all pattern categories, fail-closed rules ta
 - **No OS-level sandboxing.** Policy, approval, and cancellation are enforced in-process. There is no VM, job object, or AppContainer isolation; if the process itself is compromised, these controls do not contain it, and the only physical backstop is the PyAutoGUI failsafe screen corner.
 - **An interactive desktop session is required.** No headless mode; capture and input go through the real desktop.
 - **Model-based verification is only as good as the configured provider.** A weak vision judge can produce wrong `verified` verdicts. Deterministic strategies run first in the chain, and a judge's `uncertain` is passed through, never upgraded.
-- **Risk classification is pattern + context matching** (English patterns plus a small Arabic term set), not semantic understanding. Novel destructive phrasing in other languages may under-classify; the compensating controls are approval-by-default for interactive actions, allowlists, bounded recovery, and verification.
+- **Risk classification is pattern + context matching** (English patterns plus a small Arabic term set), not semantic understanding. Novel destructive phrasing in other languages may under-classify; the compensating controls are approval-by-default for interactive actions, allowlists, typed outcomes with host re-grounding, and verification.
 - **Screenshot secret redaction is partial.** Text-pattern redaction and explicit-region blur only; secrets visible purely as pixels are not detected.
 - **Multi-monitor logic is unit-tested with fake monitor sets** (100/125/150% DPI); the reference E2E box is single-monitor, so real multi-monitor behavior is not E2E-verified.
 - **The kill switch is cooperative and in-process.** `stop_session` guarantees no further input from this runtime; it is not an OS-level kill switch.
@@ -728,7 +734,7 @@ python -m ruff check src tests benchmarks
 CUMCP_RUN_E2E=1 pytest tests/e2e/
 ```
 
-Measured at HEAD on the development machine (Windows Server 2022, Python 3.12): **1195 passed, 7 skipped** for the standard suite (count moves with the in-flight mission-056 tree; the 7 skips are the gated real-Windows E2E desktop tests, skipped BY DEFAULT by the D6 fail-closed gate with a loud opt-in reason), and ruff reports **all checks passed**. `tests/e2e/` collects 10 tests: the 7 gated desktop tests (window identity, semantic typing verification, moved-window typed verification failure, foreground-switch staleness defense, grounded Calculator clicks, display-value verification, browser window-state verification) plus 3 benchmark-harness tests that run unconditionally in the standard suite. The desktop tests are deterministic — no vision model, no network — and cross-check runtime assertions against real Win32 state so the runtime cannot self-certify. Desktop-safety doctrine (D6): the e2e gate opens ONLY for the exact opt-in `CUMCP_RUN_E2E=1` (any other variable or value stays closed), and every e2e app instance is isolated by a run-unique window token so the suite can never attach to, type into, or close a window it did not launch itself (see `tests/e2e/README.md`).
+Measured at HEAD on the development machine (Windows Server 2022, Python 3.12): **1376 passed, 8 skipped** for the standard suite (count moves with the in-flight mission-056 tree; the 8 skips are the gated real-Windows E2E desktop tests, skipped BY DEFAULT by the D6 fail-closed gate with a loud opt-in reason), and ruff reports **all checks passed**. `tests/e2e/` collects 11 tests: the 8 gated desktop tests (window identity, semantic typing verification, moved-window typed verification failure, foreground-switch staleness defense, grounded Calculator clicks, display-value verification, browser window-state verification, real context-menu right-click) plus 3 benchmark-harness tests that run unconditionally in the standard suite. The desktop tests are deterministic — no vision model, no network — and cross-check runtime assertions against real Win32 state so the runtime cannot self-certify. Desktop-safety doctrine (D6): the e2e gate opens ONLY for the exact opt-in `CUMCP_RUN_E2E=1` (any other variable or value stays closed), and every e2e app instance is isolated by a run-unique window token so the suite can never attach to, type into, or close a window it did not launch itself (see `tests/e2e/README.md`).
 
 ## Benchmarks
 
@@ -757,7 +763,7 @@ are local-only (gitignored).
 
 The module map with verified import graph, the pipeline-to-module mapping, the pinned data contracts (`Observation`, `GroundedAction` lineage, `VerificationResult`), the coordinate-transform invariant, the recovery taxonomy table, the stop-token enforcement story, the limits table, and the audit schema: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
-Planned work per upcoming version — the prioritized improvement backlog (P0/P1/P2, items R-01 … R-20): **[ROADMAP.md](ROADMAP.md)**.
+Planned work per upcoming version — the prioritized improvement backlog (P0/P1/P2, remaining planned items R-06…R-09, R-11…R-17, R-21, R-22, R-23): **[ROADMAP.md](ROADMAP.md)**.
 
 ## Credits and references
 

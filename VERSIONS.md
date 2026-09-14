@@ -36,6 +36,18 @@ employee hire; `right_click` proven in-UI; maintainer-local evidence).
   desktop twice: the Win32 `#32768` menu window owned by the launched Notepad
   appeared and closed on ESC, and the post-action screenshot shows the open edit
   context menu.
+- **`CORTEX_CAPTURE=dxgi` — optional DXGI Desktop Duplication capture path (R-10,
+  shipped early from P1)** — a pure-ctypes Desktop Duplication engine behind the
+  existing capture-backend env switch: `blt` (default) keeps the GDI/BitBlt mss
+  pipeline, `dxgi` switches the per-monitor pixel grab to duplication (~26–43 ms vs
+  ~53–90 ms per 1920x1080 capture on the mission desktop, no new dependency). Any
+  other value degrades to `blt`. Fail-open by contract: a duplication that cannot be
+  created (RDP/protected session, a second live duplicator in the process) or fails
+  mid-session (device lost, lock screen) permanently falls back to the mss path for
+  the session — the fast path can only speed captures up, never fail one.
+  Idle-desktop semantics: duplication yields a frame only when the compositor changed
+  something; on timeout the last frame (still current) is returned, and a cold
+  duplication's first frame is fetched with a one-shot retry.
 
 ### Changed
 

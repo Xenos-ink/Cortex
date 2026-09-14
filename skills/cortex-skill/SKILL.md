@@ -19,8 +19,9 @@ After every Cortex result, classify at one glance:
   Acting on "the next step is probably X" without confirmed state is NOT CLEAR — treat
   it as escalation: one cheap read first.
 - **NOT CLEAR** — a `failed`, `uncertain`, or `ok=false` verdict, any rejection, an
-  interference event (modal_dialog, focus_drifted, focus_taken_by, stuck_modifier,
-  target_gone), an unexpected dialog or UI, an ambiguous target, or `approval_required`.
+  interference event (`MODAL_DIALOG`, `FOCUS_DRIFTED`, `FOCUS_TAKEN_BY`,
+  `STUCK_MODIFIER`, `TARGET_GONE`), an unexpected dialog or UI, an ambiguous target,
+  or `approval_required`.
   Read the message and reasons to understand the named cause, obtain fresh
   evidence when needed, then apply the smallest safe correction, and resume
   the fast path. Do not change strategy wholesale over one failure.

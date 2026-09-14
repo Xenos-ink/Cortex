@@ -98,7 +98,7 @@ If a previous (pre-D6-hardening) run typed into windows you had open, search you
 open documents for these strings and delete the stray text:
 
 - Notepad typing: `e2e-typed-7391 quick brown fox`
-- Notepad moved-window recovery: `moved-window-recovered-7391`
+- Notepad moved-window typed-failure: `moved-window-recovered-7391`
 - Notepad stale-observation: `stale-reject-marker-7391`
 - Browser page title (a tab title, harmless, close the tab): `E2E Browser Verification Page`
   (post-hardening titles carry a run-unique `cumcp-e2e-...` token after this prefix)
@@ -157,8 +157,11 @@ this directory, so they run in every plain suite run.)
    process's first awareness setter.
 3. Window-bounds-only moves do NOT trip `STALE_OBSERVATION` (identity checks are
    hwnd/pid/process/monitor/dimensions/coordinate-space). The moved-window test shows
-   the semantic verification layer catching the miss (WRONG_WINDOW → bounded recovery),
-   while the window-switch test exercises the true staleness rejection.
+   the semantic verification layer catching the miss and returning the typed failure
+   to the host, which re-grounds from a fresh observation (the loop-era bounded-recovery
+   module was removed in v0.6.0 — no auto-recovery; only `STALE_OBSERVATION` still
+   auto-retries once on the direct path), while the window-switch test exercises the
+   true staleness rejection.
 4. Foreground can be stolen by the hosting console between launch and observation; tests
    focus the target window explicitly before asserting foreground-derived state.
 
