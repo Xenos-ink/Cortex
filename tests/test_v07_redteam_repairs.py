@@ -17,9 +17,10 @@ grammar, morphology family, value floor, fusion scan), never a patched literal.
 - **S4** (RT-D1-04): bounded inflection family (s/es/ed/d/ing, e-drop, doubling) on
   V1 verbs; inflected V2 verbs flag only with the high-consequence object class.
   NO general stemming: nominalizations and typos stay benign (pinned).
-- **S5** (RT-D1-07): the copula arm's value floor is ``\\S{8,}`` AND at least one
-  digit — benign copula prose stops being redacted and stops refusing checkpoint
-  writes, while directly assigned values keep their measured floors.
+- **S5** (RT-D1-07): the copula arm's value must be secret-shaped — len >= 6 and
+  NOT pure-lowercase-ASCII of length <= 10 (Commander-refined rule) — benign
+  copula prose stops being redacted and stops refusing checkpoint writes, while
+  the evidence-corpus "hunter2"-class values stay detected.
 - **S6** (D1 LOW): launcher seed tokens shorter than 3 alphanumerics never
   participate in correlation; the seedless commit-key doctrine is unchanged.
 - **S7** (D1 "new push"): mixed-position invisible characters (in-word AND at a
@@ -290,7 +291,8 @@ def test_s5_benign_copula_prose_stays_clean(text: str) -> None:
 
 def test_s5_direct_assignment_floors_unchanged_and_b_series_still_detected() -> None:
     """The direct ``[=:]`` arms keep their measured floors; copula rows with real
-    values still detect (D1 A-grammar rows + the test_r21 B-series shapes)."""
+    values still detect — including the RESTORED evidence-corpus "hunter2" vectors
+    (Commander adjudication: the refined secret-shape rule keeps them matched)."""
     for text in (
         "password: hunter2dozen",
         "password = 'hunter2dozen'",
@@ -299,27 +301,32 @@ def test_s5_direct_assignment_floors_unchanged_and_b_series_still_detected() -> 
         "my api key is sk-proj-4f8a2b1c9d7e3f5a",
         "client secret is abcdef123456789",
         "access key: abcdef1234567890",
-        "pwd is hunter2dozen",
-        "pwd was hunter2dozen",
+        "pwd is hunter2",
+        "pwd was hunter2",
+        "pa\u200bssword is hunter2",
+        "pwd\u200b is hunter2",
         "pass is hunter2x",
         "login credentials are admin:hunter2pass",
+        "my password is Season2024",
+        "my password is correcthorsebatterystaple",
     ):
         assert contains_secret(text) is True, text
         redacted, count = redact_text(text)
         assert count >= 1 and "[REDACTED:" in redacted, (text, redacted)
 
 
-def test_s5_short_or_digitless_copula_values_are_now_clean_by_design() -> None:
-    """DOCUMENTED S5 TRADE (Commander-approved shape): copula-form values under 8
-    chars or without a digit are treated as prose. These exact rows were DETECTION
-    pins before the S5 repair and are now the precision boundary — pinned here so the
-    trade is explicit and bidirectionally stable."""
+def test_s5_copula_prose_stays_clean_by_the_secret_shape_rule() -> None:
+    """Refined S5 shape rule (Commander adjudication): a copula-arm value is
+    secret-shaped iff len>=6 and NOT pure-lowercase-ASCII of length <= 10 —
+    "hunter2" (7, digit) matches, while D1's executed FP prose rows (all
+    pure-lowercase runs) stay CLEAN. Pinned bidirectionally."""
     for text in (
-        "pwd is hunter2",
-        "pwd was hunter2",
+        "the password is stored in the vault",
+        "your token is required for every request",
+        "her password is legendary",
+        "the api key is documented in the wiki page",
         "my password is correct horse battery staple",
-        "pa\u200bssword is hunter2",
-        "pwd\u200b is hunter2",
+        "my password is correct",
     ):
         assert contains_secret(text) is False, text
         redacted, count = redact_text(text)

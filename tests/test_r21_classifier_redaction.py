@@ -177,13 +177,11 @@ CREDENTIAL_MUST_REDACT: tuple[tuple[str, str | None], ...] = (
     ("access key: abcdef123456789", "abcdef123456789"),
     ("access-key is abcdef123456789", "abcdef123456789"),
     ("auth token is abcdef1234567890", "abcdef1234567890"),
-    # v07-007 S5 repair (RT-D1-07, Commander-approved): the copula arm's value floor
-    # is \S{8,} AND >=1 digit, so these rows carry copula values of that shape. The
-    # original 7-char "hunter2" values ("pwd is hunter2" / "pwd was hunter2") are now
-    # BY DESIGN redaction-clean — pinned as FP guards in
-    # tests/test_v07_redteam_repairs.py::test_s5_copula_prose_stays_clean.
-    ("pwd is hunter2dozen", "hunter2dozen"),
-    ("pwd was hunter2dozen", "hunter2dozen"),
+    # RESTORED (Commander adjudication on the S5 repair): these are evidence-mandated
+    # R-21 vectors — the refined copula-arm secret-shape rule keeps "hunter2"-class
+    # values detected. The D1 FP prose rows stay clean (tests/test_v07_redteam_repairs.py).
+    ("pwd is hunter2", "hunter2"),
+    ("pwd was hunter2", "hunter2"),
     ("pass: hunter2x", "hunter2x"),
     ("pass is hunter2x", "hunter2x"),
     ("secret is abcdef123456789", "abcdef123456789"),

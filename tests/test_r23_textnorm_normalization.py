@@ -132,11 +132,11 @@ REDACTION_OBFUSCATED: tuple[tuple[str, str], ...] = (
     (f"pa{ZWSP}ssword = hunter2dozen", "[REDACTED:password_assignment]"),
     (f"password = hunter{ZWSP}2dozen", "[REDACTED:password_assignment]"),
     (f"password {ZWSP}: hunter2dozen", "[REDACTED:password_assignment]"),
-    # v07-007 S5 repair (RT-D1-07): the copula arm requires a \S{8,}+digit value, so
-    # these rows carry "hunter2dozen"; the original 7-char "hunter2" values are now
-    # BY DESIGN redaction-clean (pinned in tests/test_v07_redteam_repairs.py).
-    (f"pa{ZWSP}ssword is hunter2dozen", "[REDACTED:password_assignment]"),
-    (f"pwd{ZWSP} is hunter2dozen", "[REDACTED:password_assignment]"),
+    # RESTORED original values (Commander adjudication on the S5 repair): the refined
+    # copula-arm secret-shape rule keeps "hunter2"-class values detected on the
+    # canonical views.
+    (f"pa{ZWSP}ssword is hunter2", "[REDACTED:password_assignment]"),
+    (f"pwd{ZWSP} is hunter2", "[REDACTED:password_assignment]"),
     (f"pass{ZWSP}: hunter2x", "[REDACTED:password_assignment]"),
     (f"api{ZWSP} key: sk-abcdefgh1234567890", "[REDACTED:token_assignment]"),
     (f"api key {WJ}: sk-abcdefgh1234567890", "[REDACTED:token_assignment]"),

@@ -20,12 +20,13 @@ with length floors so truncated/benign strings stay clean.
 
 v07-007 repairs: **S3** (RT-D1-03) — the copula arm accepts an optional ``[:=]``
 separator after the copula, so ``password is: X`` / ``pwd was: X`` are caught;
-**S5** (RT-D1-07) — the copula arm's value floor is ``\\S{8,}`` AND at least one
-digit, so benign copula prose ("the password is stored in the vault") stays clean
-and can no longer block checkpoint persistence, while directly assigned values
-(``password: X``) keep their measured floors; **P2** — the PEM pair and the bearer/
-value-shape families are single compiled alternations (one pass on the clean path),
-with per-family hit labels resolved from the matched group.
+**S5** (RT-D1-07, Commander-refined) — the copula arm's value must be secret-shaped:
+``len(V) >= 6`` and not (pure-lowercase ASCII of length <= 10), so benign copula
+prose ("the password is stored in the vault") stays clean and can no longer block
+checkpoint persistence while "hunter2"-class evidence-corpus values and real
+assigned values still match; **P2** — the PEM pair and the bearer/value-shape
+families are single compiled alternations (one pass on the clean path), with
+per-family hit labels resolved from the matched group.
 
 Screenshot note: pixel-level secret detection is OUT of P0 scope. :func:`redact_image`
 blurs explicitly supplied regions, and without regions consults the
@@ -80,14 +81,22 @@ class SecretPattern(NamedTuple):
 #: Assignment-grammar separator + value (R-21 grammar, S3/S5 v07-007 repairs).
 #: Direct separator arm (``[=:]``): value floor ``\\S{4,}`` (password) / ``\\S{6,}``
 #: (token) — measured-fine on the benign corpus. Copula arm (``is|was|are``, S3: an
-#: OPTIONAL ``[:=]`` may follow the copula so ``password is: X`` is caught): value
-#: floor ``\\S{8,}`` AND at least one digit (S5/RT-D1-07), so benign prose ("the
-#: password is stored in the vault", "her password is legendary") is not redacted and
-#: cannot block checkpoint persistence while real assigned values still match. Group 1
-#: is set only by the direct arm and selects the value alternative via a regex
-#: conditional.
+#: OPTIONAL ``[:=]`` may follow the copula so ``password is: X`` is caught): the
+#: Commander-refined S5 secret-shape rule — value V matches iff
+#: ``len(V) >= 6 AND NOT (V is pure lowercase ASCII-alpha AND len(V) <= 10)``,
+#: i.e. secret-shaped = (any digit/uppercase/symbol and len>=6) OR (len>=10, any
+#: composition). "hunter2" (7, digit) matches — the evidence-corpus vector stays
+#: detected (AC-21a) — while D1's benign prose rows ("stored" 6, "required" 8,
+#: "legendary" 9, "documented" 10 — all pure lowercase) stay clean. BOUNDARY NOTE:
+#: the ruling's exemption text says <=9, but D1's own FP row "documented" is a
+#: 10-char pure-lowercase run; the exemption is <=10 so requirement "the 4 D1 FP
+#: rows stay clean" holds with no evidence-corpus loss (no mandated value is a
+#: 10-12 char pure-lowercase run). The ``(?-i:[a-z])`` scope keeps the shape check
+#: case-sensitive inside the IGNORECASE pattern (capitalized "Stored" is
+#: secret-shaped, not prose). Group 1 is set only by the direct arm and selects the
+#: value alternative via a regex conditional.
 _ASSIGNMENT_SEPARATOR = r"(?:([=:])\s*|\b(?:is|was|are)\b\s*[:=]?\s*)['\"]?"
-_ASSIGNMENT_VALUE = r"(?(1)\S{{{},}}|(?=\S*\d)\S{{8,}})"
+_ASSIGNMENT_VALUE = r"(?(1)\S{{{},}}|(?!(?-i:[a-z]){{1,10}}(?:\s|$))\S{{6,}})"
 
 
 def _assignment_pattern(nouns: str, direct_floor: int) -> re.Pattern[str]:
