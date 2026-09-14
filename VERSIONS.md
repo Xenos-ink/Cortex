@@ -39,6 +39,20 @@ employee hire; `right_click` proven in-UI; maintainer-local evidence).
 
 ### Changed
 
+- **(Internals-removal wave) Removed the removed-loop's orphaned internals** —
+  `recovery.py` / `approval.py` / `health.py` deleted; the agent decide-loop block
+  (`run`, `_decide`/`_call_provider`, result builders, failure/dismiss handling), the
+  provider `decide`/`decide_full`/`plan_subtasks`/`summarize_context` endpoints with
+  their `_LazyProvider` delegates, the context summarizer plumbing, the subtask
+  mutation APIs, and the `PlanValidator` classes are gone (`long_running.py` is now
+  the per-session checkpoint owner; `plan_validator.py` keeps only the pure
+  `find_cycle`/`contains_control_characters` helpers used by the live checkpoint
+  path). **No wire change**: tools/list stays at the five tools, every response shape
+  is unchanged; the `limits` session-budget fields remain accepted and validated
+  (clamping semantics untouched) and are now documented as RESERVED — not enforced on
+  the direct five-tool path since the internal loop's removal. The sealed
+  checkpoint/resume machinery and the `SessionBudgetTracker` sealed-overshoot gate
+  are unchanged and re-proven by the untouched checkpoint/resume suites.
 - **(R-01) Deterministic verification decides `type` actions** — the root defect
   behind the pixel-tier false-negatives is fixed: the deterministic
   `ui_control_text` tier now receives the TYPED TEXT as its needle (it previously

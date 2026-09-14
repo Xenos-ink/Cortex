@@ -80,7 +80,7 @@ The design principle: the goal is not to click the right pixel — it is to reac
 | **Audit trail** | Per-session JSONL with every phase event, redaction enforced at write time, 19 counters + 5 latency metrics. |
 | **Secret redaction** | 10 detection patterns enforced on audit, provider payloads, and tool responses; secret-like typed text is blocked. |
 | **Prompt-injection containment** | Five-channel prompt doctrine; screen text is untrusted data, never instructions or authorization. |
-| **Hard resource limits** | 9 enforceable limits (task time, actions, model calls, screenshot rate, sessions) with fail-closed termination. |
+| **Hard resource limits** | screenshot-rate + action-budget limits enforced fail-closed on the live path; the full limits family stays accepted and validated on the wire (session-ceiling fields are reserved since the internal loop's removal). |
 | **Checkpoint resume** | Sealed, atomic checkpoints (HMAC-SHA256 integrity) with fail-closed resume through `start_session(resume_from_checkpoint=…)` — counters restored, never reset, budgets never enlarged. |
 | **Benchmark scaffolding** | OSWorld-2.0-aligned task format plus a fake/env harness runner — harness only, no published scores. |
 
@@ -651,7 +651,7 @@ Deterministic counter cross-checks at load time (defense in depth behind the sea
 
 The start response carries `resumed: true` and `continuation_of` (the original session id).
 
-### Session resource limits
+### Session resource limits (accepted and validated; reserved)
 
 The `limits` dict on `start_session` carries the long-running session fields (validated and clamped fail-closed, like the per-task limits):
 
@@ -665,7 +665,15 @@ The `limits` dict on `start_session` carries the long-running session fields (va
 | `context_summarize_every` | 25 | 1..500 | steps between context compressions |
 | `health_check_interval` | 600 (10 min) | 60..3600 | minimum spacing between boundary health checks |
 
-These are **shared session budgets**: everything the resumed session consumes is mirrored onto the session counters, which only ever grow. On resume the counters are restored from the checkpoint — never zeroed.
+**Honest status (v0.6.0): these fields are accepted and validated — exactly the same
+clamping and checkpoint round-trip as before — but they are RESERVED, not enforced on
+the direct five-tool path since the internal loop's removal.** What still applies: the
+per-task limits (screenshot rate, action budget), the deterministic checkpoint
+cross-checks (`budget.subtasks <= max_subtasks`, `budget.steps <= max_session_steps`),
+and the sealed-overshoot gate — a resumed session whose counters were inflated past
+its checkpoint ceilings is refused, and an inflated counter grants no more work.
+
+Historically these were **shared session budgets**: everything the session consumed was mirrored onto the session counters, which only ever grew. On resume the counters are still restored from the checkpoint — never zeroed.
 
 ### Example: stop, then resume later
 
@@ -689,11 +697,11 @@ The host then continues driving the session with `computer_observe` / `computer_
 
 - The five tools (`start_session`, `stop_session`, `computer_screenshot`, `computer_observe`, `computer_execute`) keep their names, parameter positions, and response shapes.
 - The removed loop tool family is gone from tools/list; hosts must drive actions directly — the documented pattern since the loop's guarantees (grounding, validation, risk, approval, verification) wrap every `computer_execute` call.
-- No existing limit was removed or weakened; the session-level limits above are additive and clamped like the rest. A resume can never reset or enlarge a session counter.
+- No existing limit was removed or weakened; the session-level limits above are additive, clamped like the rest, and still validated on every call — they are reserved (accepted-validated, not enforced) since the internal loop's removal. A resume can never reset or enlarge a session counter.
 
 ## Safety model
 
-The threat model assumes three things: the model controls a desktop and is treated as a fallible, potentially manipulable proposer — never an authority; screen content is untrusted and can never grant permission; the vision provider sits outside the trust boundary and receives redacted payloads with no capabilities. On top of that: fail-closed defaults everywhere (unknown risk escalates to `CRITICAL`, unverifiable coordinate spaces refuse input, `uncertain` verification routes to recovery, malformed provider output is bounded recovery instead of a crash), bounded autonomy (approval budgets, recovery budgets, nine hard limits), and a redaction-enforced audit trail of every phase.
+The threat model assumes three things: the model controls a desktop and is treated as a fallible, potentially manipulable proposer — never an authority; screen content is untrusted and can never grant permission; the vision provider sits outside the trust boundary and receives redacted payloads with no capabilities. On top of that: fail-closed defaults everywhere (unknown risk escalates to `CRITICAL`, unverifiable coordinate spaces refuse input, `uncertain` verification is reported honestly and is never success, every refusal names its gate), bounded autonomy (per-call approval, screenshot-rate and action-budget limits), and a redaction-enforced audit trail of every phase.
 
 Full details — risk taxonomy with all pattern categories, fail-closed rules table, approval semantics, kill-path discipline, and the honest residual-risk list: **[docs/SAFETY.md](docs/SAFETY.md)**.
 
