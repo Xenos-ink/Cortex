@@ -1162,7 +1162,9 @@ before `LimitEnforcer.check_action`).
   `invalid_interference`): five sections — `focus_guard`
   (abort | refocus_then_abort | observe_only; `allow_owned_dialogs`;
   `transient_launch_processes=["explorer.exe"]`; `on_identity_unknown="abort"`;
-  `on_target_gone="unbind_and_report"`), `attach_or_launch` (`launch="driver"`),
+  `on_target_gone="unbind_and_report"`), `attach_or_launch` (`launch="server"`
+  DEFAULT — the server may launch an allowlisted target; `launch="driver"` or
+  `CORTEX_ATTACH_OR_LAUNCH=driver` restores never-launch),
   `dialog_sentinel` (halt | report; `auto_handle=[]` — NO auto-clicks ship enabled;
   configurable `title_table`), `focus_continuity` (abort | warn;
   `resend_terminal_key=false`), `hotkey_guard` (abort | release). Omitting the param
@@ -1180,8 +1182,10 @@ before `LimitEnforcer.check_action`).
   `REATTACHED title=... hwnd=...` (focused via the verified foreground switch, guard
   re-bound); unsaved-candidate windows (generic title heuristics) ->
   `AMBIGUOUS_INSTANCE` (discovery only); nothing matches -> `NO_INSTANCE`. The server
-  launches ONLY with `launch="server"` policy + process-allowlist match +
-  `allow_launch=True` threading; the default NEVER spawns a process.
+  launches ONLY under the `launch="server"` policy — the DEFAULT — plus a
+  process-allowlist match and the `allow_launch=True` threading; `launch="driver"`
+  (explicit, or as the default via `CORTEX_ATTACH_OR_LAUNCH=driver`) restores the
+  never-launch behavior.
 - **Mechanism (iii) DialogSentinel**: after every executed action a cheap probe
   (class `#32770` / owner chain / title table) reports
   `MODAL_DIALOG title=... controls=[...]` (the control list comes from the post-action

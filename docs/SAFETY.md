@@ -699,7 +699,7 @@ approval, or limit is weakened and no new bypass exists:
 | Modal dialog after an action | reported with its control list; queued batches HALT (`modal_dialog`); auto-handling ships DISABLED (`auto_handle=[]`) and, when a host explicitly configures it, resolves only the exact configured identity with an audit event per resolution |
 | Keyboard focus outside the target | `FOCUS_DRIFTED` rejection before dispatch; mid-type drift aborts the in-flight type (no text into foreign fields); terminal keys are never auto-resent (double-submit risk) |
 | Stuck modifiers before a chord | `STUCK_MODIFIER` rejection; opt-in `release` mode touches ONLY modifiers this session dispatched (a foreign modifier is never released) |
-| ensure_app launches | server-side launch requires `attach_or_launch.launch="server"` policy AND the process-allowlist gate; the default (`launch="driver"`) NEVER spawns a process |
+| ensure_app launches | server-side launch requires the `attach_or_launch.launch="server"` policy (the DEFAULT; `CORTEX_ATTACH_OR_LAUNCH=driver` or `launch="driver"` restores never-launch) AND the process-allowlist gate — an allowlisted `ensure_app` target IS server-launched by default when no instance matches |
 | Policy parsing | fail-closed (`invalid_interference` on unknown/invalid fields) — a malformed policy can never silently disable protection |
 
 New pacing policies are protection, not performance tuning: `CORTEX_KEY_DISPATCH_GAP`

@@ -502,7 +502,7 @@ A realistic direct-control session: Notepad is open on the desktop; the agent st
   "allowed_windows": [],
   "pending_approval_token": null,
   "allowed_processes": ["notepad.exe"],
-  "limits": "Limits(max_task_seconds=900.0, max_actions=50, max_retries_per_action=5, max_recovery_per_action=2, max_recovery_per_task=6, max_model_calls=60, min_screenshot_interval_ms=250, max_context_items=50, max_sessions=4, max_session_seconds=14400.0, max_session_actions=2000, max_session_model_calls=500, max_session_steps=500, max_subtasks=50, context_summarize_every=25, approval_epoch_seconds=1800.0, approval_epoch_actions=50, health_check_interval=600.0)",
+  "limits": "Limits(max_task_seconds=900.0, max_actions=50, max_retries_per_action=1, max_recovery_per_action=2, max_recovery_per_task=6, max_model_calls=60, min_screenshot_interval_ms=250, max_context_items=50, max_sessions=4, max_session_seconds=14400.0, max_session_actions=2000, max_session_model_calls=500, max_session_steps=500, max_subtasks=50, context_summarize_every=25, approval_epoch_seconds=1800.0, approval_epoch_actions=50, health_check_interval=600.0)",
   "task_id": "9b1d…"
 }
 ```
