@@ -111,6 +111,13 @@ _LAUNCH_COMMIT_KEYS: frozenset[str] = frozenset({"enter", "return", "numpadenter
 #: surface before the commit key), kept bounded like every other session log.
 _LAUNCH_SEED_MAX_TOKENS = 16
 _LAUNCH_SEED_MAX_TOKEN_CHARS = 64
+#: S6 repair (D1 degenerate-seed finding, LOW): seed tokens SHORTER than this many
+#: alphanumerics never take part in correlation — a 1-2 char seed ("i", "ab")
+#: casefold-substring-matches practically any candidate title, so the seed's causal
+#: value is nil and its only effect was to widen adoption. Tokens below the floor are
+#: dropped; a seed that is ENTIRELY short tokens is treated as seedless (the seedless
+#: commit-key behavior is unchanged).
+_LAUNCH_SEED_MIN_TOKEN_CHARS = 3
 
 
 @dataclass
@@ -169,13 +176,17 @@ def _launcher_seed_tokens(text: str | None) -> frozenset[str]:
 
     Alphanumeric runs, so paths/URLs split at separators too (``C:/users/me/Documents``
     yields ``documents``) — the same token a launched folder window would name.
-    Bounded in token count and token length; an empty set means no usable seed.
+    Bounded in token count and token length; tokens shorter than
+    :data:`_LAUNCH_SEED_MIN_TOKEN_CHARS` are dropped (S6: degenerate seeds correlate
+    with anything and never constrain adoption); an empty set means no usable seed.
     """
     if not text:
         return frozenset()
     tokens = re.findall(r"[a-z0-9]+", str(text).casefold())
     return frozenset(
-        token[:_LAUNCH_SEED_MAX_TOKEN_CHARS] for token in tokens[:_LAUNCH_SEED_MAX_TOKENS]
+        token[:_LAUNCH_SEED_MAX_TOKEN_CHARS]
+        for token in tokens[:_LAUNCH_SEED_MAX_TOKENS]
+        if len(token) >= _LAUNCH_SEED_MIN_TOKEN_CHARS
     )
 
 
@@ -591,37 +602,39 @@ class InterferenceGuard:
         self._pending_keyboard_launch = False
         if action.action in _GUARD_EXEMPT_ACTIONS:
             return self._verify_stuck_modifiers(action)  # hotkey hygiene applies to chords only
+        # P3: the keyboard-action membership test is computed once and reused by the
+        # hotkey-guard, focus-continuity, and arming blocks below (cheapest checks
+        # first, no back-to-back duplicate set probes on the hot path).
+        is_keyboard = action.action in _KEYBOARD_ACTIONS
         guard_policy = self.policy.focus_guard
         verdict: GuardVerdict | None = None
         if guard_policy.enabled and self.armed:
             verdict = self._verify_foreground(action)
-        if verdict is None and self.policy.hotkey_guard.enabled and action.action in {
-            ActionType.KEYPRESS,
-            ActionType.HOTKEY,
-        }:
-            verdict = self._verify_stuck_modifiers(action)
         if (
             verdict is None
-            and self.policy.focus_continuity.enabled
-            and self.armed
-            and action.action in _KEYBOARD_ACTIONS
+            and self.policy.hotkey_guard.enabled
+            and is_keyboard
+            and action.action is not ActionType.TYPE
         ):
+            verdict = self._verify_stuck_modifiers(action)
+        if verdict is None and self.policy.focus_continuity.enabled and self.armed and is_keyboard:
             verdict = self._verify_focus_continuity(action)
         if verdict is not None and verdict.blocking:
             return verdict  # a rejected action never dispatched: no launch act, no seed
         # The action dispatches (clean, or an annotate-and-proceed verdict). R-22
         # D-1/D-2: a commit-key chord into the launcher anchor is the session's launch
-        # act; a TYPE into the launcher surface records its seed tokens.
-        if (
-            self.armed
-            and action.action in _KEYBOARD_ACTIONS
-            and self._anchor_is_launcher_surface()
-        ):
+        # act; a TYPE into the launcher surface records its seed tokens. P3: the
+        # cheapest tests come first — the launcher-surface probe (0.6 µs) gates both
+        # the seed-tokenization (2.6 µs of regex + set building, paid ONLY on real
+        # launcher surfaces) and the commit-chord decision, so the steady-state
+        # matched-window dispatch pays for neither; arming/seed semantics identical.
+        if self.armed and is_keyboard and self._anchor_is_launcher_surface():
             if action.action is ActionType.TYPE:
-                tokens = _launcher_seed_tokens(action.text)
-                if tokens:
-                    self._launcher_seed = tokens
-            elif _is_commit_key_chord(action.keys):  # remaining keyboard actions: KEYPRESS/HOTKEY
+                if action.text:
+                    tokens = _launcher_seed_tokens(action.text)
+                    if tokens:
+                        self._launcher_seed = tokens
+            elif _is_commit_key_chord(action.keys):
                 self._pending_keyboard_launch = True
         return verdict
 

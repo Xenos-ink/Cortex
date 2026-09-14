@@ -15,9 +15,15 @@ Design (SPEC v3, proven by the executed obfuscation matrix in
   through tatweel U+0640), so the final translate pass guarantees the output is
   strip-free and ASCII-whitespace-only by construction (proven over all 1,114,112
   codepoints, both views, fully idempotent).
-- **Two views of the same strip set** (427 codepoints / 24 contiguous ranges,
+- **Two views of the same strip set** (437 codepoints / 30 contiguous ranges,
   Unicode 15.0.0: all category Cf format characters, the variation selectors
-  U+FE00-FE0F + U+E0100-E01EF, and the Arabic tatweel U+0640):
+  U+FE00-FE0F + U+E0100-E01EF, the Arabic tatweel U+0640, and — v07-007 repair S1
+  (RT-D1-02) — the nine zero-width/invisible non-Cf splitters U+034F (COMBINING
+  GRAPHEME JOINER), U+180B-U+180D (Mongolian free variation selectors),
+  U+115F/U+1160/U+3164 (Hangul fillers), U+FFA0 (halfwidth Hangul filler), and
+  U+17B4/U+17B5 (deprecated Khmer inherent vowels); all nine are NFKC-invariant
+  or NFKC-fold into the set (U+FFA0 -> U+3164), none is ``str.isspace()``, and
+  none is ASCII, so the ASCII fast path and the benign corpus are unaffected):
   - *delete view*: strip set removed — catches in-word insertion (``for\\u200bmat``);
   - *fold view*: strip set -> U+0020 — catches between-word insertion and
     space-substitution residue (``restart\\u200bthe\\u200bserver``, ``drop\\u200bdatabase``).
@@ -60,21 +66,30 @@ def _class_range(lo: int, hi: int) -> str:
 
 
 #: Strip set — all Unicode category Cf (format) characters, the variation selectors
-#: (U+FE00-FE0F, U+E0100-E01EF), and the Arabic tatweel U+0640: 427 codepoints in 24
+#: (U+FE00-FE0F, U+E0100-E01EF), the Arabic tatweel U+0640, and the invisible
+#: non-Cf splitters added by the v07-007 S1 repair (RT-D1-02): 437 codepoints in 30
 #: contiguous ranges. Pinned to Unicode 15.0.0; derived over the full codepoint space
-#: by ``evidence/v07-007/r23_matrix.py`` (``meta.normalization_spec``).
+#: by ``evidence/v07-007/r23_matrix.py`` (``meta.normalization_spec``) and extended by
+#: ``evidence/v07-007/redteam/report.md`` (RT-D1-02: each added codepoint provably
+#: splits keywords in BOTH canonical views exactly like the Cf set).
 _STRIP_RANGES: tuple[tuple[int, int], ...] = (
     (0x00AD, 0x00AD),  # soft hyphen
+    (0x034F, 0x034F),  # COMBINING GRAPHEME JOINER (Mn, Default_Ignorable) — S1/RT-D1-02
     (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD),  # Arabic number signs/mark
     (0x0640, 0x0640),  # Arabic tatweel (kashida) — visual-stretch joiner, no lexical content
     (0x070F, 0x070F),  # Syriac abbreviation mark
     (0x0890, 0x0891), (0x08E2, 0x08E2),  # Arabic pound/mark signs, date mark
+    (0x115F, 0x1160),  # HANGUL CHOSEONG/JUNGSEONG FILLER (Lo, zero-width) — S1/RT-D1-02
+    (0x17B4, 0x17B5),  # KHMER VOWEL INHERENT AQ/AA (Mn, deprecated) — S1/RT-D1-02
+    (0x180B, 0x180D),  # Mongolian free variation selectors (Mn) — S1/RT-D1-02
     (0x180E, 0x180E),  # Mongolian vowel separator (Cf)
     (0x200B, 0x200D),  # zero-width space / non-joiner / joiner
     (0x200E, 0x200F), (0x202A, 0x202E),  # bidi controls
     (0x2060, 0x2064),  # word joiner + invisible operators
     (0x2066, 0x206F),  # bidi isolates + deprecated format characters
+    (0x3164, 0x3164),  # HANGUL FILLER (Lo, zero-width; NFKC target of U+FFA0) — S1/RT-D1-02
     (0xFEFF, 0xFEFF),  # BOM / zero-width no-break space
+    (0xFFA0, 0xFFA0),  # HALFWIDTH HANGUL FILLER (Lo; NFKC -> U+3164) — S1/RT-D1-02
     (0xFFF9, 0xFFFB),  # interlinear annotation
     (0x110BD, 0x110BD), (0x110CD, 0x110CD),  # Kaithi number signs
     (0x13430, 0x1343F),  # Egyptian format controls

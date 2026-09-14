@@ -18,9 +18,12 @@ Acceptance criteria (ROADMAP.md ``## P0 — v0.7.0``, R-23):
 Obfuscation vectors are drawn from the executed 550-row matrix
 (``evidence/v07-007/investigation/r23-obfuscation-matrix.json``; transform ids t01-t22
 there). DOCUMENTED RESIDUAL (r23-root-cause §5.1): mixed-script homoglyphs are NOT
-NFKC-addressable and stay evasive — pinned as a skip with the future TR39 item named;
-mixed-position zero-width (in-word AND between-word in one payload) is likewise
-documented there and left for the D1 re-attack.
+NFKC-addressable and stay evasive — pinned as a skip with the future TR39 item named.
+Mixed-position zero-width (in-word AND between-word in one payload), documented there
+as a residual and re-demonstrated by D1 ("new push" ``for\u200bmat\u200bC:``), was
+CLOSED by the v07-007 S7 repair (fold-view re-fusion scan) — see
+``tests/test_v07_redteam_repairs.py``; the strip set itself was extended by the S1
+repair with the 9 invisible non-Cf splitters (RT-D1-02).
 """
 
 from __future__ import annotations
@@ -129,8 +132,11 @@ REDACTION_OBFUSCATED: tuple[tuple[str, str], ...] = (
     (f"pa{ZWSP}ssword = hunter2dozen", "[REDACTED:password_assignment]"),
     (f"password = hunter{ZWSP}2dozen", "[REDACTED:password_assignment]"),
     (f"password {ZWSP}: hunter2dozen", "[REDACTED:password_assignment]"),
-    (f"pa{ZWSP}ssword is hunter2", "[REDACTED:password_assignment]"),
-    (f"pwd{ZWSP} is hunter2", "[REDACTED:password_assignment]"),
+    # v07-007 S5 repair (RT-D1-07): the copula arm requires a \S{8,}+digit value, so
+    # these rows carry "hunter2dozen"; the original 7-char "hunter2" values are now
+    # BY DESIGN redaction-clean (pinned in tests/test_v07_redteam_repairs.py).
+    (f"pa{ZWSP}ssword is hunter2dozen", "[REDACTED:password_assignment]"),
+    (f"pwd{ZWSP} is hunter2dozen", "[REDACTED:password_assignment]"),
     (f"pass{ZWSP}: hunter2x", "[REDACTED:password_assignment]"),
     (f"api{ZWSP} key: sk-abcdefgh1234567890", "[REDACTED:token_assignment]"),
     (f"api key {WJ}: sk-abcdefgh1234567890", "[REDACTED:token_assignment]"),

@@ -1047,13 +1047,24 @@ def test_rt9_finding_benign_text_false_positives_quantified_b12() -> None:
     that layer is keyword-level (value-agnostic), while the REDACTION layer is
     value-oriented and passes the same string — the documented division of labor
     between the two layers (corpora of record in tests/test_r02_text_corpora.py).
+
+    v07-007 S4 repair (RT-D1-04, Commander-approved bounded morphology): inflected
+    forms of the V1 verbs are intent verbs, so the PAST/PARTICIPLE row "truncated
+    JWT fragment in a blog quote" ("truncated" = truncate+d + open object) now
+    keyword-gates at the approval-grade MEDIUM floor — the same documented trade as
+    the narrative-prose row "he wiped the drive yesterday" (D1 report, RT-D1-04).
+    The residual keyword-layer flag is therefore 2/18.
     """
     flagged = [t for t in BENIGN_CORPUS if _flagged(_type_decision(t))]
     assert "the closed-form solution of the integral" not in flagged
     assert "Closed Form X-4782 application approved" not in flagged
-    assert flagged == ["John's password: (none stored here)"]
-    # pinned: 1/18 residual keyword-layer flag, exactly the value-mention case
-    assert len(flagged) == 1 and len(BENIGN_CORPUS) == 18
+    assert flagged == [
+        "John's password: (none stored here)",
+        "eyJhbGciOi (truncated JWT fragment in a blog quote)",
+    ]
+    # pinned: 2/18 residual keyword-layer flag — the value-mention case plus the
+    # S4 inflected-verb participle (both documented trades, never silent).
+    assert len(flagged) == 2 and len(BENIGN_CORPUS) == 18
 
 
 def test_rt9_finding_gate_misses_compensated_by_redaction_except_modern_tokens() -> None:

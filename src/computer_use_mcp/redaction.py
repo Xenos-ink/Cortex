@@ -18,6 +18,15 @@ immediately after the noun), and value-shape families cover untagged bearer toke
 (``ghp_``-class GitHub tokens, ``github_pat_``, ``xox[abprs]`` Slack tokens, ``npm_``)
 with length floors so truncated/benign strings stay clean.
 
+v07-007 repairs: **S3** (RT-D1-03) — the copula arm accepts an optional ``[:=]``
+separator after the copula, so ``password is: X`` / ``pwd was: X`` are caught;
+**S5** (RT-D1-07) — the copula arm's value floor is ``\\S{8,}`` AND at least one
+digit, so benign copula prose ("the password is stored in the vault") stays clean
+and can no longer block checkpoint persistence, while directly assigned values
+(``password: X``) keep their measured floors; **P2** — the PEM pair and the bearer/
+value-shape families are single compiled alternations (one pass on the clean path),
+with per-family hit labels resolved from the matched group.
+
 Screenshot note: pixel-level secret detection is OUT of P0 scope. :func:`redact_image`
 blurs explicitly supplied regions, and without regions consults the
 :func:`_scan_image_for_secrets` hook (a no-op in P0) that later waves can extend.
@@ -26,7 +35,7 @@ blurs explicitly supplied regions, and without regions consults the
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
 from PIL import Image, ImageFilter
@@ -54,11 +63,38 @@ def _luhn_ok(candidate: str) -> bool:
 
 
 class SecretPattern(NamedTuple):
-    """One registered secret detector: a compiled regex plus optional value validator."""
+    """One registered secret detector: a compiled regex plus optional value validator.
+
+    ``group_names`` (trailing optional, P2) maps the regex's named alternative groups
+    to redaction-label names for FUSED patterns — one compiled alternation covering
+    several families costs one regex pass instead of N on the clean path while every
+    hit still carries its family name (``m.lastgroup`` selects it).
+    """
 
     name: str
     regex: re.Pattern[str]
     value_validator: Callable[[str], bool] | None = None
+    group_names: Mapping[str, str] | None = None
+
+
+#: Assignment-grammar separator + value (R-21 grammar, S3/S5 v07-007 repairs).
+#: Direct separator arm (``[=:]``): value floor ``\\S{4,}`` (password) / ``\\S{6,}``
+#: (token) — measured-fine on the benign corpus. Copula arm (``is|was|are``, S3: an
+#: OPTIONAL ``[:=]`` may follow the copula so ``password is: X`` is caught): value
+#: floor ``\\S{8,}`` AND at least one digit (S5/RT-D1-07), so benign prose ("the
+#: password is stored in the vault", "her password is legendary") is not redacted and
+#: cannot block checkpoint persistence while real assigned values still match. Group 1
+#: is set only by the direct arm and selects the value alternative via a regex
+#: conditional.
+_ASSIGNMENT_SEPARATOR = r"(?:([=:])\s*|\b(?:is|was|are)\b\s*[:=]?\s*)['\"]?"
+_ASSIGNMENT_VALUE = r"(?(1)\S{{{},}}|(?=\S*\d)\S{{8,}})"
+
+
+def _assignment_pattern(nouns: str, direct_floor: int) -> re.Pattern[str]:
+    return re.compile(
+        rf"\b(?:{nouns})['\"]?\s*{_ASSIGNMENT_SEPARATOR}{_ASSIGNMENT_VALUE.format(direct_floor)}",
+        re.IGNORECASE,
+    )
 
 
 SECRET_PATTERNS: tuple[SecretPattern, ...] = (
@@ -67,43 +103,60 @@ SECRET_PATTERNS: tuple[SecretPattern, ...] = (
         "jwt",
         re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]{4,})?"),
     ),
+    # P2: the PEM block and its bare header share one compiled alternation (block
+    # branch first, so a full block still wins over its own header exactly as the
+    # ordered tuple did) — one pass instead of two on clean text.
     SecretPattern(
         "private_key_block",
         re.compile(
-            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----"
-            r"[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----"
+            r"(?P<block>-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"
+            r"[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----)"
+            r"|(?P<header>-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----)"
         ),
+        group_names={"block": "private_key_block", "header": "private_key_header"},
     ),
-    SecretPattern(
-        "private_key_header",
-        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----"),
-    ),
+    # P2: the bearer separators and the R-21 value-shape families share ONE compiled
+    # alternation (the authorization arm first, preserving the tuple precedence). The
+    # `(?i:...)` scopes keep the separators case-insensitive exactly like the original
+    # IGNORECASE patterns while the value-shape prefixes stay case-sensitive.
     SecretPattern(
         "bearer_authorization",
-        re.compile(r"\b(?:authorization|auth)\s*[=:]\s*bearer\s+[A-Za-z0-9\-._~+/]{16,}", re.IGNORECASE),
-    ),
-    SecretPattern(
-        "bearer_token",
-        re.compile(r"\bbearer\s+[A-Za-z0-9\-._~+/]{24,}", re.IGNORECASE),
+        re.compile(
+            r"\b(?:(?P<bearer_authorization>(?i:authorization|auth)\s*[=:]\s*(?i:bearer)\s+"
+            r"[A-Za-z0-9\-._~+/]{16,})"
+            r"|(?P<bearer_token>(?i:bearer)\s+[A-Za-z0-9\-._~+/]{24,})"
+            r"|(?P<github_token>gh[pousr]_[A-Za-z0-9]{20,})"
+            r"|(?P<github_finegrained_pat>github_pat_[A-Za-z0-9_]{17,})"
+            r"|(?P<slack_token>xox[abprs][-_][A-Za-z0-9-]{8,})"
+            r"|(?P<npm_token>npm_[A-Za-z0-9]{20,})"
+            r"|(?P<xocr_token>xocr_[A-Za-z0-9]{20,}))"
+        ),
+        group_names={
+            "bearer_authorization": "bearer_authorization",
+            "bearer_token": "bearer_token",
+            "github_token": "github_token",
+            "github_finegrained_pat": "github_finegrained_pat",
+            "slack_token": "slack_token",
+            "npm_token": "npm_token",
+            "xocr_token": "xocr_token",
+        },
     ),
     SecretPattern(
         "basic_auth_url",
         re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s/:@]+:[^\s/@]+@[^\s]+"),
     ),
+    # S3/S5: the assignment grammar's copula arm accepts an optional separator after
+    # the copula (``password is: X``) and requires the \\S{8,}+digit value floor.
     SecretPattern(
         "password_assignment",
-        re.compile(
-            r"\b(?:passphrase|password|credentials?|passwd|pwd|pass)['\"]?\s*"
-            r"(?:[=:]\s*|\b(?:is|was|are)\s+)['\"]?\S{4,}",
-            re.IGNORECASE,
-        ),
+        _assignment_pattern(r"passphrase|password|credentials?|passwd|pwd|pass", 4),
     ),
     SecretPattern(
         "token_assignment",
-        re.compile(
-            r"\b(?:access[\s_-]?key|client[\s_-]?secret|secret[\s_-]?key|api[\s_-]?key|apikey"
-            r"|auth[\s_-]?token|secret|token)['\"]?\s*(?:[=:]\s*|\b(?:is|was|are)\s+)['\"]?\S{6,}",
-            re.IGNORECASE,
+        _assignment_pattern(
+            r"access[\s_-]?key|client[\s_-]?secret|secret[\s_-]?key|api[\s_-]?key|apikey"
+            r"|auth[\s_-]?token|secret|token",
+            6,
         ),
     ),
     SecretPattern(
@@ -111,13 +164,6 @@ SECRET_PATTERNS: tuple[SecretPattern, ...] = (
         re.compile(r"\b(?:\d{4}[ -]?){3,4}\d{1,7}\b"),
         value_validator=_luhn_ok,
     ),
-    # R-21 value-shape families (the AKIA shape generalized): untagged bearer tokens,
-    # each with a length floor so truncated or coincidental strings stay clean.
-    SecretPattern("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
-    SecretPattern("github_finegrained_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{17,}\b")),
-    SecretPattern("slack_token", re.compile(r"\bxox[abprs][-_][A-Za-z0-9-]{8,}\b")),
-    SecretPattern("npm_token", re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b")),
-    SecretPattern("xocr_token", re.compile(r"\bxocr_[A-Za-z0-9]{20,}\b")),
 )
 
 
@@ -125,6 +171,52 @@ def register_secret_pattern(pattern: SecretPattern) -> None:
     """Append a detector to the registry (tuple rebinding keeps readers consistent)."""
     global SECRET_PATTERNS
     SECRET_PATTERNS = (*SECRET_PATTERNS, pattern)
+
+
+def _redaction_label(pattern: SecretPattern, match: re.Match[str]) -> str:
+    """Label for one hit: the matched alternative's family name for fused patterns."""
+    if pattern.group_names is not None:
+        return REDACTED_TEMPLATE.format(name=pattern.group_names[match.lastgroup])
+    return REDACTED_TEMPLATE.format(name=pattern.name)
+
+
+def _label_replacer(pattern: SecretPattern) -> Callable[[re.Match[str]], str]:
+    """Stable per-pattern replacement callback for fused-alternation patterns (P2)."""
+
+    def _replace(match: re.Match[str]) -> str:
+        return _redaction_label(pattern, match)
+
+    return _replace
+
+
+def _redact_view(view: str) -> tuple[str, int]:
+    result = view
+    count = 0
+    for secret in SECRET_PATTERNS:
+        if secret.group_names is not None:
+            # fused alternation: resolve each hit's family name from its group
+            result, replaced = secret.regex.subn(_label_replacer(secret), result)
+            count += replaced
+        elif secret.value_validator is None:
+            replacement = REDACTED_TEMPLATE.format(name=secret.name)
+            result, replaced = secret.regex.subn(replacement, result)
+            count += replaced
+        else:
+            validator = secret.value_validator
+            replacement = REDACTED_TEMPLATE.format(name=secret.name)
+            valid = sum(1 for match in secret.regex.finditer(result) if validator(match.group(0)))
+            if valid:
+
+                def _conditional(
+                    match: re.Match[str],
+                    _validator: Callable[[str], bool] = validator,
+                    _replacement: str = replacement,
+                ) -> str:
+                    return _replacement if _validator(match.group(0)) else match.group(0)
+
+                result = secret.regex.sub(_conditional, result)
+                count += valid
+    return result, count
 
 
 def redact_text(text: str) -> tuple[str, int]:
@@ -145,31 +237,6 @@ def redact_text(text: str) -> tuple[str, int]:
         if count:
             return result, count
     return text, 0
-
-
-def _redact_view(view: str) -> tuple[str, int]:
-    result = view
-    count = 0
-    for secret in SECRET_PATTERNS:
-        replacement = REDACTED_TEMPLATE.format(name=secret.name)
-        if secret.value_validator is None:
-            result, replaced = secret.regex.subn(replacement, result)
-            count += replaced
-        else:
-            validator = secret.value_validator
-            valid = sum(1 for match in secret.regex.finditer(result) if validator(match.group(0)))
-            if valid:
-
-                def _conditional(
-                    match: re.Match[str],
-                    _validator: Callable[[str], bool] = validator,
-                    _replacement: str = replacement,
-                ) -> str:
-                    return _replacement if _validator(match.group(0)) else match.group(0)
-
-                result = secret.regex.sub(_conditional, result)
-                count += valid
-    return result, count
 
 
 def contains_secret(text: str) -> bool:

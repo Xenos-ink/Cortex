@@ -454,14 +454,53 @@ _COMPOUND_MARKER_TAILS: frozenset[str] = frozenset(
 
 #: V1 — unambiguous destructive verbs. V1 + any object inside the window floors the
 #: verdict at MEDIUM (``destructive_intent``) and fires the keyword gate. Whole-token
-#: matches only, NO stemming: ``deletion``/``reformatting`` are distinct tokens and
-#: stay benign.
+#: matches only; NOMINALIZATIONS (``deletion``/``reformatting``) and typos stay
+#: distinct tokens and remain benign (the no-stemming design).
+#:
+#: S4 repair (RT-D1-04, Commander-approved policy): the bounded inflection family
+#: (:func:`_inflect_verb_forms` — s/es/ed/d/ing with e-drop and consonant doubling)
+#: is allowed on V1 verbs, so gerund/past/third-person forms of the SAME verb carry
+#: the same intent ("wiping the old drive", "deleted the database"). The shell
+#: abbreviations ``del``/``rm`` stay exact tokens (they are command names, not
+#: English verbs — morphology on them is meaningless). Mention-form copula guards
+#: still apply: "wiping is configured" stays benign.
 _V1_VERBS: frozenset[str] = frozenset(
-    {"delete", "remove", "erase", "wipe", "truncate", "purge", "destroy", "del", "rm"}
+    {"delete", "remove", "erase", "wipe", "truncate", "purge", "destroy"}
 )
 #: V2 — contextual destructive verbs, flagged only with a high-consequence object hit.
+#: S4: inflected V2 forms ("formatting the drive") flag ONLY with the class-object
+#: hit, exactly like their base forms ("formatting the document" stays benign).
 _V2_VERBS: frozenset[str] = frozenset(
     {"drop", "clear", "empty", "format", "kill", "shutdown", "restart"}
+)
+
+
+def _inflect_verb_forms(verb: str) -> frozenset[str]:
+    """Bounded inflection family of one verb (S4/RT-D1-04): s/es, d/ed, ing.
+
+    Handles e-drop ("wipe" -> "wiping"), plain suffixing ("destroy" -> "destroyed"),
+    and the CVC / double-consonant doubling rule ("format" -> "formatting",
+    "drop" -> "dropping"); y/w/x finals never double ("empty" -> "emptying").
+    The produced forms are a CLOSED set per verb — this is not a stemmer: derived
+    nouns ("deletion"), prefixes ("reformatting"), and typos never match.
+    """
+    forms = {verb}
+    if verb.endswith("e"):
+        forms.update({verb + "s", verb + "d", verb[:-1] + "ing"})
+        return frozenset(forms)
+    forms.update({verb + "s", verb + "es", verb + "ed", verb + "ing"})
+    if len(verb) >= 3:
+        third, second, last = verb[-3], verb[-2], verb[-1]
+        if third not in "aeiou" and second in "aeiou" and last not in "aeiouwxy":
+            forms.update({verb + last + "ed", verb + last + "ing"})
+    return frozenset(forms)
+
+
+_V1_FORMS: frozenset[str] = _V1_VERBS | {"del", "rm"} | frozenset().union(
+    *(_inflect_verb_forms(verb) for verb in _V1_VERBS)
+)
+_V2_FORMS: frozenset[str] = frozenset().union(
+    *(_inflect_verb_forms(verb) for verb in _V2_VERBS)
 )
 #: Function words inside the object window are skipped, never object candidates.
 _FUNCTION_WORDS: frozenset[str] = frozenset(
@@ -489,37 +528,47 @@ _HIGH_CONSEQUENCE_NOUNS: frozenset[str] = frozenset(
         "environment", "environments", "everything", "all",
     }
 )
-#: Object window: the components immediately following the verb.
+#: Object window: the number of NON-function components examined after the verb.
+#: S2 repair (RT-D1-01): function words are SKIPPED, never object candidates, and no
+#: longer consume window slots — "delete the entire old production database" reaches
+#: its object through three function words.
 _INTENT_WINDOW = 3
 
 
 def _destructive_intent_tier(components: list[tuple[str, bool]]) -> RiskLevel | None:
     """Severity tier implied by the verb grammar over gate token components, or None.
 
-    V1 verb + any object inside the :data:`_INTENT_WINDOW` window -> MEDIUM;
-    V1/V2 verb + a high-consequence object in the window -> CRITICAL. Floors only —
-    callers may upgrade an existing verdict, never downgrade one.
+    V1 verb form + any object inside the :data:`_INTENT_WINDOW` window -> MEDIUM;
+    V1/V2 verb form + a high-consequence object in the window -> CRITICAL. Function
+    words are skipped without consuming window slots (S2/RT-D1-01); a copula closes
+    the window (mention-form verbs stay benign). Floors only — callers may upgrade an
+    existing verdict, never downgrade one.
     """
     count = len(components)
     for index in range(count):
         verb = components[index][0]
-        if verb in _V1_VERBS:
+        if verb in _V1_FORMS:
             open_object_scored = False
-        elif verb in _V2_VERBS:
+        elif verb in _V2_FORMS:
             open_object_scored = True  # V2: only class-object hits may flag
         else:
             continue
         floor: RiskLevel | None = None
-        for offset in range(1, _INTENT_WINDOW + 1):
-            position = index + offset
+        scanned = 0
+        position = index
+        while scanned < _INTENT_WINDOW:
+            position += 1
             if position >= count:
                 break
             word = components[position][0]
             if word in _COPULAS:
                 break  # mention-form verb; the imperative window is closed
+            if word in _FUNCTION_WORDS:
+                continue  # filler: skipped, does not consume a window slot (S2)
+            scanned += 1
             if word in _HIGH_CONSEQUENCE_NOUNS:
                 return RiskLevel.CRITICAL
-            if not open_object_scored and floor is None and word not in _FUNCTION_WORDS:
+            if not open_object_scored and floor is None:
                 floor = RiskLevel.MEDIUM  # first open object; keep scanning for class nouns
         if floor is not None:
             return floor
@@ -534,25 +583,95 @@ def _word_alternation(words: frozenset[str]) -> str:
 
 _COPULA_ALT = _word_alternation(_COPULAS)
 _FUNC_ALT = _word_alternation(_FUNCTION_WORDS)
-_VERB_ALT = _word_alternation(_V1_VERBS | _V2_VERBS)
+_VERB_ALT = _word_alternation(_V1_FORMS | _V2_FORMS)
+_V1_ALT = _word_alternation(_V1_FORMS)
 _NOUN_ALT = _word_alternation(_HIGH_CONSEQUENCE_NOUNS)
 
-#: classify-side floor for the MEDIUM tier (V1 + filler-tolerant object). The skip
-#: group is tempered on copulas, mirroring the component scanner the keyword gate
-#: uses, so mention-form verbs never flag. Bounded quantifiers only.
+#: classify-side floor for the MEDIUM tier (V1 form + filler-tolerant object). The
+#: skip group is tempered on copulas, mirroring the component scanner the keyword
+#: gate uses, and — S2 (RT-D1-01) — allows up to THREE function-word groups between
+#: the verb and its object (the component scanner skips them without limit). Bounded
+#: quantifiers only.
 _DESTRUCTIVE_INTENT_MEDIUM = re.compile(
-    rf"\b{_word_alternation(_V1_VERBS)}\W+"
-    rf"(?:(?!{_COPULA_ALT}\b){_FUNC_ALT}\W+){{0,2}}"
+    rf"\b{_V1_ALT}\W+"
+    rf"(?:(?!{_COPULA_ALT}\b){_FUNC_ALT}\W+){{0,3}}"
     rf"(?!(?:{_COPULA_ALT}|{_FUNC_ALT})\b)\w",
     re.IGNORECASE,
 )
-#: classify-side floor for the CRITICAL tier (V1/V2 + high-consequence object).
+#: classify-side floor for the CRITICAL tier (V1/V2 form + high-consequence object).
 _DESTRUCTIVE_INTENT_CRITICAL = re.compile(
     rf"\b{_VERB_ALT}\W+"
-    rf"(?:(?!{_COPULA_ALT}\b){_FUNC_ALT}\W+){{0,2}}"
+    rf"(?:(?!{_COPULA_ALT}\b){_FUNC_ALT}\W+){{0,3}}"
     rf"(?!{_COPULA_ALT}\b){_NOUN_ALT}\b",
     re.IGNORECASE,
 )
+
+# --- S7 repair (RT-D1-07 "new push"): fold-view re-fusion ---------------------------------
+#
+# Mixed-position zero-width payloads ("fo\\u200bmat\\u200bC:", "de\\u200blete\\u200bthe
+# \\u200bdatabase") carry an invisible character BOTH inside a keyword AND at a token
+# boundary. The canonical views heal exactly one role each: the delete view fuses the
+# separator ("formatC:" — the \\s-anchored patterns miss), the fold view splits the
+# keyword ("for mat C:" — no verb/marker token). Neither single view matches, so the
+# never-downgrade merge has nothing to merge. The repair stays at the view/scan level:
+# on the fold view's component stream, ADJACENT components whose CONCATENATION is a
+# known keyword token (marker, compound tail, verb form, class noun, or phrase member)
+# re-join as a virtual fused component — dictionary-driven and bounded (2- and 3-token
+# joins only, keyword-set membership required), so no general fuzzy/stem matching is
+# introduced and benign text without strip characters never takes this path.
+
+_FUSION_KEYWORDS: frozenset[str] = (
+    _SENSITIVE_TOKEN_MARKERS
+    | _COMPOUND_MARKER_TAILS
+    | _V1_FORMS
+    | _V2_FORMS
+    | _HIGH_CONSEQUENCE_NOUNS
+    | {word for phrase in _SENSITIVE_PHRASE_MARKERS for word in phrase}
+)
+
+
+def _fused_components(components: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
+    """Fold-view component stream plus virtual re-fused keyword tokens (S7)."""
+    count = len(components)
+    out: list[tuple[str, bool]] = []
+    for index in range(count):
+        out.append(components[index])
+        if index + 1 >= count:
+            continue
+        first = components[index][0]
+        for join in (
+            first + components[index + 1][0],
+            first + components[index + 1][0] + components[index + 2][0]
+            if index + 2 < count
+            else "",
+        ):
+            if join and join in _FUSION_KEYWORDS:
+                out.append((join, True))
+    return out
+
+
+#: P1: necessary condition helper set — every V1/V2 verb form in one lookup.
+_VERB_FORM_LOOKUP: frozenset[str] = _V1_FORMS | _V2_FORMS
+
+
+def _view_has_intent_verb(view: str) -> bool:
+    """Cheap prerequisite for the regex intent floor: does ANY V1/V2 verb form appear
+    as a word-delimited token in the view?
+
+    The floor regexes anchor on ``\\b<verb-form>\\W+``, so a floor hit requires the
+    form to be a complete word in the view's token stream — whole token, or a
+    hyphen-split part of one ("delete-all" carries the word "delete" to the regex).
+    A miss therefore skips both floor regexes with a provably identical outcome (P1);
+    the scan is one ``findall`` over the lowered view plus set lookups.
+    """
+    for token in _TEXT_TOKEN_PATTERN.findall(view.lower()):
+        if token in _VERB_FORM_LOOKUP:
+            return True
+        if "-" in token:
+            for part in token.split("-"):
+                if part in _VERB_FORM_LOOKUP:
+                    return True
+    return False
 
 
 def _clip(text: str, limit: int = _MAX_TEXT_SNIPPET) -> str:
@@ -584,7 +703,22 @@ class SafetyPolicy:
         waives the recorded approval requirement.
         """
         ctx = context if context is not None else SafetyContext()
-        risk, category, why = self.classify(action, ctx)
+        # P1 perf restructure: canonicalize the haystack ONCE here and reuse the views
+        # for both the classification and (for TYPE actions) the keyword gate — the
+        # gate previously re-canonicalized the same text a second time. When the
+        # action carries no separate reason, the haystack IS the typed text and the
+        # gate consumes these exact views.
+        haystack = "\n".join(part for part in (action.text, action.reason) if part)
+        views = canonical_views(haystack)
+        gate_flags: list[bool] | None = None
+        if action.action == ActionType.TYPE and action.text:
+            gate_views = views if not action.reason else canonical_views(action.text)
+            gate_flags = [
+                SafetyPolicy._view_is_sensitive(view, fusion=position > 0)
+                for position, view in enumerate(gate_views)
+            ]
+
+        risk, category, why = self._classify_views(action, ctx, views)
 
         # Legacy gates, verbatim order and outcomes (compat: test_core/test_smoke).
         if state.stopped:
@@ -593,7 +727,7 @@ class SafetyPolicy:
             return SafetyDecision(False, False, "Maximum session steps reached.", risk, category)
         if action.action == ActionType.DONE:
             return SafetyDecision(True, False, "Completion marker.", RiskLevel.LOW, "completion")
-        if action.action == ActionType.TYPE and action.text and self._looks_sensitive(action.text):
+        if gate_flags is not None and any(gate_flags):
             return SafetyDecision(
                 False,
                 True,
@@ -656,23 +790,57 @@ class SafetyPolicy:
         """
         ctx = context if context is not None else SafetyContext()
         haystack = "\n".join(part for part in (action.text, action.reason) if part)
-        views = canonical_views(haystack)
+        return self._classify_views(action, ctx, canonical_views(haystack))
+
+    def _classify_views(
+        self,
+        action: GroundedAction,
+        ctx: SafetyContext,
+        views: tuple[str, ...],
+    ) -> tuple[RiskLevel, str, str]:
+        """Classify the precomputed canonical views (P1: one canonicalization per call).
+
+        The full classifier body runs on every view (a gate-failing view can still carry
+        a pattern-class verdict — "install the app" is HIGH with no gate marker), merged
+        never-downgrade. Once a view classifies CRITICAL the merge can only reproduce
+        that verdict, so the remaining views and the intent floor are skipped — a pure
+        short-circuit with a provably identical result.
+        """
         verdict = self._classify_haystack(action, ctx, views[0])
         for view in views[1:]:
+            if verdict[0] is RiskLevel.CRITICAL:
+                break  # the never-downgrade merge cannot exceed CRITICAL
             other = self._classify_haystack(action, ctx, view)
             if _RISK_ORDER[other[0]] > _RISK_ORDER[verdict[0]]:
                 verdict = other
-        floor = self._destructive_intent_floor(views)
-        if floor is not None and _RISK_ORDER[floor[0]] > _RISK_ORDER[verdict[0]]:
-            return floor
+        if verdict[0] is not RiskLevel.CRITICAL:
+            floor = self._destructive_intent_floor(views)
+            if floor is not None and _RISK_ORDER[floor[0]] > _RISK_ORDER[verdict[0]]:
+                return floor
         return verdict
 
     def _destructive_intent_floor(
         self, views: tuple[str, ...]
     ) -> tuple[RiskLevel, str, str] | None:
-        """``destructive_intent`` floor over the canonical haystack views, or None."""
+        """``destructive_intent`` floor over the canonical haystack views, or None.
+
+        P1: the regex floor can only fire when a view contains a V1/V2 verb form as a
+        word-delimited token, so a verb-free view skips both regex passes with a
+        provably identical result. S7: on fold views (the dual-view strip-character
+        path) the component tier additionally runs over the RE-FUSED component stream
+        — the mixed-position payloads split their verb in the raw fold view, so the
+        re-fused reading is the only one that carries it.
+        """
         medium = False
-        for view in views:
+        for position, view in enumerate(views):
+            if position:
+                fused = _fused_components(_token_components(view.lower()))
+                tier = _destructive_intent_tier(fused)
+                if tier is RiskLevel.CRITICAL:
+                    return (RiskLevel.CRITICAL, "destructive_intent", self._why("destructive_intent"))
+                medium = medium or tier is RiskLevel.MEDIUM
+            if not _view_has_intent_verb(view):
+                continue  # no verb-form token -> neither floor regex can match
             if _DESTRUCTIVE_INTENT_CRITICAL.search(view):
                 return (RiskLevel.CRITICAL, "destructive_intent", self._why("destructive_intent"))
             medium = medium or bool(_DESTRUCTIVE_INTENT_MEDIUM.search(view))
@@ -784,17 +952,28 @@ class SafetyPolicy:
         R-23: matching runs on the canonical view(s) of ``text`` (ASCII input is
         matched byte-identically to before). R-21: the destructive-intent verb grammar
         (V1 verb + object, or V1/V2 verb + high-consequence object, within the window)
-        is additive — it can only widen what blocks, never narrow it.
+        is additive — it can only widen what blocks, never narrow it. S7: on the
+        dual-view (strip-character) path, the fold view additionally matches on
+        re-fused keyword tokens — mixed-position invisible characters split the
+        keyword in the fold view while fusing the separator in the delete view, and
+        neither single view alone sees the payload's plain reading.
         """
-        for view in canonical_views(text):
-            if SafetyPolicy._view_is_sensitive(view):
+        for position, view in enumerate(canonical_views(text)):
+            if SafetyPolicy._view_is_sensitive(view, fusion=position > 0):
                 return True
         return False
 
     @staticmethod
-    def _view_is_sensitive(view: str) -> bool:
-        """Legacy marker/phrase gate for one canonical view + the R-21 verb grammar."""
+    def _view_is_sensitive(view: str, *, fusion: bool = False) -> bool:
+        """Legacy marker/phrase gate for one canonical view + the R-21 verb grammar.
+
+        ``fusion=True`` (S7) marks a FOLD view of strip-character-bearing text: token
+        boundaries in it may be healed invisible-character insertions, so adjacent
+        components that re-join into a known keyword token are matched too.
+        """
         components = _token_components(view.lower())
+        if fusion:
+            components = _fused_components(components)
         for index, (token, from_compound) in enumerate(components):
             sensitive = token in _SENSITIVE_TOKEN_MARKERS or (
                 from_compound and token in _COMPOUND_MARKER_TAILS
