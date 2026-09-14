@@ -6,6 +6,18 @@ card numbers are replaced with ``[REDACTED:<pattern>]`` placeholders. Pattern ma
 value-oriented (``name=value`` / ``name: value``) so prose that merely mentions the word
 "password" or "token" is not flagged.
 
+R-23: matching runs on the canonical view(s) of the input (:mod:`textnorm`) — ASCII
+input is matched exactly as before; non-ASCII input is matched on both the delete and
+fold views (never-downgrade). A hit returns the matching view's redacted text (a sink
+representation only — redaction output is never the dispatched payload); with no hit
+the original string is returned byte-identical.
+
+R-21: the assignment grammar is filler-tolerant (spaced compound nouns ``api key`` /
+``access key``, the abbreviation ``pass``, and the copula separators ``is/was/are``
+immediately after the noun), and value-shape families cover untagged bearer tokens
+(``ghp_``-class GitHub tokens, ``github_pat_``, ``xox[abprs]`` Slack tokens, ``npm_``)
+with length floors so truncated/benign strings stay clean.
+
 Screenshot note: pixel-level secret detection is OUT of P0 scope. :func:`redact_image`
 blurs explicitly supplied regions, and without regions consults the
 :func:`_scan_image_for_secrets` hook (a no-op in P0) that later waves can extend.
@@ -20,6 +32,7 @@ from typing import NamedTuple
 from PIL import Image, ImageFilter
 
 from .models import TextRegion
+from .textnorm import canonical_views
 
 REDACTED_TEMPLATE = "[REDACTED:{name}]"
 
@@ -80,15 +93,16 @@ SECRET_PATTERNS: tuple[SecretPattern, ...] = (
     SecretPattern(
         "password_assignment",
         re.compile(
-            r"\b(?:password|passwd|pwd|passphrase)['\"]?\s*[=:]\s*['\"]?\S{4,}",
+            r"\b(?:passphrase|password|credentials?|passwd|pwd|pass)['\"]?\s*"
+            r"(?:[=:]\s*|\b(?:is|was|are)\s+)['\"]?\S{4,}",
             re.IGNORECASE,
         ),
     ),
     SecretPattern(
         "token_assignment",
         re.compile(
-            r"\b(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|secret"
-            r"|auth[_-]?token|token)['\"]?\s*[=:]\s*['\"]?\S{6,}",
+            r"\b(?:access[\s_-]?key|client[\s_-]?secret|secret[\s_-]?key|api[\s_-]?key|apikey"
+            r"|auth[\s_-]?token|secret|token)['\"]?\s*(?:[=:]\s*|\b(?:is|was|are)\s+)['\"]?\S{6,}",
             re.IGNORECASE,
         ),
     ),
@@ -97,6 +111,13 @@ SECRET_PATTERNS: tuple[SecretPattern, ...] = (
         re.compile(r"\b(?:\d{4}[ -]?){3,4}\d{1,7}\b"),
         value_validator=_luhn_ok,
     ),
+    # R-21 value-shape families (the AKIA shape generalized): untagged bearer tokens,
+    # each with a length floor so truncated or coincidental strings stay clean.
+    SecretPattern("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    SecretPattern("github_finegrained_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{17,}\b")),
+    SecretPattern("slack_token", re.compile(r"\bxox[abprs][-_][A-Za-z0-9-]{8,}\b")),
+    SecretPattern("npm_token", re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b")),
+    SecretPattern("xocr_token", re.compile(r"\bxocr_[A-Za-z0-9]{20,}\b")),
 )
 
 
@@ -107,10 +128,27 @@ def register_secret_pattern(pattern: SecretPattern) -> None:
 
 
 def redact_text(text: str) -> tuple[str, int]:
-    """Redact secret-like substrings; return ``(redacted_text, replacement_count)``."""
+    """Redact secret-like substrings; return ``(redacted_text, replacement_count)``.
+
+    R-23: matched on the canonical view(s) of ``text``. A single view (identical to
+    the input — every ASCII string) is matched exactly as before. Otherwise both
+    views are tried (never-downgrade); a hit returns that view's redacted text (the
+    delete view is preferred: it heals in-word invisible insertions so whole
+    value-shape tokens are covered). With no hit the ORIGINAL string is returned
+    byte-identical — benign pass-through never rewrites text.
+    """
     if not text:
         return text, 0
-    result = text
+    views = canonical_views(text)
+    for view in views:
+        result, count = _redact_view(view)
+        if count:
+            return result, count
+    return text, 0
+
+
+def _redact_view(view: str) -> tuple[str, int]:
+    result = view
     count = 0
     for secret in SECRET_PATTERNS:
         replacement = REDACTED_TEMPLATE.format(name=secret.name)
@@ -135,13 +173,16 @@ def redact_text(text: str) -> tuple[str, int]:
 
 
 def contains_secret(text: str) -> bool:
-    """Return True when ``text`` matches any registered secret pattern."""
-    for secret in SECRET_PATTERNS:
-        if secret.value_validator is None:
-            if secret.regex.search(text):
+    """Return True when ``text`` matches any registered secret pattern (any view)."""
+    for view in canonical_views(text):
+        for secret in SECRET_PATTERNS:
+            if secret.value_validator is None:
+                if secret.regex.search(view):
+                    return True
+            elif any(
+                secret.value_validator(match.group(0)) for match in secret.regex.finditer(view)
+            ):
                 return True
-        elif any(secret.value_validator(match.group(0)) for match in secret.regex.finditer(text)):
-            return True
     return False
 
 

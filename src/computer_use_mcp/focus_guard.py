@@ -45,6 +45,7 @@ multi-window interference protection activates exactly when a target is declared
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -99,6 +100,18 @@ _DIALOG_CONTROL_LIST_CAP = 8
 #: bounded memory like the chord log; the current anchor is always a member).
 _MAX_SESSION_SURFACES = 64
 
+#: R-22 (D-1): the launcher-COMMIT key family — the enter family only (the
+#: ``TERMINAL_KEYS`` set in backend.py minus ``tab``). The Win+R doctrine's launch
+#: act is the COMMIT key pressed in a launcher surface, so only a chord carrying one
+#: of these keys can arm the launch-act marker; letters, arrows, and modifier
+#: hotkeys are not launch acts and never arm (RT-E8-05: "keypress 'a' armed it").
+_LAUNCH_COMMIT_KEYS: frozenset[str] = frozenset({"enter", "return", "numpadenter"})
+
+#: R-22 (D-2): bounds for the launcher seed token set (the text typed into a launcher
+#: surface before the commit key), kept bounded like every other session log.
+_LAUNCH_SEED_MAX_TOKENS = 16
+_LAUNCH_SEED_MAX_TOKEN_CHARS = 64
+
 
 @dataclass
 class GuardVerdict:
@@ -144,6 +157,28 @@ def _titles_overlap(first: str, second: str) -> bool:
     return a in b or b in a
 
 
+def _is_commit_key_chord(keys: Sequence[str] | None) -> bool:
+    """R-22 (D-1): True when the chord carries a launcher-commit key (enter family)."""
+    if not keys:
+        return False
+    return any(str(key).strip().casefold() in _LAUNCH_COMMIT_KEYS for key in keys)
+
+
+def _launcher_seed_tokens(text: str | None) -> frozenset[str]:
+    """R-22 (D-2): bounded casefolded token set of the text typed into a launcher.
+
+    Alphanumeric runs, so paths/URLs split at separators too (``C:/users/me/Documents``
+    yields ``documents``) — the same token a launched folder window would name.
+    Bounded in token count and token length; an empty set means no usable seed.
+    """
+    if not text:
+        return frozenset()
+    tokens = re.findall(r"[a-z0-9]+", str(text).casefold())
+    return frozenset(
+        token[:_LAUNCH_SEED_MAX_TOKEN_CHARS] for token in tokens[:_LAUNCH_SEED_MAX_TOKENS]
+    )
+
+
 def _describe_target(info: WindowInfo | None) -> str:
     """Short human description of a window identity for FOCUS_DRIFTED payloads."""
     if info is None:
@@ -185,10 +220,16 @@ class InterferenceGuard:
         # adopted launch). Re-anchoring is restricted to this set and same-process
         # descendants; everything else is refused with REANCHOR_REFUSED.
         self._session_surfaces: list[WindowInfo] = []
-        # R-20 launch causality: set at pre-dispatch when THIS action is a chord sent
-        # while the anchor is a launcher/dialog surface (the Win+R "enter" act), and
-        # consumed by the next reanchor decision (one-action causality window).
+        # R-20 launch causality: set at pre-dispatch when THIS action is a launcher-
+        # COMMIT chord (the enter family — the Win+R "enter" act) sent while the
+        # anchor is a launcher/dialog surface, and only when it actually dispatches
+        # (R-22 D-1); consumed by the next reanchor decision (one-action window).
         self._pending_keyboard_launch = False
+        # R-22 (D-2): seed tokens of the text this session typed into the current
+        # launcher surface (overwritten per launcher TYPE, cleared when the anchor
+        # moves). A seeded launch act adopts only a candidate whose process/title
+        # correlates with the seed; a seedless commit key keeps the legacy R-20 shape.
+        self._launcher_seed: frozenset[str] = frozenset()
         self._session_chord_keys: list[list[str]] = []
         self._refocus_attempted_for: set[str] = set()
 
@@ -262,6 +303,9 @@ class InterferenceGuard:
             if len(self._session_surfaces) > _MAX_SESSION_SURFACES:
                 self._session_surfaces.pop(0)
         self._refocus_attempted_for.clear()
+        # R-22 (D-2): the seed belongs to the launcher surface just left — a new
+        # anchor invalidates it (the adoption rebind clears it with the anchor move).
+        self._launcher_seed = frozenset()
         self._audit("bound", f"BOUND target={_describe_target(self.bound)}")
 
     def rebind_from_observation(self, observation: Observation | None) -> None:
@@ -283,10 +327,13 @@ class InterferenceGuard:
           reattach, an adopted launch), or
         - it is a same-process descendant of a session surface (pid match) or an
           owner-chained dialog of one (GW_OWNER probe), or
-        - it is the outcome of the session's OWN keyboard launch act: a chord
-          dispatched while the anchor was a launcher/dialog surface (the Win+R ->
-          enter -> launched-app doctrine; the one-action marker
-          ``_pending_keyboard_launch``).
+        - it is the outcome of the session's OWN keyboard launch act: a launcher-
+          COMMIT chord (the enter family) dispatched into a launcher/dialog surface
+          (the Win+R -> enter -> launched-app doctrine; the one-action marker
+          ``_pending_keyboard_launch``, R-22 D-1), and — when this session TYPED a
+          seed into that launcher surface — the candidate correlates with the seed
+          (its process/title names a typed token; R-22 D-2). A seedless commit key
+          keeps the legacy R-20 adoption shape (adjudicated residual).
 
         EVERYTHING else is refused with the named ``REANCHOR_REFUSED`` payload (audited,
         annotation-only) and the anchor is KEPT, so the next pre-dispatch rejects with
@@ -310,9 +357,16 @@ class InterferenceGuard:
             self.rebind(new_window)
             return
         if launch_act and self._anchor_is_launcher_surface():
-            # The launch WE caused: our chord went into the launcher/dialog anchor and
-            # the new surface took over right after the verified action.
-            self.rebind(new_window)
+            # The launch WE caused: our commit chord went into the launcher/dialog
+            # anchor and the new surface took over right after the verified action.
+            # R-22 (D-2): when a seed was typed into this launcher surface, the
+            # candidate must correlate with it — an outcome that names none of the
+            # typed tokens was not launched by US.
+            if self._launch_seed_matches(new_window):
+                self.rebind(new_window)
+                return
+            payload = format_reanchor_refused(bound, new_window)
+            self._audit("reanchor_refused", payload)
             return
         payload = format_reanchor_refused(bound, new_window)
         self._audit("reanchor_refused", payload)
@@ -357,6 +411,31 @@ class InterferenceGuard:
             _exe_basename(bound) == str(pattern).strip().casefold().removesuffix(".exe")
             for pattern in self.policy.focus_guard.transient_launch_processes
         )
+
+    def _launch_seed_matches(self, new_window: WindowInfo) -> bool:
+        """R-22 (D-2): candidate correlation for a SEEDED launch act.
+
+        When the session typed nothing into the launcher surface (a pure commit key —
+        the frozen R-20 positive shape), every titled candidate is adoptable exactly
+        as before (the adjudicated D5 residual). When a seed exists, at least one
+        typed token must appear in the candidate's process name / exe basename or
+        title (the casefold-substring discipline ``find_window_by_title`` uses) —
+        otherwise the new surface names nothing this session launched. Pure string
+        containment over the bounded token set; adoption path only, no probes.
+        """
+        seed = self._launcher_seed
+        if not seed:
+            return True  # seedless commit-key act: legacy R-20 behavior (D5 residual)
+        haystack = " ".join(
+            part
+            for part in (
+                (new_window.process_name or "").casefold(),
+                _exe_basename(new_window),
+                (new_window.title or "").casefold(),
+            )
+            if part
+        )
+        return any(token in haystack for token in seed)
 
     # ------------------------------------------------------------------ B10 focus-surface rules
 
@@ -498,37 +577,53 @@ class InterferenceGuard:
         verdict (annotate and proceed). Precedence per A12: FOCUS_TAKEN_BY first (a
         hotkey against a stolen foreground is a MISDELIVERY, not a no-op), then
         STUCK_MODIFIER, then FOCUS_DRIFTED.
+
+        R-22 (D-1): the launch-act marker arms ONLY for a launcher-commit chord (the
+        enter family) into a launcher/dialog anchor, and ONLY when the chord actually
+        dispatches — the arming decision runs AFTER the gates below, so a REJECTED
+        chord (FOCUS_TAKEN_BY / STUCK_MODIFIER / FOCUS_DRIFTED) is never a launch
+        act. R-22 (D-2): a TYPE dispatched into the launcher surface records the
+        seed tokens the launched candidate must correlate against in
+        :meth:`reanchor_after_success`.
         """
         # R-20 launch causality: the marker names THE PREVIOUS dispatch — clear it
-        # first, then arm it when THIS dispatch is a chord into a launcher/dialog
-        # anchor (the session's own launch act; consumed by the next re-anchor).
+        # first; it is consumed by the next re-anchor decision (one-action window).
         self._pending_keyboard_launch = False
-        if (
-            action.action in {ActionType.KEYPRESS, ActionType.HOTKEY}
-            and self.armed
-            and self._anchor_is_launcher_surface()
-        ):
-            self._pending_keyboard_launch = True
         if action.action in _GUARD_EXEMPT_ACTIONS:
             return self._verify_stuck_modifiers(action)  # hotkey hygiene applies to chords only
         guard_policy = self.policy.focus_guard
+        verdict: GuardVerdict | None = None
         if guard_policy.enabled and self.armed:
             verdict = self._verify_foreground(action)
-            if verdict is not None:
-                return verdict
-        if self.policy.hotkey_guard.enabled and action.action in {ActionType.KEYPRESS, ActionType.HOTKEY}:
+        if verdict is None and self.policy.hotkey_guard.enabled and action.action in {
+            ActionType.KEYPRESS,
+            ActionType.HOTKEY,
+        }:
             verdict = self._verify_stuck_modifiers(action)
-            if verdict is not None:
-                return verdict
         if (
-            self.policy.focus_continuity.enabled
+            verdict is None
+            and self.policy.focus_continuity.enabled
             and self.armed
             and action.action in _KEYBOARD_ACTIONS
         ):
             verdict = self._verify_focus_continuity(action)
-            if verdict is not None:
-                return verdict
-        return None
+        if verdict is not None and verdict.blocking:
+            return verdict  # a rejected action never dispatched: no launch act, no seed
+        # The action dispatches (clean, or an annotate-and-proceed verdict). R-22
+        # D-1/D-2: a commit-key chord into the launcher anchor is the session's launch
+        # act; a TYPE into the launcher surface records its seed tokens.
+        if (
+            self.armed
+            and action.action in _KEYBOARD_ACTIONS
+            and self._anchor_is_launcher_surface()
+        ):
+            if action.action is ActionType.TYPE:
+                tokens = _launcher_seed_tokens(action.text)
+                if tokens:
+                    self._launcher_seed = tokens
+            elif _is_commit_key_chord(action.keys):  # remaining keyboard actions: KEYPRESS/HOTKEY
+                self._pending_keyboard_launch = True
+        return verdict
 
     def _verify_foreground(self, action: GroundedAction) -> GuardVerdict | None:
         """The FOCUS_TAKEN_BY / refocus / observe-only ladder (mechanism i)."""

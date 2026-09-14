@@ -1,7 +1,8 @@
 """Contextual safety policy: risk classification and policy decisions (Goal.md sections 11-12).
 
-Layering (master-mission section 5): this module imports only ``models``; the controller
-(E5) supplies :class:`SafetyContext` built from observations/task state.
+Layering (master-mission section 5): this module imports only ``models`` and the
+stdlib-only :mod:`textnorm` canonicalizer (R-23); the controller (E5) supplies
+:class:`SafetyContext` built from observations/task state.
 
 Doctrines implemented here:
 
@@ -32,8 +33,17 @@ import re
 from dataclasses import dataclass, field
 
 from .models import ActionType, GroundedAction, RiskLevel, SessionState, WindowInfo
+from .textnorm import canonical_views
 
 __all__ = ["SafetyContext", "SafetyDecision", "SafetyPolicy"]
+
+#: Risk severity order for the never-downgrade merges (R-23 dual-view + R-21 floors).
+_RISK_ORDER: dict[RiskLevel, int] = {
+    RiskLevel.LOW: 0,
+    RiskLevel.MEDIUM: 1,
+    RiskLevel.HIGH: 2,
+    RiskLevel.CRITICAL: 3,
+}
 
 
 @dataclass(frozen=True)
@@ -322,6 +332,7 @@ _CATEGORY_WHY: dict[str, str] = {
     "known_application_interaction": "interaction with an identified application window",
     "completion": "task completion marker",
     "low_routine_action": "routine action with no state-changing potential",
+    "destructive_intent": "the text pairs a destructive verb with a target object",
 }
 
 #: Human-readable consequence per category (approval/block message quality, Goal.md 12).
@@ -356,6 +367,7 @@ _CATEGORY_CONSEQUENCE: dict[str, str] = {
     "known_application_interaction": "A UI element in the target application could be activated.",
     "completion": "The task would be marked complete.",
     "low_routine_action": "A minor, recoverable UI state change could occur.",
+    "destructive_intent": "Data targeted by an explicit destructive verb could be permanently deleted or destroyed.",
 }
 
 _RISK_DEFAULT_CONSEQUENCE: dict[RiskLevel, str] = {
@@ -435,6 +447,111 @@ _COMPOUND_MARKER_TAILS: frozenset[str] = frozenset(
     {
         "key", "keys", "secret", "secrets", "token", "tokens",
     }
+)
+
+
+# --- R-21 destructive-intent grammar (additive floors over NORMALIZED components) ----------
+
+#: V1 — unambiguous destructive verbs. V1 + any object inside the window floors the
+#: verdict at MEDIUM (``destructive_intent``) and fires the keyword gate. Whole-token
+#: matches only, NO stemming: ``deletion``/``reformatting`` are distinct tokens and
+#: stay benign.
+_V1_VERBS: frozenset[str] = frozenset(
+    {"delete", "remove", "erase", "wipe", "truncate", "purge", "destroy", "del", "rm"}
+)
+#: V2 — contextual destructive verbs, flagged only with a high-consequence object hit.
+_V2_VERBS: frozenset[str] = frozenset(
+    {"drop", "clear", "empty", "format", "kill", "shutdown", "restart"}
+)
+#: Function words inside the object window are skipped, never object candidates.
+_FUNCTION_WORDS: frozenset[str] = frozenset(
+    {"the", "a", "an", "my", "your", "this", "that", "these", "those", "all", "everything",
+     "now", "entire", "whole", "old", "please", "kindly"}
+)
+#: Copulas close the window: a verb followed by a copula is a mention, not an
+#: imperative ("delete is a word in the dictionary" stays benign) — the same
+#: noun+copula-adjacency notion the redaction assignment grammar uses.
+_COPULAS: frozenset[str] = frozenset({"is", "are", "was", "were", "be", "been", "being"})
+#: High-consequence object class — decides the severity tier (V1/V2 verb + class
+#: object -> CRITICAL). The class decides the TIER only; the V1 open-object MEDIUM
+#: floor does not depend on noun enumeration.
+_HIGH_CONSEQUENCE_NOUNS: frozenset[str] = frozenset(
+    {
+        "database", "databases", "table", "tables", "schema", "schemas",
+        "index", "indexes", "indices", "view", "views", "row", "rows", "record", "records",
+        "disk", "disks", "drive", "drives", "partition", "partitions", "volume", "volumes",
+        "account", "accounts", "user", "users", "password", "passwords",
+        "credential", "credentials", "file", "files", "folder", "folders",
+        "directory", "directories", "weight", "weights", "model", "models",
+        "checkpoint", "checkpoints", "backup", "backups", "repo", "repos",
+        "repository", "repositories", "branch", "branches", "project", "projects",
+        "workspace", "workspaces", "history", "log", "logs", "key", "keys",
+        "environment", "environments", "everything", "all",
+    }
+)
+#: Object window: the components immediately following the verb.
+_INTENT_WINDOW = 3
+
+
+def _destructive_intent_tier(components: list[tuple[str, bool]]) -> RiskLevel | None:
+    """Severity tier implied by the verb grammar over gate token components, or None.
+
+    V1 verb + any object inside the :data:`_INTENT_WINDOW` window -> MEDIUM;
+    V1/V2 verb + a high-consequence object in the window -> CRITICAL. Floors only —
+    callers may upgrade an existing verdict, never downgrade one.
+    """
+    count = len(components)
+    for index in range(count):
+        verb = components[index][0]
+        if verb in _V1_VERBS:
+            open_object_scored = False
+        elif verb in _V2_VERBS:
+            open_object_scored = True  # V2: only class-object hits may flag
+        else:
+            continue
+        floor: RiskLevel | None = None
+        for offset in range(1, _INTENT_WINDOW + 1):
+            position = index + offset
+            if position >= count:
+                break
+            word = components[position][0]
+            if word in _COPULAS:
+                break  # mention-form verb; the imperative window is closed
+            if word in _HIGH_CONSEQUENCE_NOUNS:
+                return RiskLevel.CRITICAL
+            if not open_object_scored and floor is None and word not in _FUNCTION_WORDS:
+                floor = RiskLevel.MEDIUM  # first open object; keep scanning for class nouns
+        if floor is not None:
+            return floor
+    return None
+
+
+def _word_alternation(words: frozenset[str]) -> str:
+    # Longest-first so compound verbs (``delete``) win over their prefixes (``del``)
+    # without relying on backtracking; sorted for a byte-stable compiled pattern.
+    return "(?:" + "|".join(sorted(words, key=len, reverse=True)) + ")"
+
+
+_COPULA_ALT = _word_alternation(_COPULAS)
+_FUNC_ALT = _word_alternation(_FUNCTION_WORDS)
+_VERB_ALT = _word_alternation(_V1_VERBS | _V2_VERBS)
+_NOUN_ALT = _word_alternation(_HIGH_CONSEQUENCE_NOUNS)
+
+#: classify-side floor for the MEDIUM tier (V1 + filler-tolerant object). The skip
+#: group is tempered on copulas, mirroring the component scanner the keyword gate
+#: uses, so mention-form verbs never flag. Bounded quantifiers only.
+_DESTRUCTIVE_INTENT_MEDIUM = re.compile(
+    rf"\b{_word_alternation(_V1_VERBS)}\W+"
+    rf"(?:(?!{_COPULA_ALT}\b){_FUNC_ALT}\W+){{0,2}}"
+    rf"(?!(?:{_COPULA_ALT}|{_FUNC_ALT})\b)\w",
+    re.IGNORECASE,
+)
+#: classify-side floor for the CRITICAL tier (V1/V2 + high-consequence object).
+_DESTRUCTIVE_INTENT_CRITICAL = re.compile(
+    rf"\b{_VERB_ALT}\W+"
+    rf"(?:(?!{_COPULA_ALT}\b){_FUNC_ALT}\W+){{0,2}}"
+    rf"(?!{_COPULA_ALT}\b){_NOUN_ALT}\b",
+    re.IGNORECASE,
 )
 
 
@@ -530,10 +647,43 @@ class SafetyPolicy:
 
         The category is a stable machine string (e.g. ``shell_execution``); the reason is
         a human-readable "why". See the module docstring for the doctrine.
+
+        R-23: the haystack is matched on its canonical view(s) — one view (byte-identical
+        to the raw text) for every ASCII haystack, otherwise the dual delete/fold views
+        merged never-downgrade (risk = max; ties keep the first view). R-21: an additive
+        ``destructive_intent`` severity floor from the verb grammar may upgrade the
+        verdict, never downgrade one.
         """
         ctx = context if context is not None else SafetyContext()
         haystack = "\n".join(part for part in (action.text, action.reason) if part)
+        views = canonical_views(haystack)
+        verdict = self._classify_haystack(action, ctx, views[0])
+        for view in views[1:]:
+            other = self._classify_haystack(action, ctx, view)
+            if _RISK_ORDER[other[0]] > _RISK_ORDER[verdict[0]]:
+                verdict = other
+        floor = self._destructive_intent_floor(views)
+        if floor is not None and _RISK_ORDER[floor[0]] > _RISK_ORDER[verdict[0]]:
+            return floor
+        return verdict
 
+    def _destructive_intent_floor(
+        self, views: tuple[str, ...]
+    ) -> tuple[RiskLevel, str, str] | None:
+        """``destructive_intent`` floor over the canonical haystack views, or None."""
+        medium = False
+        for view in views:
+            if _DESTRUCTIVE_INTENT_CRITICAL.search(view):
+                return (RiskLevel.CRITICAL, "destructive_intent", self._why("destructive_intent"))
+            medium = medium or bool(_DESTRUCTIVE_INTENT_MEDIUM.search(view))
+        if medium:
+            return (RiskLevel.MEDIUM, "destructive_intent", self._why("destructive_intent"))
+        return None
+
+    def _classify_haystack(
+        self, action: GroundedAction, ctx: SafetyContext, haystack: str
+    ) -> tuple[RiskLevel, str, str]:
+        """Legacy contextual classification of one haystack (existing precedence verbatim)."""
         for pattern, category in _CRITICAL_PATTERNS:
             if pattern.search(haystack):
                 return RiskLevel.CRITICAL, category, self._why(category)
@@ -630,8 +780,21 @@ class SafetyPolicy:
         and still blocks, and credential nouns keep their plural forms so plural
         mentions block exactly as before. Only derived-word false positives
         (``tokenize``, ``shutdowns``) and the ``DOI token(s)`` citation phrase pass now.
+
+        R-23: matching runs on the canonical view(s) of ``text`` (ASCII input is
+        matched byte-identically to before). R-21: the destructive-intent verb grammar
+        (V1 verb + object, or V1/V2 verb + high-consequence object, within the window)
+        is additive — it can only widen what blocks, never narrow it.
         """
-        components = _token_components(text.lower())
+        for view in canonical_views(text):
+            if SafetyPolicy._view_is_sensitive(view):
+                return True
+        return False
+
+    @staticmethod
+    def _view_is_sensitive(view: str) -> bool:
+        """Legacy marker/phrase gate for one canonical view + the R-21 verb grammar."""
+        components = _token_components(view.lower())
         for index, (token, from_compound) in enumerate(components):
             sensitive = token in _SENSITIVE_TOKEN_MARKERS or (
                 from_compound and token in _COMPOUND_MARKER_TAILS
@@ -649,7 +812,7 @@ class SafetyPolicy:
                 window = tuple(components[position][0] for position in range(start, start + size))
                 if window == phrase:
                     return True
-        return False
+        return _destructive_intent_tier(components) is not None
 
     # -- message construction (P0-F, Goal.md section 12) ---------------------------------
 
