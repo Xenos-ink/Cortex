@@ -157,8 +157,11 @@ this directory, so they run in every plain suite run.)
    process's first awareness setter.
 3. Window-bounds-only moves do NOT trip `STALE_OBSERVATION` (identity checks are
    hwnd/pid/process/monitor/dimensions/coordinate-space). The moved-window test shows
-   the semantic verification layer catching the miss (WRONG_WINDOW → bounded recovery),
-   while the window-switch test exercises the true staleness rejection.
+   the semantic verification layer catching the miss and returning the typed failure
+   to the host, which re-grounds from a fresh observation (the loop-era bounded-recovery
+   module was removed in v0.6.0 — no auto-recovery; only `STALE_OBSERVATION` still
+   auto-retries once on the direct path), while the window-switch test exercises the
+   true staleness rejection.
 4. Foreground can be stolen by the hosting console between launch and observation; tests
    focus the target window explicitly before asserting foreground-derived state.
 

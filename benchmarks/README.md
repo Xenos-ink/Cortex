@@ -70,16 +70,19 @@ python -m benchmarks.runner --mode env --run-id env-<label>
 ```
 
 Exit code is 0 when no runnable task failed. Results JSON contains per-task: grounding
-strategies/confidence, per-action verification outcomes, recovery events + failure
-classes, safety blocks (expected vs false), actions/task, model calls, and latency
-summaries (observation/model/execution/verification/task) from the session metrics.
+strategies/confidence, per-action verification outcomes, safety blocks (expected vs
+false), actions/task, model calls, and latency summaries
+(observation/model/execution/verification/task) from the session metrics. (The legacy
+`recovery_events`/`recovery_classes` fields are still emitted for schema compatibility
+but are always zero — the loop-era recovery machinery was removed in v0.6.0.)
 
 ## Metric definitions
 
 - **grounding outcome** — strategy + confidence recorded on each executed action.
 - **action success** — executed actions whose runtime verification was `verified`.
 - **verification accuracy** — verified / (verified+failed+uncertain) over executed actions.
-- **recovery events** — audited `recovery` events, counted by failure class.
+- **recovery events** — (historical) audited `recovery` events counted by failure
+  class; the recovery machinery was removed in v0.6.0, so live runs report zero.
 - **task completion** — `termination_reason == "completed"` plus the task-level predicate.
 - **safety violation rate** — expected-blocked actions that nevertheless executed.
 - **false safety blocks** — benign tasks that produced `safety_block` counters.
@@ -92,7 +95,7 @@ summaries (observation/model/execution/verification/task) from the session metri
 |---|---|---|---|---|
 | t01-notepad-type-verify | verification | yes | yes | marker typed; window-text predicate |
 | t02-notepad-two-round-edit | long_horizon_state_tracking | yes | yes | two edit rounds + saves; file predicate |
-| t03-notepad-moved-window-recovery | verification | yes | yes | moved-window fault; recovery exercised |
+| t03-notepad-moved-window-recovery | verification | yes | yes | moved-window fault; typed verification failure returned to the host |
 | t04-calculator-decimal-entry | visual_spatial_precision | yes | yes | precise small-target clicks |
 | t05-calculator-keyboard-compute | verification | yes | yes | 7*6=42 via keyboard |
 | t06-browser-open-local-page | verification | no | yes | window-state title verification |

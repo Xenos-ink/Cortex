@@ -15,7 +15,7 @@ alias, computer_execute); the sealed checkpoint/resume machinery on start_sessio
 survives. This document describes the code as it exists
 at the open-source release HEAD; every claim is traceable to a named module under
 `src/computer_use_mcp/` (or `benchmarks/`, `tests/e2e/`) and, where noted, to the test
-suite (standard suite: **1375 passed, 8 skipped** at the internals-removal HEAD; the
+suite (standard suite: **1376 passed, 8 skipped** at the internals-removal HEAD; the
 skips are the gated
 real-Windows E2E desktop tests, skipped BY DEFAULT by the D6 fail-closed gate;
 `ruff check src tests benchmarks` clean at HEAD;
@@ -32,8 +32,9 @@ types — include the wave's additive members).
 - Single Python package, `src/` layout, stdio MCP server built on FastMCP (`server.py`).
   The MCP server registers under the name `Cortex` (`FastMCP("Cortex")`); the pip
   package stays `computer-use-mcp`, the Python package `computer_use_mcp`, and
-  `pyproject.toml` installs two console scripts — `cortex` and `computer-use-mcp` —
-  pointing at the same entry point (`computer_use_mcp.server:main`).
+  `pyproject.toml` installs three console scripts — `cortex` and `computer-use-mcp`
+  (both pointing at `computer_use_mcp.server:main`) and `cortex-mcp` (pointing at
+  `computer_use_mcp.cli:main`).
 - Windows-first execution (`LocalComputerBackend`); a faithful in-memory
   `FakeComputerBackend` implements the same contracts for tests and non-Windows import.
 - Python >= 3.11; runtime deps: `mcp`, `pydantic`, `Pillow`, `mss`, `pyautogui` (pyautogui is now the SELECTABLE FALLBACK input engine; the default physical-input path is raw Win32 `SendInput` via stdlib ctypes — PERF-004)
@@ -41,7 +42,7 @@ types — include the wave's additive members).
 - Version: `0.6.0` (`__init__.py`; `pyproject.toml` aligned to the same value).
 - PERF-004 release: interference guards, SendInput engine, verification ladder, run-log — see VERSIONS.md and ROADMAP.md.
 - Test/benchmark layout: `tests/` unit+integration (fakes); `tests/e2e/` real-Windows
-  E2E gated behind `CUMCP_RUN_E2E=1` (10 tests: 7 desktop + 3 benchmark-harness that
+  E2E gated behind `CUMCP_RUN_E2E=1` (11 tests: 8 desktop + 3 benchmark-harness that
   run unconditionally); `benchmarks/` harness with `--mode fake` / `--mode env`
   (NO score claims). E2E runs generate evidence locally under `evidence/e2e/` (see
   §13); those artifacts are machine-local test outputs, not shipped documentation.
@@ -68,7 +69,7 @@ observation.py     capture orchestration + digest    → backend, models
 grounding.py       GroundingStrategy protocol +      → models
                    coordinate/region impls + OCR/UIA stubs
 validator.py       staleness/binding/allowlists      → models
-verification.py    6 verification strategies         → models (+PIL)
+verification.py    8 verification strategies         → models (+PIL)
 provider.py        doctrine prompt, fail-closed      → models, redaction
                    parsing, lazy key, judge endpoint
 safety.py          RiskLevel contextual engine       → models
@@ -331,21 +332,26 @@ budget gated it instead). All of this accounting died with the loop; the survivi
 ## 8. Limits (`limits.py`)
 
 Defaults per master mission §6; `Limits.validate()` clamps into safe ranges and
-`LimitExceeded` (carrying the field name) terminates the task cleanly. The table lists
-the 9 per-task limits enforced by `LimitEnforcer`; the same dataclass now carries 18
-fields total (the 9 session-level additions are listed below the table).
+`LimitExceeded` (carrying the field name) terminates the task cleanly. The dataclass
+carries 18 fields total; **live enforcement on the direct five-tool path covers
+exactly three of them**: the screenshot rate budget, the action budget, and the
+session cap. Every other `check_*` gate below (task duration, retries, recovery
+budget, model calls, context items) had its call site in the removed internal loop —
+the fields stay accepted and validated on the wire and are RESERVED since the
+internals-removal wave (v0.6.0), consistent with §3 and the README reserved-fields
+line.
 
 | Limit | Default | Clamp range | Enforced by |
 |---|---|---|---|
-| `max_task_seconds` | 900.0 | 1..3600 | `check_task_duration` (monotonic clock) |
-| `max_actions` | 100 | 1..500 | `check_action` before execution |
-| `max_retries_per_action` | 5 | 0..5 | `check_retry` in same-instance retry |
-| `max_recovery_per_action` | 2 | 0..10 | recovery budget check |
-| `max_recovery_per_task` | 6 | 0..50 | recovery budget check |
-| `max_model_calls` | 60 | 1..1000 | `check_model_call` before DECIDE |
-| `min_screenshot_interval_ms` | 250 | 0..60000 | rate gate in `_observe` (wait ≤ 2 s then fail); PERF-004 C2: protects FRESH observations only (`loop_top`/`direct_request`); intra-step captures (`validate`, `post_action`, `revalidate`) are burst-exempt via `record_burst_screenshot` (still counted + pace-stamped) |
-| `max_context_items` | 50 | 1..1000 | `check_context_items` before provider call |
-| `max_sessions` | 4 | 1..64 | `SessionRegistry` (fail-closed refusal, no eviction) + `check_session_count` |
+| `max_task_seconds` | 900.0 | 1..3600 | RESERVED — `check_task_duration` (monotonic clock) had no call site since the loop's removal |
+| `max_actions` | 100 | 1..500 | LIVE — `check_action` before execution (`agent.py`) |
+| `max_retries_per_action` | 5 | 0..5 | RESERVED — `check_retry` gated same-instance retries of the removed loop |
+| `max_recovery_per_action` | 2 | 0..10 | RESERVED — recovery budget died with the loop |
+| `max_recovery_per_task` | 6 | 0..50 | RESERVED — recovery budget died with the loop |
+| `max_model_calls` | 60 | 1..1000 | RESERVED — `check_model_call` gated the removed DECIDE phase |
+| `min_screenshot_interval_ms` | 250 | 0..60000 | LIVE — rate gate via `can_screenshot` on the direct path's FRESH captures (wait ≤ 2 s then fail); intra-call captures (`validate`, `post_action`, `revalidate`) are burst-exempt via `record_burst_screenshot` (still counted + pace-stamped) |
+| `max_context_items` | 50 | 1..1000 | RESERVED — `check_context_items` gated the removed provider call |
+| `max_sessions` | 4 | 1..64 | LIVE — `SessionRegistry` (fail-closed refusal, no eviction) |
 
 `start_session(limits=…)` accepts a dict of these field names; unknown names or
 non-numeric values are rejected fail-closed (`invalid_limits`).
@@ -445,7 +451,9 @@ snapshot per call; on the five-tool surface the registry is read at the bundle s
 Error convention: typed failures return structured payloads `{"ok": false, "error":
 <code>, "message": …}` (codes: `task_stopped`, `limit_exceeded` + `limit`,
 `session_limit_exceeded` + `max_sessions`, `session_stopped`, `unknown_session` +
-`session_id`, `invalid_limits`, `invalid_action`, `action_error`) — no tracebacks
+`session_id`, `invalid_limits`, `invalid_action`, `action_error`,
+`invalid_interference`, `invalid_image_delivery`, `invalid_checkpoint`,
+`resume_refused`) — no tracebacks
 leak. Stopped sessions (F7) refuse identically regardless of which flavor armed the
 stop: `stop_session` and an internally-armed kill path both route through the shared
 `_close_stopped_bundle` cleanup (bundle removed from the store AND the registry, a
@@ -636,7 +644,7 @@ per `start_session`; tests monkeypatch them and inspect wiring via `_get_bundle`
 (Notepad, classic Calculator, Microsoft Edge on a local page) through the runtime's own
 MCP tool surface (`start_session` → `computer_observe` → `computer_execute`; all E2E
 tests were RETARGETED to the five-tool surface in the loop-removal wave) — no
-vision model, no network. 10 tests total:
+vision model, no network. 11 tests total: 8 desktop + 3 harness.
 
 | Test | What it proves |
 |---|---|
@@ -647,6 +655,7 @@ vision model, no network. 10 tests total:
 | `test_calculator_clicks_and_display_verification` | grounded clicks + display-predicate verification |
 | `test_calculator_division_precision` | precise small-target clicks, verified display value |
 | `test_browser_local_page_window_state_verification` | local page in Edge verified via window state |
+| `test_right_click_opens_real_context_menu` | additive `right_click` action opens a real context menu on the live desktop |
 | `test_benchmark_harness.py` (3 tests, NOT e2e-marked) | benchmark runner validation in fake mode; runs in the standard suite |
 
 Gate mechanics (`tests/e2e/conftest.py`, hardened by D6/R-8): desktop tests carry
@@ -693,9 +702,11 @@ Measured environment findings (documented, not silently worked around):
    for application-internal state.
 3. Window-bounds-only moves do NOT trip `STALE_OBSERVATION` (staleness checks hwnd/
    pid/process/monitor identity/dimensions/coordinate space — not window bounds);
-   the moved-window test shows semantic verification catching the miss
-   (`WRONG_WINDOW` → bounded recovery) while window-switch exercises the true
-   staleness rejection.
+   the moved-window test shows semantic verification catching the miss and returning
+   the typed failure to the host, which re-grounds from a fresh observation (the
+   loop-era bounded-recovery module was removed in v0.6.0 — no auto-recovery; only
+   `STALE_OBSERVATION` still auto-retries once on the direct path) while window-switch
+   exercises the true staleness rejection.
 4. `LocalComputerBackend`'s DPI fallback ladder can downgrade a pre-set
    per-monitor-v2 process to "system" awareness; the backend must be the first
    awareness setter in a process. On this single-monitor box (system DPI == monitor

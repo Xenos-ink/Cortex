@@ -10,7 +10,7 @@ the provider decide/plan/summarize endpoints, the summarizer plumbing, the subta
 mutation APIs, and the plan-validator classes — are gone; the limits fields stay
 accepted and validated, documented as reserved).
 Every live rule below is enforced in a named module and exercised by the test suite
-(standard suite: **1375 passed, 8 skipped** at the internals-removal HEAD; the skips
+(standard suite: **1376 passed, 8 skipped** at the internals-removal HEAD; the skips
 are the gated real-Windows E2E desktop tests; observed on the reference machine).
 Companion documents: `README.md` (English capability statement),
 `docs/ARCHITECTURE.md` (module map, contracts, limits, audit, E2E/benchmark layout).
@@ -283,10 +283,14 @@ layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_reject
 
 ## 8. Limits and resource isolation
 
-- **9 hard limits** with safe defaults and clamping (`limits.py`; full table in
-  `docs/ARCHITECTURE.md` §8): task 900 s, 100 actions, 5 retries/action, 2+6 recovery,
-  60 model calls, 250 ms screenshot interval, 50 context items, 4 sessions. Trips
-  raise `LimitExceeded` → audited clean termination (fail safely).
+- **Hard limits** with safe defaults and clamping (`limits.py`; full table in
+  `docs/ARCHITECTURE.md` §8): on the direct five-tool path the tripping gates are the
+  screenshot rate budget (`min_screenshot_interval_ms`), the action budget
+  (`max_actions`), and the session cap (`max_sessions` — a new session at capacity is
+  refused, never evicting a live one). Trips raise `LimitExceeded` → audited clean
+  termination (fail safely). The remaining fields of the limits family are accepted,
+  validated, and clamped on the wire but are RESERVED — not enforced since the
+  internal loop's removal (see §11.6).
 - **Unthrottled explicit observation (F5, accepted-by-design)**: the
   `min_screenshot_interval_ms` rate gate applies to the runtime's own capture paths.
   PERF-004 C2 refined semantics: the gate protects FRESH observations (the loop-top
@@ -402,18 +406,22 @@ layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_reject
 11. **Provider key handling assumes a local operator.** The key is read from process
     environment (`VISION_API_KEY`/`OPENAI_API_KEY`); anyone who can read the
     process environment can read the key.
-12. **Explicit observe calls are unthrottled (F5).** The screenshot rate gate covers
-    the internal loop only; `computer_observe`/`computer_screenshot` execute at
-    client discretion (measured ~46 captures/s) with one audit row per capture — a
-    misbehaving client can spend CPU and audit volume, though it cannot bypass any
-    safety gate (observation alone never acts).
+12. **Explicit observe calls are unthrottled (F5).** The screenshot rate gate does not
+    cover explicit observe calls: on the direct path it applies to FRESH captures in
+    `computer_execute` (the per-call grounding capture), while
+    `computer_observe`/`computer_screenshot` execute at client discretion (measured
+    ~46 captures/s) with one audit row per capture — a misbehaving client can spend
+    CPU and audit volume, though it cannot bypass any safety gate (observation alone
+    never acts).
 13. **Windows foregrounding is best-effort.** `SetForegroundWindow` can be refused by
     the OS (foreground-lock policy); `focus_window` detects a refusal by re-reading
     `GetForegroundWindow()` and fails with a typed `WindowFocusError` (a `BackendError`
-    subclass) — classified `UNKNOWN` by the recovery layer, so it terminates fail-closed
-    instead of retrying blindly. The previously-focused window is **not** restored on a
-    refusal; the caller re-observes actual window state and re-decides. Verification is
-    deterministic window state, so a refused focus can never be reported as `verified`.
+    subclass) — the host receives the typed outcome and re-grounds from a fresh
+    observation; there is no blind retry (the loop-era recovery layer that classified
+    it `UNKNOWN` was removed in v0.6.0). The previously-focused window is **not**
+    restored on a refusal; the caller re-observes actual window state and re-decides.
+    Verification is deterministic window state, so a refused focus can never be
+    reported as `verified`.
 14. **Typed-text integrity and the backslash-type wedge (input engine).** `type`
     actions are chunk-dispatched and verified once at end-of-action by reading the
     focused control's value back (a single fixed-buffer `WM_GETTEXT`, or UIA
@@ -444,7 +452,7 @@ layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_reject
     failure, never a silent partial dispatch.
 15. **Safety/guard residuals from the v0.6.0 internal red team (bounded, routed).**
     The red team found no release-blocking issue; the residuals below are
-    pre-existing or bounded and are routed to ROADMAP R-21/R-22 (full repro
+    pre-existing or bounded and are routed to ROADMAP R-21/R-22/R-23 (full repro
     steps and artifacts in the maintainer-local
     `evidence/v06-006/redteam/report.md`): destructive verbs in polite phrasings
     can type at LOW risk (RT-E8-01); space-separated or abbreviated credential
