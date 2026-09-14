@@ -98,7 +98,7 @@ If a previous (pre-D6-hardening) run typed into windows you had open, search you
 open documents for these strings and delete the stray text:
 
 - Notepad typing: `e2e-typed-7391 quick brown fox`
-- Notepad moved-window recovery: `moved-window-recovered-7391`
+- Notepad moved-window typed-failure: `moved-window-recovered-7391`
 - Notepad stale-observation: `stale-reject-marker-7391`
 - Browser page title (a tab title, harmless, close the tab): `E2E Browser Verification Page`
   (post-hardening titles carry a run-unique `cumcp-e2e-...` token after this prefix)

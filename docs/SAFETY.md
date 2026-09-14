@@ -293,12 +293,12 @@ layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_reject
   internal loop's removal (see §11.6).
 - **Unthrottled explicit observation (F5, accepted-by-design)**: the
   `min_screenshot_interval_ms` rate gate applies to the runtime's own capture paths.
-  PERF-004 C2 refined semantics: the gate protects FRESH observations (the loop-top
-  capture on a new step, host-driven `computer_execute` observes, recovery
-  re-observes); intra-step verification captures (staleness probe, post-action,
+  PERF-004 C2 refined semantics: the gate protects FRESH observations (on the direct
+  path, the per-call grounding/validation capture of a `computer_execute`);
+  intra-call verification captures (staleness probe, post-action,
   P0-H revalidate) are burst-exempt but still recorded into the enforcer (count +
   pacing timestamp), so session-wide capture volume stays enforced and bounded
-  (per-step captures are structurally capped at one staleness probe + one post-action
+  (per-call captures are structurally capped at one staleness probe + one post-action
   capture). `computer_observe` / `computer_screenshot` remain explicit client tools
   with NO rate gate — measured ~46 captures/s, and every capture emits an audit row,
   so a hammering client can generate audit volume and CPU load at its own discretion.
@@ -343,8 +343,9 @@ layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_reject
   empty title never matches) → `window_not_allowed`; a target that cannot be resolved
   → `process_identity_unavailable` (process allowlist configured) /
   `window_identity_unavailable` (title allowlist configured). Every rejection reuses
-  the validator's typed errors and codes, so the recovery mapping is `WRONG_WINDOW`
-  throughout. Fail-closed; the
+  the validator's typed errors and codes, so the host receives the identical typed
+  rejection shape throughout (the removed recovery layer historically mapped these to
+  `WRONG_WINDOW`). Fail-closed; the
   backend never runs on a disallowed target, and no window is ever brought to the
   foreground to "check" it.
 - **Title demoted to fallback**: exact-title matching via `WindowInfo` is preferred;
@@ -379,8 +380,9 @@ layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_reject
    into a window the user has open.
 5. **Risk classification is heuristic.** Regex + context matching (English + limited
    Arabic) is not semantic understanding; novel phrasings may under-classify.
-   Compensations: approval-by-default for interactive actions, allowlists, bounded
-   recovery, and verification.
+   Compensations: approval-by-default for interactive actions, allowlists, typed
+   outcomes with host re-grounding (a fresh observation, never a blind retry), and
+   verification.
 6. **CRITICAL authorization is not operator-wired.** `authorized=True` exists at the
    policy API only; no MCP tool grants it, so CRITICAL is always blocked today (fail
    safe, but also fail unavailable).

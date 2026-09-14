@@ -133,7 +133,9 @@ expected_effect)` — one host-supplied action through the full per-action gate 
    `GroundingValidator.validate(..., current_observation=...)` enforces staleness
    against it (HWND/process/monitor/dimensions/space). The validation capture checks
    screen identity, not pixels, and never becomes the verification baseline.
-   Rejection → recovery (`codes` → FailureClass). When either allowlist is
+   Rejection → typed `rejected` outcome returned to the host, which re-grounds from a
+   fresh observation (the removed recovery layer historically mapped `codes` →
+   FailureClass). When either allowlist is
    configured and the action is a `focus_window`, the resolved target window is
    checked against BOTH **before** anything executes (`_focus_allowlist_rejection`):
    process/exe outside `allowed_processes` → `process_not_allowed`; title outside
@@ -721,8 +723,10 @@ through the server tool surface with a deterministic scripted provider; it runs 
 `--mode fake` (default) runs everything against `fakeworld.py`'s fake desktop;
 `--mode env` runs real applications on this box via `appwin.py` (Notepad / win32calc /
 Edge). Collected metrics per task: grounding strategy/confidence, per-action
-verification outcomes, recovery events by failure class, safety blocks (expected vs
-false), actions/task, model calls, and latency summaries. `benchmarks/results/` is
+verification outcomes, safety blocks (expected vs false), actions/task, model calls,
+and latency summaries. (The legacy `recovery_events`/`recovery_classes` output fields
+are still emitted but always zero — the loop-era recovery machinery was removed in
+v0.6.0.) `benchmarks/results/` is
 gitignored; a fake-mode validation run produces its artifact locally. One recorded
 validation run (run id
 `harness-validation-fake-001`: 9 tasks, 7 run, 2 `requires_env`, 7 completed,
