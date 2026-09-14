@@ -40,7 +40,13 @@ from computer_use_mcp.checkpoint_manager import (
 )
 from computer_use_mcp.context_manager import ContextManager
 from computer_use_mcp.limits import Limits, SessionBudgetTracker
-from computer_use_mcp.models import ActionType, ExecutionResult, GroundedAction
+from computer_use_mcp.models import (
+    ActionType,
+    ExecutionResult,
+    GroundedAction,
+    Subtask,
+    SubtaskStatus,
+)
 from computer_use_mcp.redaction import contains_secret
 from computer_use_mcp.subtask_manager import SubtaskManager
 
@@ -57,21 +63,35 @@ def make_limits(**overrides: Any) -> Limits:
 
 
 def make_subtask_manager() -> tuple[SubtaskManager, str, str, str]:
-    """Chain: first (completed, one result) <- second <- third (all stable ids returned)."""
-    manager = SubtaskManager()
-    first = manager.create("collect the source data")
-    second = manager.create("format the workbook", depends_on=[first.subtask_id])
-    third = manager.create("send the report", depends_on=[second.subtask_id])
-    manager.start(first.subtask_id)
-    manager.record_result(
-        first.subtask_id,
-        ExecutionResult(
-            ok=True,
-            action=GroundedAction(action=ActionType.WAIT),
-            message="collected 12 rows",
-        ),
+    """Chain: first (completed, one result) <- second <- third (all stable ids returned).
+
+    (Loop removal: entities are constructed directly and installed via ``restore`` —
+    SubtaskManager is the checkpoint/resume container; the create/start/record/complete
+    mutation APIs died with the loop. Same graph, same ids, same statuses.)
+    """
+    now = datetime.now(UTC)
+    first = Subtask(
+        subtask_id="sub-first",
+        description="collect the source data",
+        status=SubtaskStatus.COMPLETED,
+        started_at=now,
+        completed_at=now,
+        results=[
+            ExecutionResult(
+                ok=True,
+                action=GroundedAction(action=ActionType.WAIT),
+                message="collected 12 rows",
+            )
+        ],
     )
-    manager.complete(first.subtask_id)
+    second = Subtask(
+        subtask_id="sub-second", description="format the workbook", depends_on=["sub-first"]
+    )
+    third = Subtask(
+        subtask_id="sub-third", description="send the report", depends_on=["sub-second"]
+    )
+    manager = SubtaskManager()
+    manager.restore([first, second, third])
     return manager, first.subtask_id, second.subtask_id, third.subtask_id
 
 
@@ -88,15 +108,14 @@ def make_budget(limits: Limits) -> SessionBudgetTracker:
 
 
 def make_context() -> ContextManager:
-    context = ContextManager(goal="prepare the monthly report", summarize_every=10)
+    # (Loop removal: summarize_every/record_step fed the removed summarize cadence.)
+    context = ContextManager(goal="prepare the monthly report")
     context.set_current_task("formatting the workbook")
     context.set_app_window_state("notepad.exe focused: notes.txt")
     context.append_history("opened the source workbook")
     context.append_history("cleaned sheet 1")
     context.record_accomplishment("loaded the source data")
     context.record_error("row 42 skipped")
-    for _ in range(5):
-        context.record_step()
     return context
 
 
@@ -356,16 +375,19 @@ def test_checkpoint_redacts_secrets_before_disk(tmp_path: Path) -> None:
     manager = CheckpointManager(base_dir=tmp_path)
     limits = make_limits()
     subtasks = SubtaskManager()
-    seeded = subtasks.create("use api_key=supersecret123 carefully")
-    subtasks.start(seeded.subtask_id)
-    subtasks.record_result(
-        seeded.subtask_id,
-        ExecutionResult(
-            ok=True,
-            action=GroundedAction(action=ActionType.WAIT),
-            message="aws key AKIAABCDEFGHIJKLMNOP appeared in logs",
-        ),
+    # (Loop removal: seeded directly — the mutation APIs died with the loop.)
+    seeded = Subtask(
+        subtask_id="sub-secret",
+        description="use api_key=supersecret123 carefully",
+        results=[
+            ExecutionResult(
+                ok=True,
+                action=GroundedAction(action=ActionType.WAIT),
+                message="aws key AKIAABCDEFGHIJKLMNOP appeared in logs",
+            )
+        ],
     )
+    subtasks.restore([seeded])
     context = ContextManager(goal="ship it (password=hunter2secret)")
     context.append_history("auth header: bearer abcdefghijklmnopqrstuvwxyz012345")
     payload = manager.capture_payload(

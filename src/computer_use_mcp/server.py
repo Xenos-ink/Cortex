@@ -66,7 +66,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import inspect
 import io
 import json
 import logging
@@ -78,7 +77,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -172,8 +170,8 @@ class _LazyProvider:
     """Defers provider construction to the first model call (compat decision 5).
 
     Construction failures (legacy providers raising without an API key) are remembered
-    and surface as a fail-closed error at decide-time instead of breaking start_session;
-    the agent converts any provider failure into an audited, bounded recovery path.
+    and surface as a fail-closed error at judge-time (the only live model surface,
+    ``judge_change``) instead of breaking start_session.
     """
 
     def __init__(self, factory: Callable[[], Any]) -> None:
@@ -192,30 +190,6 @@ class _LazyProvider:
             raise RuntimeError(f"Vision provider unavailable (fail-closed): {self._unavailable}")
         return self._provider
 
-    async def decide(self, goal: str, observation: Any, history: list[str]) -> Any:
-        provider = self._resolve()
-        result = provider.decide(goal, observation, history)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
-
-    async def decide_full(self, goal: str, observation: Any, history: list[str]) -> Any:
-        provider = self._resolve()
-        delegate = getattr(provider, "decide_full", None)
-        if callable(delegate):
-            result = delegate(goal, observation, history)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
-        decision = await self.decide(goal, observation, history)
-        return SimpleNamespace(
-            decision=decision,
-            expected_effect=None,
-            verification_hint=None,
-            suspicious_content=None,
-            redactions_applied=[],
-        )
-
     def judge_change(self, before_b64: str, after_b64: str, expected_effect: str) -> Any:
         provider = self._resolve()
         delegate = getattr(provider, "judge_change", None)
@@ -224,28 +198,6 @@ class _LazyProvider:
                 "Provider does not expose judge_change; model-based verification is unavailable."
             )
         return delegate(before_b64, after_b64, expected_effect)
-
-    async def plan_subtasks(self, goal: str, **kwargs: Any) -> Any:
-        """Delegate the long-running planner call (lazy; typed failure without a key)."""
-        provider = self._resolve()
-        delegate = getattr(provider, "plan_subtasks", None)
-        if not callable(delegate):
-            raise TypeError("Provider does not expose plan_subtasks; planning is unavailable.")
-        result = delegate(goal, **kwargs)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
-
-    async def summarize_context(self, request: Any) -> Any:
-        """Delegate the bounded context summarizer (ContextManager falls back on failure)."""
-        provider = self._resolve()
-        delegate = getattr(provider, "summarize_context", None)
-        if not callable(delegate):
-            raise TypeError("Provider does not expose summarize_context.")
-        result = delegate(request)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
 
 
 @dataclass
@@ -1120,22 +1072,14 @@ def _build_runtime(
     *,
     goal: str = "",
     resume_bundle: ResumeBundle | None = None,
-    resumed: bool = False,
 ) -> LongRunningRuntime:
     """Construct the per-session orchestration runtime over the EXISTING bundle pieces."""
     provider = bundle.agent.provider
     if resume_bundle is not None:
-        # Restore the checkpoint's context into a FRESH ContextManager bound to the
-        # (lazy) provider summarizer — snapshot/restore is lossless per A3's contract.
-        context = ContextManager(
-            goal=resume_bundle.goal,
-            summarizer=(
-                (lambda request: provider.summarize_context(request))  # type: ignore[union-attr]
-                if provider is not None and hasattr(provider, "summarize_context")
-                else None
-            ),
-            summarize_every=resume_bundle.limits.context_summarize_every,
-        )
+        # Restore the checkpoint's context into a FRESH ContextManager — snapshot/
+        # restore is lossless per A3's contract. (The provider-bound summarizer plumbing
+        # was removed with the run_goal loop family.)
+        context = ContextManager(goal=resume_bundle.goal)
         context.restore(resume_bundle.context.snapshot())
         return LongRunningRuntime(
             session_id=bundle.context.session_id,
@@ -1155,8 +1099,10 @@ def _build_runtime(
             context=context,
             continuation_of=resume_bundle.continuation_identity,
             expected_environment=resume_bundle.environment,
-            resumed=resumed,
         )
+    # No-resume branch: production start_session only builds the runtime when RESUMING
+    # (sole production call site above); this branch survives as the module seam used by
+    # tests to arm a runtime on a plain session.
     return LongRunningRuntime(
         session_id=bundle.context.session_id,
         goal=goal,
@@ -1423,9 +1369,7 @@ def start_session(
             resume_bundle = _resume_manager.prepare(
                 resume_from_checkpoint, current_environment=current_environment
             )
-            runtime = _build_runtime(
-                bundle, goal="", resume_bundle=resume_bundle, resumed=True
-            )
+            runtime = _build_runtime(bundle, goal="", resume_bundle=resume_bundle)
         except Exception as exc:  # noqa: BLE001 - typed refusal, never a partial restore
             with _lock:
                 _bundles.pop(session_id, None)

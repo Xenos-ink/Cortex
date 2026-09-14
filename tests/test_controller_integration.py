@@ -34,25 +34,16 @@ from PIL import Image
 
 from computer_use_mcp import server
 from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.backend import DisplayUnavailableError, FakeComputerBackend, InputBlockedError
-from computer_use_mcp.limits import LimitExceeded, Limits
+from computer_use_mcp.backend import DisplayUnavailableError, FakeComputerBackend
+from computer_use_mcp.limits import LimitExceeded
 from computer_use_mcp.models import (
     AgentDecision,
-    FailureClass,
     GroundedAction,
     SessionState,
     TextRegion,
-    VerificationResult,
     WindowInfo,
 )
-from computer_use_mcp.recovery import (
-    RecoveryContext,
-    RecoveryController,
-    RecoveryStrategy,
-    classify_failure,
-)
-from computer_use_mcp.state import SessionRegistry, TaskStopped
-from computer_use_mcp.validator import StaleObservationError, ValidationOutcome
+from computer_use_mcp.state import SessionRegistry
 
 # --- fakes ---------------------------------------------------------------------------------
 
@@ -349,8 +340,8 @@ async def test_wait_action_uncertain_verification_is_tolerated(
 # provider coordinates, moved-UI re-decide, blocked-UI dismiss + same-instance retry,
 # failed-verification recovery-budget exhaustion) — all loop-exclusive behavior that
 # died with the loop. What SURVIVES on the direct surface, pinned elsewhere:
-#   - the failure CLASSIFICATION mapping and RecoveryController decision table:
-#     test_failure_classification_mapping + test_recovery_controller_mapping_table below;
+#   - the failure-classification mapping and the recovery decision table:
+#     REMOVED with the loop in the internals-removal wave (see the placeholder below);
 #   - staleness on the direct path: ONE automatic re-observe + re-validate (P0-H),
 #     then a typed rejection — pinned by test_perf004 test_run_single_audits_staleness_proof
 #     and the validator suites (test_coordinate_pipeline unverifiable-space pin);
@@ -629,58 +620,13 @@ async def test_computer_execute_dry_run_never_executes(
     assert backend.executed == []
 
 # --- recovery unit contract (mapping table) --------------------------------------------------------
-
-
-def test_failure_classification_mapping() -> None:
-    source = ScriptedBackend(active_window=WindowInfo(hwnd=1, pid=1, process_name="a.exe", title="Main")).observe()
-    after_auth = ScriptedBackend(active_window=WindowInfo(hwnd=2, pid=2, process_name="b.exe", title="Sign in")).observe()
-    after_dialog = ScriptedBackend(active_window=WindowInfo(hwnd=2, pid=2, process_name="b.exe", title="Confirm Delete")).observe()
-    after_window = ScriptedBackend(active_window=WindowInfo(hwnd=2, pid=2, process_name="b.exe", title="Totally Other App")).observe()
-    after_nav = ScriptedBackend(active_window=WindowInfo(hwnd=1, pid=1, process_name="a.exe", title="Settings")).observe()
-
-    assert classify_failure(TaskStopped("stop")) is None  # a stop is not a failure
-    assert classify_failure(StaleObservationError("active_window_hwnd")) is FailureClass.STALE_COORDINATES
-    assert classify_failure(InputBlockedError("blocked")) is FailureClass.BLOCKED_UI
-    assert classify_failure(ValidationOutcome(valid=False, reasons=["x"], codes=["point_out_of_bounds"])) is FailureClass.STALE_COORDINATES
-    assert classify_failure(ValidationOutcome(valid=False, reasons=["x"], codes=["process_not_allowed"])) is FailureClass.WRONG_WINDOW
-    assert classify_failure(VerificationResult(outcome="failed", changed=False, note="n"), RecoveryContext(source_observation=source, after_observation=after_auth)) is FailureClass.AUTH_REQUIRED
-    assert classify_failure(VerificationResult(outcome="failed", changed=False, note="n"), RecoveryContext(source_observation=source, after_observation=after_dialog)) is FailureClass.UNEXPECTED_DIALOG
-    assert classify_failure(VerificationResult(outcome="failed", changed=False, note="n"), RecoveryContext(source_observation=source, after_observation=after_window)) is FailureClass.WRONG_WINDOW
-    assert classify_failure(VerificationResult(outcome="failed", changed=False, note="n"), RecoveryContext(source_observation=source, after_observation=after_nav)) is FailureClass.NAVIGATION_DRIFT
-    assert classify_failure(VerificationResult(outcome="failed", changed=False, note="n"), RecoveryContext(source_observation=source, after_observation=source)) is FailureClass.MOVED_UI
-    assert classify_failure(VerificationResult(outcome="uncertain", changed=False, note="n")) is FailureClass.LOW_CONFIDENCE
-    assert classify_failure(ValueError("mystery")) is FailureClass.UNKNOWN
-
-
-def test_recovery_controller_mapping_table() -> None:
-    controller = RecoveryController(Limits())
-
-    stale = controller.handle(FailureClass.STALE_COORDINATES, RecoveryContext(phase="validate"))
-    assert stale.strategy is RecoveryStrategy.RECOVER_REOBSERVE
-    assert stale.redecide is True and stale.retry_same_instance is False
-
-    blocked = controller.handle(FailureClass.BLOCKED_UI, RecoveryContext(phase="execute"))
-    assert blocked.strategy is RecoveryStrategy.RECOVER_DISMISS
-    assert blocked.dismiss is True and blocked.retry_same_instance is True
-    denied_dismiss = controller.handle(
-        FailureClass.BLOCKED_UI, RecoveryContext(phase="execute", dismiss_allowed=False)
-    )
-    assert denied_dismiss.strategy is RecoveryStrategy.REPLAN
-
-    assert controller.handle(FailureClass.AUTH_REQUIRED).strategy is RecoveryStrategy.TERMINATE_SAFELY
-    assert controller.handle(FailureClass.AUTH_REQUIRED).termination_reason.value == "blocked_safety"
-    assert controller.handle(FailureClass.ALREADY_COMPLETED).strategy is RecoveryStrategy.COMPLETE
-    assert controller.handle(FailureClass.APP_CRASH).strategy is RecoveryStrategy.REPLAN
-    assert controller.handle(FailureClass.UNRECOVERABLE).strategy is RecoveryStrategy.TERMINATE_SAFELY
-    assert controller.handle(FailureClass.UNKNOWN).strategy is RecoveryStrategy.TERMINATE_SAFELY
-    low = controller.handle(FailureClass.LOW_CONFIDENCE, RecoveryContext(phase="verify"))
-    assert low.strategy is RecoveryStrategy.RETRY_ONCE and low.then_replan is True
-    exhausted = controller.handle(
-        FailureClass.MOVED_UI,
-        RecoveryContext(phase="verify"),
-    )
-    # No live enforcer -> static limits only; with a fresh controller the budget is open.
-    assert exhausted.strategy is RecoveryStrategy.RECOVER_REOBSERVE
+# REMOVED (loop removal): test_failure_classification_mapping and
+# test_recovery_controller_mapping_table drove the recovery classification helper and
+# its controller — the bounded recovery machinery was removed together with the
+# internal loop (recovery.py deleted). The classification/table rules are gone with it;
+# the direct surface never classifies failures into recovery plans (rejections are
+# reported as typed outcomes; stops propagate as TaskStopped). FailureClass enum values
+# remain on models.py for checkpoint/back-compat data.
 
 
 # --- W4-fix regression tests (D1-D4, D6, D7, D9) ---------------------------------------------
@@ -757,14 +703,23 @@ async def test_computer_observe_returns_image_content_block(
 
 
 async def test_pre_stopped_run_yields_failure_not_vacuous_ok() -> None:
-    """D2: a run on a stopped session must not report ok=True over an empty result list."""
+    """D2 (retargeted to the direct surface): a stopped agent performs NO work —
+    ``run_single`` returns an honest ``safety_denied`` outcome ("Session is stopped.")
+    before any dispatch: never a vacuous ok, never a partial result, zero inputs. The
+    response-level ``task_stopped``/``session_stopped`` shapes are pinned by the
+    stopped-session suites and test_p5_redteam RT4 (pre-stopped token blocks every
+    action family on the host path)."""
     state = SessionState(session_id="pre-stopped", stopped=True, dry_run=False)
     agent = ComputerUseAgent(FakeComputerBackend(), ScriptedProvider([]), session_id="pre-stopped")
-    results = await agent.run("goal", state)
+    agent.stop_token.stop()  # arm the kill path the way stop_session does
 
-    assert results, "a stopped run still yields a result entry"
-    assert all(item.ok is False for item in results)
-    assert agent.task.termination_reason.value == "stopped_by_user"
+    outcome = await agent.run_single(
+        state, GroundedAction(action="wait", delta=1, confidence=1.0)
+    )
+    assert outcome.kind == "safety_denied"
+    assert "stopped" in outcome.message.casefold()
+    assert outcome.result is None or outcome.result.ok is False
+    assert agent.backend.executed == []
 
 
 async def test_suspicious_content_persisted_in_audit_and_results(

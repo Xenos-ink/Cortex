@@ -4,15 +4,19 @@ Status: production-hardening Waves 1–5 landed (including the E6 defect round D
 the red-team fix round F1–F7), followed by the Cortex naming pass, the DRAG action, the
 compact-change verification upgrade, and the move/hotkey/focus_window actions (full
 pipeline support, allowlist-gated focus, deterministic verification), then the
-PERF-004 release, and finally the loop-removal wave (user order): the internal
-autonomous loop and its subtask-orchestration MCP tools are GONE — the server exposes
+PERF-004 release, the loop-removal wave (user order), and finally the
+internals-removal wave (v0.6.0): the internal autonomous loop and its
+subtask-orchestration MCP tools are GONE, and the loop's ORPHANED INTERNALS were
+removed with it (recovery.py / approval.py / health.py deleted; the agent decide-loop
+block, the provider decide/plan/summarize endpoints, the summarizer plumbing, the
+subtask mutation APIs, and the plan-validator classes removed) — the server exposes
 exactly five tools (start_session, stop_session, computer_observe, computer_screenshot
 alias, computer_execute); the sealed checkpoint/resume machinery on start_session
 survives. This document describes the code as it exists
 at the open-source release HEAD; every claim is traceable to a named module under
 `src/computer_use_mcp/` (or `benchmarks/`, `tests/e2e/`) and, where noted, to the test
-suite (standard suite: **1195 passed, 7 skipped** — count moves with the in-flight
-mission-056 tree; the skips are the gated
+suite (standard suite: **1375 passed, 8 skipped** at the internals-removal HEAD; the
+skips are the gated
 real-Windows E2E desktop tests, skipped BY DEFAULT by the D6 fail-closed gate;
 `ruff check src tests benchmarks` clean at HEAD;
 observed on the reference machine). The layered rules and pinned contracts come from the
@@ -34,7 +38,7 @@ types — include the wave's additive members).
   `FakeComputerBackend` implements the same contracts for tests and non-Windows import.
 - Python >= 3.11; runtime deps: `mcp`, `pydantic`, `Pillow`, `mss`, `pyautogui` (pyautogui is now the SELECTABLE FALLBACK input engine; the default physical-input path is raw Win32 `SendInput` via stdlib ctypes — PERF-004)
   (win32), `httpx`. No OCR/UIA engines are installed (deliberate non-goal; see §12).
-- Version: `0.5.9` (`__init__.py`; `pyproject.toml` aligned to the same value).
+- Version: `0.6.0` (`__init__.py`; `pyproject.toml` aligned to the same value).
 - PERF-004 release: interference guards, SendInput engine, verification ladder, run-log — see VERSIONS.md and ROADMAP.md.
 - Test/benchmark layout: `tests/` unit+integration (fakes); `tests/e2e/` real-Windows
   E2E gated behind `CUMCP_RUN_E2E=1` (10 tests: 7 desktop + 3 benchmark-harness that
@@ -68,15 +72,21 @@ verification.py    6 verification strategies         → models (+PIL)
 provider.py        doctrine prompt, fail-closed      → models, redaction
                    parsing, lazy key, judge endpoint
 safety.py          RiskLevel contextual engine       → models
-recovery.py        FailureClass taxonomy + bounded   → limits, models, state
-                   RecoveryController
-agent.py           closed-loop phase machine         → audit, backend, grounding,
-                   (ComputerUseAgent)                  limits, models, observation,
-                                                       recovery, safety, state,
-                                                       validator, verification
-server.py          10 MCP tools + wiring             → agent, audit, backend,
-                                                       limits, models, provider,
-                                                       safety, state (+ mcp SDK)
+agent.py           direct-action pipeline            → audit, backend, grounding,
+                   (ComputerUseAgent.run_single)       limits, models, observation,
+                                                       safety, state, validator,
+                                                       verification
+server.py          5 MCP tools + wiring              → agent, audit, backend,
+                                                       checkpoint_manager, limits,
+                                                       long_running, models, provider,
+                                                       resume_manager, safety, state,
+                                                       subtask_manager (+ mcp SDK)
+
+Removed modules (internals-removal wave, v0.6.0): `recovery.py`
+(RecoveryController/failure classification — the loop's bounded-recovery machinery),
+`approval.py` (ApprovalEpochManager — approval on the five-tool surface is the
+`approved` flag + safety policy), and `health.py` (HealthMonitor). Their historical
+contracts are archived in VERSIONS.md and the §6/§15 records below.
 ```
 
 Note: the plan sketched `limits → models, state`, `grounding → observation`, and
@@ -90,41 +100,35 @@ above is measured from the actual imports.
 |---|---|---|
 | Observation | `backend.py`, `observation.py` | `observation_id`, UTC `timestamp`, `MonitorInfo` (bounds/primary/DPI), `WindowInfo(hwnd,pid,process_name,exe_path,window_class,title,bounds)`, cursor localized to screenshot space, coordinate-space classification |
 | State construction | `state.py` | `TaskState` (goal, subgoal, plan_notes, histories as bounded deques, budgets, termination reason), `StopToken`, `SessionRegistry` (max 4, fail-closed refusal) |
-| Action proposal | `provider.py` | `decide_full` → `ProviderDecision`; five-channel doctrine prompt; strict pydantic parse; fail-closed on any garbage |
 | Perception/Grounding | `grounding.py` | `GroundingRouter` over `GroundingStrategy` implementations: coordinate (real), region descriptor (real), text-anchor (P1 stub), accessibility (P1 stub); fail-closed `UnsupportedGroundingError`. `NON_SPATIAL_ACTIONS` covers type, keypress, **hotkey** (carries `keys`), scroll, wait, done, **focus_window** (carries `target`) — grounded trivially with strategy `none`; point-bearing actions (click/double_click/**right_click**/drag/**move**) route to the coordinate strategy |
 | Action validation | `validator.py` | bounds, confidence floor, coordinate-space refusal, window/process allowlists, staleness + `source_observation_id` binding (`COORDINATE_ACTIONS` = click/double_click/**right_click**/drag/**move** — `move` binds its point like click, and `right_click` binds its point exactly like click); `missing_text`/`missing_keys`/`missing_target` (focus_window requires a non-empty `target`) |
 | Risk classification + policy + approval | `safety.py` | contextual LOW/MEDIUM/HIGH/CRITICAL; approval upgrade never downgraded; CRITICAL blocked pending explicit authorization; structured approval messages |
 | Execution | `backend.py` | `execute(action, stop)` — `StopToken.ensure_live()` before every physical input (per typing chunk / drag segment; the chunk size is engine-selected); interruptible 100 ms-sliced waits |
 | Post-action observation | `observation.py` | fresh capture, new `observation_id`; burst-exempt intra-step capture (PERF-004 C2) that is REUSED as the next loop-top observation (C1) |
-| Semantic verification | `verification.py` | `VerificationStrategy` chain; outcome ∈ {verified, failed, uncertain}; first definitive wins; all-uncertain combines into `uncertain`; model-judge intents run the cheap-first ladder `deterministic_tiers` → pixel diff → judge (PERF-004 C3) |
-| Recovery/Replanning | `recovery.py` + `agent.py` | FailureClass → bounded plan; re-observe + re-ground; never blind same-coordinate retry |
+| Semantic verification | `verification.py` | `VerificationStrategy` chain; outcome ∈ {verified, failed, uncertain}; first definitive wins; all-uncertain combines into `uncertain`; model-judge intents run the cheap-first ladder `deterministic_tiers` → pixel diff → judge (`provider.judge_change`, PERF-004 C3) |
 | Audit/Telemetry | `audit.py` | per-session JSONL with write-time redaction; `Metrics` counters + latency percentiles |
-| Limits | `limits.py` | 9 limit classes enforced centrally in `agent.py` (+ session cap in `server.py`/`state.py`) |
+| Limits | `limits.py` | `LimitEnforcer` gates the live capture/execute path (screenshot rate, action budget) in `agent.py` (+ session cap in `server.py`/`state.py`); the loop-era gates (task duration, model calls, context items, retries, recovery budget) died with the loop |
 
-## 4. Closed-loop phase machine (`agent.py`)
+## 4. Direct-action pipeline (`agent.py`)
 
-`ComputerUseAgent.run(goal, state, approval)` executes one task; `run_single(state,
-action, approved, expected_effect)` runs one client-supplied action through the same
-phases (`computer_execute`). Per iteration of `run`:
+**(Internals-removal wave, v0.6.0): the closed-loop phase machine `run(goal, state,
+approval)` — OBSERVE → DECIDE(model) → … → RECOVER/REPLAN — was REMOVED together with
+its helpers (`_decide`/`_call_provider`, the `_done/_blocked/_stopped` result
+builders, `_handle_failure`, the dismiss machinery, and the `RecoveryController`
+wiring).** The LIVE path is `ComputerUseAgent.run_single(state, action, approved,
+expected_effect)` — one host-supplied action through the full per-action gate chain
+(`computer_execute`). Per call:
 
-1. **Loop-top checks** — stop token (`ensure_live`), task duration (`check_task_duration`).
-2. **OBSERVE** (`_observe`) — rate-gated fresh capture; while waiting for the
-   screenshot gate the stop token is polled every 50 ms (max 2 s, then `LimitExceeded`).
-   Audited `observation`; `screenshot_count` + `observation_ms` recorded.
-3. **DECIDE** (`_decide`) or reuse a `pending` action from recovery — model call
-   wrapped fail-closed: any provider exception is audited, consumes the step, and
-   classifies as `LOW_CONFIDENCE` recovery (never raises out of `run`). After the call
-   the stop token is re-checked: a user stop outranks a just-arrived model decision.
-   Decision points: `status == "done"` → COMPLETED (honestly marked, F3: the
-   synthetic verification states the outcome is MODEL-ASSERTED with
-   `completion_evidence="model_declared"`, an explicit no-independent-evidence note,
-   and an audited `verification` event with result `model_declared`);
-   `status == "blocked"`/no action →
-   UNRECOVERABLE (a deliberate refusal is not replanned); otherwise continue.
-4. **GROUND** (`_ground`) — route grounding, attach `GroundingResult`, and for
+1. **OBSERVE** (`_observe`, phase `direct_request`) — rate-gated fresh capture
+   (`min_screenshot_interval_ms`; the screenshot-rate wait polls the stop token every
+   50 ms, max 2 s, then `LimitExceeded`). Audited `observation`; `screenshot_count` +
+   `observation_ms` recorded. Queued `follow_ups` reuse the previous item's post-action
+   capture (PERF-004 C1).
+2. **GROUND** (`_ground`) — route grounding, attach `GroundingResult`, and for
    coordinate actions bind `source_observation_id` to the grounding-source observation.
-   Failure → recovery.
-5. **VALIDATE** — a second fresh pre-execution observation is captured and
+   Failure → typed `rejected` outcome (audited).
+3. **VALIDATE** — a fresh pre-execution observation (R-5 identity-probe reuse where the
+   premise is millisecond-fresh) and
    `GroundingValidator.validate(..., current_observation=...)` enforces staleness
    against it (HWND/process/monitor/dimensions/space). The validation capture checks
    screen identity, not pixels, and never becomes the verification baseline.
@@ -136,26 +140,29 @@ phases (`computer_execute`). Per iteration of `run`:
    `_window_allowed`) → `window_not_allowed`; an unresolvable target →
    `process_identity_unavailable` (process allowlist configured) /
    `window_identity_unavailable` (title allowlist configured) — all fail closed with
-   the validator's typed rejection shape and `WRONG_WINDOW` recovery mapping, and the
-   backend never runs on a disallowed target.
+   the validator's typed rejection shape (historically mapped to `WRONG_WINDOW` by the
+   removed recovery layer), and the backend never runs on a disallowed target.
 6. **RISK/POLICY** (`_evaluate_safety`) — builds `SafetyContext` (goal, window/process
    identity, recent actions) and evaluates; a raising policy denies fail-closed.
-   Denied → `BLOCKED_SAFETY` termination.
-7. **APPROVAL** — when `requires_approval`: an approval already granted for THIS
-   action instance (`_approved_action_ids`) is honored without re-consuming budget;
-   otherwise the callback decides. Denied/unavailable → `APPROVAL_EXHAUSTED`.
+   Denied → typed `safety_denied` outcome (never executed).
+7. **APPROVAL** — when the policy `requires_approval` and the call did not pass
+   `approved=True`: typed `approval_required` outcome, zero dispatch (per-call
+   authorization; audited `approval` event). There is NO callback and NO approval
+   budget on the direct surface.
 8. **EXECUTE** — dry-run short-circuits with a stub result (`verified=False`, explicit
-   note). Otherwise `check_action`, stop check, `backend.execute(action, stop_token)`.
-   Execution exception → recovery.
+   `DRY-RUN` banner). Otherwise `check_action`, per-action scope reset, stop check,
+   guard pre-dispatch, `backend.execute(action, stop_token)`. Execution exceptions
+   surface as typed rejections/errors — there is no in-loop recovery.
 9. **RE-OBSERVE + VERIFY** (`_build_intent`, `_verify`) — fresh post-action
    observation; verification baseline is ALWAYS the grounding-source observation (the
-   pre-action one), fixing the prototype's baseline-shift bug. `verified` → continue;
-   `uncertain` on a `wait` action → continue with audited note (the single documented
-   carve-out); otherwise failure/uncertain → recovery.
-10. **RECOVER/REPLAN** (`_handle_failure`) — classify → `RecoveryPlan` → loop control
-    (see §6).
-11. **Terminal handling** — `finally` always: `task.terminate(reason)`, `task_ms`
-    latency, `session_stop` audit event with termination reason.
+   pre-action one), fixing the prototype's baseline-shift bug. `verified` →
+   `executed` outcome; `uncertain` on a `wait` action → honest `ok` with the
+   uncertain outcome carried (the single documented carve-out); any other
+   failed/uncertain verdict rides the result honestly — the HOST decides what to do
+   next (there is no replan step).
+10. **Outcome** — `SingleActionOutcome` (`executed` / `rejected` / `safety_denied` /
+    `approval_required` / `digest_surprise` / `error`) plus the additive
+    `follow_up_results` queue bookkeeping (PERF-004 C7).
 
 Verification-intent defaults (`_build_intent`; an explicit hint naming a
 `VerificationKind` always wins): `type` → `expected_text`; `move` → `predicate`
@@ -168,16 +175,15 @@ starts with a launch prefix ("open ", "launch ", "start ", "switch to ", "focus 
 `window_state`; everything else (click/double_click/right_click/drag/scroll/wait, and hotkey
 without a launch-prefix effect) → `visual_change`. When an expected effect is stated, a
 change is REQUIRED (unchanged screen = failed); with no stated expectation, pixels
-alone stay ambiguous (identical screen → `uncertain` → recovery).
+alone stay ambiguous (identical screen → `uncertain`, reported honestly to the host).
 
-Outer guards: `TaskStopped` → `STOPPED_BY_USER` + `emergency_stop` audit;
-`LimitExceeded` → `LIMIT_EXCEEDED` + `limit_exceeded` audit; any other exception →
-`UNRECOVERABLE` with a structured fail-closed result (never propagates out of `run`).
-Loop exhaustion without termination → `LIMIT_EXCEEDED`.
-
-`TerminationReason` (8 values, `models.py`): `completed`, `failed_verification`,
-`blocked_safety`, `approval_exhausted`, `limit_exceeded`, `stopped_by_user`,
-`unrecoverable`, `provider_error`.
+Outer guards on the direct path: a fired `TaskStopped` token refuses all work (typed
+`safety_denied`/"Session is stopped." at the agent seam; `task_stopped`/`session_stopped`
+at the server boundary); `LimitExceeded` propagates as the typed `limit_exceeded`
+error; any other exception → structured `error` outcome (fail-closed, no traceback).
+(The removed `run` mapped the same guards onto `TerminationReason`s and always
+terminated the task cleanly; `TerminationReason` itself survives on `TaskState`/models
+for checkpoint compatibility.)
 
 ## 5. Pinned contracts
 
@@ -254,9 +260,17 @@ and populates the winner exactly like `query_foreground_window`; backends withou
 window enumeration return `None` (the agent-level focus allowlist gate then fails
 closed with `process_identity_unavailable`).
 
-## 6. Recovery taxonomy (`recovery.py` + `models.FailureClass`)
+## 6. Recovery taxonomy — REMOVED (historical record; `recovery.py` deleted in v0.6.0)
 
-`classify_failure` recognizes sibling exceptions structurally (by class name: 
+The bounded recovery machinery below belonged to the removed internal loop: it
+classified failures and applied recovery plans between loop iterations. With the loop
+gone, `recovery.py` (classification + `RecoveryController` + the Escape-dismiss
+machinery) is DELETED; the five-tool surface reports typed outcomes to the host
+instead (a stale premise is a rejection, a stopped session refuses, a failed
+verification rides the result). The table is kept as the historical contract;
+`models.FailureClass` values survive as checkpoint/audit data vocabulary.
+
+Historical behavior (removed): `classify_failure` recognized sibling exceptions structurally (by class name: 
 `InputBlockedError`, `CoordinateSpaceError`, `StaleObservationError`,
 `DisplayUnavailableError`, `UnsupportedGroundingError`, provider errors) and validator
 `codes` — recovery stays below the controller and imports no siblings.
@@ -289,7 +303,8 @@ a successful dismiss also consumes action budget (`record_action`) while a faile
 increments `action_failure` only — keeping `action_total == action_success +
 action_failure`. Dismiss inputs are never gated by `check_action()`: the recovery
 machinery must not be blockable by the model-action budget (the bounded recovery
-budget gates it instead).
+budget gated it instead). All of this accounting died with the loop; the surviving
+`Metrics` registry keeps the counter NAMES for audit-compat data only.
 
 ## 7. StopToken / kill path
 
@@ -299,20 +314,19 @@ budget gates it instead).
 - One token per session, created in `SessionRegistry.create()` and held in
   `SessionContext`; the server arms it in `stop_session` (which also sets
   `state.stopped` and audits `stop` + `emergency_stop`).
-- Checked at: loop top; before each provider call; during the screenshot-rate wait
-  (50 ms polling); before validation capture; immediately before execution; inside
-  recovery dismiss attempts; before and between every physical input in
-  `backend.execute` (per typed character); inside waits sliced at 100 ms
-  (`_sleep_for_wait_action`, `interruptible_wait`).
+- Checked at: during the screenshot-rate wait (50 ms polling); immediately before
+  execution on the direct path; between queued `follow_ups` items; before and between
+  every physical input in `backend.execute` (per typed character); inside waits sliced
+  at 100 ms (`_sleep_for_wait_action`, `interruptible_wait`). (Loop-era checkpoints —
+  loop top, pre-provider-call, recovery dismiss attempts — died with the loop; a
+  stopped session now refuses ALL work at the session boundary.)
 - **The model can never reach the stop setter.** Enforcement: the token lives only in
   server-held session objects and the agent; the provider receives plain data (redacted
   strings, the pydantic `Observation`, `list[str]` history) — no object graph reaches
-  the token; provider output is parsed into a fixed-schema pydantic decision (data, no
-  callables); the agent re-checks the token right after the model responds so a model
-  "done" cannot outrank a stop; the approval callback receives only
-  `(GroundedAction, str)` copies. A thread-based test asserts zero further inputs after
-  a mid-run stop, and a dedicated test asserts the setter is unreachable from provider
-  output.
+  the token; no model output is processed at all on the five-tool surface (the host
+  supplies structured action specs, never envelopes with stop fields). The
+  model-output-cannot-reach-the-token guarantee is therefore structural on the direct
+  path.
 
 ## 8. Limits (`limits.py`)
 
@@ -339,8 +353,14 @@ non-numeric values are rejected fail-closed (`invalid_limits`).
 Long-running sessions add 9 session-level fields to the same `Limits` dataclass (18
 fields total): `max_session_seconds`, `max_session_actions`, `max_session_model_calls`,
 `max_session_steps`, `max_subtasks`, `context_summarize_every`, `approval_epoch_seconds`,
-`approval_epoch_actions`, `health_check_interval` — same clamping discipline, enforced by
-the `SessionBudgetTracker` / approval-epoch / health mechanisms (§15.11, §15.9, §15.8).
+`approval_epoch_actions`, `health_check_interval` — same clamping discipline.
+**RESERVED, NOT ENFORCED (internals-removal wave, v0.6.0): these fields are still
+ACCEPTED and VALIDATED on the wire exactly as before (`Limits.validate()` semantics
+unchanged; they are stored in checkpoints and re-clamped on resume), but they are not
+enforced on the direct five-tool path since the internal loop's removal** — the
+session-budget `SessionBudgetTracker` is restored on resume and its sealed-overshoot
+fail-closed gate stays live (§15.7), while the loop-era trip points (per-run budget
+checks, approval epochs, health checks, summarize cadence) no longer exist.
 
 ## 9. Audit + metrics (`audit.py`)
 
@@ -408,10 +428,12 @@ snapshot per call; on the five-tool surface the registry is read at the bundle s
    StopToken kill path and audits `stop` + `emergency_stop`.
 5. **Lazy provider key**: `start_session` never requires an API key. The server wraps
    the provider factory in `_LazyProvider` (construction deferred to the first model
-   call, failures remembered and surfaced fail-closed at decide-time), and
-   `OpenAICompatibleVisionProvider` resolves the key lazily (`api_key` argument →
-   `VISION_API_KEY` → `OPENAI_API_KEY`), raising typed `ProviderError` on first use
-   without a key. This is a dry-run usability fix, not a break.
+   call, failures remembered and surfaced fail-closed at judge-time — the only live
+   model surface), and `OpenAICompatibleVisionProvider` resolves the key lazily
+   (`api_key` argument → `VISION_API_KEY` → `OPENAI_API_KEY`). This is a dry-run
+   usability fix, not a break. (Internals-removal wave: the decide/plan/summarize
+   endpoints and their `_LazyProvider` delegates are gone; only `judge_change`
+   delegates.)
 6. **State compat**: `SessionState` fields, `step_count` persistence across calls,
    the `computer_screenshot` alias, `computer_observe`'s
    `{observation, digest, observation_id, active_app}` shape, and the
@@ -541,15 +563,15 @@ The three newer actions:
   `process_not_allowed`; title outside `allowed_windows` → `window_not_allowed`; an
   unresolvable target → `process_identity_unavailable` (process allowlist) /
   `window_identity_unavailable` (title allowlist) — reusing the validator's typed
-  rejection shape (→ `WRONG_WINDOW` recovery mapping throughout). The Win32
+  rejection shape (the removed recovery layer historically mapped these to
+  `WRONG_WINDOW`). The Win32
   sequence restores the window when minimized (`IsIconic` → `ShowWindow(SW_RESTORE)`),
   performs the standard `AttachThreadInput` foreground switch with an ALT `keybd_event`
   nudge, then re-reads `GetForegroundWindow()` — if the foreground did not actually
-  move, the backend raises `WindowFocusError`, a typed `BackendError` deliberately
-  absent from recovery's structural name-sets: it classifies `UNKNOWN` → fail-closed
-  (`TERMINATE_SAFELY`, `unrecoverable` in the loop; `action_error` for direct calls),
-  never a blind retry. Documented residual: the previously-focused window is NOT
-  restored on a refusal — the caller re-observes actual state and re-decides.
+  move, the backend raises `WindowFocusError`, a typed `BackendError`: on the direct
+  surface it surfaces as a typed `action_error` — never a blind retry. Documented
+  residual: the previously-focused window is NOT restored on a refusal — the host
+  re-observes actual state and decides the next action.
   Classified `MEDIUM` (`window_focus_change`) always; verified via deterministic
   `window_state` (active-window title contains the target), never pixels.
 
@@ -591,9 +613,10 @@ per `start_session`; tests monkeypatch them and inspect wiring via `_get_bundle`
   suite, which injects `WindowTextPredicateStrategy` (real Edit-control read via
   `WM_GETTEXT`) and `CalcDisplayPredicateStrategy` (real Calculator display Static read
   against a `calc_display_equals:<value>` marker) ahead of the default chain — see §13.
-- **Hierarchical planning seam**: `TaskState.subgoal` + bounded `plan_notes` exist and
-  the TASK STATE channel of the doctrine prompt renders them; a planner can be added
-  above the phase machine without contract changes.
+- **Hierarchical planning seam**: `TaskState.subgoal` + bounded `plan_notes` exist on
+  the state models (checkpoint-compatible); a planner can be layered above the direct
+  surface by a host without contract changes. (Internals-removal wave: the in-process
+  LLM planner — `plan_subtasks`/`PlanValidator` — was removed with the loop.)
 - **Benchmark runner**: landed as scaffolding — `benchmarks/runner.py` with
   `--mode fake` (default; `fakeworld.py` fake desktop) and `--mode env` (real apps via
   `appwin.py`), 9 task YAMLs (`benchmarks/tasks/`, JSON-compatible YAML 1.2 subset,
@@ -718,20 +741,29 @@ numbers, not performance claims; scores require a real vision-provider run.
 
 ## 15. Long-Running Runtime (orchestration layer)
 
-**STATUS (loop-removal wave, user order): the subtask orchestration layer's MCP
-tools were REMOVED** (the whole loop-era tool family —
-including the auto-subtask entry points). What SURVIVES in production code and remains
-fully wired: the sealed checkpoint/resume machinery (`checkpoint_manager.py`,
-`resume_manager.py`, `context_manager.py`) and the shared `SessionBudgetTracker`
-restoration on `start_session(resume_from_checkpoint=…)` — the §15.6/§15.7 contracts
-below are live behavior; §15.2–§15.5, §15.9 epoch gates, and the subtask-execution
-machinery of §15.10–§15.12 describe the retained modules and their contracts but are no
-longer reachable from any tool (the domain modules and their tests remain; the
-checkpoint seal and budget cross-checks are pinned in tests/test_checkpoint_integrity.py
-and tests/test_subtask_domain.py). Historically the layer orchestrated goals too large
-for one call: a goal decomposed into subtasks executed sequentially through the §4
-executor; session state persisted server-side between MCP calls; checkpoints on disk
-allowed stop/resume.
+**STATUS (loop-removal wave, completed by the v0.6.0 internals-removal wave): the
+subtask orchestration layer's MCP tools AND its orphaned internals are REMOVED.**
+Removed with the loop: `approval.py` (approval epochs, §15.9) and `health.py`
+(§15.8) as whole modules; `long_running.py` reduced to the per-session checkpoint
+owner (`capture_checkpoint_payload`/`checkpoint`/`checkpoint_due` + the component
+holders — no execution, no planning, no gates); the subtask MUTATION/transition APIs
+(create/start/complete/fail/pause/resume/requeue, result + recovery bookkeeping, the
+fixed TRANSITIONS table — §15.2/§15.3); the plan validator classes (§15.4 — only the
+pure `find_cycle`/`contains_control_characters` helpers survive, live via
+`checkpoint_manager.py`); the context summarizer plumbing (§15.5 — `summarize`,
+`record_step`, summarizer callables; the deterministic bounded summary and the
+snapshot/restore round-trip remain); the agent `set_enforcer` seam (§15.10); and the
+provider decide/plan/summarize endpoints. What SURVIVES fully wired in production:
+the sealed checkpoint/resume machinery (`checkpoint_manager.py`, `resume_manager.py`,
+`context_manager.py` snapshot/restore) and the shared `SessionBudgetTracker`
+restoration + sealed-overshoot gate on `start_session(resume_from_checkpoint=…)` —
+the §15.6/§15.7 contracts below are live behavior; §15.1–§15.5 and §15.8–§15.12 are
+historical records of the removed machinery (the tests pin whatever survives at the
+checkpoint/resume seam; the seal and budget cross-checks are pinned in
+tests/test_checkpoint_integrity.py and tests/test_subtask_domain.py). Historically the
+layer orchestrated goals too large for one call: a goal decomposed into subtasks
+executed sequentially through the §4 executor; session state persisted server-side
+between MCP calls; checkpoints on disk allowed stop/resume.
 
 ### 15.1 Layering and the single-executor invariant
 
@@ -973,11 +1005,15 @@ expectations, and a pre-flight checklist (`checkpoint_valid`, `limits_preserved`
   session is discarded and nothing partially restores. The server reads the current
   environment from a real backend observation; a failed observation yields empty identity
   fields, which fail closed.
-- **Approval is never resurrected**: `ApprovalEpochManager.snapshot()` deliberately has
-  no restore counterpart; a resumed session must obtain fresh approval via an explicit
-  grant (an MCP call with `approve_next_action=True`).
+- **Approval is never resurrected**: the removed `ApprovalEpochManager` deliberately
+  had no restore counterpart; on the five-tool surface every call carries its own
+  per-call `approved` authorization, so a resumed session starts with NOTHING granted
+  (fresh-approval doctrine, now structural).
 
-### 15.8 Health Monitor (`health.py`)
+### 15.8 Health Monitor — REMOVED (historical record; `health.py` deleted in v0.6.0)
+
+The module below was removed with the loop (nothing constructs a `HealthMonitor`).
+Historical design, for the record:
 
 Boundary-evaluated environment verification — no background thread, no scheduler, not a
 second execution loop (the monitor holds no action executor and never performs actions).
@@ -1002,7 +1038,11 @@ second execution loop (the monitor holds no action executor and never performs a
   `DEGRADED` → ONE bounded re-evaluation, then pause if still not healthy. Probe-supplied
   strings are redacted and bounded in the result.
 
-### 15.9 Approval Epochs and the unattended modifier (`approval.py`)
+### 15.9 Approval Epochs — REMOVED (historical record; `approval.py` deleted in v0.6.0)
+
+The module below was removed with the loop. The LIVE approval semantics on the
+five-tool surface are `safety.py requires_approval` + the per-call `approved` flag on
+`computer_execute` (§10 decision 3). Historical design, for the record:
 
 - **Dual-axis expiry**: an epoch expires when its wall-clock age reaches
   `Limits.approval_epoch_seconds` (default 1800 = 30 min, clamp 60..86400) OR its count
@@ -1031,14 +1071,14 @@ second execution loop (the monitor holds no action executor and never performs a
   new subtasks (the boundary epoch gate holds with an explicit `unattended_hold` reason
   until a fresh human grant).
 
-### 15.10 The agent seam: `set_enforcer`
+### 15.10 The agent seam: `set_enforcer` — REMOVED (historical record)
 
-The single justified change to the executor (`agent.py`): `ComputerUseAgent.set_enforcer(
-enforcer)` swaps the per-run `LimitEnforcer` and rebuilds the `RecoveryController` (which
-shares the enforcer's live counters). No loop phase, ordering, approval, or verification
-semantics change — this only re-binds which counters gate a run, giving each subtask a
-fresh per-subtask budget scope (SubtasksProtocol §3). Everything else in §4 is untouched;
-there is no second executor.
+`ComputerUseAgent.set_enforcer(enforcer)` (which also rebuilt the removed
+`RecoveryController`) died with the subtask-execution machinery in the
+internals-removal wave; no production caller remains. Historical note: it was the
+single justified change to the executor of its wave — it swapped the per-run
+`LimitEnforcer` to give each subtask a fresh budget scope, changing no loop phase,
+ordering, approval, or verification semantics.
 
 ### 15.11 Shared budgets, monotonic write-back, and the step cap
 

@@ -7,25 +7,20 @@ builds every model request payload via :meth:`ContextManager.build_request_paylo
 which exposes ONLY the compressed summary + the bounded recent window — never the full
 history. Every structure is bounded: recent history is a ``deque(maxlen=5..10)``; plan
 notes are a capped ``deque`` with safe per-note truncation; summary lists and strings
-are clamped. When the step count crosses ``context_summarize_every`` a summarization is
-due; the injectable summarizer callable (async-friendly; the orchestrator binds the LLM
-provider) produces the compressed summary, and on absence/failure a deterministic
-bounded fallback derived from tracked state is used instead — summarization never raises
-into the caller.
+are clamped. The LLM summarizer path (``summarize``/summarizer plumbing) was removed
+with the removed loop family; the deterministic bounded summary built from tracked
+state is what remains, and checkpoint/resume round-trips the summary untouched.
 """
 
 from __future__ import annotations
 
-import inspect
 import threading
 import unicodedata
 from collections import deque
-from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .limits import Limits
 from .redaction import redact_text
 
 RECENT_HISTORY_MIN = 5
@@ -114,25 +109,6 @@ class ContextSummary(BaseModel):
     summarized_step: int = 0
 
 
-class SummarizationRequest(BaseModel):
-    """Bounded input handed to the summarizer callable (never the full history)."""
-
-    goal: str = ""
-    previous_summary: ContextSummary | None = None
-    tracked: ContextSummary = Field(default_factory=ContextSummary)
-    recent_history: list[str] = Field(default_factory=list)
-    plan_notes: list[str] = Field(default_factory=list)
-    total_steps: int = 0
-    steps_since_summary: int = 0
-    max_summary_chars: int = SUMMARY_NOTES_MAX_CHARS
-
-
-SummarizerResult = ContextSummary | dict[str, Any] | str
-ContextSummarizer = Callable[
-    [SummarizationRequest], SummarizerResult | Awaitable[SummarizerResult]
-]
-
-
 def _bounded_summary(summary: ContextSummary, notes_max_chars: int) -> ContextSummary:
     """Return a redacted, clamped copy of ``summary`` (defense in depth vs summarizers)."""
     data = summary.model_dump()
@@ -158,38 +134,26 @@ def _bounded_summary(summary: ContextSummary, notes_max_chars: int) -> ContextSu
 class ContextManager:
     """Bounded context holder: compressed summary + rolling recent window (5-10 entries).
 
-    Thread-safe (RLock). The orchestrator records progress with :meth:`record_step`;
-    when the count crosses ``summarize_every`` (default: ``Limits.context_summarize_every``)
-    a summarization is due and :meth:`summarize` must be awaited. :meth:`summarize` never
-    raises: an absent, failing, or malformed summarizer result falls back to a
-    deterministic summary built from the tracked bounded state.
+    Thread-safe (RLock). The summary is the deterministic bounded projection of the
+    tracked state (the LLM summarizer path was removed with the removed loop family);
+    :meth:`snapshot`/:meth:`restore` round-trip it for checkpoint/resume.
     """
 
     def __init__(
         self,
         *,
         goal: str = "",
-        summarizer: ContextSummarizer | None = None,
-        summarize_every: int | None = None,
         recent_history_cap: int = RECENT_HISTORY_MAX,
         plan_notes_limit: int = PLAN_NOTES_LIMIT_DEFAULT,
         entry_max_chars: int = ENTRY_MAX_CHARS,
         note_max_chars: int = PLAN_NOTE_MAX_CHARS,
         summary_max_chars: int = SUMMARY_NOTES_MAX_CHARS,
     ) -> None:
-        self._summarize_every = (
-            int(summarize_every)
-            if summarize_every is not None
-            else Limits().validate().context_summarize_every
-        )
-        if self._summarize_every < 1:
-            raise ValueError("summarize_every must be >= 1")
         self._recent_cap = max(RECENT_HISTORY_MIN, min(RECENT_HISTORY_MAX, int(recent_history_cap)))
         self._plan_notes_limit = max(1, min(500, int(plan_notes_limit)))
         self._entry_max_chars = max(1, int(entry_max_chars))
         self._note_max_chars = max(1, int(note_max_chars))
         self._summary_max_chars = max(1, int(summary_max_chars))
-        self._summarizer = summarizer
         self._lock = threading.RLock()
         self._recent: deque[str] = deque(maxlen=self._recent_cap)
         self._plan_notes: deque[str] = deque(maxlen=self._plan_notes_limit)
@@ -274,18 +238,6 @@ class ContextManager:
         with self._lock:
             self._plan_notes.append(redacted)
 
-    # --- summarization trigger -----------------------------------------------------
-
-    def record_step(self) -> bool:
-        """Count one step; return True when a summarization is now due."""
-        with self._lock:
-            self._steps += 1
-            return self._steps - self._steps_at_last_summary >= self._summarize_every
-
-    def should_summarize(self) -> bool:
-        with self._lock:
-            return self._steps - self._steps_at_last_summary >= self._summarize_every
-
     # --- summarization ----------------------------------------------------------------
 
     def _tracked_summary(self) -> ContextSummary:
@@ -305,72 +257,6 @@ class ContextManager:
             fallback = self._tracked_summary()
             fallback.notes = safe_truncate(" | ".join(tail), self._summary_max_chars)
             return _bounded_summary(fallback, self._summary_max_chars)
-
-    def _coerce_summary(self, result: object) -> ContextSummary | None:
-        """Normalize a summarizer result; None -> caller uses the bounded fallback."""
-        if result is None:
-            return None
-        try:
-            if isinstance(result, ContextSummary):
-                base = result
-            elif isinstance(result, dict):
-                base = ContextSummary.model_validate(result)
-            elif isinstance(result, str):
-                base = self._tracked_summary()
-                base.notes = safe_truncate(redact_text(result)[0], self._summary_max_chars)
-                return _bounded_summary(base, self._summary_max_chars)
-            else:
-                return None
-        except Exception:  # noqa: BLE001 - malformed summaries must never propagate
-            return None
-        # Merge deterministic tracked state so required info is never lost to a partial
-        # summarizer result; tracked scalars win (they are controller-owned facts).
-        tracked = self._tracked_summary()
-        merged = ContextSummary(
-            current_goal=tracked.current_goal or base.current_goal,
-            current_task=tracked.current_task or base.current_task,
-            app_window_state=tracked.app_window_state or base.app_window_state,
-            notes=base.notes,
-        )
-        for name in _CATEGORY_NAMES:
-            items = list(getattr(tracked, name))
-            items += [item for item in getattr(base, name) if item not in items]
-            setattr(merged, name, items)
-        return _bounded_summary(merged, self._summary_max_chars)
-
-    def _build_request(self) -> SummarizationRequest:
-        with self._lock:
-            return SummarizationRequest(
-                goal=self._goal,
-                previous_summary=self._summary,
-                tracked=self._tracked_summary(),
-                recent_history=list(self._recent),
-                plan_notes=list(self._plan_notes),
-                total_steps=self._steps,
-                steps_since_summary=self._steps - self._steps_at_last_summary,
-                max_summary_chars=self._summary_max_chars,
-            )
-
-    async def summarize(self) -> ContextSummary:
-        """Summarize now; never raises (fallback on summarizer absence/failure)."""
-        request = self._build_request()
-        result: object = None
-        try:
-            if self._summarizer is not None:
-                outcome = self._summarizer(request)
-                if inspect.isawaitable(outcome):
-                    outcome = await outcome
-                result = outcome
-        except Exception:  # noqa: BLE001 - summarization failure must be non-fatal
-            result = None
-        summary = self._coerce_summary(result)
-        if summary is None:
-            summary = self._fallback_summary()
-        with self._lock:
-            summary.summarized_step = self._steps
-            self._summary = summary
-            self._steps_at_last_summary = self._steps
-            return summary
 
     # --- request payload (summary + recent window ONLY; never the full history) ----
 

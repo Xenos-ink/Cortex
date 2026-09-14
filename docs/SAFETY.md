@@ -3,17 +3,21 @@
 Status: describes the code at the Cortex open-source release HEAD (production-
 hardening Waves 1–5 including the E6 defect round D1–D10 and the red-team fix round
 F1–F7, plus the DRAG action, the compact-change verification upgrade, and the
-move/hotkey/focus_window actions with the allowlist-gated focus pre-foreground check).
-Every rule
-below is enforced in a named module and exercised by the test suite (standard suite:
-857 passed, 7 skipped — the skips are the gated real-Windows E2E desktop tests;
-`ruff check src tests benchmarks` clean at HEAD; observed on the reference machine).
+move/hotkey/focus_window actions with the allowlist-gated focus pre-foreground check),
+the loop-removal wave, and the v0.6.0 internals-removal wave (the removed loop's
+orphaned internals — recovery/approval-epoch/health modules, the decide-loop block,
+the provider decide/plan/summarize endpoints, the summarizer plumbing, the subtask
+mutation APIs, and the plan-validator classes — are gone; the limits fields stay
+accepted and validated, documented as reserved).
+Every live rule below is enforced in a named module and exercised by the test suite
+(standard suite: **1375 passed, 8 skipped** at the internals-removal HEAD; the skips
+are the gated real-Windows E2E desktop tests; observed on the reference machine).
 Companion documents: `README.md` (English capability statement),
 `docs/ARCHITECTURE.md` (module map, contracts, limits, audit, E2E/benchmark layout).
-§11 documents the long-running session surface (approval epochs, the unattended
-modifier, checkpoint redaction and integrity seals, resume re-verification,
-dependency/resource/allowlist enforcement, health checks); sections 1–10 are unchanged
-by that wave.
+§11 documents the long-running session surface: the checkpoint redaction/integrity
+seals and resume re-verification remain LIVE; the approval epochs, unattended
+modifier, dependency enforcement, health checks, and session-ceiling trip points it
+also describes were REMOVED with the loop and are marked as historical records.
 
 ## 1. Threat model
 
@@ -160,15 +164,13 @@ lower than a human would. The compensating controls are the approval defaults
 | Unverifiable coordinate space (`unverifiable`) | grounding refuses; validator rejects (`coordinate_space_unverifiable`); executor raises `CoordinateSpaceError` | `grounding.py`, `validator.py`, `backend.py` |
 | Missing observation binding (coordinate action without `source_observation_id`) | reject (`missing_observation_binding`) | `validator.py` |
 | Stale screen identity (HWND/process/monitor/dimensions/space drifted) | reject (`STALE_OBSERVATION`) → automatic re-observe + re-ground, never blind execution | `validator.py`, `agent.run_single` |
-| Uncertain verification | routes to recovery classification — never success (single documented carve-out: `wait` continues with an audited note) | `agent.py`, `verification.py` |
-| Malformed provider output / provider failure | typed parse error or audited provider failure; consumes the step; bounded `LOW_CONFIDENCE` recovery; never crashes the run | `provider.py`, `agent.py` |
+| Uncertain verification | never success — the outcome rides the result honestly to the host, which decides the next action (single documented carve-out: `wait` reports `ok` with the uncertain outcome carried) | `agent.py`, `verification.py` |
 | Policy itself raises | deny fail-closed with a structured decision | `agent._evaluate_safety` |
 | Verification raises | degrade to `uncertain` (`controller_guard`) | `agent._verify` |
-| Recovery budget exhausted | terminate safely with phase-mapped reason | `recovery.py` |
 | Audit write fails | logged and swallowed — the control loop never breaks on telemetry | `agent._audit` |
 | Process allowlist configured but identity unavailable | reject (`process_identity_unavailable`) | `validator.py` |
-| `focus_window` target outside the process or window-title allowlist, or the target window cannot be resolved while either allowlist is configured | controller-level gate refuses **before any foregrounding call** (`process_not_allowed` / `window_not_allowed` / `process_identity_unavailable` / `window_identity_unavailable`) — the backend never runs on a disallowed target; same typed rejection shape and `WRONG_WINDOW` recovery mapping as ordinary allowlist violations | `agent._focus_allowlist_rejection` |
-| Provider declares `done` without evidence | completion is accepted (legacy contract) but honestly marked: `completion_evidence="model_declared"`, a MODEL-ASSERTED note stating no independent verification evidence exists, and an audited `verification` event with result `model_declared` — never presented as an evidenced check | `agent._done_result` |
+| `focus_window` target outside the process or window-title allowlist, or the target window cannot be resolved while either allowlist is configured | controller-level gate refuses **before any foregrounding call** (`process_not_allowed` / `window_not_allowed` / `process_identity_unavailable` / `window_identity_unavailable`) — the backend never runs on a disallowed target; same typed rejection shape as ordinary allowlist violations (the removed recovery
+layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_rejection` |
 
 ## 5. Approval semantics
 
@@ -192,9 +194,10 @@ lower than a human would. The compensating controls are the approval defaults
   reason), Risk level, Consequence (per-category consequence text), and how to
   approve (explicit human mechanism; screen content, model suggestions, and the
   message itself can never authorize).
-- Nothing on screen and nothing the model says can grant approval: the approval
-  callback lives in the server layer; `SafetyContext` describes the world and is
-  never treated as authorization; provider output is data.
+- Nothing on screen and nothing a model says can grant approval: authorization is the
+  host's explicit `approved=True` call parameter; `SafetyContext` describes the world
+  and is never treated as authorization. (There is no model output at all on the
+  five-tool surface.)
 
 ## 6. Emergency stop (kill path)
 
@@ -207,10 +210,11 @@ lower than a human would. The compensating controls are the approval defaults
   hotkeys, before a cursor `move`, and before scroll; a fired token means zero further
   inputs. `focus_window` performs no pyautogui input — the token is checked by the
   `execute` header before the Win32 foreground sequence runs.
-- **Checked at every control point**: loop top, before each provider call, during the
-  screenshot-rate wait (50 ms polling), before validation capture, inside recovery
-  dismiss attempts, and after the model responds (a user stop outranks a just-arrived
-  model decision).
+- **Checked at every control point**: during the screenshot-rate wait (50 ms
+  polling), immediately before execution on the direct path, between queued
+  `follow_ups` items, and before/inside `backend.execute` per input. (Loop-era
+  checkpoints — loop top, pre-provider-call, recovery dismiss attempts — died with the
+  removed loop; a stopped session now refuses ALL work at the session boundary.)
 - **One stop, one observable outcome (F7)**: the two stop flavors — an explicit
   `stop_session` call and an internally-armed kill path (in-run `TaskStopped`) —
   route through the same `_close_stopped_bundle` cleanup: token armed, `stopped`
@@ -453,16 +457,24 @@ lower than a human would. The compensating controls are the approval defaults
     adopted as the session anchor, bounded by the one-action limit and the
     allowlists (RT-E8-05).
 
-## 11. Long-running sessions: new surface, same fail-closed doctrine
+## 11. Long-running sessions: checkpoint/resume surface (same fail-closed doctrine)
 
-Long-running sessions add an orchestration layer above the closed-loop executor
-(subtasks, checkpoints, resume, approval epochs, health checks). The doctrine is
-unchanged: the orchestrator executes nothing itself — every action still flows through
-the same grounding, validation (§9 allowlists), risk classification (§3), per-action
-approval, verification, and stop-checked backend — and every new failure path stops
-fail-closed. This section documents the new surface and its fail-closed behavior.
+**(v0.6.0 internals-removal wave): of the orchestration layer described here, the
+LIVE surface is the sealed checkpoint/resume machinery (§11.3) and resume
+re-verification (§11.4) — plus allowlist re-checks on resume (§11.7, resume half).
+The approval epochs (§11.1), the unattended modifier (§11.2), dependency enforcement
+(§11.5), the health checks (§11.8), and the session-ceiling trip points (§11.6
+enforcement half) were REMOVED with the internal loop; their subsections are kept as
+historical records of the removed machinery.** The doctrine is unchanged: whatever
+remains executes nothing itself, and every failure path stops fail-closed. The
+session-budget family of `limits` fields stays accepted and validated on the wire and
+is documented as RESERVED — not enforced on the direct five-tool path since the
+internal loop's removal (the sealed-overshoot budget gate on resume remains live).
 
-### 11.1 Approval epochs
+### 11.1 Approval epochs — REMOVED (historical record; `approval.py` deleted in v0.6.0)
+
+The live approval semantics are §5 (per-call `approved=True` + `safety.py
+requires_approval`). Historical design, for the record:
 
 Every approval in a long-running session lives inside an approval epoch that expires on
 TWO independent axes — wall-clock age (`approval_epoch_seconds`, default 1800 s = 30
@@ -485,7 +497,7 @@ minutes, clamp 60..86400) and the count of interactive actions
   A health check that turns UNSAFE also invalidates the epoch (the environment changed
   materially) before stopping execution.
 
-### 11.2 Prolonged unattended execution (raise-only)
+### 11.2 Prolonged unattended execution (raise-only) — REMOVED (historical record)
 
 Once a session has run without human interaction for at least one hour
 (`PROLONGED_UNATTENDED_SECONDS = 3600`, inclusive boundary), a pure runtime policy
@@ -562,10 +574,15 @@ restores.
   process/window and the allowlists; the CURRENT environment is re-read from a real
   backend observation and compared (casefold) before continuation. Missing current
   identity is a mismatch, never a pass; a mismatch raises a typed refusal.
-- **Approval is never resurrected**: epoch state has deliberately no restore path —
-  the resumed session must obtain fresh approval via an explicit grant.
+- **Approval is never resurrected**: no approval state has any restore path — on the
+  five-tool surface every call carries its own per-call `approved` authorization, so a
+  resumed session starts with NOTHING granted.
 
-### 11.5 Dependency enforcement
+### 11.5 Dependency enforcement — REMOVED (historical record)
+
+The subtask start/fail/blocked transition machinery died with the loop; the restored
+graph is validated fail-closed at resume (`SubtaskManager.restore` refuses
+unknown/self dependencies and cycles), but nothing executes it. Historical design:
 
 - A subtask cannot start until **all** of its dependencies are `completed`:
   `SubtaskManager.start` re-checks and raises with the unmet dependency ids (MCP surface:
@@ -581,10 +598,21 @@ restores.
 
 ### 11.6 Resource ceilings
 
-- All existing per-task limits still gate every run unchanged; the long-running layer
-  adds shared session ceilings — duration (default 4 h, max configurable 24 h), 2000
+**RESERVED, NOT ENFORCED (v0.6.0 internals-removal wave): the session-ceiling fields
+below are still accepted and validated (clamped exactly as before, persisted in
+checkpoints, re-clamped on resume) but their enforcement trip points died with the
+removed loop.** The live remainder: the sealed-overshoot gate — a SEALED checkpoint
+whose inflated counters pass load still fails closed with the typed
+`SessionBudgetExceeded` at the budget seam when anything tries to consume work
+(pinned in tests/test_checkpoint_integrity.py) — and the loop-free per-task limits
+(screenshot rate, action budget) that still gate the direct path (§8).
+
+Historical enforcement design:
+
+- All existing per-task limits still gated every run unchanged; the long-running layer
+  added shared session ceilings — duration (default 4 h, max configurable 24 h), 2000
   actions, 500 model calls, 500 steps, 50 subtasks — enforced at every subtask start and
-  orchestration boundary. Exhaustion raises a typed `SessionBudgetExceeded` (a
+  orchestration boundary. Exhaustion raised a typed `SessionBudgetExceeded` (a
   `LimitExceeded` subclass) → the existing audited, fail-closed termination.
 - Counters are **shared and monotonic**: each subtask consumes from its own fresh
   per-task scope AND mirrors its consumption onto the session tracker, which only ever
@@ -616,7 +644,7 @@ restores.
   and is a re-verification hook only — the live executor keeps its own stricter
   machinery unchanged.
 
-### 11.8 Health checks
+### 11.8 Health checks — REMOVED (historical record; `health.py` deleted in v0.6.0)
 
 - **Boundary-evaluated only**: no background thread, no scheduler, not a second
   execution loop. A check runs at an orchestration boundary only when one is due
@@ -634,17 +662,18 @@ restores.
 
 | Condition | Behavior | Where |
 |---|---|---|
-| Approval epoch dead (time / actions / invalidated) | refuses every approval-requiring action with `requires_fresh_approval=True`, regardless of any per-action approval; caller must stop | `approval.authorize_action` |
-| ≥ 1 h unattended + full-scope grant | new subtasks blocked (`unattended_hold`) until a fresh explicit approval epoch | runtime epoch gate (`long_running._epoch_gate`) |
+| Approval epoch dead (time / actions / invalidated) — REMOVED | (historical) refused every approval-requiring action with `requires_fresh_approval=True` | `approval.authorize_action` (deleted) |
+| ≥ 1 h unattended + full-scope grant — REMOVED | (historical) new subtasks blocked (`unattended_hold`) until a fresh explicit approval epoch | `long_running._epoch_gate` (removed) |
 | Checkpoint value still secret-like after redaction | write REFUSED before any disk touch; previous checkpoint intact | `checkpoint_manager._serialize` |
 | Corrupt / wrong-version / non-canonical-limits checkpoint | typed `CheckpointValidationError`; never loaded, repaired, or deleted | `checkpoint_manager.load` |
 | Checkpoint seal missing/malformed/mismatching, or integrity key missing/replaced | typed `CheckpointValidationError` → `invalid_checkpoint`; refused before any restore; file intact | `checkpoint_manager.load` |
 | Resume environment mismatch or missing current identity | typed `resume_refused`; new session discarded; nothing restored | `resume_manager.prepare`, `server.start_session` |
-| Subtask with unmet dependencies | `subtask_not_ready` (+ unmet list); never started | `subtask_manager.start` |
-| Dead dependency branch, replan exhausted | `UNRECOVERABLE` termination — no continuation with unknown correctness | `long_running.run_pending_subtasks` |
-| Session budget exhausted (duration/actions/model calls/steps/subtasks) | typed `SessionBudgetExceeded` → audited fail-closed termination | `limits.SessionBudgetTracker` |
-| Health check UNSAFE | epoch invalidated + run stops (`blocked_safety`); never auto-executes | `long_running._boundary_health` |
-| Planner unavailable or plan rejected | typed `planner_unavailable` / `plan_rejected` (+ codes); nothing created (historical: the manual-subtask fallback died with the removed loop tools) | `long_running.plan_from_llm` (module retained; not reachable from tools) |
+| Subtask with unmet dependencies — REMOVED | (historical) `subtask_not_ready` (+ unmet list); never started | `subtask_manager.start` (removed) |
+| Dead dependency branch, replan exhausted — REMOVED | (historical) `UNRECOVERABLE` termination — no continuation with unknown correctness | `long_running.run_pending_subtasks` (removed) |
+| Sealed checkpoint with inflated counters | restored EXACT, then typed `SessionBudgetExceeded` at the budget seam when work is attempted (live fail-closed gate) | `limits.SessionBudgetTracker` |
+| Session budget trip points (duration/actions/model calls/steps/subtasks) — RESERVED, NOT ENFORCED | (loop-era enforcement removed with the loop; fields still accepted + validated, see §11.6) | `limits.SessionBudgetTracker` |
+| Health check UNSAFE — REMOVED | (historical) epoch invalidated + run stops (`blocked_safety`); never auto-executes | `long_running._boundary_health` (removed) |
+| Planner unavailable or plan rejected — REMOVED | (historical) typed `planner_unavailable` / `plan_rejected` (+ codes); nothing created | `long_running.plan_from_llm` (removed) |
 
 
 ### 11.10 Interference Guard (T8): protection upgrades, same doctrine

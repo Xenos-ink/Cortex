@@ -96,15 +96,13 @@ def test_resume_does_not_enlarge_limits(tmp_path: Path) -> None:
 async def test_resume_restores_context_summary_and_counters(tmp_path: Path) -> None:
     manager = CheckpointManager(base_dir=tmp_path)
     limits = make_limits()
-    context = ContextManager(goal="prepare the monthly report", summarize_every=10)
+    # (Loop removal: summarize_every/record_step/summarize fed the removed cadence; the
+    # checkpoint round-trips the context exactly as held.)
+    context = ContextManager(goal="prepare the monthly report")
     context.set_current_task("formatting the workbook")
     context.append_history("opened the source workbook")
     context.record_accomplishment("loaded the source data")
-    for _ in range(5):
-        context.record_step()
-    await context.summarize()
     context.append_history("post summary entry")
-    context.record_step()
     original = context.build_request_payload()
 
     subtasks, _first, second, _third = make_subtask_manager()
@@ -124,11 +122,6 @@ async def test_resume_restores_context_summary_and_counters(tmp_path: Path) -> N
     assert restored["summary"] == original["summary"]
     assert restored["recent_history"] == original["recent_history"]
     assert bundle.context.steps == context.steps
-    # Summarization cadence continues from the restored counters (no reset): it falls due
-    # exactly summarize_every steps after the restored last-summary marker.
-    while not bundle.context.should_summarize():
-        bundle.context.record_step()
-    assert bundle.context.steps == context.steps + 10 - 1
 
 
 def test_resume_refuses_invalid_checkpoints_fail_closed(tmp_path: Path) -> None:

@@ -44,7 +44,6 @@ from computer_use_mcp.grounding import GroundingRouter
 from computer_use_mcp.limits import Limits
 from computer_use_mcp.models import (
     ActionType,
-    FailureClass,
     GroundedAction,
     Observation,
     SessionState,
@@ -55,7 +54,6 @@ from computer_use_mcp.provider import (
     ProviderParseError,
     parse_decision,
 )
-from computer_use_mcp.recovery import _VALIDATION_CODE_MAP
 from computer_use_mcp.safety import RiskLevel, SafetyContext, SafetyPolicy
 from computer_use_mcp.state import SessionRegistry, StopToken, TaskStopped
 from computer_use_mcp.validator import GroundingValidator, WindowIdentityUnavailableError
@@ -597,8 +595,9 @@ async def test_title_allowlist_unresolvable_target_fails_closed() -> None:
     assert rejection is not None
     assert rejection.codes == ["window_identity_unavailable"]
     assert isinstance(rejection.error, WindowIdentityUnavailableError)
-    # Recovery mapping mirrors the process-identity fail-closed code: WRONG_WINDOW.
-    assert _VALIDATION_CODE_MAP["window_identity_unavailable"] is FailureClass.WRONG_WINDOW
+    # (Loop removal: the recovery CLASSIFICATION map that mirrored this code to
+    # FailureClass.WRONG_WINDOW died with recovery.py; the fail-closed rejection
+    # itself is what the direct surface pins below.)
     outcome = await agent.run_single(state, focus("Ghost Window"))
     assert outcome.kind == "rejected"
     assert backend.executed == []
