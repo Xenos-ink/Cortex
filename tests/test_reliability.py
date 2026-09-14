@@ -7,17 +7,9 @@ from PIL import Image
 
 from computer_use_mcp.agent import ComputerUseAgent
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.models import AgentDecision, GroundedAction, Observation, SessionState
+from computer_use_mcp.models import GroundedAction, Observation, SessionState
 from computer_use_mcp.validator import GroundingValidator
 from computer_use_mcp.verification import VerificationEngine
-
-
-class SequenceProvider:
-    def __init__(self, decisions: list[AgentDecision]) -> None:
-        self.decisions = iter(decisions)
-
-    async def decide(self, goal: str, observation: Observation, history: list[str]) -> AgentDecision:
-        return next(self.decisions)
 
 
 class ChangingBackend(FakeComputerBackend):
@@ -76,35 +68,37 @@ def test_verification_detects_visual_change() -> None:
 
 
 async def test_dry_run_reports_not_verified_and_never_executes() -> None:
+    """RETARGETED (loop removal): the dry-run guarantee is pinned on the direct surface —
+    ``run_single`` reports an executed-shaped stub whose verification is honestly NOT
+    verified, and no input is ever dispatched."""
     backend = FakeComputerBackend()
-    action = GroundedAction(action="wait", delta=1, confidence=1.0)
-    provider = SequenceProvider([
-        AgentDecision(status="action", action=action),
-        AgentDecision(status="done", summary="done"),
-    ])
-    agent = ComputerUseAgent(backend, provider)
-    results = await agent.run("wait", SessionState(session_id="test", dry_run=True), approval=lambda *_: True)
-    assert results[0].ok is True
-    assert results[0].verification is not None
-    assert results[0].verification.verified is False
+    agent = ComputerUseAgent(backend, object())
+    outcome = await agent.run_single(
+        SessionState(session_id="test", dry_run=True),
+        GroundedAction(action="wait", delta=1, confidence=1.0),
+    )
+    assert outcome.kind == "executed"
+    assert outcome.result is not None and outcome.result.ok is True
+    assert outcome.result.verification is not None
+    assert outcome.result.verification.verified is False
     assert backend.executed == []
 
 
-async def test_interactive_approval_is_consumed_per_action() -> None:
+async def test_interactive_approval_is_required_per_direct_call() -> None:
+    """RETARGETED (loop removal): the per-action approval CALLBACK was loop machinery.
+    The direct surface gates the same interactive risk with the per-call ``approved``
+    flag: without it an interactive action is refused (approval_required, zero
+    dispatches); with it the action runs. Every call is judged independently."""
     backend = ChangingBackend()
     action = GroundedAction(action="click", point={"x": 10, "y": 10}, confidence=1.0)
-    provider = SequenceProvider([
-        AgentDecision(status="action", action=action),
-        AgentDecision(status="done", summary="done"),
-    ])
-    approvals = 0
-
-    def approve_once(*_) -> bool:
-        nonlocal approvals
-        approvals += 1
-        return approvals == 1
-
+    agent = ComputerUseAgent(backend, object())
     state = SessionState(session_id="test", dry_run=False, min_confidence=0.0)
-    results = await ComputerUseAgent(backend, provider).run("click", state, approval=approve_once)
-    assert approvals == 1
-    assert results[0].ok is True
+
+    refused = await agent.run_single(state, action)
+    assert refused.kind == "approval_required"
+    assert refused.requires_approval is True
+    assert backend.executed == []
+
+    executed = await agent.run_single(state, action, approved=True)
+    assert executed.kind == "executed"
+    assert len(backend.executed) == 1

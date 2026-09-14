@@ -415,8 +415,6 @@ async def test_provider_judge_reuses_encoded_base64(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The judge path passes the observation's OWN base64 through — no PIL re-encode."""
-    from computer_use_mcp import agent as agent_module
-
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
@@ -424,7 +422,6 @@ async def test_provider_judge_reuses_encoded_base64(
     agent = bundle.agent
 
     captured: dict[str, str] = {}
-    reencodes = {"count": 0}
 
     class ProbeJudgeProvider(ScriptedProvider):
         def judge_change(
@@ -434,13 +431,8 @@ async def test_provider_judge_reuses_encoded_base64(
             captured["after"] = after_b64
             return {"outcome": "verified", "confidence": 0.9, "reason": "probed"}
 
-    original_encode = agent_module._image_to_base64
-
-    def counting_encode(image: Any) -> str:
-        reencodes["count"] += 1
-        return original_encode(image)
-
-    monkeypatch.setattr(agent_module, "_image_to_base64", counting_encode)
+    # (Loop removal: the old PIL re-encode helper the counter monkeypatched is GONE —
+    # the H1 invariant is now structural: no re-encode path exists at all.)
     agent.provider = ProbeJudgeProvider([])
     before = agent._observe("direct_request")
     after = agent._observe("post_action")
@@ -454,4 +446,3 @@ async def test_provider_judge_reuses_encoded_base64(
     # The judge received the ALREADY-ENCODED base64 verbatim (no decode->re-encode).
     assert captured["before"] == before.image_base64
     assert captured["after"] == after.image_base64
-    assert reencodes["count"] == 0  # H1: zero redundant PIL re-encodes on the judge path
