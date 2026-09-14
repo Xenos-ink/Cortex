@@ -373,7 +373,9 @@ class ResumeManager:
             except Exception as exc:
                 raise self._refusal(outcomes, "budget_restored", exc) from exc
             try:
-                context = ContextManager(summarize_every=limits.context_summarize_every)
+                # (Loop removal: the summarize cadence the kwarg fed is gone; the
+                # context is restored as the pure checkpoint/resume container.)
+                context = ContextManager()
                 context.restore(payload.context)
                 outcomes.append(
                     CheckOutcome(
