@@ -37,10 +37,14 @@ released version is `pyproject.toml`.
 
 ## P0 — v0.7.0 (safety & guard residuals discovered during v0.6.0)
 
-### R-21 Safety text-classifier vocabulary gaps (polite destructives + unlabeled secrets)
+All three P0 items are **DONE** (branch `v0.7.0`, commit range `a36033d..9069ac2`);
+each acceptance criterion is adjudicated Proven by the executable test file named
+below. Per the changelog note these entries move to VERSIONS.md at release time.
 
-- **Status:** DISCOVERED-DEFERRED (red-team findings RT-E8-01/02/03, severity
-  MEDIUM each).
+### R-21 Safety text-classifier vocabulary gaps (polite destructives + unlabeled secrets) — DONE (v0.7.0)
+
+- **Status:** DONE (v0.7.0). Was DISCOVERED-DEFERRED (red-team findings
+  RT-E8-01/02/03, severity MEDIUM each).
 - **Problem:** destructive verbs in polite phrasings type at LOW risk — "please
   delete the model", "delete the database/table", "please remove the model
   weights", "wipe the disk now" all pass the safety gate and the classifier;
@@ -49,45 +53,76 @@ released version is `pyproject.toml`.
   gate and secret redaction, so raw secrets can reach the audit JSONL and tool
   responses; bare token values with no keyword label (ghp_…, xoxb-…, npm_…)
   match no redaction pattern and no safety marker.
-- **Approach:** extend the token/phrase marker vocabulary and the risk
-  classifier for polite destructive phrasings; add value-shape detection for
-  bearer-token prefixes (ghp_/xoxb-/npm_ families) to redaction. The
-  both-directions rule applies: the benign corpus must still pass AND the true
-  secret/credential corpus must still block — do NOT weaken real protection.
+- **Shipped design:** a destructive-intent verb grammar over the normalized
+  token components (V1 unambiguous verbs flag with any object; V2 contextual
+  verbs only with a high-consequence object class; severity floors are additive
+  and never downgrade an existing verdict) plus a filler-tolerant redaction
+  assignment grammar (spaced compound nouns, the `pass` abbreviation, copula
+  separators `is/was/are`) and value-shape bearer-token families (`ghp_`-class
+  GitHub, `github_pat_`, `xox[abprs]` Slack, `npm_`/`xocr_`) with length floors.
+  Design-level: verb classes + grammar shapes, not per-string patches.
+- **Executable proof:** `tests/test_r21_classifier_redaction.py` (AC-21a/AC-21b:
+  destructive corpus blocks on both layers, credential + bearer families detected
+  and redacted, sink end-to-end tests, benign corpus unchanged, zero blocked-corpus
+  relaxation) + `tests/test_v07_redteam_repairs.py` (the adversarial repair corpus).
+  Remaining accepted trades are documented in `docs/SAFETY.md` §10.
 - **Evidence:** (maintainer-local) `evidence/v06-006/redteam/report.md`
-  (RT-E8-01/02/03; `artifacts/r02_nearmiss_results.json`).
+  (RT-E8-01/02/03; `artifacts/r02_nearmiss_results.json`); root cause in
+  `evidence/v07-007/r21-root-cause.md`.
 - **Accept:** the red-team near-miss corpus blocks on both the safety and
-  redaction layers; the R-02 benign corpus still passes unchanged.
+  redaction layers; the R-02 benign corpus still passes unchanged. — PROVEN.
 
-### R-22 Re-anchor adoption residual (launch-act widening)
+### R-22 Re-anchor adoption residual (launch-act widening) — DONE (v0.7.0)
 
-- **Status:** DISCOVERED-DEFERRED (red-team finding RT-E8-05, severity MEDIUM).
+- **Status:** DONE (v0.7.0). Was DISCOVERED-DEFERRED (red-team finding RT-E8-05,
+  severity MEDIUM).
 - **Problem:** ANY keypress into a `#32770`/explorer.exe anchor arms R-20's
   launch-act marker, so the NEXT window — even a foreign-process one — is
   adopted as the session anchor. The one-action bound holds and the allowlists
   still gate dispatch, but adoption is wider than R-20's causal intent.
-- **Approach:** tighten launch-act arming (allowlist-bound anchors and/or
-  chord+window-class pairing) without reintroducing the dead-anchor deadlock
-  R-20 removed.
+- **Shipped design:** commit-key-only arming — the launch-act marker arms ONLY
+  for a chord carrying the enter family, and only AFTER the pre-dispatch gates
+  (a rejected chord is never a launch act) — plus seed↔outcome correlation: text
+  typed into the launcher surface is recorded as a bounded token set, and a
+  seeded launch act adopts only a candidate whose process/title correlates with
+  the seed; everything else is refused with the named `REANCHOR_REFUSED` payload,
+  anchor kept. R-20's paths (surface-set membership, pid/owner descent,
+  dead-anchor `TARGET_GONE` unbind) are untouched and pinned green unmodified.
+- **Executable proof:** `tests/test_r22_launch_act_adoption.py` (AC-22a: letter/
+  hotkey/explorer-process/non-commit forms refused; AC-22b: Win+R positive control,
+  one-action bound, R-20 suite green unmodified) — including the pinned seedless
+  commit-key residual class; the R-20 file `tests/test_r20_reanchor_causality.py`
+  stays green UNMODIFIED across the same commit range.
 - **Evidence:** (maintainer-local) `evidence/v06-006/redteam/report.md`
-  (RT-E8-05).
+  (RT-E8-05); root cause in `evidence/v07-007/r22-root-cause.md`.
 - **Accept:** a foreign window immediately following a keypress into a
   `#32770`/explorer.exe anchor is refused as anchor (named `REANCHOR_REFUSED`);
-  R-20's documented positive adoption paths still work.
+  R-20's documented positive adoption paths still work. — PROVEN.
 
-### R-23 Zero-width/space tokenizer evasion of the safety text classifier
+### R-23 Zero-width/space tokenizer evasion of the safety text classifier — DONE (v0.7.0)
 
-- **Status:** DISCOVERED-DEFERRED (red-team finding RT-E8-04; the typed payload
-  itself is inert in the flagged repro).
+- **Status:** DONE (v0.7.0). Was DISCOVERED-DEFERRED (red-team finding RT-E8-04;
+  the typed payload itself is inert in the flagged repro).
 - **Problem:** zero-width/space characters can split the destructive tokens the
   safety text classifier matches on, evading the gate entirely (tokenizer-level
   evasion of the safety text classifier).
-- **Approach:** normalize (strip/map zero-width and confusable whitespace)
-  before classifier matching, keeping the benign corpus passing unchanged.
-- **Evidence:** redteam report RT-E8-04 (maintainer-local
-  `evidence/v06-006/redteam/report.md`).
+- **Shipped design:** a matching-only normalization layer (`textnorm.py`) — every
+  text matcher (keyword gate, classifier, redaction) consumes canonical view(s)
+  `TRANSLATE(NFKC(x))`: a 437-codepoint strip set (all category Cf, variation
+  selectors, Arabic tatweel, plus nine invisible non-Cf splitters found by the
+  red team) in two views (delete view for in-word insertion, fold view for
+  between-word insertion), 28-codepoint whitespace fold to U+0020, and an ASCII
+  fast path that keeps every ASCII input byte-identical at today's cost. Views
+  merge never-downgrade. The dispatched text is never rewritten (matching-only).
+- **Executable proof:** `tests/test_r23_textnorm_normalization.py` (AC-23a:
+  obfuscated payloads classify at the plain risk, obfuscated secrets detected;
+  AC-23b: benign decisions unchanged, dispatched text keeps the original bytes)
+  + `tests/test_r02_text_corpora.py` (both-directions corpus, unmodified).
+- **Evidence:** root cause + executed 550-row obfuscation matrix in
+  `evidence/v07-007/r23-root-cause.md` (maintainer-local).
 - **Accept:** zero-width/space-obfuscated destructive payloads classify at the
-  same risk as their plain counterparts; the benign corpus still passes unchanged.
+  same risk as their plain counterparts; the benign corpus still passes
+  unchanged. — PROVEN.
 
 ## P1 — v0.7.0 (performance & driver economics)
 

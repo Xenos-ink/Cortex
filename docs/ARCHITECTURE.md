@@ -12,13 +12,17 @@ block, the provider decide/plan/summarize endpoints, the summarizer plumbing, th
 subtask mutation APIs, and the plan-validator classes removed) — the server exposes
 exactly five tools (start_session, stop_session, computer_observe, computer_screenshot
 alias, computer_execute); the sealed checkpoint/resume machinery on start_session
-survives. This document describes the code as it exists
+survives. The v0.7.0 safety wave adds the `textnorm.py` matching-only normalization
+layer consumed by the safety gate, the classifier, and secret redaction (R-21/R-23:
+destructive-intent grammar, extended redaction families), and tightens the
+Interference Guard's launch-act policy to commit-key arming plus seed correlation
+(R-22) — §2/§3/§16 below reflect this. This document describes the code as it exists
 at the open-source release HEAD; every claim is traceable to a named module under
 `src/computer_use_mcp/` (or `benchmarks/`, `tests/e2e/`) and, where noted, to the test
-suite (standard suite: **1376 passed, 8 skipped** at the internals-removal HEAD; the
-skips are the gated
-real-Windows E2E desktop tests, skipped BY DEFAULT by the D6 fail-closed gate;
-`ruff check src tests benchmarks` clean at HEAD;
+suite (standard suite: **1594 passed, 10 skipped** at the v0.7.0 HEAD; 8 skips are the
+gated
+real-Windows E2E desktop tests, skipped BY DEFAULT by the D6 fail-closed gate, and 2
+are documented-residual pins;
 observed on the reference machine). The layered rules and pinned contracts come from the
 mission architecture (master mission §5–§6); where reality differs from the plan, this
 document records reality. The Long-Running Sessions wave (an orchestration layer ABOVE the
@@ -56,7 +60,10 @@ controller (`agent._provider_judge` adapts `provider.judge_change`), breaking th
 
 ```
 models.py          universal pydantic types          imports: (stdlib only)
-redaction.py       secret detection/redaction        → models
+redaction.py       secret detection/redaction        → models, textnorm
+textnorm.py        matching-only text canonicalizer  imports: (stdlib only)
+                   (R-23: dual-view NFKC + strip/fold
+                   consumed by safety and redaction)
 state.py           StopToken, TaskState,             → models
                    SessionContext/Registry
 limits.py          Limits + LimitEnforcer            → (stdlib only)
@@ -72,7 +79,7 @@ validator.py       staleness/binding/allowlists      → models
 verification.py    8 verification strategies         → models (+PIL)
 provider.py        doctrine prompt, fail-closed      → models, redaction
                    parsing, lazy key, judge endpoint
-safety.py          RiskLevel contextual engine       → models
+safety.py          RiskLevel contextual engine       → models, textnorm
 agent.py           direct-action pipeline            → audit, backend, grounding,
                    (ComputerUseAgent.run_single)       limits, models, observation,
                                                        safety, state, validator,
@@ -103,7 +110,7 @@ above is measured from the actual imports.
 | State construction | `state.py` | `TaskState` (goal, subgoal, plan_notes, histories as bounded deques, budgets, termination reason), `StopToken`, `SessionRegistry` (max 4, fail-closed refusal) |
 | Perception/Grounding | `grounding.py` | `GroundingRouter` over `GroundingStrategy` implementations: coordinate (real), region descriptor (real), text-anchor (P1 stub), accessibility (P1 stub); fail-closed `UnsupportedGroundingError`. `NON_SPATIAL_ACTIONS` covers type, keypress, **hotkey** (carries `keys`), scroll, wait, done, **focus_window** (carries `target`) — grounded trivially with strategy `none`; point-bearing actions (click/double_click/**right_click**/drag/**move**) route to the coordinate strategy |
 | Action validation | `validator.py` | bounds, confidence floor, coordinate-space refusal, window/process allowlists, staleness + `source_observation_id` binding (`COORDINATE_ACTIONS` = click/double_click/**right_click**/drag/**move** — `move` binds its point like click, and `right_click` binds its point exactly like click); `missing_text`/`missing_keys`/`missing_target` (focus_window requires a non-empty `target`) |
-| Risk classification + policy + approval | `safety.py` | contextual LOW/MEDIUM/HIGH/CRITICAL; approval upgrade never downgraded; CRITICAL blocked pending explicit authorization; structured approval messages |
+| Risk classification + policy + approval | `safety.py` (+ `textnorm.py` canonical views) | matching runs on the normalization layer's canonical view(s) — ASCII inputs byte-identical, dual views merged never-downgrade; contextual LOW/MEDIUM/HIGH/CRITICAL with the R-21 `destructive_intent` floors; approval upgrade never downgraded; CRITICAL blocked pending explicit authorization; structured approval messages |
 | Execution | `backend.py` | `execute(action, stop)` — `StopToken.ensure_live()` before every physical input (per typing chunk / drag segment; the chunk size is engine-selected); interruptible 100 ms-sliced waits |
 | Post-action observation | `observation.py` | fresh capture, new `observation_id`; burst-exempt intra-step capture (PERF-004 C2) that is REUSED as the next loop-top observation (C1) |
 | Semantic verification | `verification.py` | `VerificationStrategy` chain; outcome ∈ {verified, failed, uncertain}; first definitive wins; all-uncertain combines into `uncertain`; model-judge intents run the cheap-first ladder `deterministic_tiers` → pixel diff → judge (`provider.judge_change`, PERF-004 C3) |
@@ -1177,6 +1184,13 @@ before `LimitEnforcer.check_action`).
   bound pid; configured transient launcher) dispatch; FOREIGN aborts with
   `FOCUS_TAKEN_BY ...`. A dead bound window reports `TARGET_GONE` and (default policy)
   clears the binding instead of deadlocking. Identity-unavailable fails closed.
+  R-22 (v0.7.0): the launch-act marker arms ONLY for a commit-key chord
+  (`enter`/`return`/`numpadenter`) into a launcher/dialog anchor and only after the
+  pre-dispatch gates pass (a rejected chord never arms); a TYPE into the launcher
+  records bounded seed tokens, and a seeded launch act adopts only a candidate whose
+  process/title correlates with the seed — everything else is refused with
+  `REANCHOR_REFUSED` (annotation-only, anchor kept; the seedless commit-key case
+  keeps the R-20 shape — see `docs/SAFETY.md` §10/§11.11).
 - **Mechanism (ii) AttachOrLaunch**: additive `ActionType.ENSURE_APP`
   (`target="process[|doc-token]"`) — enumerate -> identity match ->
   `REATTACHED title=... hwnd=...` (focused via the verified foreground switch, guard

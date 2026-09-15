@@ -4,14 +4,18 @@ Status: describes the code at the Cortex open-source release HEAD (production-
 hardening Waves 1–5 including the E6 defect round D1–D10 and the red-team fix round
 F1–F7, plus the DRAG action, the compact-change verification upgrade, and the
 move/hotkey/focus_window actions with the allowlist-gated focus pre-foreground check),
-the loop-removal wave, and the v0.6.0 internals-removal wave (the removed loop's
+the loop-removal wave, the v0.6.0 internals-removal wave (the removed loop's
 orphaned internals — recovery/approval-epoch/health modules, the decide-loop block,
 the provider decide/plan/summarize endpoints, the summarizer plumbing, the subtask
 mutation APIs, and the plan-validator classes — are gone; the limits fields stay
-accepted and validated, documented as reserved).
+accepted and validated, documented as reserved), and the v0.7.0 safety wave
+(the R-21/R-22/R-23 design fixes: the textnorm normalization layer, the
+destructive-intent grammar, the extended secret-redaction families, and the
+commit-key re-anchor policy — §3.1–§3.2, §7.1–§7.3, §10, §11.11, §12).
 Every live rule below is enforced in a named module and exercised by the test suite
-(standard suite: **1376 passed, 8 skipped** at the internals-removal HEAD; the skips
-are the gated real-Windows E2E desktop tests; observed on the reference machine).
+(standard suite: **1594 passed, 10 skipped** at the v0.7.0 HEAD; 8 skips are the
+gated real-Windows E2E desktop tests and 2 are the documented-residual pins named
+in §10; observed on the reference machine).
 Companion documents: `README.md` (English capability statement),
 `docs/ARCHITECTURE.md` (module map, contracts, limits, audit, E2E/benchmark layout).
 §11 documents the long-running session surface: the checkpoint redaction/integrity
@@ -155,6 +159,95 @@ a coarse, conservative net — novel destructive phrasing in other languages may
 lower than a human would. The compensating controls are the approval defaults
 (click/type require approval by default), the allowlists, and verification.
 
+### 3.1 Pre-classifier normalization layer (R-23, v0.7.0 — `textnorm.py`)
+
+Zero-width/variation-selector/tatweel characters split the tokens and `\b` anchors
+every text matcher matches on (`"de\u200blete"` tokenizes as `[de, lete]`;
+`"for\u200bmat C:"` breaks the `\b`-anchored disk pattern). v0.7.0 adds ONE
+canonicalizer that every matcher consumes INSTEAD of raw text:
+
+- **Pipeline:** `view(x) = TRANSLATE(NFKC(x))` — NFKC first, strip/fold second.
+  The order is load-bearing: NFKC can *manufacture* strip-set characters during
+  composition (Arabic presentation ligatures decompose through tatweel U+0640), so
+  the final pass guarantees strip-free, ASCII-whitespace-only output by construction
+  (proven over all 1,114,112 codepoints, both views, fully idempotent).
+- **Strip set — 437 codepoints / 30 contiguous ranges** (Unicode 15.0.0): all
+  category Cf format characters (the zero-width family, soft hyphen, bidi controls,
+  tag characters), the variation selectors U+FE00-FE0F + U+E0100-E01EF, the Arabic
+  tatweel U+0640 (the standard Arabic-search joiner used to split Arabic markers),
+  and — the v0.7.0 red-team repair S1 (RT-D1-02) — the nine invisible non-Cf
+  splitters U+034F, U+180B-U+180D, U+115F/U+1160, U+3164, U+FFA0, U+17B4/U+17B5,
+  each of which provably splits keywords exactly like the Cf set.
+- **Two views of the same strip set:** the *delete view* removes strip characters
+  (catches in-word insertion: `for\u200bmat` → `format`); the *fold view* maps them
+  to U+0020 (catches between-word insertion and space-substitution:
+  `restart\u200bthe\u200bserver`, `drop\u200bdatabase`). All 28 non-ASCII
+  `str.isspace()` codepoints fold to U+0020 in both views.
+- **ASCII fast path:** every ASCII string is returned as-is (`str.isascii` gate,
+  ~0.05 µs), so the entire benign corpus and the overwhelming TYPE population run
+  exactly the pre-v0.7.0 single-pass matching at the same cost. `canonical_views`
+  returns ONE element whenever the two views coincide, so well-formed non-ASCII
+  input pays no added matching either.
+- **Merge rule:** matchers run on every view and merge never-downgrade — block if
+  any view blocks, risk = max across views (safety), redaction prefers the
+  matching view (§7). On the dual-view path the keyword gate additionally matches
+  the fold view's RE-FUSED component stream: adjacent components whose
+  concatenation is a known keyword re-join, but only across strip-derived gaps
+  (boundary-faithful fusion via the U+001F sentinel in `fold_marked`; repair S7 +
+  RT2-D1-01) — benign multi-word prose with strip-character noise (a trailing VS16
+  emoji, one stray joiner) somewhere else in the payload never fuses into a keyword.
+- **TYPE-integrity invariant (matching-only):** normalization never rewrites
+  dispatched text. The typed string keeps its original bytes
+  (`CORTEX_TYPE_INTEGRITY` semantics unchanged), approval-message reasons keep the
+  original text, and redaction returns the ORIGINAL string byte-identical when no
+  pattern matches any view (a redaction hit returns the matching view's redacted
+  text — a sink representation, never a dispatched payload). Pinned by
+  `tests/test_r23_textnorm_normalization.py`
+  (`test_ac23b_matching_only_type_integrity_unit`,
+  `test_ac23b_dispatched_text_keeps_the_original_bytes`,
+  `test_ac23a_redaction_no_match_returns_the_original_bytes`).
+
+### 3.2 Destructive-intent grammar (R-21, v0.7.0 — `safety.py`)
+
+The pre-v0.7.0 classifier matched literal command templates; polite phrasings of the
+same destructive act passed ("please delete the model" typed at LOW). The R-21 fix is
+a verb-anchored severity floor over the NORMALIZED token components — design-level
+grammar, not per-string patching:
+
+- **V1 unambiguous destructive verbs** (`delete`, `remove`, `erase`, `wipe`,
+  `truncate`, `purge`, `destroy`; the shell abbreviations `del`/`rm` stay exact
+  tokens): V1 + any non-function-word object inside the window floors the verdict
+  at **MEDIUM** (new category `destructive_intent`) and fires the keyword gate.
+  The floor no longer depends on noun enumeration to decide WHETHER to flag — that
+  shape inversion covers polite phrasing, open objects, and filler tolerance at once.
+- **V2 contextual destructive verbs** (`drop`, `clear`, `empty`, `format`, `kill`,
+  `shutdown`, `restart`): never flagged on an open object; require a
+  high-consequence object-class hit (databases, tables, disks/drives, accounts,
+  files, models, backups, logs, credentials, … — the class decides the TIER only).
+  V1/V2 + a class object floors at **CRITICAL**.
+- **Object window:** the 3 non-function components after the verb. Function words
+  (the, a, my, all, entire, old, please, kindly, …) are skipped WITHOUT consuming
+  window slots (repair S2/RT-D1-01 — "delete the entire old production database"
+  reaches its object through three function words); a copula (is/are/was/…) closes
+  the window, so mention-form verbs stay benign ("delete is a word in the
+  dictionary", "wiping is configured").
+- **Bounded morphology (repair S4/RT-D1-04, Commander-approved):** the closed
+  inflection family s/es/ed/d/ing with e-drop and consonant doubling is allowed on
+  V1/V2 verbs, so gerund/past/third-person forms of the SAME verb carry the same
+  intent ("wiping the old drive", "deleted the database"). This is not a stemmer:
+  derived nouns (`deletion`), prefixes (`reformatting`), and typos never match
+  (pinned benign). The accepted trade — narrative past tense with a class noun now
+  flags — is documented in §10.
+- **Floors only, never downgrades:** the grammar can only upgrade an existing
+  verdict, never lower one; every pre-v0.7.0 marker, phrase, pattern, the DOI
+  suppression, and the Arabic handling are unchanged and still fire first. The
+  classify-side regex floors use bounded quantifiers (filler groups `{0,3}`,
+  tempered on copulas) and are gated by a cheap verb-presence prerequisite; on the
+  dual-view path the re-fused component stream feeds both the gate and the floor,
+  and phrase markers fire across strip-connected fusions (repair RT3-D1-02 —
+  `cm\u200bd\u200bexe` / `re\u200bg\u200bdelete` block at CRITICAL with plain-form
+  parity).
+
 ## 4. Fail-closed rules
 
 | Condition | Behavior | Where |
@@ -248,7 +341,11 @@ layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_reject
   (`scheme://user:pass@host`), password/passphrase assignment (`name=value`),
   token/API-key/secret assignment, credit-card numbers (Luhn-validated). Matching is
   value-oriented, so prose merely mentioning "password" is not flagged. The registry
-  is extensible (`register_secret_pattern`).
+  is extensible (`register_secret_pattern`). v0.7.0 extends the grammar and the
+  value-shape coverage (§7.1–§7.2) and adds the non-executed response shapes to the
+  redaction choke point (§7.3). Matching runs on the canonical view(s) of the input
+  (§3.1): ASCII input is matched exactly as before; non-ASCII input is matched on
+  both views (never-downgrade) with byte-identical benign pass-through.
 - **Typed-text secret block** (pre-existing gate, preserved): `type` actions whose
   text resembles a secret/credential/destructive command (keyword markers: password,
   api_key, secret, token, credential, rm, del, format, shutdown, powershell, …) are
@@ -280,6 +377,73 @@ layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_reject
   blurs only explicitly supplied regions; pixel-level secret detection is the
   `_scan_image_for_secrets` hook (no-op in P0). Screenshots are not persisted to disk
   by the server.
+
+### 7.1 Assignment grammar (R-21, v0.7.0 — `redaction.py`)
+
+The pre-v0.7.0 grammar detected labelled assignments only (`noun [=:] value` with a
+closed noun list); `pwd is hunter2`, `api key: sk-…`, and `password is: X` passed
+raw. The extended grammar is filler-tolerant on both sides of the separator:
+
+- **Nouns:** the spaced/hyphenated compound forms (`api key`, `access key`,
+  `client secret`, `secret key`, `auth token`) and the abbreviations `pwd`/`pass`
+  join the existing alternation.
+- **Separators:** the direct `[=:]` arm keeps its measured value floors
+  (`\S{4,}` password-family / `\S{6,}` token-family). The **copula arm**
+  (`is|was|are` immediately after the noun — `password policy was updated` stays
+  clean because the copula is not adjacent) accepts an optional `[:=]` after the
+  copula (repair S3/RT-D1-03 — `password is: X` / `pwd was: X` are caught) and
+  requires a **secret-shaped value**: `len(V) >= 6` and NOT pure-lowercase-ASCII of
+  length ≤ 10 (repair S5/RT-D1-07, Commander-refined — benign copula prose such as
+  "the password is stored in the vault" stays clean and can no longer block
+  checkpoint persistence, while evidence-corpus values like `hunter2` still match).
+- **Shape rule (repair RT4, Commander-adjudicated):** a token is PROSE-shaped
+  (skippable, never a value) when it is pure ASCII-alpha in a natural-language form
+  — all-lowercase ≤ 10, or Capitalized-form `[A-Z][a-z]+` ≤ 20. Everything else
+  with len ≥ 6 is SECRET-shaped: digit/symbol-bearing runs, ALL-CAPS acronyms
+  (`ABCDEF`), all-lower passphrases ≥ 10 (defeating the exemption: digits,
+  capitals, punctuation, or non-ASCII letters all defeat it), and mixed runs. A
+  Capitalized+digit token ("Vault2024") is therefore treated secret-shaped — the
+  Commander's Vault2024 ruling, pinned (§10).
+- **Decoy bound (repairs RT2-D1-02/RT3-D1-01/RT4):** the copula arm skips at most
+  TWO prose-shaped tokens before the secret-shaped value
+  ("password is abcdefghij supersecret123" is caught; the bound is the
+  evidence-forced value — three prose tokens precede the value in D1's false-positive
+  row). The trade classes of any finite bound are documented in §10.
+- **Bridge-continued secret-run (repair RT5/RT4-D1-01-02):** the value is a maximal
+  run of secret-shaped tokens whose separators carry at most two prose-shaped
+  bridge tokens ("and"/"or"/"then" or decoys), all consumed/redacted —
+  "password is ABCDEF and supersecret123" leaves no raw survivor in any sink.
+  Prose-only sequences never match: the run is anchored by secret-shaped tokens on
+  both sides of every bridge.
+
+### 7.2 Bearer-token value-shape families (R-21, v0.7.0 — `redaction.py`)
+
+The `AKIA` shape mechanism generalized: standalone token VALUES are detected by
+prefix + charset + length floor, no keyword label required — `gh[pousr]_…`
+(GitHub, 20+ chars), `github_pat_…` (17+), `xox[abprs][-_]…` (Slack, both
+separators, 8+), `npm_…` and `xocr_…` (20+). Length floors keep truncated/benign
+strings clean. For hot-path economy the bearer separators and all value-shape
+families share ONE compiled alternation (P2: one pass on clean text) with
+per-family hit labels resolved from the matched group; the PEM block and its bare
+header share the same fused-pattern treatment (a full block still wins over its own
+header).
+
+### 7.3 One choke point feeding every sink (v0.7.0)
+
+`redact_text` / `contains_secret` remain the single detection choke point; every
+redaction-enforced sink calls exactly it, so a grammar/family improvement repairs
+all sinks simultaneously: the audit JSONL (write-time redaction + wholesale
+redaction under sensitive-named metadata keys), the provider request body
+(`expected_effect`/`goal` before the judge call), model context (goal/task/state/
+history/plan notes), checkpoints (per-value redaction plus the fail-closed
+`contains_secret` gate that REFUSES a checkpoint write when a value stays
+secret-like), long-running state, resume error text, `safe_repr`, and the MCP
+response path. v0.7.0 closes the last response-shape gap: the non-executed
+responses (`rejected`, `safety_denied`, `approval_required`, `digest_surprise`,
+`error`) embed model-proposed text in `message` and now pass the SAME
+`_redact_result_payload` redaction the executed shape already applied (additive;
+pinned end-to-end by `tests/test_r21_classifier_redaction.py` sink tests — approval
+response, audit JSONL, and provider request body carry no raw secret).
 
 ## 8. Limits and resource isolation
 
@@ -452,20 +616,94 @@ layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_reject
     accepted risk: a one-off OS input-stack wedge cannot be made impossible
     in-process; it is bounded by the session watchdog and surfaces as a typed
     failure, never a silent partial dispatch.
-15. **Safety/guard residuals from the v0.6.0 internal red team (bounded, routed).**
-    The red team found no release-blocking issue; the residuals below are
-    pre-existing or bounded and are routed to ROADMAP R-21/R-22/R-23 (full repro
-    steps and artifacts in the maintainer-local
-    `evidence/v06-006/redteam/report.md`): destructive verbs in polite phrasings
-    can type at LOW risk (RT-E8-01); space-separated or abbreviated credential
-    phrasings can bypass the safety gate and redaction (RT-E8-02); bare token
-    values without a keyword label (`ghp_`/`xoxb-`/`npm_` shapes) match no
-    redaction pattern (RT-E8-03); zero-width-space tokenizer evasion of the
-    safety gate, with the typed payload itself inert (RT-E8-04); a keypress into
-    a `#32770`/explorer.exe anchor arms the R-20 launch-act marker for one
-    action, so the immediately following window — even foreign-process — can be
-    adopted as the session anchor, bounded by the one-action limit and the
-    allowlists (RT-E8-05).
+15. **v0.6.0 red-team residuals R-21/R-22/R-23 — CLOSED in v0.7.0.** The three
+    routed residuals were fixed at the design level (ROADMAP P0, commit range
+    `a36033d..9069ac2`; root causes, executed repro matrices, and the adversarial
+    re-attack record are archived in the maintainer-local `evidence/v07-007/`
+    tree): polite/phrased destructives typed at LOW because the gate was a closed
+    tool-token list and the classifier a set of verb+noun adjacency templates
+    (RT-E8-01) — replaced by the destructive-intent verb grammar (§3.2); varied
+    credential formats and untagged bearer tokens bypassed redaction because the
+    grammar was `[=:]`-assignment-only with one value-shape family (RT-E8-02/03) —
+    replaced by the filler-tolerant assignment grammar + bearer families (§7.1–
+    §7.2); zero-width characters split tokens/anchors because no canonicalization
+    existed between ingress and four independent matchers (RT-E8-04) — replaced by
+    the normalization layer (§3.1); and a keypress into a `#32770`/explorer.exe
+    anchor armed the launch-act marker for one action regardless of key or outcome
+    (RT-E8-05) — replaced by commit-key-only arming after the gates plus
+    seed↔outcome correlation (§11.11). Executable proof:
+    `tests/test_r21_classifier_redaction.py`,
+    `tests/test_r22_launch_act_adoption.py`,
+    `tests/test_r23_textnorm_normalization.py`,
+    `tests/test_v07_redteam_repairs.py`.
+16. **v0.7.0 accepted residual and trade classes (bounded, each named, each with a
+    direction).** The adversarial cycle that found them is recorded in §12; every
+    enforceable class is pinned by a test so it can never drift silently:
+    - **Cyrillic/mixed-script homoglyphs (fail-open).** Cross-script confusables
+      (`а/е/о/с/р/х` for `a/e/o/c/p/x`) split or replace keywords and are not
+      NFKC-addressable; closure needs TR39-style skeleton mapping (future item).
+      Pinned skip: `tests/test_r23_textnorm_normalization.py`
+      (`test_residual_cyrillic_homoglyph_not_nfkc_addressable`).
+    - **Seedless commit-key adoption (fail-open, adjudicated).** A bare commit key
+      (enter family) into a launcher anchor still adopts the next titled window —
+      including the `ctrl+enter`/`shift+enter`/`numpadenter` chord forms and the
+      paste-then-enter shape (clipboard text never seeds). Accepted because any
+      in-process gate refusing it also refuses R-20's frozen Win+R positive
+      control (the two are evidence-identical); allowlists still gate dispatch,
+      the bound is one action, and a refusal keeps the anchor. Pinned:
+      `tests/test_r22_launch_act_adoption.py`
+      (`test_residual_seedless_commit_key_unrelated_foreign_window_adopts`).
+      Adjacent LOW trades, pinned in the same file's doctrine: a title-spoofing
+      seed (`notepad` typed, foreign window titled `notepad`) correlates, and
+      fully-short/fullwidth seeds degrade to the seedless behavior (the S6
+      min-length repair removed the degenerate-correlation widening).
+    - **Stripe `sk_live_`/`rk_live_`/`pk_live_` key family (fail-open).** Matches
+      no pattern family; the value-shape mechanism that would cover it is proven
+      (§7.2) and adding the family is additive. Kept pinned in
+      `tests/test_p5_redteam.py`.
+    - **Pure-lowercase ≤ 10 copula values treated as prose (fail-open boundary).**
+      The S5/RT4 secret-shape rule exempts all-lowercase ASCII values of length
+      ≤ 10 (`password is letmeinnow` passes redaction); digits, capitals,
+      punctuation, or non-ASCII letters defeat the exemption. Accepted to stop the
+      measured false-positive class that blocked benign prose and refused
+      checkpoint writes. Pinned boundary rows in `tests/test_v07_redteam_repairs.py`
+      (S5 section). Corollary trade: the decoy-skip bound is finite (two prose
+      tokens), so a bound+1 decoy sequence dodges the copula arm — any finite
+      bound admits this; the bound is the evidence-forced value (RT4 adjudication).
+    - **Capitalized+digit tokens are secret-shaped (fail-closed, by ruling).**
+      "Vault2024"-class values at copula or skip distance are detected and
+      redacted — an intentional over-block of some prose shapes ("the password is
+      kept in Vault2024" redacts), the Commander's Vault2024 ruling. The class is
+      pinned in `RT4_CONSTRAINT_TABLE`
+      (`tests/test_v07_redteam_repairs.py`, the `Season2024` row; the V01–V06
+      ruling-row variants are pinned in the mission evidence corpus).
+    - **Fail-closed over-blocks of decorated prose (by design).** Text carrying
+      strip-class noise adjacent to marker vocabulary hard-blocks: accented-prose
+      + emoji/VS16 payloads, `please re\u200bformat the document` (fold view
+      exposes `format`), and the pre-existing legacy-marker vocabulary trade
+      (`restart`, `del`, `format` as standalone tokens block their prose
+      mentions). Negation is ignored (RT-D1-05: "do NOT delete anything" blocks),
+      and V1 mention-prose blocks wider than the pinned trade (RT-D1-06: "the
+      delete key on this keyboard is stuck"). All are over-block direction —
+      normalization never un-matches a marker the plain form contains. Pinned
+      representative rows in `tests/test_v07_redteam_repairs.py` (legacy-marker
+      rows, RT3 INFO pin, `test_s4_mention_form_copula_guard_applies_to_inflected_forms`).
+    - **S4 narrative past-tense blocking (fail-closed trade).** Closing the
+      inflected-verb bypass means narrative/habitual past tense with a
+      high-consequence object flags ("he wiped the drive yesterday" keyword-gates).
+      Commander-approved; pinned:
+      `tests/test_v07_redteam_repairs.py::test_s4_narrative_prose_trade_pinned`.
+    - **Fusion end-boundary omission (fail-open, INFO).** The boundary-faithful
+      fusion enumerates keyword concatenations LEFT of an internal boundary; a
+      strip-split keyword whose final join terminates AT the payload end (with
+      trailing strip noise) is not formed. Bounded shape class; the delete view
+      covers every strip-removed reading containing a whole keyword token. Pinned
+      skip: `tests/test_v07_redteam_repairs.py`
+      (`test_residual_r4_info_end_boundary_fusion_omission`).
+    Outside-vocabulary imperatives (`nuke`/`trash`/`obliterate` classes), typo'd
+    verbs, and nominalizations remain unflagged by the no-stemming closed-vocabulary
+    design (typed honestly in §3's limitation; benign-safe, pinned in
+    `tests/test_v07_redteam_repairs.py`).
 
 ## 11. Long-running sessions: checkpoint/resume surface (same fail-closed doctrine)
 
@@ -706,3 +944,128 @@ New pacing policies are protection, not performance tuning: `CORTEX_KEY_DISPATCH
 (default 0.05 s) paces terminal-key chords and `CORTEX_FOCUS_SETTLE_SECONDS`
 (default 0.3 s) paces keyboard input behind a recent window activation — both reduce
 dropped/misdelivered-input windows (B3/B5/B8); both accept `0` to disable.
+
+### 11.11 Launch-act / re-anchor policy (R-22, v0.7.0 — `focus_guard.py`)
+
+R-20's adoption lattice is unchanged — a verified action's foreground is adopted as
+the new anchor only when it is a session surface (hwnd membership), a same-pid
+descendant, or an owner-chained dialog of one; everything else is refused with the
+named `REANCHOR_REFUSED` payload, anchor kept. v0.7.0 tightens the ONE remaining
+path (the keyboard launch act), whose pre-v0.7.0 form armed on ANY keypress into a
+launcher-looking anchor regardless of key or outcome:
+
+- **Commit-key-only arming, AFTER the gates (D-1).** The launch-act marker arms
+  only for a chord carrying the launcher-commit key family (`enter`/`return`/
+  `numpadenter` — the Win+R doctrine's act) dispatched into a launcher/dialog
+  anchor (`#32770` class or a configured transient launcher process), and the
+  arming decision runs after the pre-dispatch gates: a REJECTED chord
+  (`FOCUS_TAKEN_BY` / `STUCK_MODIFIER` / `FOCUS_DRIFTED`) never dispatches and is
+  never a launch act. Letters, arrows, modifier-only hotkeys, and enter-free chords
+  never arm.
+- **Seed↔outcome correlation (D-2).** A TYPE dispatched into the launcher surface
+  records a bounded casefolded token set of the typed text (the "seed" — path and
+  URL separators split too; tokens below 3 alphanumerics are dropped per the S6
+  repair so degenerate seeds cannot widen correlation, and a fully-short seed is
+  treated as seedless). When a seed exists, a seeded launch act adopts only a
+  candidate whose process name/exe basename or title contains a seed token ("we
+  typed `notepad`, enter; a surface matching `notepad` appeared"); an unrelated
+  surface is refused with `REANCHOR_REFUSED`. A seedless pure commit key keeps the
+  legacy R-20 adoption shape — the adjudicated residual in §10. The seed is cleared
+  when the anchor moves or the marker is consumed; the one-action consumption bound
+  and the intervening-non-keyboard-dispatch break are unchanged.
+- **Dead-anchor path unchanged.** `TARGET_GONE` → (default) unbind-and-report —
+  the guard returns to DORMANT and reattachment happens only by explicit identity
+  (`ensure_app`/`focus_window`), never by adopting an arbitrary successor. R-20's
+  suite stays green unmodified (`tests/test_r20_reanchor_causality.py`, pinned
+  cross-file by `tests/test_r22_launch_act_adoption.py::
+  test_ac22b_r20_reanchor_causality_suite_green_unmodified`).
+
+## 12. v0.7.0 adversarial red-team cycle (record)
+
+After the R-21/R-22/R-23 fixes landed, an independent adversarial review re-attacked
+all three fixed layers (classifier/redaction, normalization, re-anchor state
+machine) in the same classes the v0.6.0 red team had revealed, followed by four
+differential re-verification rounds, each round re-attacking the previous round's
+repairs. Every attack row is an executed in-process probe against the real
+functions; **661+ attack-row instances were executed across the rounds** (initial
+round: 261 new rows + the 65-row historical vector corpus re-run; re-verification
+rounds: 241, 181, and 199 rows including 35 novel attack-surface probes, plus an
+aggregate 377-row prior-round sweep). Full per-row results, repro drivers, and the
+round reports are archived in the maintainer-local mission workspace
+(`evidence/v07-007/redteam/`); they are not part of this repository. Every finding
+was either fixed-and-retested in-mission or dispositioned into §10's residual
+classes. No open HIGH/CRITICAL finding remains.
+
+**Initial round findings (RT-D1-01…08).** Four bypass-class findings against the
+fresh fixes: RT-D1-01 window-overflow (3+ function words defeated the intent
+window); RT-D1-02 (HIGH) nine invisible non-Cf codepoints outside the strip set
+flipped blocked payloads to allowed/LOW on both layers; RT-D1-03 copula-then-colon
+(`password is: X`) defeated the assignment grammar; RT-D1-04 inflected destructive
+verbs stayed unflagged. Three false-positive findings: RT-D1-05 negation ignored,
+RT-D1-06 V1 mention-prose blocked wider than pinned, RT-D1-07 copula arm redacted
+benign prose (checkpoint availability side-effect). RT-D1-08 graded the new-family
+residuals (basic-auth header MEDIUM; stripe/OpenAI/Google/Slack-webhook INFO) and
+confirmed the R-22 joints held (no bypass in the fixed path; seedless-commit-key
+residual boundary extended). Layer-3 perf probing found nothing (no ReDoS; worst
+adversarial 2000-char payload 8.5 ms).
+
+**Repair rounds R1–R5** (commit chain `a36033d` → `fa03828` → `e59f1ea` →
+`c4624da` → `e88cec4` → `d433a5b` → `9069ac2`):
+
+- **R1 (`fa03828`)** — strip set +9 invisible non-Cf splitters (S1), intent-window
+  filler no longer consumes slots (S2), copula-then-colon (S3), bounded verb
+  morphology (S4), copula value floor (S5), seed min-length (S6), mixed-position
+  fusion scan (S7), plus hot-path restoration (gate-first per-view, fused bearer
+  alternation, guard check ordering).
+- **R2 (`e59f1ea` + `c4624da`)** — S5 floor refined to the secret-shape rule
+  (evidence corpus intact, prose rows clean); boundary-faithful fusion (RT2-D1-01
+  — joins span strip-derived gaps only, never a real space); copula-arm decoy-token
+  continuation (RT2-D1-02); accented-prose residual documented (RT2-D1-03).
+- **R3 (`e88cec4`)** — decoy continuation bounded to one prose-token skip
+  (RT3-D1-01); fused-stream phrase windows (RT3-D1-02 — `cm\u200bd\u200bexe`/
+  `re\u200bg\u200bdelete` block at CRITICAL with plain-form parity); secret-run
+  value redaction (RT3-D1-03).
+- **R4 (`d433a5b`)** — shape-sharpened decoy/value classification (prose-shaped =
+  all-lowercase ≤ 10 or Capitalized-form; secret-shaped = everything else
+  len ≥ 6), skip bound raised to two, bridge words covered, evidence pin restored
+  (B01 back to must-catch).
+- **R5 (`9069ac2`)** — bridge-continued secret-run redaction: the maximal
+  secret-shaped run continues across at most two prose-shaped bridge tokens, so
+  the r4 X01–X03 leak rows ("password is ABCDEF and supersecret123") leave no raw
+  survivor in any sink; constraint table extended.
+
+**Re-verification verdicts (rounds r2–r5).** Every round's closures were
+re-verified differential (both-heads execution where applicable), with zero
+unexpected regressions in every round: r2 closed all first-pass findings (241
+row-instances; one NEW fail-closed FP found — RT2-D1-01, fixed by R2/R3); r3
+verified R2's closures real (181 rows) but found the unbounded decoy skip
+(RT3-D1-01, fixed by R3); r4 verified R3's closures (199 rows, 35 novel probes)
+but found the two-decoy dodge (RT4-D1-01, fixed by R4 and confirmed by r5) and the
+bridge-word
+member (RT4-D1-02, closed by R5); r5 verified R4's claims (constraint table 22/22
+strict, B01 differential-proven, Vault2024 ruling pinned) with the aggregate sweep
+showing 368/377 rows no-diff and 9 adjudicated closures, zero unexpected drift —
+its single forced finding (RT5-D1-01, the fail-open X01–X03 bridge class) is the
+one R5 closed. **Final status: all rounds' closures verified, zero unexpected
+regressions across the whole cycle; MISSION-GRADE STABLE is pending the final r6
+re-verification of the R5 commit** (the pre-adjudicated stop rule — any
+raw-secret-persists row forces FINDINGS — was satisfied by closing X01–X03; the
+confirming r6 pass had not run at documentation time). The pinned regression corpus
+for everything above lives in `tests/test_v07_redteam_repairs.py`.
+
+**Performance adjudication (honest).** The user-facing speed gate PASSED at every
+official measurement: end-to-end per-action latency within noise of the `439a043`
+baseline (paired adjacent deltas −3.6%…+1.8% across type/keypress/hotkey proxies),
+full-suite wall time 100.2–101.9 s against the 100.26 s baseline while the suite
+grew by +218 tests (1594 passed + 10 skipped at `9069ac2` vs 1376 + 8 at baseline),
+and captures identical (9 per 3-action flow, zero increase). The STRICT
+pre-registered per-function rule (×1.10 gate) FAILED at the release-candidate
+measurement on 13 of 36 gated functions: the dominant cluster is the dual-view
+obfuscated-input path (`classify.type_obfuscated` ×1.85, `evaluate.type_obfuscated`
+×1.76 — µs-scale absolutes, 20–63 µs), the security-mandated cost of the R2–R4
+fusion-scan repairs; removing the dual-view scan is prohibited (it is what catches
+zero-width obfuscation the baseline missed). The remaining rows are long-text
+redaction scans (×1.12–1.17 on 2 KB inputs) and µs-scale guard rows — all
+invisible at the ~300 ms end-to-end action floor, and disclosed with raw numbers
+in the maintainer-local `perf-release-verdict.md` artifact of the mission
+workspace.
