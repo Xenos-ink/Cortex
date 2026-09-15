@@ -12,6 +12,102 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
+## v0.7.0 (2026-09-15, ORVEX-CORTEX-v07-007 — safety & guard residuals)
+
+The three P0 safety and guard residual classes discovered during v0.6.0 red-teaming
+are closed at the design level (shapes and grammars, not per-string patches), then
+attacked for six adversarial rounds (661+ executed attack rows) until the re-verify
+verdict was MISSION-GRADE STABLE — every residual that remains is fail-closed,
+documented, and pinned by a test.
+
+### Added
+
+- **Matching-only normalization layer — `textnorm.py` (R-23)** — a canonicalization
+  pass between action-text ingress and the safety gate, the classifier, and secret
+  redaction: dual views `TRANSLATE(NFKC(x))` (437 codepoints / 30 ranges stripped —
+  all Cf invisible characters, variation selectors, tatweel — plus whitespace fold
+  to ASCII space), never-downgrade merge, boundary-faithful fusion for
+  strip-character-joined keywords, and an ASCII fast path that is byte-identical to
+  the pre-layer single pass. **Type integrity invariant: dispatched text is never
+  rewritten** — normalization feeds matching decisions only. Obfuscated destructive
+  payloads (zero-width, invisible separators, fullwidth) now classify at their plain
+  form's severity (executed 550-row matrix: 225 full bypasses → 0 in the
+  zero-width/space class).
+- **Destructive-intent grammar (R-21)** — verb-anchored, filler-tolerant severity
+  tiers over normalized components: unambiguous destructive verbs (`delete`,
+  `wipe`, `purge`, …) block with any object in a K=3 window (function words do not
+  consume slots), contextual verbs require a consequence-noun class hit, bounded
+  morphology (s/es/ed/ing) for suffixed forms, mention-form copula guards
+  (`delete is a word in the dictionary` stays clean), and a new
+  `destructive_intent` classification category. Additive severity floors only —
+  every pre-existing pattern, gate, and refusal path is preserved.
+- **Secret redaction families (R-21)** — the assignment grammar now accepts spaced
+  nouns (`api key:`), abbreviations (`pass`, `credentials`), and copula arms
+  (`password is/was/are …`) with a prose-vs-secret token-shape rule and
+  bridge-continued maximal secret-run consumption; value-shape families for
+  untagged bearer tokens (`ghp_/gho_/ghu_/ghs_/ghr_`, `github_pat_`,
+  `xox[abprs]-/_`, `xocr_`, `npm_`) join `AKIA` in one compiled choke point that
+  feeds all eight sinks; non-executed response shapes (`rejected`, `safety_denied`,
+  `approval_required`, `digest_surprise`, `error`) now redact their payloads too.
+- **Regression corpora** — `tests/test_r21_classifier_redaction.py`,
+  `tests/test_r22_launch_act_adoption.py`,
+  `tests/test_r23_textnorm_normalization.py`,
+  `tests/test_v07_redteam_repairs.py`: per-acceptance-criterion matrices with
+  adversarial must-block rows, benign must-pass rows, false-positive guards, and
+  plain-vs-obfuscated parity pins (218 net new tests; suite now 1594 passed +
+  10 skipped).
+
+### Changed
+
+- **Launch-act / re-anchor arming policy (R-22)** — the session launch-act marker
+  arms only on commit-key chords (enter/return/numpadenter) and only after the
+  pre-dispatch gates pass (a rejected chord never arms); Path-B window adoption
+  requires seed↔outcome correlation (tokens the session actually typed into the
+  launcher must match the candidate's process/title; ≥3-character tokens). A
+  foreign-process window reached by an unrelated keypress is refused as
+  `REANCHOR_REFUSED` with the anchor kept. The R-20 launcher-act positive paths
+  (enter flows), the one-action marker bound, and the dead-anchor
+  (TARGET_GONE → unbind → reattach-only) machinery are unchanged and their suites
+  stay green unmodified.
+
+### Fixed
+
+- **R-21** — polite/phrased destructive commands and indirect formulations no
+  longer bypass the classifier; credentials written in varied formats
+  (copula, spaced nouns, abbreviations, quoted) and untagged bearer tokens
+  (`ghp_`, `xoxb-`, `npm_`, …) no longer reach any sink raw (65 executed
+  near-miss vectors: 28 bypasses → 0).
+- **R-22** — a foreign window following an unrelated keypress can no longer
+  become the session anchor (4/4 attack scenarios refused post-fix), with the
+  R-20 documented adoption paths proven intact.
+- **R-23** — zero-width/whitespace/invisible-character obfuscation of destructive
+  commands (and of secret labels/values) no longer evades classification or
+  redaction; the residual Cyrillic-homoglyph class (not NFKC-addressable) is
+  documented as a future TR39 hardening item.
+- **Red-team repair rounds** — six adversarial rounds over the fixed layers
+  closed every material finding (invisible-codepoint strip gap, intent-window
+  filler overflow, copula-then-colon separator, inflected verbs, decoy-slot and
+  bridge-word dodges, capitalized-prose false positives) with zero unexpected
+  regressions; final verdict MISSION-GRADE STABLE.
+
+### Performance
+
+- End-to-end action latency statistically unchanged (paired deltas −3.6…+1.8 %
+  against the 439a043 baseline; screen-capture counts identical at 9 per
+  3-action flow); full suite 98.8–101.9 s vs 100.26 s baseline with 218 more
+  tests. Per-function micro-benchmarks on the dual-view obfuscated path run
+  ~×1.8 baseline (microseconds-scale, inherent to never-downgrade dual-view
+  matching) — disclosed in the mission's `perf-release-verdict.md`.
+
+### Compatibility notes
+
+- No wire change: `tools/list` stays at five tools and every response shape is
+  unchanged (redaction is now additionally applied to non-executed response
+  payloads). `type` actions dispatch the original bytes — normalization is
+  matching-only. `DEFAULT_TRANSIENT_LAUNCH_PROCESSES` is unchanged
+  (`explorer.exe`). Plain keypresses and non-commit hotkeys no longer arm the
+  launch-act marker — launcher flows that press enter are unaffected.
+
 ## v0.6.0 (2026-09-13, ORVEX-CORTEX-060 — quality, right-click, live D365 proof)
 
 Quality and reliability across the verification, input, safety, and guard layers,
