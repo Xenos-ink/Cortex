@@ -105,21 +105,26 @@ _ASSIGNMENT_SEPARATOR = r"(?:([=:])\s*|\b(?:is|was|are)\b\s*[:=]?\s*)['\"]?"
 #: inside the SAME compiled pattern (no extra pass; a no-hit scan costs the same
 #: single pass). Secret-shaped tokens are never skipped, and every skip alternative
 #' is case-sensitive where the shape rule demands it.
-_COPIULA_SKIP_TOKEN = r"(?:(?-i:[a-z]){2,10}|\S{1,5})(?=\s)\s*"
-_COPIULA_SECRET = r"(?!(?-i:[a-z]){1,10}(?:\s|$))\S{6,}"
-#: RT3-D1-03: the value is the MAXIMAL RUN of consecutive secret-shaped tokens — a
-#: decoy-shaped token ("ABCDEF") can no longer match alone and shield the true value
-#: ("supersecret123") raw in checkpoints; the run replaces both.
-_COPIULA_SECRET_RUN = _COPIULA_SECRET + r"(?:\s+(?!(?-i:[a-z]){1,10}(?:\s|$))\S{6,})*"
+_COPIULA_SKIP_TOKEN = r"(?:(?-i:[a-z]){1,10}|(?-i:[A-Z][a-z]{1,19}))(?=\s)\s*"
+#: RT4 shape rule: a token is PROSE-shaped (skippable, never a value) when it is pure
+#: ASCII-alpha of the natural-language forms — all-lowercase (<=10, the S5 boundary)
+#: OR Capitalized-form ([A-Z][a-z]+, <=20: "Database", "Correct", "Stored", "README"
+#' at value distance is the documented trade). Everything else with len >= 6 is
+#: SECRET-shaped: contains a digit/symbol, or is a long non-prose alpha run
+#: (ALL-CAPS acronyms "ABCDEF"/"README", all-lower >= 10 passphrases, mixed runs).
+_COPIULA_SECRET_RUN = (
+    r"(?!(?:(?-i:[a-z]){1,10}|(?-i:[A-Z][a-z]{1,19}))(?:\s|$))\S{6,}"
+    r"(?:\s+(?!(?:(?-i:[a-z]){1,10}|(?-i:[A-Z][a-z]{1,19}))(?:\s|$))\S{6,})*"
+)
 
 
 def _assignment_value(direct_floor: int) -> str:
-    """Value group: direct arm keeps its measured floor; copula arm = at most ONE
-    skipped prose token (RT3-D1-01 bound — the decoy-slot attack has exactly one
-    decoy, while prose sequences like "stored in the Database" have several before
-    any secret-shaped token and therefore never match) + the maximal secret-shaped
-    token run (RT3-D1-03)."""
-    return rf"(?(1)\S{{{direct_floor},}}|(?:{_COPIULA_SKIP_TOKEN})?{_COPIULA_SECRET_RUN})"
+    """Value group: direct arm keeps its measured floor; copula arm = at most TWO
+    skipped prose-shaped tokens (RT4: the bound the evidence set forces — three
+    prose tokens precede "README" in D1's FP row, so a bound of 2 keeps it clean
+    while both-decoy attack rows are caught) + the maximal secret-shaped token run
+    (RT3-D1-03)."""
+    return rf"(?(1)\S{{{direct_floor},}}|(?:{_COPIULA_SKIP_TOKEN}){{0,2}}{_COPIULA_SECRET_RUN})"
 
 
 def _assignment_pattern(nouns: str, direct_floor: int) -> re.Pattern[str]:

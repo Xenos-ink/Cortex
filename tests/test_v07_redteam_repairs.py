@@ -33,6 +33,18 @@ grammar, morphology family, value floor, fusion scan), never a patched literal.
   the secret-shaped value ("password is abcdefghij supersecret123").
 - **RT2-D1-03** (documented residual, INFO): accented benign prose under the ASCII
   shape rule ("password is cafecrème") is a redaction FP surface — future TR39 item.
+- **RT4**: the shape rule is SHARPENED — PROSE-shaped = pure ASCII-alpha in
+  natural-language form (all-lowercase <=10, or Capitalized-form [A-Z][a-z]+ <=20:
+  "Database"/"Correct"/"Stored" are skippable prose, never values); SECRET-shaped =
+  everything else with len >= 6 (digit/symbol-bearing, ALL-CAPS acronyms
+  "ABCDEF"/"README", all-lower >= 10 passphrases, mixed runs); the copula arm skips
+  at most TWO prose tokens (the bound D1's "README" FP row forces) and redacts the
+  maximal secret-shaped token run. DOCUMENTED RT4 INFO RESIDUALS: (1) end-boundary
+  fusion omission (a keyword concatenation whose final join lands at the payload end
+  is not formed — fail-open, bounded to tail-strip-split shapes); (2) fail-closed
+  over-blocks M01-M10 (normalization only ever WIDENS matching, so strip-char noise
+  near legacy marker vocabulary hard-blocks benign prose — same accepted trade class
+  as the "truncated JWT fragment" S4 row and the reformat-prose row below).
 """
 
 from __future__ import annotations
@@ -576,11 +588,13 @@ def test_rt2_s7_parity_rows_still_block() -> None:
 # --- RT2-D1-02: copula-arm decoy-token continuation ----------------------------------------------
 
 #: D1's decoy-slot finding: an exempt first token must not swallow the real value.
-#: RT3-D1-01: at most ONE prose-shaped decoy is skipped (the attack shape); two or
-#: more prose tokens before any secret-shaped token is prose and stays clean.
+#: RT3-D1-01/RT4: at most TWO prose-shaped tokens are skipped (the evidence-forced
+#: bound — three prose tokens precede "README" in D1's FP row, so the bound is 2).
 RT2_DECOY_MUST_CATCH: tuple[str, ...] = (
     "password is abcdefghij supersecret123",
-    "pwd is stored supersecret123",
+    "pwd is stored correctly supersecret123",
+    "password is kept very supersecret123",
+    "the api key is stored safely abcdef123456",
     "password is: abcdefghij supersecret123",
     "password is abcdefghij  supersecret123",
     "password is\tabcdefghij\nsupersecret123",
@@ -628,14 +642,67 @@ def test_residual_accented_prose_under_ascii_shape_rule() -> None:
         assert contains_secret(text) is False, text  # pure-lowercase neighbors stay clean
 
 
-# --- RT3-D1-01: the decoy continuation is bounded to ONE skipped prose token ---------------------
+# --- RT3-D1-01 / RT4: the decoy/value shape rule and its evidence-forced bound -------------------
+
+#: The FULL R4 constraint set in one table: (text, must_be_detected). Rows are D1's
+#: exact vectors (r3 FP rows, the restored B01, run rows, S5 FP prose) plus the
+#: bridge/decoy class rows. Shape rule as implemented (RT4):
+#:   PROSE-shaped  = pure ASCII-alpha, all-lowercase (<=10) OR Capitalized-form
+#:                   ([A-Z][a-z]+, <=20) — skippable, never a value;
+#:   SECRET-shaped = everything else with len >= 6 (digit/symbol-bearing, ALL-CAPS
+#:                   acronyms, all-lower >= 10 passphrases, mixed runs);
+#:   the copula arm skips at most TWO prose tokens (the bound D1's FP row forces:
+#:   three prose tokens precede "README" in "the api key is documented in the README
+#:   file") and matches the maximal run of secret-shaped tokens.
+RT4_CONSTRAINT_TABLE: tuple[tuple[str, bool], ...] = (
+    # (a) r3 FP rows — clean, byte-identical, checkpoint-clean:
+    ("the password is stored in the Database", False),
+    ("the api key is documented in the README file", False),
+    # (b) two-decoy rows — CAUGHT (B01 RESTORED per the stop-the-oscillation ruling):
+    ("pwd is stored correctly supersecret123", True),
+    ("password is kept very supersecret123", True),
+    ("the api key is stored safely abcdef123456", True),
+    # (c) bridge words — CAUGHT:
+    ("the token is stale or supersecret123", True),
+    ("password is wrong and supersecret123", True),
+    ("the api key is old then abcdef123456", True),
+    # (d) single decoy — CAUGHT:
+    ("password is abcdefghij supersecret123", True),
+    ("password is: abcdefghij supersecret123", True),
+    # (e) S5 FP prose + passphrase-prose — clean:
+    ("the password is stored in the vault", False),
+    ("your token is required for every request", False),
+    ("her password is legendary", False),
+    ("the api key is documented in the wiki page", False),
+    ("my password is correct horse battery staple", False),
+    ("my password is correct", False),
+    # (f) run rows — the maximal run covers the decoy-shaped lead token:
+    ("password is ABCDEF supersecret123", True),
+    # evidence corpus unchanged:
+    ("pwd is hunter2", True),
+    ("pwd was hunter2", True),
+    ("my password is Season2024", True),
+    ("my password is correcthorsebatterystaple", True),
+    ("her password is chriie", False),
+)
 
 
-def test_rt3_decoy_continuation_bounded_to_one_prose_token() -> None:
-    """RT3-D1-01 (D1 r3): the continuation skips AT MOST ONE prose-shaped token, so
-    multi-token prose sequences after a copula never reach a later secret-shaped
-    word ("...stored in the Database" — three prose tokens before the capital).
-    Byte-identical clean incl. the checkpoint gate."""
+@pytest.mark.parametrize(("text", "must_detect"), list(RT4_CONSTRAINT_TABLE))
+def test_rt4_decoy_value_shape_constraint_table(text: str, must_detect: bool) -> None:
+    """RT4: the whole (a)-(f) constraint set holds SIMULTANEOUSLY under the
+    shape-sharpened rule (capitalized-alpha prose vs secret-shaped tokens)."""
+    assert contains_secret(text) is must_detect, text
+    redacted, count = redact_text(text)
+    if must_detect:
+        assert count >= 1 and "[REDACTED:" in redacted, (text, redacted)
+    else:
+        assert count == 0 and redacted == text, (text, redacted)
+
+
+def test_rt3_decoy_continuation_bounded_to_two_prose_tokens() -> None:
+    """RT3-D1-01 as refined by RT4: the bound is TWO prose tokens (evidence-forced —
+    see the constraint table), the FP rows are clean BYTE-IDENTICAL including the
+    checkpoint gate, and the single-decoy attack shape is still caught."""
     from computer_use_mcp.checkpoint_manager import _redact_and_gate
 
     for text in (
@@ -708,6 +775,37 @@ def test_documented_rt3_trade_reformat_prose_over_block() -> None:
     assert SafetyPolicy._looks_sensitive("please re\u200bformat the document ✅") is True
     assert SafetyPolicy._looks_sensitive("re format the document") is True  # plain form: same marker
     assert _type_decision("please re\u200bformat the document ✅").allowed is False
+
+
+# --- RT4 INFO residuals: end-boundary fusion omission + fail-closed over-blocks ------------------
+
+
+def test_residual_r4_info_end_boundary_fusion_omission() -> None:
+    """DOCUMENTED RT4 INFO RESIDUAL (no code change, D1-dispositioned): the fusion
+    scan forms keyword concatenations LEFT of an internal boundary; a strip-split
+    keyword whose final join terminates AT the payload end — with no following
+    component to anchor the boundary — is not formed by the enumeration (a MISS,
+    fail-open, bounded to payloads whose tail keyword is strip-split with trailing
+    strip noise). The complete fix needs end-boundary events in the enumeration
+    (a future hardening item); D1 grades it INFO."""
+    pytest.skip(
+        "R4 documented residual: end-boundary fusion omission — tail strip-split "
+        "keyword joins are not enumerated at the payload end boundary (fail-open, "
+        "INFO-graded); see evidence/v07-007/redteam/reverify/r4/report.md"
+    )
+
+
+def test_residual_r4_info_fail_closed_over_blocks() -> None:
+    """DOCUMENTED RT4 INFO RESIDUAL (no code change, D1-dispositioned): the M01-M10
+    over-blocks are FAIL-CLOSED by design — normalization never un-matches a legacy
+    marker the plain form also contains, so strip-char noise adjacent to marker
+    vocabulary ("format"/"restart"/"del" classes) hard-blocks benign prose. Pinned
+    representatives already exist in this file (legacy-marker rows, the reformat
+    prose trade); this test pins the CLASS disposition: the guard only ever ADDS
+    rejections."""
+    # the pinned representatives of the class (see the tests above for the full rows):
+    assert SafetyPolicy._looks_sensitive("restart\u200b the server after the api key meeting") is True
+    assert SafetyPolicy._looks_sensitive("please re\u200bformat the document ✅") is True
 
 
 # --- session-state shape guard -------------------------------------------------------------------
