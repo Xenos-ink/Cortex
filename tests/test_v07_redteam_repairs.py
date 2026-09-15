@@ -678,6 +678,10 @@ RT4_CONSTRAINT_TABLE: tuple[tuple[str, bool], ...] = (
     ("my password is correct", False),
     # (f) run rows — the maximal run covers the decoy-shaped lead token:
     ("password is ABCDEF supersecret123", True),
+    # RT5 X rows — bridge-continued runs (bridge = <=2 prose tokens INSIDE the run):
+    ("password is ABCDEF and supersecret123", True),
+    ("pwd was erased then supersecret123", True),
+    ("the api key is wrong or abcdef123456", True),
     # evidence corpus unchanged:
     ("pwd is hunter2", True),
     ("pwd was hunter2", True),
@@ -689,14 +693,37 @@ RT4_CONSTRAINT_TABLE: tuple[tuple[str, bool], ...] = (
 
 @pytest.mark.parametrize(("text", "must_detect"), list(RT4_CONSTRAINT_TABLE))
 def test_rt4_decoy_value_shape_constraint_table(text: str, must_detect: bool) -> None:
-    """RT4: the whole (a)-(f) constraint set holds SIMULTANEOUSLY under the
-    shape-sharpened rule (capitalized-alpha prose vs secret-shaped tokens)."""
+    """RT4/RT5: the whole (a)-(f)+X constraint set holds SIMULTANEOUSLY under the
+    shape-sharpened rule with the RT5 bridge-continued run (consecutive secret-shaped
+    tokens separated by at most two prose-shaped bridge tokens are ALL consumed)."""
     assert contains_secret(text) is must_detect, text
     redacted, count = redact_text(text)
     if must_detect:
         assert count >= 1 and "[REDACTED:" in redacted, (text, redacted)
     else:
         assert count == 0 and redacted == text, (text, redacted)
+
+
+def test_rt5_bridge_continuation_consumes_the_whole_run() -> None:
+    """RT5 (D1 r5 X01-X03): the maximal secret-run continues across at most two
+    prose-shaped bridge tokens, so a bridge word can no longer re-shield the true
+    value — every token of the run is redacted and the sink/checkpoint gate sees a
+    clean result. Prose-only sequences still never match (anchors are
+    secret-shaped)."""
+    from computer_use_mcp.checkpoint_manager import _redact_and_gate
+
+    for text, secrets in (
+        ("password is ABCDEF and supersecret123", ("ABCDEF", "supersecret123")),
+        ("pwd was erased then supersecret123", ("supersecret123",)),
+        ("the api key is wrong or abcdef123456", ("abcdef123456",)),
+    ):
+        assert contains_secret(text) is True, text
+        redacted, count = redact_text(text)
+        assert count >= 1, (text, count)
+        for secret in secrets:
+            assert secret not in redacted, (text, redacted)
+        assert contains_secret(redacted) is False, (text, redacted)  # sink path clean
+        assert _redact_and_gate({"goal": redacted})[1] == [], redacted
 
 
 def test_rt3_decoy_continuation_bounded_to_two_prose_tokens() -> None:

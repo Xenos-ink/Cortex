@@ -96,25 +96,27 @@ class SecretPattern(NamedTuple):
 #: tokens (the decoy slot) before the secret-shaped value.
 _ASSIGNMENT_SEPARATOR = r"(?:([=:])\s*|\b(?:is|was|are)\b\s*[:=]?\s*)['\"]?"
 
-#: RT2-D1-02 (decoy-slot): the copula arm's value region may skip leading PROSE
-#: tokens — a token followed by whitespace that is not itself secret-shaped (a run
-#: of 1-5 arbitrary characters, or a pure-lowercase ASCII run of 2-10) — so
-#: "password is abcdefghij supersecret123" catches the real value behind an exempt
-#: decoy. Bounded to the same whitespace-delimited value region (each skip consumes
-#: exactly one token + one separator; a token at end-of-region is never skipped),
-#: inside the SAME compiled pattern (no extra pass; a no-hit scan costs the same
-#: single pass). Secret-shaped tokens are never skipped, and every skip alternative
-#' is case-sensitive where the shape rule demands it.
-_COPIULA_SKIP_TOKEN = r"(?:(?-i:[a-z]){1,10}|(?-i:[A-Z][a-z]{1,19}))(?=\s)\s*"
+#: RT2-D1-02/RT4: the copula arm's skip unit — ONE prose-shaped token (pure
+#: ASCII-alpha: all-lowercase <=10 or Capitalized-form <=20 — case-sensitive scopes
+#: where the shape rule demands it) followed by its whitespace separator. Secret-
+#: shaped tokens never match the skip class.
+_COPIULA_SKIP_TOKEN = r"(?:(?-i:[a-z]){1,10}|(?-i:[A-Z][a-z]{1,19}))(?=\s)\s+"
 #: RT4 shape rule: a token is PROSE-shaped (skippable, never a value) when it is pure
 #: ASCII-alpha of the natural-language forms — all-lowercase (<=10, the S5 boundary)
 #: OR Capitalized-form ([A-Z][a-z]+, <=20: "Database", "Correct", "Stored", "README"
 #' at value distance is the documented trade). Everything else with len >= 6 is
 #: SECRET-shaped: contains a digit/symbol, or is a long non-prose alpha run
 #: (ALL-CAPS acronyms "ABCDEF"/"README", all-lower >= 10 passphrases, mixed runs).
+_PROSE_EXEMPT = r"(?:(?-i:[a-z]){1,10}|(?-i:[A-Z][a-z]{1,19}))(?:\s|$)"
+_COPIULA_SECRET = rf"(?!{_PROSE_EXEMPT})\S{{6,}}"
+#: RT5: bridge continuation — the run is a maximal sequence of secret-shaped tokens
+#: whose separators carry AT MOST TWO prose-shaped bridge tokens ("and"/"or"/"then"
+#: or decoys; zero-bridge plain-whitespace separators included), all consumed/
+#: redacted. Prose-only sequences never match: the run is anchored by secret-shaped
+#: tokens on BOTH sides of every bridge.
 _COPIULA_SECRET_RUN = (
-    r"(?!(?:(?-i:[a-z]){1,10}|(?-i:[A-Z][a-z]{1,19}))(?:\s|$))\S{6,}"
-    r"(?:\s+(?!(?:(?-i:[a-z]){1,10}|(?-i:[A-Z][a-z]{1,19}))(?:\s|$))\S{6,})*"
+    _COPIULA_SECRET
+    + rf"(?:\s+(?:{_COPIULA_SKIP_TOKEN}){{0,2}}{_COPIULA_SECRET})*"
 )
 
 
@@ -122,8 +124,8 @@ def _assignment_value(direct_floor: int) -> str:
     """Value group: direct arm keeps its measured floor; copula arm = at most TWO
     skipped prose-shaped tokens (RT4: the bound the evidence set forces — three
     prose tokens precede "README" in D1's FP row, so a bound of 2 keeps it clean
-    while both-decoy attack rows are caught) + the maximal secret-shaped token run
-    (RT3-D1-03)."""
+    while both-decoy attack rows are caught) + the maximal bridge-continued
+    secret-shaped token run (RT3-D1-03 + RT5)."""
     return rf"(?(1)\S{{{direct_floor},}}|(?:{_COPIULA_SKIP_TOKEN}){{0,2}}{_COPIULA_SECRET_RUN})"
 
 
