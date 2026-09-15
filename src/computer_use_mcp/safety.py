@@ -648,34 +648,102 @@ def _gap_is_strip_derived(text: str, start: int, end: int) -> bool:
     return True
 
 
-def _fused_components_marked(marked_fold: str) -> list[tuple[str, bool]]:
-    """Fold-view component stream plus virtual re-fused keyword tokens (S7), joined
-    only across strip-derived gaps (RT2-D1-01 boundary faithfulness)."""
+#: Longest keyword the fusion can form — bounds the strip-connected accumulation.
+_FUSION_MAX_TOKEN_LEN = max(len(word) for word in _FUSION_KEYWORDS)
+
+#: RT3-D1-02: phrase-first words keyed to their seconds, for the fused-stream
+#: phrase-window scan (multi-token commands split by strip characters).
+_PHRASE_FIRSTS: dict[str, set[str]] = {}
+for _first, _second in _SENSITIVE_PHRASE_MARKERS:
+    _PHRASE_FIRSTS.setdefault(_first, set()).add(_second)
+_PHRASE_SECONDS: frozenset[str] = frozenset(
+    _second for _first, _second in _SENSITIVE_PHRASE_MARKERS
+)
+
+
+def _fusion_scan_marked(marked_fold: str) -> tuple[list[tuple[str, bool]], bool]:
+    """Scan a MARKED fold view (RT2-D1-01): return the component stream with virtual
+    re-fused keyword tokens inserted, and whether a multi-token PHRASE fires across
+    strip-connected concatenations (RT3-D1-02).
+
+    Boundary faithfulness (RT2-D1-01): concatenations may only span strip-derived
+    gaps. RT3-D1-02: each strip-connected RUN of components enumerates every keyword
+    prefix ending at each internal boundary — chained joins compose ("re"+"g" ->
+    ``reg``, and the phrase window ("reg", "delete") then consumes the fused stream:
+    the virtual token is inserted at its END boundary, immediately before the next
+    component), and a phrase fires when a first-word ending at boundary ``j`` pairs
+    with a second-word starting at ``j``.
+    """
     lowered = marked_fold.lower()
     spans = list(_TEXT_TOKEN_PATTERN.finditer(lowered))
-    out: list[tuple[str, bool]] = []
-    count = len(spans)
-    for index, match in enumerate(spans):
-        out.append((match.group(), False))
-        if index + 1 >= count or not _gap_is_strip_derived(
-            lowered, match.end(), spans[index + 1].start()
-        ):
-            continue
-        pair = match.group() + spans[index + 1].group()
-        if pair in _FUSION_KEYWORDS:
-            out.append((pair, True))
-        if (
-            index + 2 < count
-            and _gap_is_strip_derived(lowered, spans[index + 1].end(), spans[index + 2].start())
-        ):
-            triple = pair + spans[index + 2].group()
-            if triple in _FUSION_KEYWORDS:
-                out.append((triple, True))
-    return out
+    toks = [match.group() for match in spans]
+    count = len(toks)
+    strip_gap = [
+        i < count - 1 and _gap_is_strip_derived(lowered, spans[i].end(), spans[i + 1].start())
+        for i in range(count)
+    ]
+    # ends_at[j]: (token, first-component-index) for strip-connected keyword
+    # concatenations of components i..j-1 (multi-component only).
+    ends_at: list[set[tuple[str, int]]] = [set() for _ in range(count + 1)]
+    # starts_at[i]: strip-connected keyword concatenations of components i..k-1
+    # (multi-component only) that can serve as a phrase SECOND word.
+    starts_at: list[set[str]] = [set() for _ in range(count + 1)]
+    for boundary in range(1, count + 1):
+        index = boundary - 1
+        acc = toks[index]
+        while True:
+            if boundary - index >= 2 and acc in _FUSION_KEYWORDS:
+                ends_at[boundary].add((acc, index))
+            if (
+                index == 0
+                or not strip_gap[index - 1]
+                or len(acc) + len(toks[index - 1]) > _FUSION_MAX_TOKEN_LEN
+            ):
+                break
+            index -= 1
+            acc = toks[index] + acc
+    for index in range(count):
+        acc = toks[index]
+        position = index
+        while True:
+            if position - index >= 1 and acc in _PHRASE_SECONDS:
+                starts_at[index].add(acc)
+            if (
+                position + 1 >= count
+                or not strip_gap[position]
+                or len(acc) + len(toks[position + 1]) > _FUSION_MAX_TOKEN_LEN
+            ):
+                break
+            position += 1
+            acc = acc + toks[position]
+    components: list[tuple[str, bool]] = []
+    for index in range(count):
+        for token, _start in sorted(ends_at[index]):
+            components.append((token, True))
+        components.append((toks[index], False))
+    phrase_hit = any(
+        first in _PHRASE_FIRSTS and starts_at[boundary] & _PHRASE_FIRSTS[first]
+        for boundary in range(count + 1)
+        for first, _start in ends_at[boundary]
+    )
+    return components, phrase_hit
 
 
 #: P1: necessary condition helper set — every V1/V2 verb form in one lookup.
 _VERB_FORM_LOOKUP: frozenset[str] = _V1_FORMS | _V2_FORMS
+
+
+def _component_phrases_hit(components: list[tuple[str, bool]]) -> bool:
+    """Exact-token phrase scan over a component stream (shared by the keyword gate
+    and the R-21 classify floor, so fused virtual tokens feed BOTH — RT3-D1-02)."""
+    count = len(components)
+    for phrase in _SENSITIVE_PHRASE_MARKERS:
+        size = len(phrase)
+        for start in range(count - size + 1):
+            window = tuple(components[position][0] for position in range(start, start + size))
+            if window == phrase:
+                return True
+    return False
 
 
 def _view_has_intent_verb(view: str) -> bool:
@@ -868,7 +936,9 @@ class SafetyPolicy:
             if position:
                 if marked_fold is None:
                     continue
-                fused = _fused_components_marked(marked_fold)
+                fused, fusion_phrase = _fusion_scan_marked(marked_fold)
+                if fusion_phrase or _component_phrases_hit(fused):
+                    return (RiskLevel.CRITICAL, "destructive_intent", self._why("destructive_intent"))
                 tier = _destructive_intent_tier(fused)
                 if tier is RiskLevel.CRITICAL:
                     return (RiskLevel.CRITICAL, "destructive_intent", self._why("destructive_intent"))
@@ -1010,8 +1080,11 @@ class SafetyPolicy:
         across a strip-derived gap — never across a real space (RT2-D1-01).
         """
         components = _token_components(view.lower())
+        phrase_hit = False
         if fusion is not None:
-            components = _fused_components_marked(fusion)
+            components, phrase_hit = _fusion_scan_marked(fusion)
+            if phrase_hit:
+                return True
         for index, (token, from_compound) in enumerate(components):
             sensitive = token in _SENSITIVE_TOKEN_MARKERS or (
                 from_compound and token in _COMPOUND_MARKER_TAILS
@@ -1022,13 +1095,8 @@ class SafetyPolicy:
             if token in _DOI_TOKEN_HEAD_NOUNS and previous == "doi":
                 continue  # "DOI token(s)": digital-object-identifier citation context
             return True
-        count = len(components)
-        for phrase in _SENSITIVE_PHRASE_MARKERS:
-            size = len(phrase)
-            for start in range(count - size + 1):
-                window = tuple(components[position][0] for position in range(start, start + size))
-                if window == phrase:
-                    return True
+        if _component_phrases_hit(components):
+            return True
         return _destructive_intent_tier(components) is not None
 
     # -- message construction (P0-F, Goal.md section 12) ---------------------------------

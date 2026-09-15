@@ -107,12 +107,19 @@ _ASSIGNMENT_SEPARATOR = r"(?:([=:])\s*|\b(?:is|was|are)\b\s*[:=]?\s*)['\"]?"
 #' is case-sensitive where the shape rule demands it.
 _COPIULA_SKIP_TOKEN = r"(?:(?-i:[a-z]){2,10}|\S{1,5})(?=\s)\s*"
 _COPIULA_SECRET = r"(?!(?-i:[a-z]){1,10}(?:\s|$))\S{6,}"
+#: RT3-D1-03: the value is the MAXIMAL RUN of consecutive secret-shaped tokens — a
+#: decoy-shaped token ("ABCDEF") can no longer match alone and shield the true value
+#: ("supersecret123") raw in checkpoints; the run replaces both.
+_COPIULA_SECRET_RUN = _COPIULA_SECRET + r"(?:\s+(?!(?-i:[a-z]){1,10}(?:\s|$))\S{6,})*"
 
 
 def _assignment_value(direct_floor: int) -> str:
-    """Value group: direct arm keeps its measured floor; copula arm = prose-token
-    skips + the refined secret-shape token (S5 adjudicated + RT2-D1-02)."""
-    return rf"(?(1)\S{{{direct_floor},}}|(?:{_COPIULA_SKIP_TOKEN})*{_COPIULA_SECRET})"
+    """Value group: direct arm keeps its measured floor; copula arm = at most ONE
+    skipped prose token (RT3-D1-01 bound — the decoy-slot attack has exactly one
+    decoy, while prose sequences like "stored in the Database" have several before
+    any secret-shaped token and therefore never match) + the maximal secret-shaped
+    token run (RT3-D1-03)."""
+    return rf"(?(1)\S{{{direct_floor},}}|(?:{_COPIULA_SKIP_TOKEN})?{_COPIULA_SECRET_RUN})"
 
 
 def _assignment_pattern(nouns: str, direct_floor: int) -> re.Pattern[str]:

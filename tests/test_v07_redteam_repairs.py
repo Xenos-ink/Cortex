@@ -539,7 +539,7 @@ def test_rt2_fusion_rows_blocked_only_by_legacy_markers() -> None:
     ASCII forms ("restart" and "del" are standalone token markers), independently of
     any fusion — weakening that vocabulary is forbidden, so these stay blocked. The
     fusion machinery itself is verified INACTIVE on them (zero virtual joins)."""
-    from computer_use_mcp.safety import _fused_components_marked
+    from computer_use_mcp.safety import _fusion_scan_marked
     from computer_use_mcp.textnorm import fold_marked
 
     for plain in (
@@ -554,7 +554,7 @@ def test_rt2_fusion_rows_blocked_only_by_legacy_markers() -> None:
         "a del ete task note ✅️",
     ):
         marked = fold_marked(text)
-        virtuals = [c for c in _fused_components_marked(marked) if c[1]] if marked else []
+        virtuals = [c for c in _fusion_scan_marked(marked)[0] if c[1]] if marked else []
         assert virtuals == [], (text, virtuals)  # the fix IS active: no fusion joins
 
 
@@ -576,9 +576,11 @@ def test_rt2_s7_parity_rows_still_block() -> None:
 # --- RT2-D1-02: copula-arm decoy-token continuation ----------------------------------------------
 
 #: D1's decoy-slot finding: an exempt first token must not swallow the real value.
+#: RT3-D1-01: at most ONE prose-shaped decoy is skipped (the attack shape); two or
+#: more prose tokens before any secret-shaped token is prose and stays clean.
 RT2_DECOY_MUST_CATCH: tuple[str, ...] = (
     "password is abcdefghij supersecret123",
-    "pwd is stored correctly supersecret123",
+    "pwd is stored supersecret123",
     "password is: abcdefghij supersecret123",
     "password is abcdefghij  supersecret123",
     "password is\tabcdefghij\nsupersecret123",
@@ -624,6 +626,88 @@ def test_residual_accented_prose_under_ascii_shape_rule() -> None:
         assert contains_secret(text) is True, text
     for text in ("her password is chriie", "her password is chrie"):
         assert contains_secret(text) is False, text  # pure-lowercase neighbors stay clean
+
+
+# --- RT3-D1-01: the decoy continuation is bounded to ONE skipped prose token ---------------------
+
+
+def test_rt3_decoy_continuation_bounded_to_one_prose_token() -> None:
+    """RT3-D1-01 (D1 r3): the continuation skips AT MOST ONE prose-shaped token, so
+    multi-token prose sequences after a copula never reach a later secret-shaped
+    word ("...stored in the Database" — three prose tokens before the capital).
+    Byte-identical clean incl. the checkpoint gate."""
+    from computer_use_mcp.checkpoint_manager import _redact_and_gate
+
+    for text in (
+        "the password is stored in the Database",
+        "the api key is documented in the README file",
+        "the password is stored in the vault",
+        "my password is correct horse battery staple",
+    ):
+        assert contains_secret(text) is False, text
+        redacted, count = redact_text(text)
+        assert count == 0 and redacted == text, (text, redacted)
+        assert _redact_and_gate({"goal": text})[1] == [], text  # checkpoint stays clean
+    # exactly one decoy still catches (the decoy-slot attack shape):
+    assert contains_secret("password is abcdefghij supersecret123") is True
+
+
+# --- RT3-D1-02: phrase windows consume the fused stream ------------------------------------------
+
+
+def test_rt3_fused_phrase_windows_critical_parity() -> None:
+    """RT3-D1-02 (D1 r3): multi-token commands split ONLY by strip characters
+    ("cm\\u200bd\\u200bexe", "re\\u200bg\\u200bdelete") reach the phrase windows
+    through chained fusion joins and classify at the SAME CRITICAL risk as their
+    plain counterparts (parity — the category differs: the gate/phrase layer's
+    destructive_intent vs the legacy shell/registry categories)."""
+    for obfuscated, plain in (
+        ("cm\u200bd\u200bexe", "cmd.exe"),
+        ("re\u200bg\u200bdelete", "reg delete"),
+    ):
+        assert SafetyPolicy._looks_sensitive(obfuscated) is True, obfuscated
+        plain_decision = _type_decision(plain)
+        obf_decision = _type_decision(obfuscated)
+        assert plain_decision.allowed is False and obf_decision.allowed is False, obfuscated
+        assert str(obf_decision.risk) == str(plain_decision.risk) == "critical", (
+            obfuscated,
+            obf_decision.risk,
+            plain_decision.risk,
+        )
+
+
+# --- RT3-D1-03: the value is the maximal run of secret-shaped tokens -----------------------------
+
+
+def test_rt3_value_run_redacts_every_secret_shaped_token() -> None:
+    """RT3-D1-03 (D1 r3): a decoy-shaped token can no longer match alone and shield
+    the true value — the copula-arm value is the maximal run of consecutive
+    secret-shaped tokens, so the checkpoint never persists the survivor raw."""
+    redacted, count = redact_text("password is ABCDEF supersecret123")
+    assert count >= 1
+    assert "ABCDEF" not in redacted and "supersecret123" not in redacted, redacted
+    assert contains_secret(redacted) is False, redacted
+    redacted, count = redact_text("password is abcdefghij supersecret123")
+    assert count >= 1 and "supersecret123" not in redacted, redacted
+    # prose runs are never consumed:
+    for text in ("the password is stored in the Database", "her password is legendary"):
+        _, count = redact_text(text)
+        assert count == 0, (text, count)
+
+
+# --- RT3 INFO (documented trade): re\u200bformat prose + emoji over-block ------------------------
+
+
+def test_documented_rt3_trade_reformat_prose_over_block() -> None:
+    """DOCUMENTED RT3 TRADE (INFO, D1 r3 — fail-closed, no code change): "please
+    re\\u200bformat the document ✅" keyword-gates because the fold view exposes the
+    standalone legacy token "format" (a v0.6 keyword marker) — the same
+    legacy-vocabulary trade class as the "restart"/"del" rows above, inherent to the
+    R-23 normalization's never-downgrade design (normalization can only widen what
+    matches, never un-match a legacy marker the plain form also contains)."""
+    assert SafetyPolicy._looks_sensitive("please re\u200bformat the document ✅") is True
+    assert SafetyPolicy._looks_sensitive("re format the document") is True  # plain form: same marker
+    assert _type_decision("please re\u200bformat the document ✅").allowed is False
 
 
 # --- session-state shape guard -------------------------------------------------------------------
