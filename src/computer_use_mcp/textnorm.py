@@ -52,7 +52,13 @@ from __future__ import annotations
 import re
 import unicodedata
 
-__all__ = ["canonical_views"]
+__all__ = ["canonical_views", "fold_marked"]
+
+#: RT2-D1-01: sentinel marking strip-derived separators in :func:`fold_marked`.
+#: U+001F is ``str.isspace()`` (it is in the whitespace fold set) and ``\s``-matched,
+#: so a marked fold view behaves EXACTLY like the fold view for every pattern, while
+#: remaining distinguishable from a real U+0020 space.
+_FOLD_MARK = "\u001f"
 
 
 def _cp_escape(cp: int) -> str:
@@ -127,6 +133,12 @@ def _to_delete(match: re.Match[str]) -> str:
     return "" if not match.group().isspace() else " "
 
 
+def _to_mark(match: re.Match[str]) -> str:
+    """Fold-replacement that keeps separator provenance (RT2-D1-01): strip-class
+    characters become the U+001F sentinel, real whitespace becomes U+0020."""
+    return _FOLD_MARK if not match.group().isspace() else " "
+
+
 def canonical_views(text: str) -> tuple[str, ...]:
     """Return the matching view(s) of ``text`` per SPEC v3.
 
@@ -143,3 +155,22 @@ def canonical_views(text: str) -> tuple[str, ...]:
     if delete_view == fold_view:
         return (delete_view,)
     return (delete_view, fold_view)
+
+
+def fold_marked(text: str) -> str | None:
+    """The fold view of ``text`` with strip-derived separators MARKED (RT2-D1-01).
+
+    Identical to the fold view (the second element of :func:`canonical_views`) except
+    that every separator a strip-set character produced is the U+001F sentinel while
+    real whitespace is U+0020 — token streams are identical, gap provenance is kept.
+    ``None`` when the text cannot contain strip characters (pure-ASCII input, and
+    non-ASCII input whose NFKC form is pure ASCII): there is nothing to mark, and the
+    caller's boundary-faithful fusion is simply inactive. Matching behavior of the
+    marked view equals the fold view for every whitespace-tolerant pattern.
+    """
+    if text.isascii():
+        return None
+    nfkc = unicodedata.normalize("NFKC", text)
+    if nfkc.isascii():
+        return None
+    return _INVISIBLE_RE.sub(_to_mark, nfkc)

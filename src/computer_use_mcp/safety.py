@@ -33,7 +33,7 @@ import re
 from dataclasses import dataclass, field
 
 from .models import ActionType, GroundedAction, RiskLevel, SessionState, WindowInfo
-from .textnorm import canonical_views
+from .textnorm import _FOLD_MARK, canonical_views, fold_marked
 
 __all__ = ["SafetyContext", "SafetyDecision", "SafetyPolicy"]
 
@@ -606,19 +606,27 @@ _DESTRUCTIVE_INTENT_CRITICAL = re.compile(
     re.IGNORECASE,
 )
 
-# --- S7 repair (RT-D1-07 "new push"): fold-view re-fusion ---------------------------------
+# --- S7 repair (RT-D1-07 "new push") + RT2-D1-01 boundary faithfulness --------------------
 #
 # Mixed-position zero-width payloads ("fo\\u200bmat\\u200bC:", "de\\u200blete\\u200bthe
 # \\u200bdatabase") carry an invisible character BOTH inside a keyword AND at a token
 # boundary. The canonical views heal exactly one role each: the delete view fuses the
 # separator ("formatC:" — the \\s-anchored patterns miss), the fold view splits the
 # keyword ("for mat C:" — no verb/marker token). Neither single view matches, so the
-# never-downgrade merge has nothing to merge. The repair stays at the view/scan level:
-# on the fold view's component stream, ADJACENT components whose CONCATENATION is a
-# known keyword token (marker, compound tail, verb form, class noun, or phrase member)
-# re-join as a virtual fused component — dictionary-driven and bounded (2- and 3-token
-# joins only, keyword-set membership required), so no general fuzzy/stem matching is
-# introduced and benign text without strip characters never takes this path.
+# never-downgrade merge has nothing to merge.
+#
+# The repair stays at the view/scan level: on the fold view's component stream,
+# ADJACENT components whose CONCATENATION is a known keyword token (marker, compound
+# tail, verb form, class noun, or phrase member) re-join as a virtual fused component.
+# RT2-D1-01 (boundary faithfulness): a join is allowed ONLY where the separator
+# between the two components is itself strip-class — the fold view is taken in its
+# MARKED form (:func:`textnorm.fold_marked`, strip-derived gaps = U+001F sentinel,
+# real whitespace = U+0020) and two components join only when their gap consists
+# solely of sentinels. A join across a real space is forbidden, so benign multi-word
+# prose never fuses into a keyword merely because strip-character noise (a trailing
+# VS16 emoji, one stray CGJ) exists SOMEWHERE ELSE in the payload. Dictionary-driven
+# and bounded (2- and 3-token joins, keyword-set membership required) — no general
+# fuzzy/stem matching; ASCII text never enters this path.
 
 _FUSION_KEYWORDS: frozenset[str] = (
     _SENSITIVE_TOKEN_MARKERS
@@ -630,23 +638,39 @@ _FUSION_KEYWORDS: frozenset[str] = (
 )
 
 
-def _fused_components(components: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
-    """Fold-view component stream plus virtual re-fused keyword tokens (S7)."""
-    count = len(components)
+def _gap_is_strip_derived(text: str, start: int, end: int) -> bool:
+    """True when ``text[start:end]`` is a non-empty run of fold-mark sentinels only."""
+    if start >= end:
+        return False
+    for char in text[start:end]:
+        if char != _FOLD_MARK:
+            return False
+    return True
+
+
+def _fused_components_marked(marked_fold: str) -> list[tuple[str, bool]]:
+    """Fold-view component stream plus virtual re-fused keyword tokens (S7), joined
+    only across strip-derived gaps (RT2-D1-01 boundary faithfulness)."""
+    lowered = marked_fold.lower()
+    spans = list(_TEXT_TOKEN_PATTERN.finditer(lowered))
     out: list[tuple[str, bool]] = []
-    for index in range(count):
-        out.append(components[index])
-        if index + 1 >= count:
-            continue
-        first = components[index][0]
-        for join in (
-            first + components[index + 1][0],
-            first + components[index + 1][0] + components[index + 2][0]
-            if index + 2 < count
-            else "",
+    count = len(spans)
+    for index, match in enumerate(spans):
+        out.append((match.group(), False))
+        if index + 1 >= count or not _gap_is_strip_derived(
+            lowered, match.end(), spans[index + 1].start()
         ):
-            if join and join in _FUSION_KEYWORDS:
-                out.append((join, True))
+            continue
+        pair = match.group() + spans[index + 1].group()
+        if pair in _FUSION_KEYWORDS:
+            out.append((pair, True))
+        if (
+            index + 2 < count
+            and _gap_is_strip_derived(lowered, spans[index + 1].end(), spans[index + 2].start())
+        ):
+            triple = pair + spans[index + 2].group()
+            if triple in _FUSION_KEYWORDS:
+                out.append((triple, True))
     return out
 
 
@@ -713,8 +737,11 @@ class SafetyPolicy:
         gate_flags: list[bool] | None = None
         if action.action == ActionType.TYPE and action.text:
             gate_views = views if not action.reason else canonical_views(action.text)
+            marked_fold = fold_marked(action.text) if len(gate_views) > 1 else None
             gate_flags = [
-                SafetyPolicy._view_is_sensitive(view, fusion=position > 0)
+                SafetyPolicy._view_is_sensitive(
+                    view, fusion=marked_fold if position else None
+                )
                 for position, view in enumerate(gate_views)
             ]
 
@@ -814,13 +841,17 @@ class SafetyPolicy:
             if _RISK_ORDER[other[0]] > _RISK_ORDER[verdict[0]]:
                 verdict = other
         if verdict[0] is not RiskLevel.CRITICAL:
-            floor = self._destructive_intent_floor(views)
+            marked_fold = None
+            if len(views) > 1:
+                haystack = "\n".join(part for part in (action.text, action.reason) if part)
+                marked_fold = fold_marked(haystack)
+            floor = self._destructive_intent_floor(views, marked_fold)
             if floor is not None and _RISK_ORDER[floor[0]] > _RISK_ORDER[verdict[0]]:
                 return floor
         return verdict
 
     def _destructive_intent_floor(
-        self, views: tuple[str, ...]
+        self, views: tuple[str, ...], marked_fold: str | None = None
     ) -> tuple[RiskLevel, str, str] | None:
         """``destructive_intent`` floor over the canonical haystack views, or None.
 
@@ -829,12 +860,15 @@ class SafetyPolicy:
         provably identical result. S7: on fold views (the dual-view strip-character
         path) the component tier additionally runs over the RE-FUSED component stream
         — the mixed-position payloads split their verb in the raw fold view, so the
-        re-fused reading is the only one that carries it.
+        re-fused reading is the only one that carries it. RT2-D1-01: the re-fusion is
+        boundary-faithful (strip-derived gaps only), computed from the marked fold.
         """
         medium = False
         for position, view in enumerate(views):
             if position:
-                fused = _fused_components(_token_components(view.lower()))
+                if marked_fold is None:
+                    continue
+                fused = _fused_components_marked(marked_fold)
                 tier = _destructive_intent_tier(fused)
                 if tier is RiskLevel.CRITICAL:
                     return (RiskLevel.CRITICAL, "destructive_intent", self._why("destructive_intent"))
@@ -956,24 +990,28 @@ class SafetyPolicy:
         dual-view (strip-character) path, the fold view additionally matches on
         re-fused keyword tokens — mixed-position invisible characters split the
         keyword in the fold view while fusing the separator in the delete view, and
-        neither single view alone sees the payload's plain reading.
+        neither single view alone sees the payload's plain reading. RT2-D1-01: the
+        fusion is boundary-faithful — it joins only across strip-derived gaps.
         """
-        for position, view in enumerate(canonical_views(text)):
-            if SafetyPolicy._view_is_sensitive(view, fusion=position > 0):
-                return True
+        views = canonical_views(text)
+        if SafetyPolicy._view_is_sensitive(views[0]):
+            return True
+        if len(views) > 1:
+            return SafetyPolicy._view_is_sensitive(views[1], fusion=fold_marked(text))
         return False
 
     @staticmethod
-    def _view_is_sensitive(view: str, *, fusion: bool = False) -> bool:
+    def _view_is_sensitive(view: str, *, fusion: str | None = None) -> bool:
         """Legacy marker/phrase gate for one canonical view + the R-21 verb grammar.
 
-        ``fusion=True`` (S7) marks a FOLD view of strip-character-bearing text: token
-        boundaries in it may be healed invisible-character insertions, so adjacent
-        components that re-join into a known keyword token are matched too.
+        ``fusion`` (S7) is the MARKED fold view (:func:`textnorm.fold_marked`) of the
+        same text: token boundaries in it that strip characters produced are
+        distinguishable, so adjacent components re-join into a keyword token only
+        across a strip-derived gap — never across a real space (RT2-D1-01).
         """
         components = _token_components(view.lower())
-        if fusion:
-            components = _fused_components(components)
+        if fusion is not None:
+            components = _fused_components_marked(fusion)
         for index, (token, from_compound) in enumerate(components):
             sensitive = token in _SENSITIVE_TOKEN_MARKERS or (
                 from_compound and token in _COMPOUND_MARKER_TAILS

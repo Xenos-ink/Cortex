@@ -83,25 +83,41 @@ class SecretPattern(NamedTuple):
 #: (token) — measured-fine on the benign corpus. Copula arm (``is|was|are``, S3: an
 #: OPTIONAL ``[:=]`` may follow the copula so ``password is: X`` is caught): the
 #: Commander-refined S5 secret-shape rule — value V matches iff
-#: ``len(V) >= 6 AND NOT (V is pure lowercase ASCII-alpha AND len(V) <= 10)``,
-#: i.e. secret-shaped = (any digit/uppercase/symbol and len>=6) OR (len>=10, any
-#: composition). "hunter2" (7, digit) matches — the evidence-corpus vector stays
-#: detected (AC-21a) — while D1's benign prose rows ("stored" 6, "required" 8,
-#: "legendary" 9, "documented" 10 — all pure lowercase) stay clean. BOUNDARY NOTE:
-#: the ruling's exemption text says <=9, but D1's own FP row "documented" is a
-#: 10-char pure-lowercase run; the exemption is <=10 so requirement "the 4 D1 FP
-#: rows stay clean" holds with no evidence-corpus loss (no mandated value is a
-#: 10-12 char pure-lowercase run). The ``(?-i:[a-z])`` scope keeps the shape check
-#: case-sensitive inside the IGNORECASE pattern (capitalized "Stored" is
-#: secret-shaped, not prose). Group 1 is set only by the direct arm and selects the
-#: value alternative via a regex conditional.
+#: ``len(V) >= 6 AND NOT (V is pure lowercase ASCII-alpha AND len(V) <= 10)`` —
+#: "hunter2" (7, digit) matches (evidence corpus, AC-21a) while D1's benign prose
+#: rows ("stored" 6, "required" 8, "legendary" 9, "documented" 10 — all pure
+#: lowercase) stay clean. BOUNDARY NOTE: the ruling's exemption text says <=9, but
+#: D1's own FP row "documented" is a 10-char pure-lowercase run; the exemption is
+#: <=10 so requirement "the 4 D1 FP rows stay clean" holds with no evidence-corpus
+#: loss. The ``(?-i:[a-z])`` scope keeps the shape check case-sensitive inside the
+#: IGNORECASE pattern (capitalized "Stored" is secret-shaped, not prose). Group 1 is
+#: set only by the direct arm and selects the value alternative via a regex
+#: conditional. RT2-D1-02: the copula arm additionally SKIPS leading prose-shaped
+#: tokens (the decoy slot) before the secret-shaped value.
 _ASSIGNMENT_SEPARATOR = r"(?:([=:])\s*|\b(?:is|was|are)\b\s*[:=]?\s*)['\"]?"
-_ASSIGNMENT_VALUE = r"(?(1)\S{{{},}}|(?!(?-i:[a-z]){{1,10}}(?:\s|$))\S{{6,}})"
+
+#: RT2-D1-02 (decoy-slot): the copula arm's value region may skip leading PROSE
+#: tokens — a token followed by whitespace that is not itself secret-shaped (a run
+#: of 1-5 arbitrary characters, or a pure-lowercase ASCII run of 2-10) — so
+#: "password is abcdefghij supersecret123" catches the real value behind an exempt
+#: decoy. Bounded to the same whitespace-delimited value region (each skip consumes
+#: exactly one token + one separator; a token at end-of-region is never skipped),
+#: inside the SAME compiled pattern (no extra pass; a no-hit scan costs the same
+#: single pass). Secret-shaped tokens are never skipped, and every skip alternative
+#' is case-sensitive where the shape rule demands it.
+_COPIULA_SKIP_TOKEN = r"(?:(?-i:[a-z]){2,10}|\S{1,5})(?=\s)\s*"
+_COPIULA_SECRET = r"(?!(?-i:[a-z]){1,10}(?:\s|$))\S{6,}"
+
+
+def _assignment_value(direct_floor: int) -> str:
+    """Value group: direct arm keeps its measured floor; copula arm = prose-token
+    skips + the refined secret-shape token (S5 adjudicated + RT2-D1-02)."""
+    return rf"(?(1)\S{{{direct_floor},}}|(?:{_COPIULA_SKIP_TOKEN})*{_COPIULA_SECRET})"
 
 
 def _assignment_pattern(nouns: str, direct_floor: int) -> re.Pattern[str]:
     return re.compile(
-        rf"\b(?:{nouns})['\"]?\s*{_ASSIGNMENT_SEPARATOR}{_ASSIGNMENT_VALUE.format(direct_floor)}",
+        rf"\b(?:{nouns})['\"]?\s*{_ASSIGNMENT_SEPARATOR}{_assignment_value(direct_floor)}",
         re.IGNORECASE,
     )
 

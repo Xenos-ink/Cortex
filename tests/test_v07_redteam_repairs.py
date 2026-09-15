@@ -26,6 +26,13 @@ grammar, morphology family, value floor, fusion scan), never a patched literal.
 - **S7** (D1 "new push"): mixed-position invisible characters (in-word AND at a
   token boundary in one payload) are caught by the fold-view re-fusion scan —
   adjacent fold-view components that re-join into a known keyword token match.
+  **RT2-D1-01**: the fusion is BOUNDARY-FAITHFUL — joins span only strip-derived
+  gaps (never a real space), so strip-char noise elsewhere in a benign payload
+  cannot fuse its multi-word phrases into keywords.
+- **RT2-D1-02**: the copula arm continues past shape-exempt "decoy" prose tokens to
+  the secret-shaped value ("password is abcdefghij supersecret123").
+- **RT2-D1-03** (documented residual, INFO): accented benign prose under the ASCII
+  shape rule ("password is cafecrème") is a redaction FP surface — future TR39 item.
 """
 
 from __future__ import annotations
@@ -496,6 +503,127 @@ def test_documented_a1_trade_ui_prose_destructive_mentions() -> None:
     assert blocked.allowed is False
     assert str(blocked.risk) == "medium" and blocked.category == "destructive_intent"
     assert SafetyPolicy._looks_sensitive("the delete button is broken") is True
+
+
+# --- RT2-D1-01: boundary-faithful fusion (D1 re-verify S7X-fp2/S7X-minimal) ----------------------
+
+#: D1's re-verify FP probes (``reverify/results_new_probes2.json``): benign prose whose
+#: multi-word phrases would fuse into keywords must NOT gate just because a strip
+#: character exists somewhere in the payload (trailing VS16 emoji, stray CGJ/Khmer cp).
+RT2_FUSION_FP_ROWS: tuple[str, ...] = (
+    "the registration form at the front desk",
+    "the registration form at the front desk ❤️",
+    "please fill out the form at reception ✅️",
+    "shut down the server gracefully tonight ✅️",
+    "the api key rotation happens monthly ✅️",
+    "pass word manager app ✅️",
+    "the api key expires soon͏",
+    "shut down the machine឴",
+    "shut down the machineᅠ",
+    "api key x͏",
+    "x͏ api key",
+    "shut down x͏",
+)
+
+
+@pytest.mark.parametrize("text", list(RT2_FUSION_FP_ROWS))
+def test_rt2_fusion_is_boundary_faithful_benign_rows_clean(text: str) -> None:
+    """RT2-D1-01: fusion joins only across strip-derived gaps — a strip character
+    ELSEWHERE in the payload never enables a join across a real space."""
+    assert SafetyPolicy._looks_sensitive(text) is False, text
+    assert _type_decision(text).allowed is True, text
+
+
+def test_rt2_fusion_rows_blocked_only_by_legacy_markers() -> None:
+    """Two of D1's FP demos gate via the LEGACY keyword vocabulary on their plain
+    ASCII forms ("restart" and "del" are standalone token markers), independently of
+    any fusion — weakening that vocabulary is forbidden, so these stay blocked. The
+    fusion machinery itself is verified INACTIVE on them (zero virtual joins)."""
+    from computer_use_mcp.safety import _fused_components_marked
+    from computer_use_mcp.textnorm import fold_marked
+
+    for plain in (
+        "restart the server after the api key meeting",
+        "a del ete task note",
+    ):
+        assert SafetyPolicy._looks_sensitive(plain) is True, plain  # legacy marker, no strip chars
+        marked = fold_marked(plain)
+        assert marked is None  # pure ASCII: the fusion path never engages
+    for text in (
+        "restart\u200b the server after the api key meeting",
+        "a del ete task note ✅️",
+    ):
+        marked = fold_marked(text)
+        virtuals = [c for c in _fused_components_marked(marked) if c[1]] if marked else []
+        assert virtuals == [], (text, virtuals)  # the fix IS active: no fusion joins
+
+
+def test_rt2_s7_parity_rows_still_block() -> None:
+    """RT2-D1-01 must not reopen S7: D1's S7X-parity attack rows (fusion across
+    strip-derived gaps only) still block."""
+    for text in (
+        "shut͏down the computer",
+        "shut\u034Fdown the computer",
+        "de\u200blete\u200bthe\u200bdatabase",
+        "for\u200bmat\u200bC:",
+        "api\u200bkey: sk-1234567890abcdef",
+        "re\u200bmove the item from the cart",
+    ):
+        assert SafetyPolicy._looks_sensitive(text) is True, text
+        assert _type_decision(text).allowed is False, text
+
+
+# --- RT2-D1-02: copula-arm decoy-token continuation ----------------------------------------------
+
+#: D1's decoy-slot finding: an exempt first token must not swallow the real value.
+RT2_DECOY_MUST_CATCH: tuple[str, ...] = (
+    "password is abcdefghij supersecret123",
+    "pwd is stored correctly supersecret123",
+    "password is: abcdefghij supersecret123",
+    "password is abcdefghij  supersecret123",
+    "password is\tabcdefghij\nsupersecret123",
+)
+
+
+@pytest.mark.parametrize("text", list(RT2_DECOY_MUST_CATCH))
+def test_rt2_decoy_slot_continuation_catches_real_value(text: str) -> None:
+    """RT2-D1-02: the copula arm continues past shape-exempt prose tokens."""
+    assert contains_secret(text) is True, text
+    redacted, count = redact_text(text)
+    assert count >= 1 and "supersecret123" not in redacted, (text, redacted)
+
+
+def test_rt2_decoy_continuation_keeps_d1_fp_prose_clean() -> None:
+    """The continuation never fires on D1's four FP prose rows (no secret-shaped
+    token anywhere in their value regions)."""
+    for text in (
+        "the password is stored in the vault",
+        "your token is required for every request",
+        "her password is legendary",
+        "the api key is documented in the wiki page",
+        "my password is correct horse battery staple",
+    ):
+        assert contains_secret(text) is False, text
+        redacted, count = redact_text(text)
+        assert count == 0 and redacted == text, (text, redacted)
+
+
+# --- RT2-D1-03: documented residual — accented prose under the ASCII shape rule ------------------
+
+
+def test_residual_accented_prose_under_ascii_shape_rule() -> None:
+    """DOCUMENTED RESIDUAL (RT2-D1-03, INFO — no code change, D1-dispositioned): the
+    S5 shape rule is ASCII-only, so accented benign prose after a copula
+    ("her password is chriée", "password is cafecrème") is secret-SHAPED by the rule
+    (accented letters are not [a-z]) and gets redacted — an FP surface. The fix for
+    this class is Unicode-aware word characterization (TR39 skeleton / UWP word
+    breaking, a future hardening item), exactly like the R-23 homoglyph residual
+    (tests/test_r23_textnorm_normalization.py). Pinned here so the residual is
+    explicit and its future fix cannot silently drift the boundary."""
+    for text in ("her password is chriée", "password is cafecrème"):
+        assert contains_secret(text) is True, text
+    for text in ("her password is chriie", "her password is chrie"):
+        assert contains_secret(text) is False, text  # pure-lowercase neighbors stay clean
 
 
 # --- session-state shape guard -------------------------------------------------------------------
