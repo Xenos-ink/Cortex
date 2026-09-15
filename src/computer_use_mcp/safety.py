@@ -1,7 +1,8 @@
 """Contextual safety policy: risk classification and policy decisions (Goal.md sections 11-12).
 
-Layering (master-mission section 5): this module imports only ``models``; the controller
-(E5) supplies :class:`SafetyContext` built from observations/task state.
+Layering (master-mission section 5): this module imports only ``models`` and the
+stdlib-only :mod:`textnorm` canonicalizer (R-23); the controller (E5) supplies
+:class:`SafetyContext` built from observations/task state.
 
 Doctrines implemented here:
 
@@ -32,8 +33,17 @@ import re
 from dataclasses import dataclass, field
 
 from .models import ActionType, GroundedAction, RiskLevel, SessionState, WindowInfo
+from .textnorm import _FOLD_MARK, canonical_views, fold_marked
 
 __all__ = ["SafetyContext", "SafetyDecision", "SafetyPolicy"]
+
+#: Risk severity order for the never-downgrade merges (R-23 dual-view + R-21 floors).
+_RISK_ORDER: dict[RiskLevel, int] = {
+    RiskLevel.LOW: 0,
+    RiskLevel.MEDIUM: 1,
+    RiskLevel.HIGH: 2,
+    RiskLevel.CRITICAL: 3,
+}
 
 
 @dataclass(frozen=True)
@@ -322,6 +332,7 @@ _CATEGORY_WHY: dict[str, str] = {
     "known_application_interaction": "interaction with an identified application window",
     "completion": "task completion marker",
     "low_routine_action": "routine action with no state-changing potential",
+    "destructive_intent": "the text pairs a destructive verb with a target object",
 }
 
 #: Human-readable consequence per category (approval/block message quality, Goal.md 12).
@@ -356,6 +367,7 @@ _CATEGORY_CONSEQUENCE: dict[str, str] = {
     "known_application_interaction": "A UI element in the target application could be activated.",
     "completion": "The task would be marked complete.",
     "low_routine_action": "A minor, recoverable UI state change could occur.",
+    "destructive_intent": "Data targeted by an explicit destructive verb could be permanently deleted or destroyed.",
 }
 
 _RISK_DEFAULT_CONSEQUENCE: dict[RiskLevel, str] = {
@@ -438,6 +450,322 @@ _COMPOUND_MARKER_TAILS: frozenset[str] = frozenset(
 )
 
 
+# --- R-21 destructive-intent grammar (additive floors over NORMALIZED components) ----------
+
+#: V1 — unambiguous destructive verbs. V1 + any object inside the window floors the
+#: verdict at MEDIUM (``destructive_intent``) and fires the keyword gate. Whole-token
+#: matches only; NOMINALIZATIONS (``deletion``/``reformatting``) and typos stay
+#: distinct tokens and remain benign (the no-stemming design).
+#:
+#: S4 repair (RT-D1-04, Commander-approved policy): the bounded inflection family
+#: (:func:`_inflect_verb_forms` — s/es/ed/d/ing with e-drop and consonant doubling)
+#: is allowed on V1 verbs, so gerund/past/third-person forms of the SAME verb carry
+#: the same intent ("wiping the old drive", "deleted the database"). The shell
+#: abbreviations ``del``/``rm`` stay exact tokens (they are command names, not
+#: English verbs — morphology on them is meaningless). Mention-form copula guards
+#: still apply: "wiping is configured" stays benign.
+_V1_VERBS: frozenset[str] = frozenset(
+    {"delete", "remove", "erase", "wipe", "truncate", "purge", "destroy"}
+)
+#: V2 — contextual destructive verbs, flagged only with a high-consequence object hit.
+#: S4: inflected V2 forms ("formatting the drive") flag ONLY with the class-object
+#: hit, exactly like their base forms ("formatting the document" stays benign).
+_V2_VERBS: frozenset[str] = frozenset(
+    {"drop", "clear", "empty", "format", "kill", "shutdown", "restart"}
+)
+
+
+def _inflect_verb_forms(verb: str) -> frozenset[str]:
+    """Bounded inflection family of one verb (S4/RT-D1-04): s/es, d/ed, ing.
+
+    Handles e-drop ("wipe" -> "wiping"), plain suffixing ("destroy" -> "destroyed"),
+    and the CVC / double-consonant doubling rule ("format" -> "formatting",
+    "drop" -> "dropping"); y/w/x finals never double ("empty" -> "emptying").
+    The produced forms are a CLOSED set per verb — this is not a stemmer: derived
+    nouns ("deletion"), prefixes ("reformatting"), and typos never match.
+    """
+    forms = {verb}
+    if verb.endswith("e"):
+        forms.update({verb + "s", verb + "d", verb[:-1] + "ing"})
+        return frozenset(forms)
+    forms.update({verb + "s", verb + "es", verb + "ed", verb + "ing"})
+    if len(verb) >= 3:
+        third, second, last = verb[-3], verb[-2], verb[-1]
+        if third not in "aeiou" and second in "aeiou" and last not in "aeiouwxy":
+            forms.update({verb + last + "ed", verb + last + "ing"})
+    return frozenset(forms)
+
+
+_V1_FORMS: frozenset[str] = _V1_VERBS | {"del", "rm"} | frozenset().union(
+    *(_inflect_verb_forms(verb) for verb in _V1_VERBS)
+)
+_V2_FORMS: frozenset[str] = frozenset().union(
+    *(_inflect_verb_forms(verb) for verb in _V2_VERBS)
+)
+#: Function words inside the object window are skipped, never object candidates.
+_FUNCTION_WORDS: frozenset[str] = frozenset(
+    {"the", "a", "an", "my", "your", "this", "that", "these", "those", "all", "everything",
+     "now", "entire", "whole", "old", "please", "kindly"}
+)
+#: Copulas close the window: a verb followed by a copula is a mention, not an
+#: imperative ("delete is a word in the dictionary" stays benign) — the same
+#: noun+copula-adjacency notion the redaction assignment grammar uses.
+_COPULAS: frozenset[str] = frozenset({"is", "are", "was", "were", "be", "been", "being"})
+#: High-consequence object class — decides the severity tier (V1/V2 verb + class
+#: object -> CRITICAL). The class decides the TIER only; the V1 open-object MEDIUM
+#: floor does not depend on noun enumeration.
+_HIGH_CONSEQUENCE_NOUNS: frozenset[str] = frozenset(
+    {
+        "database", "databases", "table", "tables", "schema", "schemas",
+        "index", "indexes", "indices", "view", "views", "row", "rows", "record", "records",
+        "disk", "disks", "drive", "drives", "partition", "partitions", "volume", "volumes",
+        "account", "accounts", "user", "users", "password", "passwords",
+        "credential", "credentials", "file", "files", "folder", "folders",
+        "directory", "directories", "weight", "weights", "model", "models",
+        "checkpoint", "checkpoints", "backup", "backups", "repo", "repos",
+        "repository", "repositories", "branch", "branches", "project", "projects",
+        "workspace", "workspaces", "history", "log", "logs", "key", "keys",
+        "environment", "environments", "everything", "all",
+    }
+)
+#: Object window: the number of NON-function components examined after the verb.
+#: S2 repair (RT-D1-01): function words are SKIPPED, never object candidates, and no
+#: longer consume window slots — "delete the entire old production database" reaches
+#: its object through three function words.
+_INTENT_WINDOW = 3
+
+
+def _destructive_intent_tier(components: list[tuple[str, bool]]) -> RiskLevel | None:
+    """Severity tier implied by the verb grammar over gate token components, or None.
+
+    V1 verb form + any object inside the :data:`_INTENT_WINDOW` window -> MEDIUM;
+    V1/V2 verb form + a high-consequence object in the window -> CRITICAL. Function
+    words are skipped without consuming window slots (S2/RT-D1-01); a copula closes
+    the window (mention-form verbs stay benign). Floors only — callers may upgrade an
+    existing verdict, never downgrade one.
+    """
+    count = len(components)
+    for index in range(count):
+        verb = components[index][0]
+        if verb in _V1_FORMS:
+            open_object_scored = False
+        elif verb in _V2_FORMS:
+            open_object_scored = True  # V2: only class-object hits may flag
+        else:
+            continue
+        floor: RiskLevel | None = None
+        scanned = 0
+        position = index
+        while scanned < _INTENT_WINDOW:
+            position += 1
+            if position >= count:
+                break
+            word = components[position][0]
+            if word in _COPULAS:
+                break  # mention-form verb; the imperative window is closed
+            if word in _FUNCTION_WORDS:
+                continue  # filler: skipped, does not consume a window slot (S2)
+            scanned += 1
+            if word in _HIGH_CONSEQUENCE_NOUNS:
+                return RiskLevel.CRITICAL
+            if not open_object_scored and floor is None:
+                floor = RiskLevel.MEDIUM  # first open object; keep scanning for class nouns
+        if floor is not None:
+            return floor
+    return None
+
+
+def _word_alternation(words: frozenset[str]) -> str:
+    # Longest-first so compound verbs (``delete``) win over their prefixes (``del``)
+    # without relying on backtracking; sorted for a byte-stable compiled pattern.
+    return "(?:" + "|".join(sorted(words, key=len, reverse=True)) + ")"
+
+
+_COPULA_ALT = _word_alternation(_COPULAS)
+_FUNC_ALT = _word_alternation(_FUNCTION_WORDS)
+_VERB_ALT = _word_alternation(_V1_FORMS | _V2_FORMS)
+_V1_ALT = _word_alternation(_V1_FORMS)
+_NOUN_ALT = _word_alternation(_HIGH_CONSEQUENCE_NOUNS)
+
+#: classify-side floor for the MEDIUM tier (V1 form + filler-tolerant object). The
+#: skip group is tempered on copulas, mirroring the component scanner the keyword
+#: gate uses, and — S2 (RT-D1-01) — allows up to THREE function-word groups between
+#: the verb and its object (the component scanner skips them without limit). Bounded
+#: quantifiers only.
+_DESTRUCTIVE_INTENT_MEDIUM = re.compile(
+    rf"\b{_V1_ALT}\W+"
+    rf"(?:(?!{_COPULA_ALT}\b){_FUNC_ALT}\W+){{0,3}}"
+    rf"(?!(?:{_COPULA_ALT}|{_FUNC_ALT})\b)\w",
+    re.IGNORECASE,
+)
+#: classify-side floor for the CRITICAL tier (V1/V2 form + high-consequence object).
+_DESTRUCTIVE_INTENT_CRITICAL = re.compile(
+    rf"\b{_VERB_ALT}\W+"
+    rf"(?:(?!{_COPULA_ALT}\b){_FUNC_ALT}\W+){{0,3}}"
+    rf"(?!{_COPULA_ALT}\b){_NOUN_ALT}\b",
+    re.IGNORECASE,
+)
+
+# --- S7 repair (RT-D1-07 "new push") + RT2-D1-01 boundary faithfulness --------------------
+#
+# Mixed-position zero-width payloads ("fo\\u200bmat\\u200bC:", "de\\u200blete\\u200bthe
+# \\u200bdatabase") carry an invisible character BOTH inside a keyword AND at a token
+# boundary. The canonical views heal exactly one role each: the delete view fuses the
+# separator ("formatC:" — the \\s-anchored patterns miss), the fold view splits the
+# keyword ("for mat C:" — no verb/marker token). Neither single view matches, so the
+# never-downgrade merge has nothing to merge.
+#
+# The repair stays at the view/scan level: on the fold view's component stream,
+# ADJACENT components whose CONCATENATION is a known keyword token (marker, compound
+# tail, verb form, class noun, or phrase member) re-join as a virtual fused component.
+# RT2-D1-01 (boundary faithfulness): a join is allowed ONLY where the separator
+# between the two components is itself strip-class — the fold view is taken in its
+# MARKED form (:func:`textnorm.fold_marked`, strip-derived gaps = U+001F sentinel,
+# real whitespace = U+0020) and two components join only when their gap consists
+# solely of sentinels. A join across a real space is forbidden, so benign multi-word
+# prose never fuses into a keyword merely because strip-character noise (a trailing
+# VS16 emoji, one stray CGJ) exists SOMEWHERE ELSE in the payload. Dictionary-driven
+# and bounded (2- and 3-token joins, keyword-set membership required) — no general
+# fuzzy/stem matching; ASCII text never enters this path.
+
+_FUSION_KEYWORDS: frozenset[str] = (
+    _SENSITIVE_TOKEN_MARKERS
+    | _COMPOUND_MARKER_TAILS
+    | _V1_FORMS
+    | _V2_FORMS
+    | _HIGH_CONSEQUENCE_NOUNS
+    | {word for phrase in _SENSITIVE_PHRASE_MARKERS for word in phrase}
+)
+
+
+def _gap_is_strip_derived(text: str, start: int, end: int) -> bool:
+    """True when ``text[start:end]`` is a non-empty run of fold-mark sentinels only."""
+    if start >= end:
+        return False
+    for char in text[start:end]:
+        if char != _FOLD_MARK:
+            return False
+    return True
+
+
+#: Longest keyword the fusion can form — bounds the strip-connected accumulation.
+_FUSION_MAX_TOKEN_LEN = max(len(word) for word in _FUSION_KEYWORDS)
+
+#: RT3-D1-02: phrase-first words keyed to their seconds, for the fused-stream
+#: phrase-window scan (multi-token commands split by strip characters).
+_PHRASE_FIRSTS: dict[str, set[str]] = {}
+for _first, _second in _SENSITIVE_PHRASE_MARKERS:
+    _PHRASE_FIRSTS.setdefault(_first, set()).add(_second)
+_PHRASE_SECONDS: frozenset[str] = frozenset(
+    _second for _first, _second in _SENSITIVE_PHRASE_MARKERS
+)
+
+
+def _fusion_scan_marked(marked_fold: str) -> tuple[list[tuple[str, bool]], bool]:
+    """Scan a MARKED fold view (RT2-D1-01): return the component stream with virtual
+    re-fused keyword tokens inserted, and whether a multi-token PHRASE fires across
+    strip-connected concatenations (RT3-D1-02).
+
+    Boundary faithfulness (RT2-D1-01): concatenations may only span strip-derived
+    gaps. RT3-D1-02: each strip-connected RUN of components enumerates every keyword
+    prefix ending at each internal boundary — chained joins compose ("re"+"g" ->
+    ``reg``, and the phrase window ("reg", "delete") then consumes the fused stream:
+    the virtual token is inserted at its END boundary, immediately before the next
+    component), and a phrase fires when a first-word ending at boundary ``j`` pairs
+    with a second-word starting at ``j``.
+    """
+    lowered = marked_fold.lower()
+    spans = list(_TEXT_TOKEN_PATTERN.finditer(lowered))
+    toks = [match.group() for match in spans]
+    count = len(toks)
+    strip_gap = [
+        i < count - 1 and _gap_is_strip_derived(lowered, spans[i].end(), spans[i + 1].start())
+        for i in range(count)
+    ]
+    # ends_at[j]: (token, first-component-index) for strip-connected keyword
+    # concatenations of components i..j-1 (multi-component only).
+    ends_at: list[set[tuple[str, int]]] = [set() for _ in range(count + 1)]
+    # starts_at[i]: strip-connected keyword concatenations of components i..k-1
+    # (multi-component only) that can serve as a phrase SECOND word.
+    starts_at: list[set[str]] = [set() for _ in range(count + 1)]
+    for boundary in range(1, count + 1):
+        index = boundary - 1
+        acc = toks[index]
+        while True:
+            if boundary - index >= 2 and acc in _FUSION_KEYWORDS:
+                ends_at[boundary].add((acc, index))
+            if (
+                index == 0
+                or not strip_gap[index - 1]
+                or len(acc) + len(toks[index - 1]) > _FUSION_MAX_TOKEN_LEN
+            ):
+                break
+            index -= 1
+            acc = toks[index] + acc
+    for index in range(count):
+        acc = toks[index]
+        position = index
+        while True:
+            if position - index >= 1 and acc in _PHRASE_SECONDS:
+                starts_at[index].add(acc)
+            if (
+                position + 1 >= count
+                or not strip_gap[position]
+                or len(acc) + len(toks[position + 1]) > _FUSION_MAX_TOKEN_LEN
+            ):
+                break
+            position += 1
+            acc = acc + toks[position]
+    components: list[tuple[str, bool]] = []
+    for index in range(count):
+        for token, _start in sorted(ends_at[index]):
+            components.append((token, True))
+        components.append((toks[index], False))
+    phrase_hit = any(
+        first in _PHRASE_FIRSTS and starts_at[boundary] & _PHRASE_FIRSTS[first]
+        for boundary in range(count + 1)
+        for first, _start in ends_at[boundary]
+    )
+    return components, phrase_hit
+
+
+#: P1: necessary condition helper set — every V1/V2 verb form in one lookup.
+_VERB_FORM_LOOKUP: frozenset[str] = _V1_FORMS | _V2_FORMS
+
+
+def _component_phrases_hit(components: list[tuple[str, bool]]) -> bool:
+    """Exact-token phrase scan over a component stream (shared by the keyword gate
+    and the R-21 classify floor, so fused virtual tokens feed BOTH — RT3-D1-02)."""
+    count = len(components)
+    for phrase in _SENSITIVE_PHRASE_MARKERS:
+        size = len(phrase)
+        for start in range(count - size + 1):
+            window = tuple(components[position][0] for position in range(start, start + size))
+            if window == phrase:
+                return True
+    return False
+
+
+def _view_has_intent_verb(view: str) -> bool:
+    """Cheap prerequisite for the regex intent floor: does ANY V1/V2 verb form appear
+    as a word-delimited token in the view?
+
+    The floor regexes anchor on ``\\b<verb-form>\\W+``, so a floor hit requires the
+    form to be a complete word in the view's token stream — whole token, or a
+    hyphen-split part of one ("delete-all" carries the word "delete" to the regex).
+    A miss therefore skips both floor regexes with a provably identical outcome (P1);
+    the scan is one ``findall`` over the lowered view plus set lookups.
+    """
+    for token in _TEXT_TOKEN_PATTERN.findall(view.lower()):
+        if token in _VERB_FORM_LOOKUP:
+            return True
+        if "-" in token:
+            for part in token.split("-"):
+                if part in _VERB_FORM_LOOKUP:
+                    return True
+    return False
+
+
 def _clip(text: str, limit: int = _MAX_TEXT_SNIPPET) -> str:
     cleaned = " ".join(text.split())
     if len(cleaned) <= limit:
@@ -467,7 +795,25 @@ class SafetyPolicy:
         waives the recorded approval requirement.
         """
         ctx = context if context is not None else SafetyContext()
-        risk, category, why = self.classify(action, ctx)
+        # P1 perf restructure: canonicalize the haystack ONCE here and reuse the views
+        # for both the classification and (for TYPE actions) the keyword gate — the
+        # gate previously re-canonicalized the same text a second time. When the
+        # action carries no separate reason, the haystack IS the typed text and the
+        # gate consumes these exact views.
+        haystack = "\n".join(part for part in (action.text, action.reason) if part)
+        views = canonical_views(haystack)
+        gate_flags: list[bool] | None = None
+        if action.action == ActionType.TYPE and action.text:
+            gate_views = views if not action.reason else canonical_views(action.text)
+            marked_fold = fold_marked(action.text) if len(gate_views) > 1 else None
+            gate_flags = [
+                SafetyPolicy._view_is_sensitive(
+                    view, fusion=marked_fold if position else None
+                )
+                for position, view in enumerate(gate_views)
+            ]
+
+        risk, category, why = self._classify_views(action, ctx, views)
 
         # Legacy gates, verbatim order and outcomes (compat: test_core/test_smoke).
         if state.stopped:
@@ -476,7 +822,7 @@ class SafetyPolicy:
             return SafetyDecision(False, False, "Maximum session steps reached.", risk, category)
         if action.action == ActionType.DONE:
             return SafetyDecision(True, False, "Completion marker.", RiskLevel.LOW, "completion")
-        if action.action == ActionType.TYPE and action.text and self._looks_sensitive(action.text):
+        if gate_flags is not None and any(gate_flags):
             return SafetyDecision(
                 False,
                 True,
@@ -530,10 +876,86 @@ class SafetyPolicy:
 
         The category is a stable machine string (e.g. ``shell_execution``); the reason is
         a human-readable "why". See the module docstring for the doctrine.
+
+        R-23: the haystack is matched on its canonical view(s) — one view (byte-identical
+        to the raw text) for every ASCII haystack, otherwise the dual delete/fold views
+        merged never-downgrade (risk = max; ties keep the first view). R-21: an additive
+        ``destructive_intent`` severity floor from the verb grammar may upgrade the
+        verdict, never downgrade one.
         """
         ctx = context if context is not None else SafetyContext()
         haystack = "\n".join(part for part in (action.text, action.reason) if part)
+        return self._classify_views(action, ctx, canonical_views(haystack))
 
+    def _classify_views(
+        self,
+        action: GroundedAction,
+        ctx: SafetyContext,
+        views: tuple[str, ...],
+    ) -> tuple[RiskLevel, str, str]:
+        """Classify the precomputed canonical views (P1: one canonicalization per call).
+
+        The full classifier body runs on every view (a gate-failing view can still carry
+        a pattern-class verdict — "install the app" is HIGH with no gate marker), merged
+        never-downgrade. Once a view classifies CRITICAL the merge can only reproduce
+        that verdict, so the remaining views and the intent floor are skipped — a pure
+        short-circuit with a provably identical result.
+        """
+        verdict = self._classify_haystack(action, ctx, views[0])
+        for view in views[1:]:
+            if verdict[0] is RiskLevel.CRITICAL:
+                break  # the never-downgrade merge cannot exceed CRITICAL
+            other = self._classify_haystack(action, ctx, view)
+            if _RISK_ORDER[other[0]] > _RISK_ORDER[verdict[0]]:
+                verdict = other
+        if verdict[0] is not RiskLevel.CRITICAL:
+            marked_fold = None
+            if len(views) > 1:
+                haystack = "\n".join(part for part in (action.text, action.reason) if part)
+                marked_fold = fold_marked(haystack)
+            floor = self._destructive_intent_floor(views, marked_fold)
+            if floor is not None and _RISK_ORDER[floor[0]] > _RISK_ORDER[verdict[0]]:
+                return floor
+        return verdict
+
+    def _destructive_intent_floor(
+        self, views: tuple[str, ...], marked_fold: str | None = None
+    ) -> tuple[RiskLevel, str, str] | None:
+        """``destructive_intent`` floor over the canonical haystack views, or None.
+
+        P1: the regex floor can only fire when a view contains a V1/V2 verb form as a
+        word-delimited token, so a verb-free view skips both regex passes with a
+        provably identical result. S7: on fold views (the dual-view strip-character
+        path) the component tier additionally runs over the RE-FUSED component stream
+        — the mixed-position payloads split their verb in the raw fold view, so the
+        re-fused reading is the only one that carries it. RT2-D1-01: the re-fusion is
+        boundary-faithful (strip-derived gaps only), computed from the marked fold.
+        """
+        medium = False
+        for position, view in enumerate(views):
+            if position:
+                if marked_fold is None:
+                    continue
+                fused, fusion_phrase = _fusion_scan_marked(marked_fold)
+                if fusion_phrase or _component_phrases_hit(fused):
+                    return (RiskLevel.CRITICAL, "destructive_intent", self._why("destructive_intent"))
+                tier = _destructive_intent_tier(fused)
+                if tier is RiskLevel.CRITICAL:
+                    return (RiskLevel.CRITICAL, "destructive_intent", self._why("destructive_intent"))
+                medium = medium or tier is RiskLevel.MEDIUM
+            if not _view_has_intent_verb(view):
+                continue  # no verb-form token -> neither floor regex can match
+            if _DESTRUCTIVE_INTENT_CRITICAL.search(view):
+                return (RiskLevel.CRITICAL, "destructive_intent", self._why("destructive_intent"))
+            medium = medium or bool(_DESTRUCTIVE_INTENT_MEDIUM.search(view))
+        if medium:
+            return (RiskLevel.MEDIUM, "destructive_intent", self._why("destructive_intent"))
+        return None
+
+    def _classify_haystack(
+        self, action: GroundedAction, ctx: SafetyContext, haystack: str
+    ) -> tuple[RiskLevel, str, str]:
+        """Legacy contextual classification of one haystack (existing precedence verbatim)."""
         for pattern, category in _CRITICAL_PATTERNS:
             if pattern.search(haystack):
                 return RiskLevel.CRITICAL, category, self._why(category)
@@ -630,8 +1052,39 @@ class SafetyPolicy:
         and still blocks, and credential nouns keep their plural forms so plural
         mentions block exactly as before. Only derived-word false positives
         (``tokenize``, ``shutdowns``) and the ``DOI token(s)`` citation phrase pass now.
+
+        R-23: matching runs on the canonical view(s) of ``text`` (ASCII input is
+        matched byte-identically to before). R-21: the destructive-intent verb grammar
+        (V1 verb + object, or V1/V2 verb + high-consequence object, within the window)
+        is additive — it can only widen what blocks, never narrow it. S7: on the
+        dual-view (strip-character) path, the fold view additionally matches on
+        re-fused keyword tokens — mixed-position invisible characters split the
+        keyword in the fold view while fusing the separator in the delete view, and
+        neither single view alone sees the payload's plain reading. RT2-D1-01: the
+        fusion is boundary-faithful — it joins only across strip-derived gaps.
         """
-        components = _token_components(text.lower())
+        views = canonical_views(text)
+        if SafetyPolicy._view_is_sensitive(views[0]):
+            return True
+        if len(views) > 1:
+            return SafetyPolicy._view_is_sensitive(views[1], fusion=fold_marked(text))
+        return False
+
+    @staticmethod
+    def _view_is_sensitive(view: str, *, fusion: str | None = None) -> bool:
+        """Legacy marker/phrase gate for one canonical view + the R-21 verb grammar.
+
+        ``fusion`` (S7) is the MARKED fold view (:func:`textnorm.fold_marked`) of the
+        same text: token boundaries in it that strip characters produced are
+        distinguishable, so adjacent components re-join into a keyword token only
+        across a strip-derived gap — never across a real space (RT2-D1-01).
+        """
+        components = _token_components(view.lower())
+        phrase_hit = False
+        if fusion is not None:
+            components, phrase_hit = _fusion_scan_marked(fusion)
+            if phrase_hit:
+                return True
         for index, (token, from_compound) in enumerate(components):
             sensitive = token in _SENSITIVE_TOKEN_MARKERS or (
                 from_compound and token in _COMPOUND_MARKER_TAILS
@@ -642,14 +1095,9 @@ class SafetyPolicy:
             if token in _DOI_TOKEN_HEAD_NOUNS and previous == "doi":
                 continue  # "DOI token(s)": digital-object-identifier citation context
             return True
-        count = len(components)
-        for phrase in _SENSITIVE_PHRASE_MARKERS:
-            size = len(phrase)
-            for start in range(count - size + 1):
-                window = tuple(components[position][0] for position in range(start, start + size))
-                if window == phrase:
-                    return True
-        return False
+        if _component_phrases_hit(components):
+            return True
+        return _destructive_intent_tier(components) is not None
 
     # -- message construction (P0-F, Goal.md section 12) ---------------------------------
 

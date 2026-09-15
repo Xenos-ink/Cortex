@@ -1047,24 +1047,47 @@ def test_rt9_finding_benign_text_false_positives_quantified_b12() -> None:
     that layer is keyword-level (value-agnostic), while the REDACTION layer is
     value-oriented and passes the same string — the documented division of labor
     between the two layers (corpora of record in tests/test_r02_text_corpora.py).
+
+    v07-007 S4 repair (RT-D1-04, Commander-approved bounded morphology): inflected
+    forms of the V1 verbs are intent verbs, so the PAST/PARTICIPLE row "truncated
+    JWT fragment in a blog quote" ("truncated" = truncate+d + open object) now
+    keyword-gates at the approval-grade MEDIUM floor — the same documented trade as
+    the narrative-prose row "he wiped the drive yesterday" (D1 report, RT-D1-04).
+    The residual keyword-layer flag is therefore 2/18.
     """
     flagged = [t for t in BENIGN_CORPUS if _flagged(_type_decision(t))]
     assert "the closed-form solution of the integral" not in flagged
     assert "Closed Form X-4782 application approved" not in flagged
-    assert flagged == ["John's password: (none stored here)"]
-    # pinned: 1/18 residual keyword-layer flag, exactly the value-mention case
-    assert len(flagged) == 1 and len(BENIGN_CORPUS) == 18
+    assert flagged == [
+        "John's password: (none stored here)",
+        "eyJhbGciOi (truncated JWT fragment in a blog quote)",
+    ]
+    # pinned: 2/18 residual keyword-layer flag — the value-mention case plus the
+    # S4 inflected-verb participle (both documented trades, never silent).
+    assert len(flagged) == 2 and len(BENIGN_CORPUS) == 18
 
 
 def test_rt9_finding_gate_misses_compensated_by_redaction_except_modern_tokens() -> None:
-    """The second half of RT9-1: the type gate blocks only 3/10 secret corpus entries;
-    redaction at the dispatch sink covers 7/10 — the GitHub/Slack/Stripe token classes
-    are covered by NEITHER layer (defense-in-depth gap, documented in SAFETY §7 as the
-    10-pattern list; typed into a local app they never leave the machine, so exposure
-    is limited to the provider/audit sinks)."""
+    """FINDING RT9-1b — UPDATED to the post-R-21 remediation state (v0.7.0, R-21/FIX-2).
+
+    ORIGINAL FINDING (pre-fix, pinned here for two release cycles): the type gate
+    blocked only 3/10 secret corpus entries and redaction covered 7/10 — the
+    GitHub/Slack/Stripe token classes were covered by NEITHER layer (defense-in-depth
+    gap, documented in SAFETY §7 as the 10-pattern list).
+
+    v0.7.0 R-21/FIX-2 CLOSED the modern-token half BY ROADMAP MANDATE: value-shape
+    ``SecretPattern`` families with length floors now cover ghp_/gho_/ghu_/ghs_/ghr_
+    (github_token), github_pat_ (github_finegrained_pat), xox[abprs] with both - and _
+    separators (slack_token), npm_ (npm_token), and xocr_ (xocr_token) — redaction now
+    catches 9/10. The keyword gate stays keyword-level (3/10, unchanged by design — the
+    bare token values carry no credential noun for the gate to match). THE RESIDUAL IS
+    KEPT PINNED: the Stripe ``sk_live_`` key matches no pattern family and remains
+    uncovered by both layers — that row must STAY in ``uncovered`` until a stripe key
+    family is added (a finding-pin, deliberately not relaxed). Per-AC coverage for the
+    fixed families lives in tests/test_r21_classifier_redaction.py."""
     gate_blocked = [t for t in SECRET_CORPUS if _flagged(_type_decision(t))]
     assert len(gate_blocked) == 3
     redacted = [t for t in SECRET_CORPUS if redact_text(t)[0] != t]
-    assert len(redacted) == 7
+    assert len(redacted) == 9  # R-21/FIX-2: ghp_/xoxb_ (and the other families) now covered
     uncovered = set(SECRET_CORPUS) - set(gate_blocked) - set(redacted)
-    assert uncovered == {_GHP_TOKEN, _SLACK_TOKEN, _STRIPE_KEY}
+    assert uncovered == {_STRIPE_KEY}  # residual stays pinned: no stripe family yet

@@ -1772,6 +1772,12 @@ async def computer_execute(
             }
         )
         response = payload
+    # v07-007 R-21 (Commander decision D1): the non-executed response shapes embed
+    # model-proposed text in ``message`` (e.g. approval messages carry _clip(action.text)),
+    # so they get the SAME redaction the executed shape already applies — additive
+    # redaction only, no shape/field changes.
+    if outcome.kind in {"rejected", "safety_denied", "approval_required", "digest_surprise", "error"}:
+        response = _redact_result_payload(response)
     # PERF-004 C4: host-payload opt-out (additive, off by default) — omit the heavy
     # image from the response entirely when the caller asked for it.
     if include_screenshot_after is False:
