@@ -12,6 +12,119 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
+## v0.7.1 (2026-09-17, ORVEX-CORTEX-v07-008 — live-session field defects)
+
+The three defect classes that forced a live-field tester to bypass Cortex entirely
+while driving Blender (OpenGL, no accessibility tree) on v0.7.0 are fixed at the
+design level: visual verification confidently reporting `Mean pixel difference
+0.000000` from a dead capture source, `ensure_app` reporting `NO_INSTANCE` while
+silently spawning nothing, and per-character `type` inserting zero characters while
+chords worked. Every fix is additive, honest-by-contract, and generic (never
+app-specific), each carried by its own executable test file plus a cross-track
+integration file (78 net new tests; suite now 1672 passed + 10 skipped).
+
+### Added
+
+- **Launch path mapping — `CORTEX_LAUNCH_PATHS`** (env; `needle=path;needle=path`,
+  fail-safe parse): an explicitly-authorized `ensure_app` launch of a GUI app not on
+  PATH resolves the needle in a fixed order — **mapped path → `PATH`
+  (`shutil.which`) → Microsoft Store execution alias → raw-name spawn**. The needle
+  side passes the same charset gate as the launch itself (case-insensitive whole-needle
+  match); the path side must exist as a FILE (a directory is skipped); every malformed
+  entry is skipped fail-safe — never fatal, nothing ever spawned FROM a malformed
+  entry. Local trusted configuration (host `env` block); allowlist and approval
+  semantics for the launch itself are unchanged.
+- **Launch-status honesty** — an authorized (`launch=server`) `NO_INSTANCE` is never
+  silent: the payload carries exactly one launch status (`launched=<exe>` unchanged,
+  `launch_rejected=LaunchTargetError` unchanged, new
+  `launch_unresolved=path-lookup-missed` for a valid needle every resolution step
+  missed, new `launch_unresolved=spawn-failed (<Exc>: <bounded msg>)` surfacing the
+  real OS error). `launch=driver` payloads stay byte-identical and never spawn; the
+  suffixes add no driver-controlled injection surface (static text / bounded local
+  OS-error text only). The fake-backend launch mirror honors the same mapping and
+  returns the same typed suffixes (real/fake parity pinned).
+- **Capture provenance** — `VerificationResult.capture_provenance`
+  (`CaptureProvenance`: sha256 + byte size of BOTH frames the visual tier already
+  diffed, computed from bytes in hand — zero new captures, zero sleeps; additive
+  evidence line `capture sha256 before=<12hex>… after=<12hex>… bytes=<n>/<n>`).
+  None-preserving: every non-pixel verdict and legacy constructor is unchanged.
+- **Capture-source integrity guard** — a per-session agent counter of CONSECUTIVE
+  byte-identical pre/post capture pairs across DISTINCT screen-affecting actions
+  (`wait`/`done`/ensure_app probes exempt; any differing pair resets; the
+  expected-text fallback re-verification replaces its own contribution). At ≥ 3 the
+  verification note+evidence and the audit event carry the typed marker
+  `CAPTURE_SOURCE_SUSPECTED identical_pairs=<n>` (same uppercase vocabulary family as
+  `TARGET_GONE`/`FOCUS_DRIFTED`/`NO_INSTANCE`). THE VERDICT IS NEVER ALTERED — a
+  confident meaningless `0.000000` stream becomes a typed, actionable suspicion
+  instead. Works in text-mode sessions (the internal capture is payload-independent).
+- **Clipboard text entry — `via="clipboard"`** (additive `type`-only field; default
+  `null`/`"sendinput"` is byte-identical to pre-`via` behavior): save the current
+  clipboard text → set `CF_UNICODETEXT` (raw ctypes user32/kernel32, zero new
+  dependencies) → ONE ctrl+v chord through the existing hotkey path → best-effort
+  restore in `finally` (a restore failure is typed-annotated
+  `clipboard_restore=failed`, never raised, dispatches no keystrokes; an abort
+  anywhere after the set still restores; a set failure fails typed with zero
+  keystrokes). For OpenGL/console apps that receive chords but drop per-character
+  injection (field case: Blender's Python Console). `follow_ups` entries accept the
+  same `via`.
+- **`TYPE_UNCONFIRMED no-readable-target`** — typed diagnostic on a blind
+  (`integrity=unverified`) type whose semantic reader could not even identify a
+  readable focused target, with a transport-appropriate hint (verify visually with a
+  stated `expected_effect`; on the default transport additionally: retry with
+  `via="clipboard"`). A present-but-valueless control keeps the plain honest message.
+
+### Changed
+
+- `computer_execute` gains the trailing-optional `via` parameter (`None` == legacy
+  behavior; wire pin updated — the tool's only parameter addition). `via` on any
+  non-type action or an unknown value is a fail-closed typed `invalid_action`
+  rejection (validator codes `via_not_allowed` / `via_invalid`; teach-in text covers
+  both). Five tools stay five.
+- Gate parity by construction and by test: the clipboard transport NEVER bypasses any
+  gate — classification, secret redaction (`clipboard_credential` family included),
+  and the approval decision are computed from the identical `text` for both `via`
+  values (identical `SafetyDecision` rows pinned) and differ only after approval.
+  R-04 read-back: the clipboard path uses the honest single-read-back form (no
+  per-char repair ladder — a re-paste could double-apply); R-02 corpora untouched.
+- Pre-existing payload pins updated for the additive suffixes only (design-mandated
+  payload extensions): blind-type payloads in `test_io_parity`/`test_r04` and the
+  RT-7 wire pin in `test_p5_redteam`.
+- README (env table, action table, type-transports section) and docs/SAFETY.md
+  (launch-mapping, launch-outcome-honesty, malformed-mapping rows) document which
+  apps need which transport and the local-trusted-config status of the mapping.
+
+### Fixed
+
+- (Defect B) `ensure_app` `NO_INSTANCE` under `launch=server` for a Blender-like
+  target now either really launches via the mapping (`launched=<basename>`) or tells
+  the driver exactly why not and what to configure — the former silent bare payload
+  is gone.
+- (Defect A) a dead/frozen capture source is detected and typed
+  (`CAPTURE_SOURCE_SUSPECTED`) with frame identity evidence (`capture_provenance`)
+  instead of an endless confident `0.000000`.
+- (Defect C) text entry into OpenGL/console apps works natively through the clipboard
+  transport with clipboard-restore discipline; blind types say so honestly.
+
+### Performance
+
+- Provenance hashing: sha256 over the frames already in hand measured ~1.4 ms per
+  ~1.9 MB frame; `blake2b(digest_size=16)` measured ~4.1 ms and missed the ≤~2 ms/frame
+  budget, so sha256 ships. The detector performs ZERO new captures (observe-call
+  parity pinned against a provenance-disabled run); the default `sendinput` path pays
+  zero clipboard cost (the ctypes binding and helpers are reached only on the
+  `via="clipboard"` branch).
+
+### Compatibility notes
+
+- No wire change: five tools stay five; every addition is an optional trailing
+  parameter (`via`), an additive None-preserving model field (`capture_provenance`),
+  or an additive payload suffix. `via=null`/`"sendinput"` and `launch=driver`
+  payloads are byte-identical to v0.7.0. Approval semantics unchanged (TYPE stays
+  approval-required-by-default; the clipboard transport runs the identical gate
+  stack). No protection weakened: R-02 corpora byte-identical, failsafe/stop-token/
+  `InputBlockedError` semantics ride the chord dispatch unchanged, launch
+  soft-failure still degrades to a payload (never raises).
+
 ## v0.7.0 (2026-09-15, ORVEX-CORTEX-v07-007 — safety & guard residuals)
 
 The three P0 safety and guard residual classes discovered during v0.6.0 red-teaming
