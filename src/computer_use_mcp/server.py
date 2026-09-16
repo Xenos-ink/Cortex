@@ -1021,6 +1021,19 @@ def _grounded_shape_hint(text: str) -> str | None:
             "ensure_app requires a non-empty target: {\"action\": \"ensure_app\", "
             "\"target\": \"<process>\"} or \"<process>|<doc-token>\"."
         )
+    if "via is only valid on type actions" in text:
+        return (
+            "via selects the type-action transport only: "
+            "{\"action\": \"type\", \"text\": \"...\", \"via\": \"clipboard\"} or "
+            "via=\"sendinput\" (default). Remove via from every other action."
+        )
+    if "via must be" in text:
+        return (
+            "via accepts exactly \"sendinput\" (default per-character typing) or "
+            "\"clipboard\" (set CF_UNICODETEXT then ctrl+v paste, for OpenGL/console "
+            "apps that drop per-character input): {\"action\": \"type\", \"text\": \"...\", "
+            "\"via\": \"clipboard\"}."
+        )
     return None
 
 
@@ -1577,6 +1590,7 @@ async def computer_execute(
     x2: NullableCoordinate = None,
     y2: NullableCoordinate = None,
     target: NullableStr = None,
+    via: NullableStr = None,
     include_screenshot_after: NullableBool = None,
     follow_ups: NullableFollowUps = None,
 ) -> Any:
@@ -1606,6 +1620,22 @@ async def computer_execute(
     drag end (both required, screenshot coordinates). ``action="move"`` requires
     ``x``/``y``; ``action="hotkey"`` requires ``keys`` (2-12 key names);
     ``action="focus_window"`` requires ``target`` (a window title).
+
+    Type transport selector (v0.7.1, type actions ONLY): ``via`` chooses HOW text is
+    delivered. ``via="sendinput"`` (default; also ``via=null``) is per-character
+    ``KEYEVENTF_UNICODE`` injection. ``via="clipboard"`` saves the current clipboard,
+    sets ``CF_UNICODETEXT`` with the typed text, dispatches the ctrl+v chord through the
+    existing hotkey path, then best-effort restores the previous clipboard content
+    (restore failure is typed-annotated, never fails the action). Use the clipboard
+    transport for OpenGL/console apps that receive chords but drop per-character
+    injection (field case: Blender's Python Console). GATE PARITY: the transport never
+    bypasses anything — the SAME classification, redaction, and approval decision is
+    computed for both transports from the identical text; they differ only after
+    approval. When the target is unreadable (no accessibility tree), a blind type
+    reports ``TYPE_UNCONFIRMED no-readable-target`` and recommends
+    ``via="clipboard"`` plus visual verification with a stated ``expected_effect``.
+    ``via`` on any non-type action, or an unknown value, is a typed ``invalid_action``
+    rejection (fail closed).
 
     REM-F weak-model tolerance (boundary only): integer coordinates also accept
     integral floats (1343.0) and numeric strings ("1343"); NON-INTEGRAL values ROUND
@@ -1705,6 +1735,7 @@ async def computer_execute(
             confidence=1.0,
             expected_effect=expected_effect,
             target=target,
+            via=via,
         )
     except Exception as exc:  # noqa: BLE001 - structured error, no traceback
         return _teaching_invalid_action(exc, action)

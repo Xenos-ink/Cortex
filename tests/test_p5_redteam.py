@@ -843,7 +843,8 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
     expected_new: dict[str, set[str]] = {
         # D1 (ORVEX-CORTEX-056-LIVEFIX): image_delivery joins the trailing set.
         "start_session": {"interference", "image_delivery"},
-        "computer_execute": {"include_screenshot_after", "follow_ups"},
+        # v0.7.1 (Defect C): via joins the trailing set (type-transport selector).
+        "computer_execute": {"via", "include_screenshot_after", "follow_ups"},
     }
     for tool_name, new_params in expected_new.items():
         signature = inspect.signature(getattr(server, tool_name))
@@ -861,7 +862,8 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
         "session_id", "action", "x", "y", "text", "keys", "delta", "approved",
         "expected_effect", "x2", "y2", "target",
     ]
-    assert params[12:] == ["include_screenshot_after", "follow_ups"]  # the ONLY additions
+    # v0.7.1: via is the ONLY new addition (trailing optional, None == legacy sendinput).
+    assert params[12:] == ["via", "include_screenshot_after", "follow_ups"]
 
 
 async def test_rt7_old_client_shapes_accepted_on_the_tool_surface(

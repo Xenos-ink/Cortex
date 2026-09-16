@@ -504,9 +504,15 @@ def test_empty_text_stays_legacy_noop(
 
 def test_fake_backend_type_integrity_contract() -> None:
     backend = FakeComputerBackend()
-    # unreadable by default: honest unverified, action still recorded
+    # unreadable by default: honest unverified, action still recorded.
+    # v0.7.1 (Defect C): focused_control_value=None IS the simulated no-readable-target
+    # (Blender) shape, so the additive typed diagnostic is now part of the expected
+    # payload (prefix + integrity suffix unchanged).
     message = backend.execute(_type_action("abc"))
-    assert message == "Simulated type. integrity=unverified(0/3)"
+    assert message == (
+        "Simulated type. integrity=unverified(0/3) TYPE_UNCONFIRMED no-readable-target "
+        '(verify visually with a stated expected_effect (or retry with via="clipboard"))'
+    )
     assert [item.action.value for item in backend.executed] == ["type"]
     # matching value: verified
     backend.focused_control_value = "abc"

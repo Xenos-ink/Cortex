@@ -24,7 +24,7 @@ import uuid
 from collections import deque
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, PrivateAttr, computed_field, model_validator
 
@@ -184,6 +184,13 @@ class GroundedAction(BaseModel):
     ``focus_window``, ``None`` for every other action type). It is a dedicated field,
     deliberately NOT ``text``: ``text`` is the redaction/secret-scan channel, while
     ``target`` is a window-identity selector audited and allowlist-gated separately.
+
+    ``via`` (v0.7.1, additive; ``type`` actions ONLY) selects the text-entry transport:
+    ``None``/``"sendinput"`` keeps the default per-character dispatch (byte-identical to
+    the pre-via behavior); ``"clipboard"`` sets CF_UNICODETEXT then dispatches the ctrl+v
+    chord through the existing hotkey path, for OpenGL/console apps whose input stack
+    does not process per-character injection. The transport NEVER bypasses any gate:
+    classification, redaction, and approval run on ``text`` identically for both values.
     """
 
     action: ActionType
@@ -197,9 +204,35 @@ class GroundedAction(BaseModel):
     source_observation_id: str | None = None
     expected_effect: str | None = Field(default=None, max_length=500)
     target: str | None = Field(default=None, max_length=200)
+    via: str | None = Field(default=None, max_length=20)
     action_id: str = Field(default_factory=_new_id)
     risk: RiskLevel | None = None
     grounding: GroundingResult | None = None
+
+    #: v0.7.1: the ONLY valid non-None ``via`` values, and only on ``type`` actions.
+    VIA_TRANSPORTS: ClassVar[tuple[str, ...]] = ("sendinput", "clipboard")
+
+    @model_validator(mode="after")
+    def _via_type_only_known_values(self) -> GroundedAction:
+        """``via`` is a type-action transport selector: fail closed on any misuse.
+
+        v0.7.1 (Defect C): ``None``/``"sendinput"`` keeps the per-character dispatch;
+        ``"clipboard"`` selects the paste transport. A ``via`` on ANY non-type action,
+        or an unknown value on a type action, is a malformed action and fails
+        construction (surfacing as the typed ``invalid_action`` boundary error) so it
+        can never reach the backend silently ignored.
+        """
+        if self.via is None:
+            return self
+        if self.action is not ActionType.TYPE:
+            raise ValueError(
+                "via is only valid on type actions; "
+                f'received via="{self.via}" on action="{self.action.value}"'
+            )
+        if self.via not in self.VIA_TRANSPORTS:
+            allowed = " or ".join(f'"{value}"' for value in self.VIA_TRANSPORTS)
+            raise ValueError(f"via must be {allowed}; received {self.via!r}")
+        return self
 
     @model_validator(mode="after")
     def _drag_requires_start_and_end(self) -> GroundedAction:
@@ -327,6 +360,25 @@ class GroundingValidation(BaseModel):
     reasons: list[str] = Field(default_factory=list)
 
 
+class CaptureProvenance(BaseModel):
+    """Identity evidence for the two pixel frames a visual verification consumed.
+
+    v0.7.1 Defect A (additive, purely diagnostic): a confident ``Mean pixel
+    difference 0.000000`` from a dead/frozen capture source is indistinguishable
+    from a genuinely static screen unless the frames themselves carry identity.
+    The provenance is computed by the verification tier from the frames ALREADY in
+    hand at verification time (sha256 + byte size of each side's frame bytes) —
+    never from new captures. ``algorithm`` names the hash so the evidence can never
+    silently change meaning.
+    """
+
+    algorithm: str = "sha256"
+    before_sha256: str
+    after_sha256: str
+    before_bytes: int = Field(ge=0)
+    after_bytes: int = Field(ge=0)
+
+
 class VerificationResult(BaseModel):
     """Outcome of semantic verification.
 
@@ -344,6 +396,10 @@ class VerificationResult(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     verification_method: str = "none"
     observation_id: str | None = None
+    # v0.7.1 Defect A (additive, None-preserving): capture identity for the visual
+    # tier's two in-hand frames. Diagnostic only — it NEVER alters ``outcome``;
+    # older results (every non-pixel strategy, legacy constructors) leave it None.
+    capture_provenance: CaptureProvenance | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -405,6 +461,10 @@ class ActionSpec(BaseModel):
     delta: int = Field(default=0, ge=-20, le=20)
     target: str | None = Field(default=None, max_length=200)
     expected_effect: str | None = Field(default=None, max_length=500)
+    # v0.7.1 (Defect C): pass-through of the type-action transport selector so a queued
+    # {"action": "type", "via": "clipboard"} entry behaves EXACTLY like the equivalent
+    # single action. Validation (type-only + known values) happens in GroundedAction.
+    via: str | None = Field(default=None, max_length=20)
 
     def to_grounded(self, *, reason_prefix: str = "Explicit MCP action") -> GroundedAction:
         """Build the :class:`GroundedAction` this spec denotes (validation happens there)."""
@@ -419,6 +479,7 @@ class ActionSpec(BaseModel):
             confidence=1.0,
             expected_effect=self.expected_effect,
             target=self.target,
+            via=self.via,
         )
 
 

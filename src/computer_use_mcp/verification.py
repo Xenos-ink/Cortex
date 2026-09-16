@@ -42,7 +42,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from PIL import Image, ImageChops
 
-from .models import Observation, VerificationResult
+from .models import CaptureProvenance, Observation, VerificationResult
 
 __all__ = [
     "DEFAULT_STRATEGY_CHAIN",
@@ -170,7 +170,14 @@ class VerificationStrategy(Protocol):
         ...
 
 
-def _uncertain(strategy: str, note: str, evidence: list[str], confidence: float, changed: bool) -> VerificationResult:
+def _uncertain(
+    strategy: str,
+    note: str,
+    evidence: list[str],
+    confidence: float,
+    changed: bool,
+    capture_provenance: CaptureProvenance | None = None,
+) -> VerificationResult:
     return VerificationResult(
         outcome="uncertain",
         changed=changed,
@@ -178,6 +185,63 @@ def _uncertain(strategy: str, note: str, evidence: list[str], confidence: float,
         confidence=confidence,
         evidence=evidence,
         verification_method=strategy,
+        capture_provenance=capture_provenance,
+    )
+
+
+def _frame_identity_bytes(image: Image.Image) -> bytes | bytearray | None:
+    """The exact byte identity of a diff frame's pixels (for capture provenance).
+
+    Preference order (v0.7.1 Defect A): the producing backend's stashed raw capture
+    buffer (``_frame_raw`` — the true capture bytes, zero re-encode cost), else the
+    RGB pixel bytes of the decoded frame. ``None`` on any structural doubt (no
+    pixels, non-RGB decoded frame) — provenance is best-effort additive evidence and
+    must never break (or pretend to exist for) a verification.
+    """
+    raw = getattr(image, "_frame_raw", None)
+    if isinstance(raw, (bytes, bytearray)):
+        return raw
+    try:
+        if image.mode == "RGB":
+            return image.tobytes()
+    except Exception:  # noqa: BLE001 - a broken frame degrades to no provenance
+        return None
+    return None
+
+
+def _capture_provenance(before_image: Image.Image, after_image: Image.Image) -> CaptureProvenance | None:
+    """Hash identity for the two frames the visual tier is about to diff.
+
+    sha256 over each side's frame identity bytes (see :func:`_frame_identity_bytes`)
+    plus the byte sizes. Measured cost on the reference machine: ~1.4 ms per ~1.9 MB
+    frame (OpenSSL SHA-NI); the considered ``blake2b(digest_size=16)`` measured
+    ~4.1 ms per frame and missed the <= ~2 ms/frame budget, so sha256 ships. The
+    result is pure diagnostics for the capture-source integrity guard — it NEVER
+    changes a verdict, and any failure degrades to ``None``.
+    """
+    try:
+        before_data = _frame_identity_bytes(before_image)
+        after_data = _frame_identity_bytes(after_image)
+        if before_data is None or after_data is None:
+            return None
+        return CaptureProvenance(
+            before_sha256=hashlib.sha256(before_data).hexdigest(),
+            after_sha256=hashlib.sha256(after_data).hexdigest(),
+            before_bytes=len(before_data),
+            after_bytes=len(after_data),
+        )
+    except Exception:  # noqa: BLE001 - provenance must never break verification
+        return None
+
+
+def _provenance_evidence_line(provenance: CaptureProvenance | None) -> str | None:
+    """The single additive evidence line attesting the compared frames' identity."""
+    if provenance is None:
+        return None
+    return (
+        f"capture {provenance.algorithm} "
+        f"before={provenance.before_sha256[:12]}… after={provenance.after_sha256[:12]}… "
+        f"bytes={provenance.before_bytes}/{provenance.after_bytes}"
     )
 
 
@@ -338,6 +402,7 @@ def _definitive(
     evidence: list[str],
     confidence: float,
     changed: bool,
+    capture_provenance: CaptureProvenance | None = None,
 ) -> VerificationResult:
     return VerificationResult(
         outcome=outcome,
@@ -346,6 +411,7 @@ def _definitive(
         confidence=confidence,
         evidence=evidence,
         verification_method=strategy,
+        capture_provenance=capture_provenance,
     )
 
 
@@ -396,8 +462,14 @@ class ScreenshotDiffStrategy:
                 0.5,
                 changed=True,
             )
+        provenance: CaptureProvenance | None = None
         try:
             before_image, after_image = self._frames(before, after)
+            # v0.7.1 Defect A: identity of the exact frames about to be diffed —
+            # computed from bytes already in hand (no new capture, no sleep), so a
+            # zero diff is always accompanied by evidence the frames were real and
+            # distinct (or identical-by-hash from a frozen capture source).
+            provenance = _capture_provenance(before_image, after_image)
             if before_image.size != after_image.size:
                 return _uncertain(
                     self.name,
@@ -405,6 +477,7 @@ class ScreenshotDiffStrategy:
                     [f"Decoded sizes {before_image.size} vs {after_image.size}."],
                     0.2,
                     changed=True,
+                    capture_provenance=provenance,
                 )
             mean_difference, strongly_changed = _diff_magnitude(before_image, after_image)
         except Exception as exc:  # noqa: BLE001 - degrade, never escape as success
@@ -414,6 +487,7 @@ class ScreenshotDiffStrategy:
                 [f"{type(exc).__name__}: {exc}"],
                 0.0,
                 changed=False,
+                capture_provenance=provenance,
             )
 
         threshold = max(intent.diff_threshold, 0.0)
@@ -423,8 +497,19 @@ class ScreenshotDiffStrategy:
         )
 
         if intent.kind == VerificationKind.VISUAL_CHANGE:
-            return self._verify_visual_change(intent, mean_difference, changed, strongly_changed)
-        return self._verify_supporting(intent, mean_difference, changed, strongly_changed)
+            result = self._verify_visual_change(intent, mean_difference, changed, strongly_changed)
+        else:
+            result = self._verify_supporting(intent, mean_difference, changed, strongly_changed)
+        # v0.7.1 Defect A: every verdict this tier emits rides with the compared
+        # frames' identity — verdict text/confidence/outcome stay EXACTLY as computed
+        # above; only additive diagnostics are attached (fail-open on the verdict,
+        # fail-loud in diagnostics).
+        if provenance is not None and result.capture_provenance is None:
+            result.capture_provenance = provenance
+            provenance_line = _provenance_evidence_line(provenance)
+            if provenance_line is not None:
+                result.evidence = [*result.evidence, provenance_line]
+        return result
 
     def _verify_visual_change(
         self,
@@ -1696,6 +1781,14 @@ class VerificationEngine:
         combined_note = note or (
             "Verification could not determine the outcome (all strategies uncertain): " + " | ".join(notes)
         )
+        # v0.7.1 Defect A: the combined-uncertain result keeps the pixel tier's
+        # capture provenance (first strategy that carries one) — the identical-frames
+        # case is exactly the ALL-UNCERTAIN path, and dropping the provenance here
+        # would blind the agent-side capture-source guard.
+        capture_provenance = next(
+            (result.capture_provenance for result in uncertains if result.capture_provenance is not None),
+            None,
+        )
         return VerificationResult(
             outcome="uncertain",
             changed=changed,
@@ -1704,6 +1797,7 @@ class VerificationEngine:
             evidence=evidence,
             verification_method="+".join(methods) if methods else "none",
             observation_id=after.observation_id,
+            capture_provenance=capture_provenance,
         )
 
     @staticmethod
