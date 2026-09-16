@@ -21,6 +21,8 @@ that preserves the user's clipboard content.
 
 from __future__ import annotations
 
+import ctypes
+
 import pytest
 from recording_engine import RecordingEngine
 
@@ -488,3 +490,189 @@ def test_real_win32_clipboard_roundtrip_preserves_prior_content() -> None:
     finally:
         assert _clipboard_write_text(prior) is True
     assert _clipboard_read_text() == prior
+
+
+# --- F-01 (RED-1) regression: allocation sizing by UTF-16 CODE UNITS, never char count ---------------
+#
+# The defect: ``size = (len(text) + 1) * 2`` counted CHARACTERS, but an astral char
+# (emoji, CJK Ext-B) is TWO UTF-16 wchars — the CF_UNICODETEXT block shipped WITHOUT
+# its terminating NUL and pasted text silently lost its final character (the restore
+# path corrupted the user's clipboard the same way). RED-1 proof: wrote
+# 61003dd880de6200, clipboard held 61003dd880de0000 ('b' -> 0000).
+
+
+class _FakeAllocKernel32:
+    """kernel32 stand-in recording every GlobalAlloc size (exact-size zeroed blocks)."""
+
+    def __init__(self) -> None:
+        self.alloc_sizes: list[int] = []
+        self._blocks: dict[int, ctypes.create_string_buffer] = {}  # type: ignore[valid-type]
+        self._next = 1
+
+    @staticmethod
+    def _unwrap(handle: object) -> int:
+        """The integer handle behind an int or a c_void_p wrapper (None -> 0)."""
+        value = getattr(handle, "value", handle)
+        return int(value) if value is not None else 0
+
+    def GlobalAlloc(self, flags: int, size: int) -> int:
+        size = int(size)
+        self.alloc_sizes.append(size)
+        handle = self._next
+        self._next += 1
+        self._blocks[handle] = ctypes.create_string_buffer(size)  # EXACT size, zero-filled
+        return handle
+
+    def GlobalLock(self, handle: object) -> int | None:
+        block = self._blocks.get(self._unwrap(handle)) if self._unwrap(handle) else None
+        return ctypes.addressof(block) if block is not None else None
+
+    def GlobalUnlock(self, handle: object) -> int:
+        return 1
+
+    def GlobalFree(self, handle: object) -> None:
+        self._blocks.pop(self._unwrap(handle), None)
+
+
+class _FakeClipboardUser32:
+    """user32 stand-in: clipboard content = the LAST successfully Set handle."""
+
+    def __init__(self, kernel32: _FakeAllocKernel32) -> None:
+        self.k = kernel32
+        self._handle: int | None = None
+
+    def OpenClipboard(self, _owner: int | None) -> int:
+        return 1
+
+    def CloseClipboard(self) -> int:
+        return 1
+
+    def EmptyClipboard(self) -> int:
+        self._handle = None
+        return 0
+
+    def IsClipboardFormatAvailable(self, fmt: int) -> int:
+        return 1 if self._handle is not None else 0
+
+    def GetClipboardData(self, fmt: int) -> int:
+        return self._handle or 0
+
+    def SetClipboardData(self, fmt: int, handle: object) -> int | None:
+        value = getattr(handle, "value", handle)
+        if value is None or int(value) == 0:
+            return None
+        self._handle = int(value)
+        return self._handle
+
+
+def test_clipboard_alloc_size_counts_utf16_code_units_not_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-01 sizing pin: GlobalAlloc receives (UTF-16 units + 1) * 2 BYTES for every text.
+
+    The exact-size zero-filled fake makes the defect mechanically visible: with the
+    char-counted formula, astral text leaves the terminator OUTSIDE the block (the
+    recorded size is simply wrong). Hermetic — no real clipboard.
+    """
+    kernel32 = _FakeAllocKernel32()
+    monkeypatch.setattr(backend_module, "_kernel32", kernel32)
+    monkeypatch.setattr(backend_module, "_user32", _FakeClipboardUser32(kernel32))
+    # The fakes are plain callables: ctypes prototype binding is skipped (no-op needed).
+    monkeypatch.setattr(backend_module, "_CLIPBOARD_ARGTYPES_BOUND", True)
+    cases = [
+        ("plain", (5 + 1) * 2),  # 5 BMP chars + NUL
+        ("", (0 + 1) * 2),  # NUL only
+        ("héllo", (5 + 1) * 2),  # non-ASCII BMP still 1 unit per char
+        ("a\U0001F680b", (4 + 1) * 2),  # emoji = 2 units: 4 units + NUL (was 8 defectively)
+        ("\U000020000\U000020001", (4 + 1) * 2),  # CJK Ext-B pair = 4 units + NUL
+        ("e\u0301\U0001F9D1\u200D\U0001F91D\u200D\U0001F9D1", (10 + 1) * 2),  # combining + ZWJ family
+    ]
+    for text, expected_size in cases:
+        kernel32.alloc_sizes.clear()
+        assert _clipboard_write_text(text) is True
+        assert kernel32.alloc_sizes == [expected_size], f"{text!r}: {kernel32.alloc_sizes}"
+
+
+@WINDOWS_ONLY
+def test_real_win32_clipboard_astral_roundtrip_byte_identical() -> None:
+    """F-01 end-to-end: astral text round-trips write->read BYTE-identical (was lossy)."""
+    prior = _clipboard_read_text()
+    if prior is None:
+        pytest.skip("clipboard not readable as text right now (non-text content or locked)")
+    cases = [
+        "a\U0001F680b",  # the RED-1 proof shape: astral MIDDLE (tail 'b' was zeroed)
+        "\U0001F680",  # astral tail: the last character was lost entirely
+        "script\U00020000ab",  # CJK Ext-B
+        "e\u0301\u0327",  # combining marks (BMP)
+        "héllo 世界 \U0001F680RED1",  # mixed BMP + astral
+    ]
+    try:
+        for text in cases:
+            assert _clipboard_write_text(text) is True, text
+            assert _clipboard_read_text() == text, text  # the last char SURVIVES
+    finally:
+        assert _clipboard_write_text(prior) is True
+    assert _clipboard_read_text() == prior
+
+
+@WINDOWS_ONLY
+def test_real_win32_clipboard_property_roundtrip_bmp_and_astral() -> None:
+    """F-01 property row: N seeded random BMP+astral+combining strings all round-trip."""
+    import random
+
+    rng = random.Random(0xF01)  # deterministic
+    pool_bmp = list("abcXYZ 0189") + ["é", "世", "界", "e\u0301", "£", "\U0000FFFD"]
+    pool_astral = ["\U0001F680", "\U00020000", "\U0001D54F", "\U0001F9D1\u200D\U0001F91D"]
+    prior = _clipboard_read_text()
+    if prior is None:
+        pytest.skip("clipboard not readable as text right now (non-text content or locked)")
+    try:
+        for _ in range(40):
+            text = "".join(
+                rng.choice(pool_bmp) if rng.random() < 0.6 else rng.choice(pool_astral)
+                for _ in range(rng.randint(0, 24))
+            )
+            assert _clipboard_write_text(text) is True
+            assert _clipboard_read_text() == text, f"roundtrip corrupted {text!r}"
+    finally:
+        assert _clipboard_write_text(prior) is True
+    assert _clipboard_read_text() == prior
+
+
+@WINDOWS_ONLY
+def test_clipboard_transport_astral_paste_and_restore(
+    real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F-01 at transport level: an astral suffix survives the paste AND the restore."""
+    text = "console: a\U0001F680b"  # astral char mid-text, BMP tail (the lossy shape)
+    prior = "prior \U00020000-content"  # astral content the restore must preserve
+    monkeypatch.setattr(backend_module, "TYPE_VERIFY_SETTLE_SECONDS", 0.0)
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
+    monkeypatch.setattr(real_backend, "_semantic_reader", _ScriptedReader([text]))
+    captured: list[str | None] = []
+
+    real_chord = engine.chord
+
+    def _chord(keys: list[str]) -> None:
+        captured.append(_clipboard_read_text())  # what the OS clipboard holds AT PASTE TIME
+        real_chord(keys)
+
+    monkeypatch.setattr(engine, "chord", _chord)
+    assert _clipboard_write_text(prior) is True  # pre-existing astral clipboard content
+    message = real_backend.execute(_type_action(text, "clipboard"))
+    assert message == f"Executed type. via=clipboard integrity=verified({len(text)}/{len(text)})"
+    assert engine.calls[-1] == ("chord", "ctrl", "v")
+    assert captured == [text], f"clipboard at paste time lost the astral tail: {captured}"
+    assert _clipboard_read_text() == prior  # the astral restore is byte-identical
+
+
+@WINDOWS_ONLY
+def test_real_win32_refused_write_leaves_user_clipboard_intact() -> None:
+    """A refused write (lone surrogate cannot be UTF-16 encoded) must not destroy the
+    user's current clipboard content: the encode runs BEFORE the clipboard is opened."""
+    prior = _clipboard_read_text()
+    if prior is None:
+        pytest.skip("clipboard not readable as text right now (non-text content or locked)")
+    assert _clipboard_write_text("x\ud800y") is False  # refused, never a corrupt block
+    assert _clipboard_read_text() == prior  # content untouched by the refused write

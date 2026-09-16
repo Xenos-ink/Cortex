@@ -1238,17 +1238,31 @@ def _clipboard_read_text() -> str | None:
 def _clipboard_write_text(text: str) -> bool:
     """Replace the clipboard with ``text`` as CF_UNICODETEXT; ``True`` on success.
 
-    Sequence: open (bounded retries) -> EmptyClipboard (takes ownership) ->
-    GlobalAlloc a ``(len+1)*2``-byte UTF-16 buffer with the terminating NUL ->
-    SetClipboardData (the system OWNS the handle on success; on failure WE still own
-    it and GlobalFree it before closing). Any failure returns ``False``; never raises.
+    Sequence: encode ONCE -> open (bounded retries) -> EmptyClipboard (takes
+    ownership) -> GlobalAlloc a ``(UTF-16 code units + 1) * 2``-byte buffer WITH its
+    terminating NUL -> SetClipboardData (the system OWNS the handle on success; on
+    failure WE still own it and GlobalFree it before closing). Any failure returns
+    ``False``; never raises.
+
+    F-01 (RED-1, fixed): the size counts UTF-16 CODE UNITS, never Python characters —
+    an astral char (emoji, CJK Ext-B) is TWO wchars, so a character-counted allocation
+    shipped the block WITHOUT its terminating NUL and pasted text silently lost its
+    final character (identical corruption on the restore path). The encode runs BEFORE
+    the clipboard is opened: a text that cannot be represented as UTF-16 (a lone
+    surrogate raises ``UnicodeEncodeError``) is refused with ``False`` while the user's
+    current clipboard content stays untouched, and the SAME encoded bytes are allocated
+    and copied (single source of truth for both the size and the payload).
     """
+    try:
+        payload = text.encode("utf-16-le") + b"\x00\x00"
+    except (OSError, ValueError):  # UnicodeEncodeError: refused BEFORE any clipboard op
+        return False
     if not _clipboard_open():
         return False
     try:
         try:
             _user32.EmptyClipboard()
-            size = (len(text) + 1) * 2
+            size = len(payload)  # == (len(text.encode('utf-16-le')) // 2 + 1) * 2
             handle = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, size)
             if not handle:
                 return False
@@ -1257,7 +1271,7 @@ def _clipboard_write_text(text: str) -> bool:
                 _kernel32.GlobalFree(ctypes.c_void_p(handle))
                 return False
             try:
-                ctypes.memmove(pointer, ctypes.c_wchar_p(text), size)
+                ctypes.memmove(pointer, payload, size)
             finally:
                 _kernel32.GlobalUnlock(ctypes.c_void_p(handle))
             if not _user32.SetClipboardData(_CF_UNICODETEXT, ctypes.c_void_p(handle)):
