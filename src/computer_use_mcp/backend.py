@@ -558,6 +558,93 @@ def validate_launch_needle(needle: str) -> str:
     return needle
 
 
+#: v0.7.1 (Defect B, field Blender case): optional needle->executable mapping for
+#: explicitly-authorized ``ensure_app`` launches of GUI executables that are NOT on
+#: PATH (they install under ``C:\\Program Files\\...`` and ``shutil.which`` never
+#: resolves them — the field tester got a silent bare NO_INSTANCE and nothing
+#: spawned). Value shape: semicolon-separated ``needle=path`` pairs, e.g.
+#: ``CORTEX_LAUNCH_PATHS="blender=C:\Program Files\Blender Foundation\Blender 4.2\blender.exe"``.
+#: Design-level and generic: any app, no hardcoded names anywhere.
+LAUNCH_PATHS_ENV = "CORTEX_LAUNCH_PATHS"
+
+
+def parse_launch_paths(raw: str | None) -> dict[str, str]:
+    """Parse ``CORTEX_LAUNCH_PATHS`` (``needle=path;needle=path``) fail-safe.
+
+    Returns ``{casefolded needle: path}`` for the whole-needle, case-insensitive
+    lookup in :func:`_mapped_launch_path`. EVERY malformed entry is skipped
+    silently-safe — never fatal, and a malformed entry can never spawn anything:
+
+    - entry without ``=`` (or an empty needle / empty path) -> skipped;
+    - the NEEDLE side must pass :func:`validate_launch_needle` (same charset gate
+      as the launch itself — no path separators, quotes, or shell metacharacters;
+      ``=`` and ``;`` are outside the charset, so the first ``=`` partition and the
+      ``;`` split are unambiguous for any valid needle) -> else skipped;
+    - the PATH side must exist as a FILE right now (``os.path.isfile`` — a missing
+      path or a directory is skipped, never spawned); one surrounding quote pair is
+      stripped because quoted paths are the common hand-written form;
+    - a duplicated needle: the LAST valid entry wins.
+
+    Parsed at use-site (``_launch_process`` entry — the launch path is not hot);
+    zero cost added to any dispatch path.
+    """
+    mapping: dict[str, str] = {}
+    if not isinstance(raw, str) or not raw.strip():
+        return mapping
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        needle, sep, path = entry.partition("=")
+        needle = needle.strip()
+        path = path.strip()
+        if not sep or not needle or not path:
+            continue
+        if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
+            path = path[1:-1].strip()
+        if not path:
+            continue
+        try:
+            validate_launch_needle(needle)
+        except LaunchTargetError:
+            continue  # malformed needle side: skipped fail-safe
+        if not os.path.isfile(path):
+            continue  # the path side must be an existing FILE
+        mapping[needle.casefold()] = path
+    return mapping
+
+
+def _mapped_launch_path(process_needle: str) -> str | None:
+    """The ``CORTEX_LAUNCH_PATHS`` mapped executable for ``process_needle``, or ``None``.
+
+    Whole-needle, case-insensitive match (``"blender"`` maps ``"BLENDER"`` too, but
+    ``"blender.exe"`` is a DIFFERENT needle — map the exact needle you drive). The
+    parser is fail-safe: malformed entries never resolve, never spawn, never raise.
+    """
+    return parse_launch_paths(os.environ.get(LAUNCH_PATHS_ENV)).get(process_needle.casefold())
+
+
+def _launch_unresolved_suffix(exc: BaseException, *, resolved: bool) -> str:
+    """Typed NO_INSTANCE suffix for an authorized launch that produced no process.
+
+    v0.7.1 (Defect B) honesty contract: a charset-valid needle that missed every
+    resolution step reports ``launch_unresolved=path-lookup-missed`` (the raw-name
+    spawn's FileNotFoundError IS the "not found anywhere" evidence), while a
+    resolved target whose spawn raised reports the real OS error via
+    ``launch_unresolved=spawn-failed (<ExcType>: <msg[:120]>)``. The driver-supplied
+    needle is never embedded in either suffix (path-lookup-missed is fully static;
+    spawn-failed's bounded OS text may echo the local operator-configured target).
+    """
+    from .interference import (
+        format_launch_unresolved_path_miss,
+        format_launch_unresolved_spawn_failed,
+    )
+
+    if not resolved and isinstance(exc, FileNotFoundError):
+        return format_launch_unresolved_path_miss()
+    return format_launch_unresolved_spawn_failed(exc)
+
+
 class AppWindowCandidate:
     """One visible top-level window of a process, for attach-or-launch discovery (T8).
 
@@ -1028,6 +1115,176 @@ def _format_integrity_status(
     if healed:
         suffix += f" healed={healed}"
     return suffix
+
+
+# --- v0.7.1 (Defect C): clipboard text-entry transport (raw ctypes, zero new deps) -----------
+#: Typed diagnostic for the honest no-read-back outcome (additive action-message suffix;
+#: the ``Executed type.`` prefix and the ``integrity=`` suffix stay stable). Fired when the
+#: final status is ``unverified`` AND the semantic reader could not even identify a
+#: readable focused target (reader absent/unavailable, read failed, or NO focused element
+#: in the snapshot) — the OpenGL/console-app shape (field case: Blender). A focused
+#: control that EXISTS but exposes no value does NOT fire the marker: a target is
+#: present, the app merely does not report its text.
+TYPE_UNCONFIRMED_MARKER = "TYPE_UNCONFIRMED no-readable-target"
+#: Hint after the marker on the DEFAULT per-char transport: the actionable escape hatch
+#: is the clipboard transport plus visual verification with a stated expected_effect.
+TYPE_UNCONFIRMED_HINT_SENDINPUT = (
+    'verify visually with a stated expected_effect (or retry with via="clipboard")'
+)
+#: Clipboard-transport variant: the transport is already the recommended one, so the hint
+#: names only the verification path.
+TYPE_UNCONFIRMED_HINT_CLIPBOARD = (
+    "verify visually with a stated expected_effect (screenshot/observe after the action)"
+)
+
+#: Win32 clipboard format for a UTF-16 string allocation (winuser.h).
+_CF_UNICODETEXT = 13
+#: GlobalAlloc flag for a movable (system-relocatable) allocation, the SetClipboardData norm.
+_GMEM_MOVEABLE = 0x0002
+#: Fixed internal OpenClipboard retry pacing: another process legitimately holding the
+#: clipboard open is transient (clipboard viewers, office apps). Deliberately NOT an env
+#: knob (no new timing knobs) and only ever reached on the via="clipboard" branch — the
+#: default sendinput path pays zero cost.
+_CLIPBOARD_OPEN_ATTEMPTS = 10
+_CLIPBOARD_OPEN_RETRY_SECONDS = 0.01
+
+_CLIPBOARD_ARGTYPES_BOUND = False
+
+
+def _clipboard_bind() -> bool:
+    """Bind the win32 clipboard prototypes once (64-bit-safe handle types); False off-Windows.
+
+    Handle-returning functions (GlobalAlloc/GlobalLock/GetClipboardData) get
+    ``c_void_p`` restypes so a >2^31 handle value can never be sign-truncated; the
+    binding is idempotent and bounded to the clipboard path's first use.
+    """
+    global _CLIPBOARD_ARGTYPES_BOUND
+    if not IS_WINDOWS or _user32 is None or _kernel32 is None:
+        return False
+    if _CLIPBOARD_ARGTYPES_BOUND:
+        return True
+    _user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    _user32.OpenClipboard.restype = ctypes.c_int
+    _user32.CloseClipboard.argtypes = []
+    _user32.CloseClipboard.restype = ctypes.c_int
+    _user32.EmptyClipboard.argtypes = []
+    _user32.EmptyClipboard.restype = ctypes.c_void_p
+    _user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
+    _user32.IsClipboardFormatAvailable.restype = ctypes.c_int
+    _user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    _user32.GetClipboardData.restype = ctypes.c_void_p
+    _user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    _user32.SetClipboardData.restype = ctypes.c_void_p
+    _kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    _kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    _kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    _kernel32.GlobalLock.restype = ctypes.c_void_p
+    _kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    _kernel32.GlobalUnlock.restype = ctypes.c_int
+    _kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    _kernel32.GlobalFree.restype = ctypes.c_void_p
+    _CLIPBOARD_ARGTYPES_BOUND = True
+    return True
+
+
+def _clipboard_open() -> bool:
+    """Open the clipboard for this (unowned) thread with bounded retries; never raises."""
+    if not _clipboard_bind():
+        return False
+    for attempt in range(_CLIPBOARD_OPEN_ATTEMPTS):
+        try:
+            if _user32.OpenClipboard(None):
+                return True
+        except (OSError, AttributeError, ValueError):
+            return False
+        if attempt + 1 < _CLIPBOARD_OPEN_ATTEMPTS:
+            time.sleep(_CLIPBOARD_OPEN_RETRY_SECONDS)
+    return False
+
+
+def _clipboard_read_text() -> str | None:
+    """Best-effort CF_UNICODETEXT read of the CURRENT clipboard; ``None`` on ANY failure.
+
+    Used ONLY for the save half of the clipboard transport's restore discipline: a
+    ``None`` here means "nothing restorable is known" (non-text content, open refused,
+    read failed) and the restore step is skipped silently — a failed SAVE must never
+    fail or even annotate the action.
+    """
+    if not _clipboard_open():
+        return None
+    try:
+        try:
+            if not _user32.IsClipboardFormatAvailable(_CF_UNICODETEXT):
+                return None
+            handle = _user32.GetClipboardData(_CF_UNICODETEXT)
+            if not handle:
+                return None
+            pointer = _kernel32.GlobalLock(ctypes.c_void_p(handle))
+            if not pointer:
+                return None
+            try:
+                return ctypes.wstring_at(pointer)
+            finally:
+                _kernel32.GlobalUnlock(ctypes.c_void_p(handle))
+        except (OSError, AttributeError, ValueError):
+            return None
+    finally:
+        try:
+            _user32.CloseClipboard()
+        except (OSError, AttributeError, ValueError):
+            pass
+
+
+def _clipboard_write_text(text: str) -> bool:
+    """Replace the clipboard with ``text`` as CF_UNICODETEXT; ``True`` on success.
+
+    Sequence: encode ONCE -> open (bounded retries) -> EmptyClipboard (takes
+    ownership) -> GlobalAlloc a ``(UTF-16 code units + 1) * 2``-byte buffer WITH its
+    terminating NUL -> SetClipboardData (the system OWNS the handle on success; on
+    failure WE still own it and GlobalFree it before closing). Any failure returns
+    ``False``; never raises.
+
+    F-01 (RED-1, fixed): the size counts UTF-16 CODE UNITS, never Python characters —
+    an astral char (emoji, CJK Ext-B) is TWO wchars, so a character-counted allocation
+    shipped the block WITHOUT its terminating NUL and pasted text silently lost its
+    final character (identical corruption on the restore path). The encode runs BEFORE
+    the clipboard is opened: a text that cannot be represented as UTF-16 (a lone
+    surrogate raises ``UnicodeEncodeError``) is refused with ``False`` while the user's
+    current clipboard content stays untouched, and the SAME encoded bytes are allocated
+    and copied (single source of truth for both the size and the payload).
+    """
+    try:
+        payload = text.encode("utf-16-le") + b"\x00\x00"
+    except (OSError, ValueError):  # UnicodeEncodeError: refused BEFORE any clipboard op
+        return False
+    if not _clipboard_open():
+        return False
+    try:
+        try:
+            _user32.EmptyClipboard()
+            size = len(payload)  # == (len(text.encode('utf-16-le')) // 2 + 1) * 2
+            handle = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, size)
+            if not handle:
+                return False
+            pointer = _kernel32.GlobalLock(ctypes.c_void_p(handle))
+            if not pointer:
+                _kernel32.GlobalFree(ctypes.c_void_p(handle))
+                return False
+            try:
+                ctypes.memmove(pointer, payload, size)
+            finally:
+                _kernel32.GlobalUnlock(ctypes.c_void_p(handle))
+            if not _user32.SetClipboardData(_CF_UNICODETEXT, ctypes.c_void_p(handle)):
+                _kernel32.GlobalFree(ctypes.c_void_p(handle))  # ownership stayed with us
+                return False
+            return True
+        except (OSError, AttributeError, ValueError):
+            return False
+    finally:
+        try:
+            _user32.CloseClipboard()
+        except (OSError, AttributeError, ValueError):
+            pass
 
 
 def _virtual_screen_metrics() -> tuple[int, int, int, int]:
@@ -3540,17 +3797,29 @@ class LocalComputerBackend(ComputerBackend):
         value on such a control means the control is EMPTY (returned as ``''``) -- not
         unreadable. Any other control type without a value stays ``None`` (unverified;
         never verified against, never repaired).
+
+        v0.7.1 (Defect C) additive diagnostic stash: ``self._last_read_had_target``
+        records whether the read could even IDENTIFY a focused target (reader present
+        and available, read succeeded, snapshot carried a focused element). ``False``
+        — the OpenGL/console shape, field case Blender — lets the type dispatcher
+        append the typed ``TYPE_UNCONFIRMED no-readable-target`` marker to an
+        ``unverified`` outcome; a valueless-but-present control (``True``) keeps the
+        legacy message byte-identical. Never consulted as typing evidence.
         """
         reader = getattr(self, "_semantic_reader", None)
         if reader is None or not reader.available:
+            self._last_read_had_target = False
             return None
         try:
             snapshot = reader.read()
         except Exception:  # noqa: BLE001 - a broken reader must never break typing
+            self._last_read_had_target = False
             return None
         focused = snapshot.get("focused") if isinstance(snapshot, dict) else None
         if not isinstance(focused, dict):
+            self._last_read_had_target = False
             return None
+        self._last_read_had_target = True
         value = focused.get("value")
         if isinstance(value, str):
             return value
@@ -3876,6 +4145,11 @@ class LocalComputerBackend(ComputerBackend):
                 focus_hook()
 
             before_chunk = _chained
+        if (action.via or "sendinput") == "clipboard":
+            # v0.7.1 (Defect C): the paste transport rides the field-proven chord path.
+            # Zero cost for every other value: this branch is the ONLY new code the
+            # default sendinput path touches (a single string compare).
+            return self._execute_type_via_clipboard(action, stop, focus_hook)
         if not TYPE_INTEGRITY_ENABLED or not text:
             self._engine.type_text(text, before_chunk=before_chunk)
             self._last_key_dispatch = time.monotonic()
@@ -3912,7 +4186,15 @@ class LocalComputerBackend(ComputerBackend):
             return self._read_landed_normalized()
 
         def _unverified() -> str:
-            return f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+            base = f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+            # v0.7.1 (Defect C) honest diagnostic: when the read-backs were blind because
+            # there was NO readable focused target at all (OpenGL/console apps), say so in
+            # typed vocabulary and teach the escape hatch. A valueless-but-present control
+            # keeps the legacy message byte-identical. The getattr default preserves the
+            # exact legacy output for doubles that patch the read method itself.
+            if not getattr(self, "_last_read_had_target", True):
+                return f"{base} {TYPE_UNCONFIRMED_MARKER} ({TYPE_UNCONFIRMED_HINT_SENDINPUT})"
+            return base
 
         def _repair_and_recheck(matched: int) -> str:
             """The ONE verified retype of the exact missing suffix + quick re-verify."""
@@ -4003,6 +4285,85 @@ class LocalComputerBackend(ComputerBackend):
                 return _unverified()
             return _resolve_trusted(trusted_n)
         return _unverified()
+
+    def _execute_type_via_clipboard(
+        self,
+        action: GroundedAction,
+        stop: StopToken | None,
+        focus_hook: Callable[[], None] | None,
+    ) -> str:
+        """``via="clipboard"`` transport (v0.7.1 Defect C): set CF_UNICODETEXT, paste ctrl+v.
+
+        Field evidence (Blender's Python Console): chords (hotkey ctrl+v, keypress enter)
+        reach the app while per-character ``KEYEVENTF_UNICODE`` injection inserts nothing,
+        so the text rides the chord path instead. Sequence:
+
+        1. B8 focus settle + B3 gap policy, exactly like keypress/hotkey (no new knobs).
+        2. Best-effort SAVE of the current clipboard text (``None`` = nothing restorable
+           — non-text content or the open/read failed; skipping the restore is silent).
+        3. Set the action text as ``CF_UNICODETEXT``. A failure here raises
+           :class:`InputBlockedError` (the established dispatch-could-not-proceed type;
+           the payload names the clipboard cause) with ZERO keystrokes dispatched and the
+           clipboard untouched.
+        4. ONE ctrl+v chord through the EXISTING ``engine.chord`` path — failsafe,
+           stop-token, and :class:`InputBlockedError` semantics ride it unchanged. The
+           T8 focus hook runs once, pre-dispatch, like the single-chunk legacy path.
+        5. ``finally``: best-effort restore of the saved clipboard. A restore failure is
+           typed-annotated (``clipboard_restore=failed``) and NEVER raised, and the
+           restore dispatches no keystrokes. An abort anywhere after step 3 still
+           restores.
+
+        Verification is the honest single-read-back form (the per-char fast/escalation
+        ladder does not apply to a single paste): confirmed endswith →
+        ``integrity=verified``; blind or unconfirmed → ``integrity=unverified`` plus the
+        ``TYPE_UNCONFIRMED no-readable-target`` diagnostic when no readable target
+        exists. No repair is ever attempted on this transport (a re-paste could
+        double-apply).
+        """
+        text = action.text or ""
+        total = len(text)
+        if not text:
+            # Existing empty-text contract: a no-op, byte-identical, no clipboard churn.
+            return "Executed type."
+        if stop is not None:
+            stop.ensure_live()
+        self._apply_focus_settle()  # B8: pace behind a recent focus transition
+        # B3 gap-policy parity (a ctrl+v chord carries no terminal key: policy no-op,
+        # kept so the clipboard transport can never be faster-paced than keypress).
+        self._apply_key_dispatch_gap(["ctrl", "v"])
+        prior = _clipboard_read_text()
+        restore_note = ""
+        try:
+            if not _clipboard_write_text(text):
+                raise InputBlockedError(
+                    "Clipboard transport failed: the clipboard could not be set "
+                    "(held by another process or allocation refused); no input dispatched."
+                )
+            if stop is not None:
+                stop.ensure_live()
+            if focus_hook is not None:
+                focus_hook()
+            self._engine.chord(["ctrl", "v"])
+            self._last_key_dispatch = time.monotonic()
+        finally:
+            # Restore discipline: best-effort, silent-failure, ZERO extra keystrokes.
+            if prior is not None and not _clipboard_write_text(prior):
+                restore_note = " clipboard_restore=failed"
+        if TYPE_VERIFY_SETTLE_SECONDS > 0:
+            time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
+        if stop is not None:
+            stop.ensure_live()
+        landed = self._read_landed_normalized()
+        if landed is not None and landed.endswith(_normalize_landed_text(text)):
+            status = _format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)
+            return f"Executed type. via=clipboard {status}{restore_note}"
+        suffix = _format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)
+        base = f"Executed type. via=clipboard {suffix}{restore_note}"
+        # Same marker discipline as the per-char path: the diagnostic names a MISSING
+        # target, so a present-but-valueless control keeps the plain honest message.
+        if not getattr(self, "_last_read_had_target", True):
+            return f"{base} {TYPE_UNCONFIRMED_MARKER} ({TYPE_UNCONFIRMED_HINT_CLIPBOARD})"
+        return base
 
     def _read_landed_normalized(self) -> str | None:
         """One read-back, normalized; ``None`` when the value is unavailable."""
@@ -4115,6 +4476,23 @@ class LocalComputerBackend(ComputerBackend):
            session policy ``attach_or_launch.launch == "server"`` — enforced by the
            caller) AND the process is resolvable is ``Popen`` used; the DEFAULT
            path never spawns a process.
+
+        v0.7.1 (Defect B) honest-payload contract for the AUTHORIZED (``launch=server``)
+        launch outcome — the payload carries EXACTLY ONE of:
+
+        - ``launched=<exe>`` — a process was really spawned (the actual basename);
+        - ``launch_rejected=LaunchTargetError`` — the needle failed charset validation
+          (nothing spawned, REM-C);
+        - ``launch_unresolved=path-lookup-missed (...)`` — a valid needle that missed
+          every resolution step (``CORTEX_LAUNCH_PATHS`` mapping, PATH, Store alias,
+          raw-name spawn) — the field Blender case, no longer silent;
+        - ``launch_unresolved=spawn-failed (<ExcType>: <msg[:120]>)`` — a resolved
+          target whose ``Popen`` raised (the real OS error, bounded).
+
+        ``launch=driver`` payloads are byte-identical to v0.7.0: never a spawn, never
+        a suffix. Supported way to launch GUI executables not on PATH: configure
+        ``CORTEX_LAUNCH_PATHS`` (``needle=path;...``, see README "Environment
+        variables") — the mapping is consulted FIRST.
         """
         from .interference import format_ambiguous_instance, format_no_instance, format_reattached
 
@@ -4133,6 +4511,15 @@ class LocalComputerBackend(ComputerBackend):
                     return f"{payload} launch_rejected=LaunchTargetError"
                 if launched:
                     payload = f"{payload} launched={launched}"
+                else:
+                    # v0.7.1 (Defect B): an authorized launch that produced no process
+                    # is NEVER silent — _launch_process leaves the typed reason on
+                    # ``_launch_diagnostic`` (a stubbed launch, as in the pre-existing
+                    # tests, sets nothing and the payload stays the bare probe).
+                    diagnostic = getattr(self, "_launch_diagnostic", None)
+                    self._launch_diagnostic = None
+                    if diagnostic:
+                        payload = f"{payload} {diagnostic}"
             return payload
 
         def _doc_matches(candidate: AppWindowCandidate) -> bool:
@@ -4172,12 +4559,14 @@ class LocalComputerBackend(ComputerBackend):
         - the needle is validated FIRST (:func:`validate_launch_needle`,
           ``^[A-Za-z0-9._ -]+$`` only) — an invalid needle raises
           :class:`LaunchTargetError` BEFORE any spawn (nothing is created);
-        - the validated needle is resolved via ``shutil.which`` and spawned as a
-          plain one-element argv with ``shell=False`` (the cmd.exe quote-breakout
-          surface is gone);
+        - the validated needle is resolved via the ``CORTEX_LAUNCH_PATHS`` mapping
+          (v0.7.1, FIRST), then ``shutil.which``, and spawned as a plain one-element
+          argv with ``shell=False`` (the cmd.exe quote-breakout surface is gone);
         - any soft failure (``FileNotFoundError`` etc.) keeps the REM-B contract:
           ``None`` (payload degrade), never an exception — only an INVALID needle
-          is a typed rejection.
+          is a typed rejection; since v0.7.1 the payload also carries the typed
+          ``launch_unresolved=...`` reason (see below), so the degrade is no
+          longer silent.
 
         REM-E (live-test gap, Store execution aliases): on this machine Paint and
         other Microsoft Store apps are reachable ONLY through the execution-alias
@@ -4205,17 +4594,49 @@ class LocalComputerBackend(ComputerBackend):
         NO_INSTANCE payload is only ever emitted when a process was really
         spawned, and names the real executable (a bare "mspaint" launched through
         the alias reports ``launched=mspaint.exe``).
+
+        v0.7.1 (Defect B, field Blender case) — mapping-first resolution + typed
+        failure reasons: a GUI executable installed outside PATH (``shutil.which``
+        -> ``None``) used to degrade to a SILENT ``None`` (bare NO_INSTANCE, zero
+        explanation, nothing spawned). Two changes, contract-preserving:
+
+        - ``CORTEX_LAUNCH_PATHS`` (:data:`LAUNCH_PATHS_ENV`, parsed fail-safe by
+          :func:`parse_launch_paths` at this method's entry) is consulted FIRST:
+          resolution order is now **mapped path -> ``shutil.which`` -> Store
+          alias -> raw-name fallback** (the later legs byte-identical to the
+          REM-E order). The external return contract is UNCHANGED — the basename
+          of the target that ACTUALLY started, or ``None`` on any failure — so
+          every pre-existing pin (``is None`` on failure) keeps holding.
+        - the typed failure reason travels OUT-OF-BAND on
+          ``self._launch_diagnostic`` (read and cleared by ``ensure_app``; a
+          stubbed ``_launch_process``, as used by existing tests, simply never
+          sets it): ``launch_unresolved=path-lookup-missed`` when nothing
+          resolved (the raw-name spawn's FileNotFoundError), or
+          ``launch_unresolved=spawn-failed (<ExcType>: <msg[:120]>)`` when a
+          resolved target's ``Popen`` raised. ``ensure_app`` folds exactly one
+          suffix into the NO_INSTANCE payload — never a silent bare probe, never
+          a false ``launched=`` claim.
         """
         process_needle = validate_launch_needle(process_needle)  # raises before any spawn
-        resolved = shutil.which(process_needle)
-        if resolved:
-            spawn_target: str = resolved
-        else:
-            spawn_target = self._store_alias_path(process_needle) or process_needle
+        self._launch_diagnostic: str | None = None  # fresh per attempt (consumed by ensure_app)
+        spawn_target: str | None = _mapped_launch_path(process_needle)
+        resolved = spawn_target is not None
+        if not resolved:
+            spawn_target = shutil.which(process_needle)
+            resolved = spawn_target is not None
+        if not resolved:
+            alias = self._store_alias_path(process_needle)
+            if alias:
+                spawn_target = alias
+                resolved = True
+        # raw-name fallback (Windows CreateProcess PATH search): spawn_target stays
+        # None here and the bare, already-charset-validated needle goes to Popen.
+        target = spawn_target if spawn_target else process_needle
         try:
-            subprocess.Popen([spawn_target], shell=False)
-            return os.path.basename(spawn_target)
-        except Exception:  # noqa: BLE001 - a launch failure degrades to the payload
+            subprocess.Popen([target], shell=False)
+            return os.path.basename(target)
+        except Exception as exc:  # noqa: BLE001 - a launch failure degrades to the payload
+            self._launch_diagnostic = _launch_unresolved_suffix(exc, resolved=resolved)
             return None
 
     @staticmethod
@@ -4449,6 +4870,12 @@ class FakeComputerBackend(ComputerBackend):
         # control; a string is compared against the typed text (CRLF-normalized,
         # same policy as the real backend, including the simulated prefix repair).
         self.focused_control_value: str | None = None
+        # v0.7.1 (Defect C) clipboard-transport simulation: ``clipboard_value`` models
+        # the OS clipboard (save/set/restore discipline, parity with the real ctypes
+        # path); ``clipboard_pastes`` records every simulated ctrl+v paste payload so
+        # tests can assert the transport actually dispatched the chord.
+        self.clipboard_value: str | None = None
+        self.clipboard_pastes: list[str] = []
 
     def set_windows(self, windows: list[WindowInfo]) -> None:
         """Replace the fake top-level window list (first entry = top of Z-order)."""
@@ -4563,16 +4990,22 @@ class FakeComputerBackend(ComputerBackend):
                 # REM-C (V-2 F3): same typed validation as the real backend — a
                 # hostile needle is never recorded as spawned and never reaches
                 # ``launched=`` (launch_rejected=LaunchTargetError folds into the
-                # NO_INSTANCE payload instead). An UNRESOLVABLE target
-                # likewise never claims ``launched=`` — the payload stays the bare
-                # NO_INSTANCE probe (no false launch claim); a Store-alias name
-                # launches and records the alias's real ``<name>.exe`` identity.
+                # NO_INSTANCE payload instead). An UNRESOLVABLE target likewise
+                # never claims ``launched=`` — since v0.7.1 (Defect B) it carries
+                # the SAME typed ``launch_unresolved=path-lookup-missed`` suffix
+                # the real backend emits (real-vs-fake payload parity), instead of
+                # the pre-0.7.1 silent bare probe; a Store-alias name or a
+                # ``CORTEX_LAUNCH_PATHS`` mapping launches and records the real
+                # ``<name>.exe`` identity.
+                from .interference import format_launch_unresolved_path_miss
+
                 try:
                     validate_launch_needle(process_needle)
                 except LaunchTargetError:
                     return f"{payload} launch_rejected=LaunchTargetError"
                 resolved = self._resolve_fake_launch_target(process_needle)
                 if resolved is None:
+                    payload = f"{payload} {format_launch_unresolved_path_miss()}"
                     return payload
                 self.launched_processes.append(resolved)
                 payload = f"{payload} launched={resolved}"
@@ -4608,12 +5041,19 @@ class FakeComputerBackend(ComputerBackend):
     def _resolve_fake_launch_target(self, process_needle: str) -> str | None:
         """alias-launch launch-resolution simulation mirroring the real resolution order.
 
-        Returns the NAME the launch records (``None`` = nothing spawned): an
-        unresolvable needle (``launch_unresolvable``, .exe-tolerant) yields ``None``
-        so the NO_INSTANCE payload stays honest; a Store-alias name
+        Returns the NAME the launch records (``None`` = nothing spawned): a
+        ``CORTEX_LAUNCH_PATHS`` mapping hit (v0.7.1 parity — the mapping goes FIRST
+        on the real backend too) yields the mapped file's real basename; an
+        unresolvable needle (``launch_unresolvable``, .exe-tolerant — the fake's
+        model of "PATH/alias miss", which the real backend reports as
+        ``launch_unresolved=path-lookup-missed``) yields ``None`` so the
+        NO_INSTANCE payload stays honest; a Store-alias name
         (``store_aliases``) yields ``<name>.exe`` (the reparse point's real name);
         everything else keeps the pre-058 default — the needle itself, verbatim.
         """
+        mapped = _mapped_launch_path(process_needle)
+        if mapped:
+            return os.path.basename(mapped)
         needle = (process_needle or "").strip().casefold().removesuffix(".exe")
         if needle in {n.strip().casefold().removesuffix(".exe") for n in self.launch_unresolvable}:
             return None
@@ -4746,6 +5186,12 @@ class FakeComputerBackend(ComputerBackend):
                 stop.ensure_live()
             self._apply_focus_settle()
             self._last_key_dispatch = time.monotonic()  # B3 clock parity
+            if (getattr(action, "via", None) or "sendinput") == "clipboard":
+                # v0.7.1 (Defect C): fake parity for the paste transport — same save/set/
+                # paste/restore discipline as the real ctypes path, including the
+                # mid-transport abort restore (a pre-stopped token raises AFTER the set).
+                self.executed.append(action)  # this branch returns before the shared append
+                return self._simulate_type_clipboard(action, stop)
             if not action.text or not TYPE_INTEGRITY_ENABLED:
                 message = "Simulated type."
             else:
@@ -4756,8 +5202,12 @@ class FakeComputerBackend(ComputerBackend):
                     else None
                 )
                 if landed_n is None:
-                    message = "Simulated type. " + _format_integrity_status(
-                        0, total, mismatch=0, unverified=total, healed=0
+                    # All-blind (no readable target — the simulated Blender shape):
+                    # the typed v0.7.1 diagnostic rides the additive suffix chain.
+                    message = (
+                        "Simulated type. "
+                        + _format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)
+                        + f" {TYPE_UNCONFIRMED_MARKER} ({TYPE_UNCONFIRMED_HINT_SENDINPUT})"
                     )
                 else:
                     expected_n = _normalize_landed_text(action.text)
@@ -4812,6 +5262,45 @@ class FakeComputerBackend(ComputerBackend):
             self.drags.append((start, end))
         self.executed.append(action)
         return f"Simulated {action.action}."
+
+    def _simulate_type_clipboard(self, action: GroundedAction, stop: StopToken | None) -> str:
+        """Fake parity for ``via="clipboard"`` (v0.7.1 Defect C): save/set/paste/restore.
+
+        Mirrors the real transport's discipline in memory: ``clipboard_value`` is saved,
+        set to the action text, the paste payload is recorded in ``clipboard_pastes``,
+        and the prior value is restored in ``finally`` — including on a MID-TRANSPORT
+        abort (a pre-stopped token raises AFTER the set, before the paste; the restore
+        still runs). With a readable ``focused_control_value`` the paste APPENDS the
+        text at the cursor and the single read-back confirms ``integrity=verified``;
+        with ``None`` (the simulated Blender shape) the outcome is the honest
+        ``integrity=unverified`` + ``TYPE_UNCONFIRMED no-readable-target`` diagnostic.
+        """
+        text = action.text or ""
+        total = len(text)
+        if not text:
+            return "Simulated type."
+        prior = self.clipboard_value
+        try:
+            self.clipboard_value = text  # the set
+            if stop is not None:
+                stop.ensure_live()  # mid-transport abort point (mirrors the real pre-chord check)
+            self.clipboard_pastes.append(text)  # the ctrl+v chord
+            if self.focused_control_value is not None:
+                # A paste lands at the cursor: append, then the single read-back below.
+                self.focused_control_value = self.focused_control_value + text
+        finally:
+            # Restore discipline (in-memory; never raises, never dispatches).
+            if prior is not None:
+                self.clipboard_value = prior
+        if self.focused_control_value is None:
+            return (
+                "Simulated type. via=clipboard "
+                + _format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)
+                + f" {TYPE_UNCONFIRMED_MARKER} ({TYPE_UNCONFIRMED_HINT_CLIPBOARD})"
+            )
+        return "Simulated type. via=clipboard " + _format_integrity_status(
+            total, total, mismatch=0, unverified=0, healed=0
+        )
 
     def _white_png(self) -> str:
         image = Image.new("RGB", (self.width, self.height), "white")

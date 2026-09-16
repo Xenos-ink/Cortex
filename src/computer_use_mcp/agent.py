@@ -170,6 +170,25 @@ _INTRA_STEP_EXEMPT_PHASES = frozenset({"validate", "post_action", "revalidate"})
 #: Cursor-at-target tolerance for the deterministic ``move`` verification predicate (px).
 _CURSOR_TOLERANCE_PX = 2
 
+# --- capture-source integrity guard (v0.7.1 Defect A) ----------------------------------------
+#
+#: Consecutive byte-identical pre/post capture pairs (across DISTINCT screen-affecting
+#: actions) after which the capture SOURCE itself is called suspect. Field evidence
+#: (v0.7.0 live Blender session): a dead/frozen capture source returned byte-identical
+#: frames for every action, so the pixel tier confidently reported
+#: ``Mean pixel difference 0.000000`` forever — a verdict-shaped lie. The marker never
+#: changes a verdict; it converts that silent stream into typed, actionable diagnostics.
+_CAPTURE_SUSPECT_THRESHOLD = 3
+
+#: Marker vocabulary — same uppercase family as TARGET_GONE / FOCUS_DRIFTED /
+#: STUCK_MODIFIER / NO_INSTANCE. Generic by design (any frozen capture source: a
+#: disconnected session, a protected desktop, a stale duplicator — never app-specific).
+CAPTURE_SOURCE_SUSPECTED = "CAPTURE_SOURCE_SUSPECTED"
+
+#: Action kinds whose execution makes no screen-affecting claim; their (naturally
+#: static) capture pairs must never feed the suspicion counter.
+_CAPTURE_PAIR_EXEMPT_KINDS = frozenset({ActionType.WAIT, ActionType.DONE})
+
 # --- R-5 mechanical-speed knobs (ORVEX-CORTEX-056-LIVEFIX) -----------------------------------
 #: Env knob name: ``CORTEX_VALIDATE_REUSE_MS`` — the freshness window (milliseconds)
 #: within which a DIRECT action's premise capture (taken at the start of this very
@@ -382,6 +401,14 @@ class ComputerUseAgent:
         # the A12 protective policy when the caller omits it.
         self.interference = interference if interference is not None else parse_interference(None)
         self.guard = InterferenceGuard(backend, self.interference, emit=self._audit_guard_event)
+        # v0.7.1 Defect A: capture-source integrity guard state (O(1), per session).
+        # ``_capture_identical_pairs`` counts CONSECUTIVE byte-identical pre/post
+        # visual-tier capture pairs across DISTINCT screen-affecting actions; the
+        # action-id/base pair makes the expected-text fallback re-verify replace its
+        # own contribution instead of double-counting one action.
+        self._capture_identical_pairs = 0
+        self._capture_pairs_action_id: str | None = None
+        self._capture_pairs_counter_base = 0
 
     def _audit_guard_event(self, event_type: str, **kwargs: Any) -> None:
         """Audit-adapter for the Interference Guard (audit failures never break control)."""
@@ -1012,6 +1039,58 @@ class ComputerUseAgent:
             return self.verifier.verify(intent, before, after), "model_judge"
         return await self._provider_judge(intent, before, after), "model_judge"
 
+    def _capture_source_guard(
+        self, action: GroundedAction | None, result: VerificationResult
+    ) -> tuple[VerificationResult, str | None]:
+        """v0.7.1 Defect A: detect a dead/frozen capture source and say so honestly.
+
+        Consumes the visual tier's ``capture_provenance`` (hash+size of the pre/post
+        frames ALREADY diffed — no new captures): a byte-identical pair feeds a
+        per-session counter of consecutive identical pairs across DISTINCT
+        screen-affecting actions; any pair whose hashes/bytes differ RESETS it;
+        pairs without provenance (a deterministic tier decided first, a starved
+        ladder) and exempt kinds (``wait``/``done`` — and ensure_app probe results,
+        which never reach this method with provenance) leave it untouched.
+
+        At :data:`_CAPTURE_SUSPECT_THRESHOLD` consecutive identical pairs the result
+        is re-issued with the typed marker ``CAPTURE_SOURCE_SUSPECTED
+        identical_pairs=<n>`` appended to note+evidence, and the marker string is
+        returned for the verification audit metadata. THE VERDICT ITSELF IS NEVER
+        ALTERED — ``verified``/``failed``/``uncertain`` stay exactly what the
+        evidence honestly supports (fail-open on the verdict, fail-loud in
+        diagnostics). The expected-text fallback re-verifies the SAME action; the
+        stored counter base makes that re-verification replace its own contribution
+        so one action counts at most one pair.
+        """
+        provenance = result.capture_provenance
+        if provenance is None or action is None or action.action in _CAPTURE_PAIR_EXEMPT_KINDS:
+            return result, None
+        if action.action_id != self._capture_pairs_action_id:
+            self._capture_pairs_action_id = action.action_id
+            self._capture_pairs_counter_base = self._capture_identical_pairs
+        else:
+            # same action re-verified (expected-text fallback): undo the previous
+            # contribution before re-applying, so the pair is counted exactly once.
+            self._capture_identical_pairs = self._capture_pairs_counter_base
+        identical = (
+            provenance.before_bytes == provenance.after_bytes
+            and provenance.before_sha256 == provenance.after_sha256
+        )
+        if identical:
+            self._capture_identical_pairs += 1
+        else:
+            self._capture_identical_pairs = 0
+        if self._capture_identical_pairs < _CAPTURE_SUSPECT_THRESHOLD:
+            return result, None
+        marker = f"{CAPTURE_SOURCE_SUSPECTED} identical_pairs={self._capture_identical_pairs}"
+        annotated = result.model_copy(
+            update={
+                "note": result.note if marker in result.note else f"{result.note} | {marker}"[:900],
+                "evidence": [*result.evidence, marker],
+            }
+        )
+        return annotated, marker
+
     async def _verify(
         self,
         intent: VerificationIntent,
@@ -1048,6 +1127,9 @@ class ComputerUseAgent:
                 verification_method="controller_guard",
                 observation_id=after.observation_id,
             )
+        # v0.7.1 Defect A: honest capture-source diagnostics (marker rides ALONGSIDE
+        # the verdict; the verdict itself is never altered).
+        result, capture_marker = self._capture_source_guard(action, result)
         duration_ms = (time.perf_counter() - started) * 1000.0
         self.metrics.record_latency("verification_ms", duration_ms)
         if result.outcome == "verified":
@@ -1056,6 +1138,7 @@ class ComputerUseAgent:
             self.metrics.incr("verification_failed")
         else:
             self.metrics.incr("verification_uncertain")
+        provenance = result.capture_provenance
         self._audit(
             "verification",
             observation=after,
@@ -1068,6 +1151,16 @@ class ComputerUseAgent:
                 "note": result.note[:200],
                 "intent_kind": intent.kind,
                 "ladder_tier": ladder_tier,
+                # honest provenance on every verified-action audit event (None dropped)
+                "capture_provenance": (
+                    (
+                        f"before={provenance.before_sha256[:12]}:{provenance.before_bytes} "
+                        f"after={provenance.after_sha256[:12]}:{provenance.after_bytes}"
+                    )
+                    if provenance is not None
+                    else None
+                ),
+                "capture_source_suspected": capture_marker,
             },
         )
         return result

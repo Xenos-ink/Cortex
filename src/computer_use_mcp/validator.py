@@ -162,7 +162,8 @@ class ValidationOutcome(GroundingValidation):
     ``STALE_OBSERVATION``, ``process_not_allowed``, ``process_identity_unavailable``,
     ``confidence_below_floor``, ``coordinate_space_unverifiable``,
     ``window_not_allowed``, ``window_identity_unavailable``, ``point_out_of_bounds``,
-    ``missing_point``, ``missing_text``, ``missing_keys``, ``missing_target``).
+    ``missing_point``, ``missing_text``, ``missing_keys``, ``missing_target``,
+    ``via_not_allowed``, ``via_invalid``).
     ``error`` (private, never serialized) carries the first typed rejection instance
     for controllers that branch on exception type.
     """
@@ -386,6 +387,25 @@ class GroundingValidator:
                     )
         if action.action == ActionType.TYPE and not action.text:
             reject("missing_text", "Type actions require non-empty text.")
+        # --- v0.7.1 (Defect C): ``via`` transport selector is type-only, known values ---
+        # Defense in depth: GroundedAction construction already fails closed on a via
+        # misuse (models.GroundedAction._via_type_only_known_values); this pipeline-side
+        # check catches model_construct-style bypasses so an invalid via can never reach
+        # the backend through any path. No new gate exceptions: sendinput/clipboard differ
+        # ONLY after the identical safety/approval decision.
+        if action.via is not None:
+            if action.action is not ActionType.TYPE:
+                reject(
+                    "via_not_allowed",
+                    f'via is only valid on type actions; received via="{action.via}" '
+                    f'on action="{action.action.value if hasattr(action.action, "value") else action.action}".',
+                )
+            elif action.via not in GroundedAction.VIA_TRANSPORTS:
+                allowed = " or ".join(f'"{value}"' for value in GroundedAction.VIA_TRANSPORTS)
+                reject(
+                    "via_invalid",
+                    f"via must be {allowed}; received {action.via!r}.",
+                )
         if action.action in {ActionType.KEYPRESS, ActionType.HOTKEY} and not action.keys:
             reject("missing_keys", "Keypress/hotkey actions require at least one key.")
         if action.action == ActionType.FOCUS_WINDOW and not (action.target or "").strip():

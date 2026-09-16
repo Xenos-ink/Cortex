@@ -43,6 +43,7 @@ __all__ = [
     "ATTACH_OR_LAUNCH_ENV",
     "DEFAULT_DIALOG_TITLE_TABLE",
     "DEFAULT_TRANSIENT_LAUNCH_PROCESSES",
+    "LAUNCH_UNRESOLVED_PATH_MISS",
     "REFOCUS_HINT",
     "AttachOrLaunchPolicy",
     "DialogSentinelPolicy",
@@ -54,6 +55,8 @@ __all__ = [
     "format_focus_drifted",
     "format_focus_identity_unknown",
     "format_focus_taken_by",
+    "format_launch_unresolved_path_miss",
+    "format_launch_unresolved_spawn_failed",
     "format_modal_dialog",
     "format_no_instance",
     "format_reanchor_refused",
@@ -70,6 +73,10 @@ __all__ = [
 #: foreground-identity loss; A12's ``on_identity_unknown: abort`` payload),
 #: ``TARGET_GONE`` (B6 dead-binding report) and ``REANCHOR_REFUSED`` (R-20 causality:
 #: annotation-only refusal to adopt an unrelated foreground as the session anchor).
+#: v0.7.1 adds the NO_INSTANCE launch-status suffix vocabulary (Defect B):
+#: ``launch_unresolved=path-lookup-missed`` / ``launch_unresolved=spawn-failed (...)``
+#: appended ONLY to authorized (``launch=server``) payloads; ``launch=driver``
+#: payloads stay byte-identical.
 FOCUS_TAKEN_BY = "FOCUS_TAKEN_BY"
 FOCUS_DRIFTED = "FOCUS_DRIFTED"
 MODAL_DIALOG = "MODAL_DIALOG"
@@ -377,6 +384,40 @@ def format_no_instance(target: str, launch: str) -> str:
         "(no existing window matched; with launch=driver the driver may launch through "
         "its normal flow)"
     )
+
+
+#: v0.7.1 (Defect B, field Blender case): typed launch-status suffix appended to an
+#: AUTHORIZED (``launch=server``) NO_INSTANCE payload whose charset-valid needle
+#: missed EVERY resolution step (``CORTEX_LAUNCH_PATHS`` mapping, ``shutil.which``,
+#: Store alias, raw-name spawn -> FileNotFoundError). Replaces the v0.7.0 silent
+#: bare-probe degrade; ``launch=driver`` payloads never carry any suffix.
+LAUNCH_UNRESOLVED_PATH_MISS = "launch_unresolved=path-lookup-missed"
+
+
+def format_launch_unresolved_path_miss() -> str:
+    """``launch_unresolved=path-lookup-missed (...)`` — nothing resolved, nothing spawned.
+
+    Static text only (the needle and any configured path are NEVER embedded), so the
+    suffix adds no injection surface. The hint names the supported fix: configure the
+    executable's location via ``CORTEX_LAUNCH_PATHS`` (see README "Environment
+    variables") or make it resolvable on PATH.
+    """
+    return (
+        f"{LAUNCH_UNRESOLVED_PATH_MISS} (valid needle, nothing resolved: not on PATH, "
+        "no Store alias, no CORTEX_LAUNCH_PATHS mapping)"
+    )
+
+
+def format_launch_unresolved_spawn_failed(exc: BaseException) -> str:
+    """``launch_unresolved=spawn-failed (<ExcType>: <msg[:120]>)`` — resolved but the spawn raised.
+
+    v0.7.1 (Defect B): a mapped/which/alias-RESOLVED target whose ``Popen`` raised
+    surfaces the real OS error (whitespace-flattened, bounded to 120 chars) instead
+    of a silent ``None`` degrade. Soft-failure contract preserved: the caller folds
+    this into the NO_INSTANCE payload, it never raises.
+    """
+    detail = " ".join(str(exc).split())[:120]
+    return f"launch_unresolved=spawn-failed ({type(exc).__name__}: {detail})"
 
 
 def format_stuck_modifier(keys: Sequence[str]) -> str:
