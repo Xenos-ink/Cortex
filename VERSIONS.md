@@ -12,6 +12,107 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
+## v0.7.5 (2026-09-18, MISSION-CRF-AVR-010 — adaptive visual representations)
+
+The observation family becomes adaptive: per-call `visual_view` (raw/grid) with a
+`visual_view_density` control, a sixth observation-only `computer_zoom` tool (a fresh
+native-resolution crop of a region), and an OCR-once spatial text layer attached to
+observe-family results through a pluggable `TextSubstrate` seam whose default and
+always-present substrate is the existing UIA read. Scope is honest: the optional
+OCR/DOM engine packages are NOT part of this release — the seam auto-detects an
+optional side package (`cortex_text_ocr`) and falls back to UIA. Everything is
+additive; the default path (no new parameter used) is byte-identical to v0.7.1, and
+grounding, validation, safety, approval, the agent pipeline, and backend capture are
+untouched. 67 net new tests (two new test files plus minimal extensions of seven
+existing suites for the new signatures and the six-tool probe surface); suite now
+1744 passed + 11 skipped.
+
+### Added
+
+- **`visual_view` / `visual_view_density` on `computer_observe`** (trailing optionals;
+  the absent request = byte-identical pass-through of untouched stock bytes):
+  "raw" (default) or "grid" (a derived coordinate-grid annotation; labels show
+  canonical screenshot-space coordinates, `displayed + crop_origin = screen` is a
+  reader-side fact). `visual_view_density` selects the grid density — closed enum
+  `coarse|standard|fine` (default `coarse`) — and is ignored silently by raw/absent
+  view requests. Unknown view/density names are rejected fail-closed (typed
+  `invalid_visual_view`) BEFORE any capture; a view that cannot be derived never
+  substitutes a raw image silently — the executed result is returned honestly with no
+  image block and a `view_derive_failed` marker. Additive response keys
+  (`visual_view`, `visual_view_scale`) report what was served.
+- **`computer_zoom(session_id, region, visual_view, visual_view_density, pixel_evidence)`**
+  — the sixth tool, OBSERVATION-ONLY (no action surface, no queue interaction): a
+  FRESH capture through the existing lifecycle (a new `observation_id` every call, no
+  cross-request frame caching; `screenshot_count` increments and the audit event
+  carries `metadata={"source": "computer_zoom"}` even when a later check refuses).
+  `region` is `[left, top, width, height]` in canonical screenshot space. Fail-closed
+  region contract: malformed/non-int regions are rejected pre-capture, out-of-bounds
+  regions or an unverifiable coordinate space against the fresh observation, and every
+  violation is the typed `invalid_region` error naming the bounds — never a clipped
+  guess, never a silent full-frame fallback. The served image is the NATIVE-RESOLUTION
+  crop (no downscale, no upscale — the crop itself is the zoom); the stock outbound
+  budget ladder still governs the served bytes and `visual_view_scale` reports any
+  ladder-applied scale. `visual_view="grid"` renders the coordinate grid ON the crop
+  with the crop origin baked into the label VALUES; the result metadata carries
+  top-level `crop_region`. Text-mode sessions get the single-text-block treatment,
+  never an image block.
+- **OCR-once spatial text layer (`spatial_text`)** — ALWAYS attached on the observe
+  family: UIA-derived text regions with bboxes in canonical coordinates, derived ONCE
+  per Observation (cached on a private, never-serialized attribute; deliberately NO
+  cross-observation store) and never part of any digest. A degraded read reports
+  honest absence (`spatial_text` null plus `spatial_text_available: false`), never an
+  empty block. `computer_zoom` filters the full cached block to the crop with
+  `crop_region` + `crop_origin` provenance so a reader can convert crop-local to
+  screenshot coordinates.
+- **`TextSubstrate` pluggable seam (`text_substrates.py`)** — the substrate protocol
+  behind the spatial text layer, with auto-detect of an optional side package
+  (`cortex_text_ocr`, not shipped in this repository) and the UIA substrate as the
+  always-present default and fallback; substrate load/derive failures degrade honestly.
+- **`pixel_evidence` (opt-in, strict boolean)** — per-region measured-evidence scores
+  (frozen formula) on the `spatial_text` regions when `pixel_evidence=true` is passed
+  (`"pixel_evidence_mode": "on"`); the default OFF omits the field entirely and
+  records `"pixel_evidence_mode": "off"` (no score computation). Non-boolean values
+  are rejected fail-closed (`invalid_pixel_evidence`) BEFORE any capture.
+- **Instrumentation** — `view_derive_ms` latency recording, the OCR-once compute
+  counter (test-visible), and the additive `visual_view` / `visual_view_scale` /
+  `pixel_evidence_mode` report keys.
+- **Tests** — `tests/test_avr_visual_views.py` and `tests/test_avr_text_substrates.py`
+  (byte-identical default path, view/density/pixel-evidence fail-closed matrices, the
+  zoom region contract, the substrate seam, OCR-once semantics); seven existing suites
+  minimally extended for the six-tool probe surface and the new signatures
+  (`test_c059_install_cli.py`, `test_c060_probe_subcommand.py`, `test_p5_redteam.py`,
+  `test_perf004_loop_economics.py`, `test_r2_redteam_speed.py`,
+  `test_r3_install_cli_redteam.py`, `test_rem_g_plain_schemas.py`).
+
+### Changed
+
+- The served surface is six tools: `computer_zoom` joins `start_session`,
+  `computer_observe`, `computer_screenshot`, `computer_execute`, `stop_session`. The
+  `cortex-mcp probe` install verifier expects exactly the registered six-tool surface
+  and still refuses any tool NOT in the set.
+- README (tool reference, install-prompt probe steps) and docs/ARCHITECTURE.md
+  (header, module map, tool-reference note) document the new tool, parameters, and
+  modules.
+
+### Performance
+
+- The absent-request observe path pays zero view cost (pass-through; the default never
+  reads the view registry). The spatial text block is built once per Observation and
+  reused (OCR-once); `pixel_evidence` computes only when requested; grid derivations
+  and substrate timing are recorded (`view_derive_ms`).
+
+### Compatibility notes
+
+- Wire change, additive only: a sixth tool (`computer_zoom`, observation-only — it
+  never dispatches input and never touches the action queue) and trailing optional
+  parameters on `computer_observe`. Omitting every new parameter returns the
+  byte-identical v0.7.1 response (no new keys on the default path). Grounding,
+  validation, safety, approval, agent, and backend capture are untouched. The OCR/DOM
+  engine packages are NOT included — the seam auto-detects the optional
+  `cortex_text_ocr` side package and UIA remains the default and fallback substrate.
+  `cortex-mcp probe` now PASSes the six-tool surface; install prompts verified against
+  the old five-tool expectation must be re-read.
+
 ## v0.7.1 (2026-09-17, ORVEX-CORTEX-v07-008 — live-session field defects)
 
 The three defect classes that forced a live-field tester to bypass Cortex entirely
