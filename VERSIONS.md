@@ -25,12 +25,16 @@ optional side package (`cortex_text_ocr`) and falls back to UIA. (Amended in pla
 at `sidepackages/cortex_text_ocr` — zero dependencies, never installed by default;
 the `install`/`update` prompt offers it with default No, and installing it is the
 user's acceptance of the added per-observation OCR latency, reported as
-`substrate_ms`.) Everything is
+`substrate_ms`; `cortex-mcp uninstall-ocr` removes it; the package's PowerShell
+JSON transport is UTF-8/control-char-safe (found and fixed in live use).)
+Everything is
 additive; the default path (no new parameter used) is byte-identical to v0.7.1, and
 grounding, validation, safety, approval, the agent pipeline, and backend capture are
 untouched. 67 net new tests (two new test files plus minimal extensions of seven
 existing suites for the new signatures and the six-tool probe surface); suite now
-1744 passed + 11 skipped.
+1753 passed + 11 skipped. Production status: Cortex 0.7.5 is suitable for
+production use, with deferred Phase 2 items explicitly treated as not fully
+validated, especially OCR performance and `pixel_evidence` theme calibration.
 
 ### Added
 
@@ -95,6 +99,16 @@ existing suites for the new signatures and the six-tool probe surface); suite no
   `computer_observe`, `computer_screenshot`, `computer_execute`, `stop_session`. The
   `cortex-mcp probe` install verifier expects exactly the registered six-tool surface
   and still refuses any tool NOT in the set.
+- **`cortex-mcp uninstall-ocr`** — removes the optional `cortex_text_ocr` side
+  package from the managed venv (removed / not installed / no-venv are all honest
+  no-ops); UIA remains the default substrate either way.
+- **`cortex_text_ocr` robustness (live-found)**: PowerShell 5.1's `ConvertTo-Json`
+  can emit raw C0 control characters and OEM-codepage stdout — real terminal text
+  broke the JSON parse on the live desktop. `ocr.ps1` now forces UTF-8 (no BOM) and
+  pre-escapes C0 characters; the parser accepts control characters (`strict=False`)
+  with one sanitize-and-retry pass, stamping `json_sanitized` on saved regions. The
+  seam's fail-open to UIA held throughout (verified live: parse failure → UIA truth
+  + `substrate_error` recorded, no observation failure).
 - README (tool reference, install-prompt probe steps) and docs/ARCHITECTURE.md
   (header, module map, tool-reference note) document the new tool, parameters, and
   modules.
