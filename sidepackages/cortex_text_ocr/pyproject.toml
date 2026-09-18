@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cortex_text_ocr"
+version = "0.1.0"
+description = "Optional OCR text substrate for Cortex: Windows.Media.Ocr via a bounded PowerShell/WinRT transport (side package, zero dependencies)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+# Deliberately NO runtime dependencies: Python stdlib + a bundled PowerShell script
+# only. The side package is opt-in BY INSTALLATION and must never perturb the
+# default Cortex install.
+
+[project.optional-dependencies]
+# none — the whole point (stdlib + powershell.exe)
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["cortex_text_ocr"]
+
+[tool.setuptools.package-data]
+cortex_text_ocr = ["*.ps1"]

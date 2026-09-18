@@ -456,6 +456,58 @@ def _package_version(python_exe: Path | str) -> str:
     return result.stdout.strip()
 
 
+# The optional OCR text substrate side package (A3 amendment; see
+# sidepackages/cortex_text_ocr/README.md). Default NO everywhere — the UIA read
+# remains the default text substrate; installing the package IS the user's
+# acceptance of the added per-observation OCR latency (reported as substrate_ms).
+SIDE_PACKAGE_DIRNAME = Path("sidepackages") / "cortex_text_ocr"
+
+
+def _offer_text_ocr_side_package(venv_python: Path, repo: Path, dry_run: bool) -> None:
+    """Optional, default-No offer of the OCR text substrate (A3 amendment).
+
+    Asked once at the natural completion point of install/update. Default No; on
+    yes the package is pip-installed into the created/managed venv. Non-interactive
+    runs (stdin not a tty, EOF) always SKIP. A failed install is a warning, never
+    an installer failure (the side package is optional; UIA remains the default).
+    """
+    package_dir = repo / SIDE_PACKAGE_DIRNAME
+    if dry_run:
+        print(f"[DRY-RUN] would offer the optional OCR text substrate ({package_dir})")
+        return
+    if not package_dir.is_dir():
+        return  # source tree without the side package: nothing to offer
+    install_cmd = f'"{venv_python}" -m pip install "{package_dir}"'
+    if not sys.stdin.isatty():
+        print(f"  ocr substrate: skipped (non-interactive); install later with:\n    {install_cmd}")
+        return
+    try:
+        answer = input("Install the optional OCR text substrate (cortex_text_ocr)? [y/N] ")
+    except (EOFError, OSError):
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print(f"  skipped — UIA remains the default text substrate; install later with:\n    {install_cmd}")
+        return
+    print(f"  $ {venv_python} -m pip install {package_dir}")
+    try:
+        subprocess.run(
+            [str(venv_python), "-m", "pip", "install", str(package_dir)], check=True
+        )
+    except subprocess.CalledProcessError as exc:
+        print(
+            f"  warning: cortex_text_ocr install failed (exit {exc.returncode}); "
+            "UIA remains the default text substrate"
+        )
+        return
+    print(
+        "  cortex_text_ocr installed — the Windows.Media.Ocr text substrate is auto-detected\n"
+        "  on the next observation (no server restart needed; UIA regions still serve first,\n"
+        "  OCR adds coverage). Installing it is your acceptance of the added per-observation\n"
+        "  latency, which is reported in the block (substrate_ms). Remove any time with:\n"
+        f'    "{venv_python}" -m pip uninstall cortex_text_ocr'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Planning (pure) + application of per-agent registrations.
 # ---------------------------------------------------------------------------
@@ -627,6 +679,8 @@ def cmd_install(args: argparse.Namespace) -> int:
             if status in (SKIPPED_NOT_FOUND, "ERROR"):
                 any_error = any_error or status == "ERROR"
 
+    _offer_text_ocr_side_package(venv_python, repo, dry_run)
+
     if dry_run:
         print("[DRY-RUN] probe skipped (no writes performed)")
         print("Restart each agent to load the new registration.")
@@ -681,6 +735,8 @@ def cmd_update(args: argparse.Namespace) -> int:
 
     version_after = _package_version(venv_python)
     print(f"version after:  {version_after}")
+
+    _offer_text_ocr_side_package(venv_python, repo, dry_run)
 
     ok, detail = probe_server(venv_python, repo)
     print(f"probe: {detail}")

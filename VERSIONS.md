@@ -19,8 +19,13 @@ The observation family becomes adaptive: per-call `visual_view` (raw/grid) with 
 native-resolution crop of a region), and an OCR-once spatial text layer attached to
 observe-family results through a pluggable `TextSubstrate` seam whose default and
 always-present substrate is the existing UIA read. Scope is honest: the optional
-OCR/DOM engine packages are NOT part of this release — the seam auto-detects an
-optional side package (`cortex_text_ocr`) and falls back to UIA. Everything is
+DOM engine package is NOT part of this release — the seam auto-detects an
+optional side package (`cortex_text_ocr`) and falls back to UIA. (Amended in place
+2026-09-18, AVR-010: the optional Windows.Media.Ocr side package now ships in-repo
+at `sidepackages/cortex_text_ocr` — zero dependencies, never installed by default;
+the `install`/`update` prompt offers it with default No, and installing it is the
+user's acceptance of the added per-observation OCR latency, reported as
+`substrate_ms`.) Everything is
 additive; the default path (no new parameter used) is byte-identical to v0.7.1, and
 grounding, validation, safety, approval, the agent pipeline, and backend capture are
 untouched. 67 net new tests (two new test files plus minimal extensions of seven
