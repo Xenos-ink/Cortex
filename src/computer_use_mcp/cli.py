@@ -479,14 +479,20 @@ def _offer_text_ocr_side_package(venv_python: Path, repo: Path, dry_run: bool) -
         return  # source tree without the side package: nothing to offer
     install_cmd = f'"{venv_python}" -m pip install "{package_dir}"'
     if not sys.stdin.isatty():
-        print(f"  ocr substrate: skipped (non-interactive); install later with:\n    {install_cmd}")
+        print(
+            f"  ocr substrate: skipped (non-interactive); install later with:\n    {install_cmd}\n"
+            "  (cortex-mcp uninstall-ocr removes it again)"
+        )
         return
     try:
         answer = input("Install the optional OCR text substrate (cortex_text_ocr)? [y/N] ")
     except (EOFError, OSError):
         answer = ""
     if answer.strip().lower() not in ("y", "yes"):
-        print(f"  skipped — UIA remains the default text substrate; install later with:\n    {install_cmd}")
+        print(
+            f"  skipped — UIA remains the default text substrate; install later with:\n    {install_cmd}\n"
+            "  (cortex-mcp uninstall-ocr removes it again)"
+        )
         return
     print(f"  $ {venv_python} -m pip install {package_dir}")
     try:
@@ -504,7 +510,7 @@ def _offer_text_ocr_side_package(venv_python: Path, repo: Path, dry_run: bool) -
         "  on the next observation (no server restart needed; UIA regions still serve first,\n"
         "  OCR adds coverage). Installing it is your acceptance of the added per-observation\n"
         "  latency, which is reported in the block (substrate_ms). Remove any time with:\n"
-        f'    "{venv_python}" -m pip uninstall cortex_text_ocr'
+        "    cortex-mcp uninstall-ocr"
     )
 
 
@@ -744,6 +750,51 @@ def cmd_update(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_uninstall_ocr(args: argparse.Namespace) -> int:
+    """Remove the optional OCR text substrate side package from the managed venv.
+
+    The uninstall counterpart of the install/update OCR offer (A3 amendment): runs
+    ``pip uninstall -y cortex_text_ocr`` in the created/managed venv and prints the
+    honest outcome (removed / not installed / no venv). UIA remains the default text
+    substrate either way. Never interactive (``pip -y``; no prompts), and a missing
+    venv or package is a no-op, not an error.
+    """
+    repo = Path(args.repo).resolve() if args.repo else default_repo()
+    venv_dir = Path(args.venv).resolve() if args.venv else repo / ".venv"
+    venv_python = _venv_python(venv_dir)
+    dry_run = bool(args.dry_run)
+
+    print(f"cortex-mcp uninstall-ocr{' [DRY-RUN]' if dry_run else ''}")
+    print(f"  venv: {venv_dir} (python: {venv_python})")
+
+    if dry_run:
+        print(f"[DRY-RUN] would run: {venv_python} -m pip uninstall -y cortex_text_ocr")
+        return 0
+    if not venv_python.exists():
+        print(f"  no venv at {venv_dir}; nothing to uninstall")
+        print("  UIA remains the default text substrate.")
+        return 0
+    result = subprocess.run(
+        [str(venv_python), "-m", "pip", "uninstall", "-y", "cortex_text_ocr"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    if "not installed" in output.lower():
+        print("  cortex_text_ocr: not installed (nothing to remove)")
+    elif result.returncode == 0:
+        print("  removed: cortex_text_ocr uninstalled from the venv")
+    else:
+        print(f"  warning: pip uninstall failed (exit {result.returncode}):")
+        if output.strip():
+            print(f"{output.strip()}")
+        print("  UIA remains the default text substrate.")
+        return 1
+    print("  UIA remains the default text substrate.")
+    return 0
+
+
 def cmd_probe(args: argparse.Namespace) -> int:
     """One-shot verification: single-line PASS/FAIL; exit 0 only on PASS."""
     python_exe = Path(args.python) if args.python else default_probe_python()
@@ -799,6 +850,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="print the plan; run nothing"
     )
     p_update.set_defaults(func=cmd_update)
+
+    p_uninstall_ocr = sub.add_parser(
+        "uninstall-ocr",
+        help="remove the optional OCR text substrate (cortex_text_ocr); UIA remains the default",
+        epilog=(
+            "Exit code: 0 when the package was removed, was not installed, or the venv is "
+            "missing (an honest no-op); 1 when pip uninstall fails. Never interactive."
+        ),
+    )
+    p_uninstall_ocr.add_argument(
+        "--repo", default=None, help="repo root (default: this package's repo)"
+    )
+    p_uninstall_ocr.add_argument("--venv", default=None, help="venv dir (default: <repo>/.venv)")
+    p_uninstall_ocr.add_argument(
+        "--dry-run", action="store_true", help="print the plan; run nothing"
+    )
+    p_uninstall_ocr.set_defaults(func=cmd_uninstall_ocr)
 
     p_probe = sub.add_parser(
         "probe",

@@ -449,6 +449,68 @@ def test_cli_parse_smoke_defaults_and_update():
     assert update.func is cli.cmd_update
 
 
+def test_cli_parse_smoke_uninstall_ocr():
+    parser = cli.build_parser()
+    args = parser.parse_args(["uninstall-ocr", "--repo", "R", "--venv", "V", "--dry-run"])
+    assert args.command == "uninstall-ocr"
+    assert args.repo == "R"
+    assert args.venv == "V"
+    assert args.dry_run is True
+    assert callable(args.func) and args.func is cli.cmd_uninstall_ocr
+
+    defaults = parser.parse_args(["uninstall-ocr"])
+    assert defaults.repo is None and defaults.venv is None and defaults.dry_run is False
+
+
+def test_uninstall_ocr_dry_run_runs_nothing(tmp_path, capsys):
+    code = cli.main(["uninstall-ocr", "--repo", str(tmp_path), "--dry-run"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "[DRY-RUN] would run:" in out and "uninstall -y cortex_text_ocr" in out
+
+
+def test_uninstall_ocr_runs_pip_against_the_venv(tmp_path, monkeypatch, capsys):
+    """The expected pip command runs against the managed venv python (mocked subprocess)."""
+    venv_dir = tmp_path / ".venv"
+    (venv_dir / "Scripts").mkdir(parents=True)
+    (venv_dir / "Scripts" / "python.exe").write_bytes(b"")
+    calls: list[list[str]] = []
+
+    class _FakeResult:
+        returncode = 0
+        stdout = "Successfully uninstalled cortex_text_ocr"
+        stderr = ""
+
+    def _fake_run(cmd, **_kwargs):
+        calls.append([str(c) for c in cmd])
+        return _FakeResult()
+
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run)
+    code = cli.main(["uninstall-ocr", "--repo", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert calls and calls[0][-4:] == ["pip", "uninstall", "-y", "cortex_text_ocr"]
+    assert calls[0][0] == str(venv_dir / "Scripts" / "python.exe")
+    assert "removed" in out and "UIA remains the default text substrate." in out
+
+
+def test_uninstall_ocr_not_installed_is_an_honest_noop(tmp_path, monkeypatch, capsys):
+    venv_dir = tmp_path / ".venv"
+    (venv_dir / "Scripts").mkdir(parents=True)
+    (venv_dir / "Scripts" / "python.exe").write_bytes(b"")
+
+    class _FakeResult:
+        returncode = 0
+        stdout = "WARNING: Skipping cortex_text_ocr as it is not installed."
+        stderr = ""
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **_k: _FakeResult())
+    code = cli.main(["uninstall-ocr", "--repo", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "not installed" in out and "UIA remains the default text substrate." in out
+
+
 def test_known_agents_table_contract():
     assert [s.name for s in KNOWN_AGENTS] == ["zcode", "claude", "cursor", "codex", "kimi"]
     assert KNOWN_AGENTS[0].fmt == "zcode-json"
