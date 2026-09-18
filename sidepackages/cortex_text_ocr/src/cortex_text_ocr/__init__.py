@@ -39,6 +39,12 @@ Honesty contract:
   the seam converts that into the honest ``substrate_error`` record and serves
   the UIA regions (the observation never fails). Malformed per-line rects are
   DROPPED rather than served.
+- Control-character-safe JSON parse (AVR-010 live bug): a real terminal's text
+  can carry raw C0 control characters that break a strict JSON parse. The parse
+  tries ``json.loads(raw, strict=False)`` first; on failure it escapes raw
+  control chars (\\x00-\\x1f except \\t\\n\\r) and retries ONCE — and when that
+  sanitize retry is what saved the parse, every served region dict is stamped
+  with the honest ``"json_sanitized": True`` (absent on the clean path).
 - Provenance: engine identifier :data:`SUBSTRATE_ID` (``"windows-media"``);
   the served block token is seam-owned (``ocr:cortex_text_ocr``).
 
@@ -56,6 +62,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 from typing import Any
@@ -88,6 +95,50 @@ _SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr.ps1
 
 _available_cache: bool | None = None
 _last_error: str | None = None
+
+#: Raw C0 control characters that can break a JSON parse. \t \n \r are exempt
+#: (JSON whitespace / self-escapable).
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+#: True when the MOST RECENT parse was saved by the sanitize retry (never reset
+#: to True by anything else; every parse sets it honestly).
+_last_parse_sanitized: bool = False
+
+
+def _sanitize_control_chars(raw: str) -> str:
+    """Escape raw C0 control chars (except \\t\\n\\r) as literal \\uXXXX text."""
+    return _CTRL_CHARS_RE.sub(lambda m: f"\\u{ord(m.group(0)):04x}", raw)
+
+
+def _parse_ps_output(raw: str) -> dict[str, Any]:
+    """Parse one line of ocr.ps1 JSON, control-char-safe (raise RuntimeError).
+
+    Belt-and-braces for the live-found bug (real terminal text carried a raw
+    control character inside a string value, which broke the old strict parse;
+    the seam's fail-open held but the observation lost its OCR):
+
+    1. ``json.loads(raw, strict=False)`` first — accepts raw control characters
+       inside string values;
+    2. on JSONDecodeError, escape raw control chars (\\x00-\\x1f except
+       \\t\\n\\r) and retry ONCE; when that retry saved the parse,
+       :data:`_last_parse_sanitized` is True and :func:`regions` stamps each
+       served region dict with ``"json_sanitized": True``.
+    """
+    global _last_parse_sanitized
+    _last_parse_sanitized = False
+    try:
+        data = json.loads(raw, strict=False)
+    except json.JSONDecodeError as first_error:
+        try:
+            data = json.loads(_sanitize_control_chars(raw))
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                f"cortex_text_ocr: PowerShell output is not valid JSON ({first_error})"
+            ) from first_error
+        _last_parse_sanitized = True
+    if not isinstance(data, dict):
+        raise RuntimeError("cortex_text_ocr: PowerShell output is not a JSON object")
+    return data
 
 
 def last_error() -> str | None:
@@ -133,15 +184,7 @@ def _run_ps(image_path: str | None, timeout: float) -> dict[str, Any]:
     if start < 0:
         tail = stderr.strip().splitlines()[-1] if stderr.strip() else "no output"
         raise RuntimeError(f"cortex_text_ocr: unparsable PowerShell output ({tail})")
-    try:
-        data = json.loads(stdout[start:].strip())
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"cortex_text_ocr: PowerShell output is not valid JSON ({exc})"
-        ) from exc
-    if not isinstance(data, dict):
-        raise RuntimeError("cortex_text_ocr: PowerShell output is not a JSON object")
-    return data
+    return _parse_ps_output(stdout[start:].strip())
 
 
 def available() -> bool:
@@ -220,6 +263,10 @@ def regions(
         _last_error = f"cortex_text_ocr: {data.get('reason', 'unknown')}"
         raise RuntimeError(_last_error)
 
+    # Honest provenance (AVR-010 live bug): when the control-char sanitize retry
+    # is what made THIS parse possible, stamp every served region with it.
+    sanitized = _last_parse_sanitized
+
     out: list[dict[str, Any]] = []
     for line in data.get("lines") or []:
         try:
@@ -232,16 +279,17 @@ def regions(
             continue  # malformed rect: dropped, never served
         if not text or x < 0 or y < 0 or width <= 0 or height <= 0:
             continue  # contract-violating entry: dropped, never served
-        out.append(
-            {
-                "text": text[:_TEXT_TRUNCATE],
-                "x": x,
-                "y": y,
-                "width": width,
-                "height": height,
-                "confidence": None,
-            }
-        )
+        region: dict[str, Any] = {
+            "text": text[:_TEXT_TRUNCATE],
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+            "confidence": None,
+        }
+        if sanitized:
+            region["json_sanitized"] = True
+        out.append(region)
         if len(out) >= MAX_REGIONS:
             break
     _last_error = None

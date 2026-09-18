@@ -16,6 +16,36 @@
 
 param([string]$Image = "")
 
+# Encoding fix (AVR-010 live bug): force UTF-8 output WITHOUT BOM so the Python
+# side's utf-8 decode of stdout is exact for non-ASCII (a real terminal's Arabic
+# text etc.); the default OEM console codepage mangles unmappable characters.
+# try/catch: setting OutputEncoding can fail when no console handle exists.
+try {
+  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch { }
+
+# JSON-safety (AVR-010 live bug): Windows PowerShell 5.1's ConvertTo-Json can emit
+# RAW C0 control characters inside string values (real terminal/progress text
+# carries them), which is invalid JSON and broke the Python parse. Choice of
+# record: each control char in a string VALUE is replaced by its literal
+# backslash-u escape TEXT (e.g. the 6 characters \u001b) — ConvertTo-Json then
+# escapes the backslash, so the value stays valid JSON and remains a readable
+# representation of the character. U+0009/U+000A/U+000D are left for
+# ConvertTo-Json's own \t/\n/\r escaping.
+function ConvertTo-JsonSafeText([string]$Value) {
+  if ([string]::IsNullOrEmpty($Value)) { return $Value }
+  $sb = New-Object System.Text.StringBuilder
+  foreach ($ch in $Value.ToCharArray()) {
+    $code = [int]$ch
+    if (($code -le 0x08) -or ($code -eq 0x0B) -or ($code -eq 0x0C) -or (($code -ge 0x0E) -and ($code -le 0x1F))) {
+      [void]$sb.Append('\u{0:x4}' -f $code)
+    } else {
+      [void]$sb.Append($ch)
+    }
+  }
+  return $sb.ToString()
+}
+
 $ErrorActionPreference = 'Stop'
 $out = [ordered]@{ ok = $false; mode = 'probe'; reason = $null; lines = @() }
 try {
@@ -77,7 +107,7 @@ try {
       if (($rc.Y + $rc.Height) -gt $b) { $b = $rc.Y + $rc.Height }
     }
     $lines += [ordered]@{
-      text = [string]$line.Text
+      text = ConvertTo-JsonSafeText ([string]$line.Text)
       x = $x; y = $y; width = ($r - $x); height = ($b - $y)
       words = @($line.Words).Count
     }
@@ -86,7 +116,9 @@ try {
   $out.lines = $lines
 } catch {
   $out.ok = $false
-  $out.reason = $_.Exception.GetType().Name + ': ' + $_.Exception.Message
-  if ($_.Exception.InnerException) { $out.reason += ' | inner: ' + $_.Exception.InnerException.Message }
+  $out.reason = ConvertTo-JsonSafeText (
+    $_.Exception.GetType().Name + ': ' + $_.Exception.Message +
+    $(if ($_.Exception.InnerException) { ' | inner: ' + $_.Exception.InnerException.Message } else { '' })
+  )
 }
 $out | ConvertTo-Json -Depth 5 -Compress
