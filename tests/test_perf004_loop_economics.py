@@ -395,8 +395,17 @@ async def test_include_screenshot_after_false_omits_image_default_is_half_res_jp
 
 
 def test_computer_execute_signature_additions_are_trailing_optional() -> None:
+    # AL-002 (MISSION-CRF-AVR-008 W2, 2026-09-17): visual_view is the NEXT trailing
+    # optional (None == byte-identical legacy behavior; documented existing-test
+    # change — the tested property is unchanged and re-pinned in
+    # tests/test_avr_visual_views.py). The pre-AL-002 pins below are otherwise intact.
     parameters = list(inspect.signature(server.computer_execute).parameters.values())
-    assert [p.name for p in parameters][-2:] == ["include_screenshot_after", "follow_ups"]
+    assert [p.name for p in parameters][-3:] == [
+        "include_screenshot_after",
+        "follow_ups",
+        "visual_view",
+    ]
+    assert parameters[-3].default is None
     assert parameters[-2].default is None
     assert parameters[-1].default is None
 

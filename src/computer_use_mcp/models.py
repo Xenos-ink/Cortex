@@ -294,6 +294,18 @@ class GroundedAction(BaseModel):
         return self
 
 
+# --- AL-002 adaptive visual representations (additive constants; MISSION-CRF-AVR-008) --------
+#: Registry keys of the observation view providers (AL-002 Component 1). Extensible (R2):
+#: registering a new provider adds a key here and in the registry; the DEFAULT path never
+#: reads this tuple (absent request = byte-identical behavior, I-1).
+VISUAL_VIEWS: tuple[str, ...] = ("raw", "grid")
+
+#: The view served when a request names none (AL-002): pass-through, byte-identical to the
+#: pre-AL-002 server (I-1). The server NEVER auto-selects a different view — the host
+#: picks per call, or the default stands.
+DEFAULT_VISUAL_VIEW = "raw"
+
+
 class Observation(BaseModel):
     """A captured computer state with identity, timing, and coordinate-space metadata."""
 
@@ -353,6 +365,17 @@ class Observation(BaseModel):
     # ~0.5 ms vs a ~25 ms full-frame diff); absent on every other path (decoded PNGs,
     # tests, fakes) and never serialized.
     _frame_raw: Any = PrivateAttr(default=None)
+    # AL-002 OCR-once spatial-text cache (Component 2, additive; the ``_frame``
+    # precedent): ``_spatial_text`` is the bounded spatial-text block (or None when the
+    # UIA read degraded — honest absence, never an empty lie), ``_spatial_text_derived``
+    # the memo flag, ``_spatial_text_compute_count`` the H21 instrumentation datum
+    # (test-visible only). Never serialized (pydantic PrivateAttr), never part of any
+    # digest (``observation.observation_digest`` reads only ``image_base64``), never
+    # visible in any tool result or audit event as state (I-3). Lifetime = the
+    # Observation object's lifetime — deliberately NO cross-observation store (ST-03).
+    _spatial_text_derived: bool = PrivateAttr(default=False)
+    _spatial_text: dict | None = PrivateAttr(default=None)
+    _spatial_text_compute_count: int = PrivateAttr(default=0)
 
 
 class GroundingValidation(BaseModel):

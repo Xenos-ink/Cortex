@@ -369,7 +369,7 @@ def test_probe_stub_ok_on_exact_surface(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: _FakeProc(_ok_stdout()))
     ok, detail = cli.probe_server("python", tmp_path)
     assert ok is True
-    assert "5 tools" in detail
+    assert f"{len(cli.EXPECTED_TOOLS)} tools" in detail
 
 
 def test_probe_stub_rejects_missing_tool(monkeypatch, tmp_path):

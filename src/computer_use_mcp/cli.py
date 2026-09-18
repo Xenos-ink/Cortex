@@ -8,8 +8,8 @@ Stdlib only (argparse/json/subprocess/pathlib/shutil/tomllib). Three subcommands
   (zcode/claude/cursor/codex/kimi), backs up every file before the first write
   (collision-proof: an existing backup is never overwritten), never clobbers an existing
   cortex entry — nor a non-dict value sitting on the registration path — unless ``--force``,
-  and verifies the built server with a zero-input stdio probe (exactly the 5 tools, zero
-  anyOf/$ref).
+  and verifies the built server with a zero-input stdio probe (exactly the registered
+  tool surface, zero anyOf/$ref).
 - ``update``: fast-forwards the repo to ``origin/main`` (clean abort when not
   fast-forward — no reset anywhere), refreshes both editable installs, verifies the
   package version before/after, and re-probes the server.
@@ -43,13 +43,18 @@ UNCHANGED = "UNCHANGED"
 SKIPPED_EXISTS = "SKIPPED-EXISTS-USE-FORCE"
 SKIPPED_NOT_FOUND = "SKIPPED-NOT-FOUND"
 
-#: The exact 5-tool surface the probe must observe (server invariant).
+#: The exact registered tool surface the probe must observe (server invariant).
+#: AL-002 Amendment A1 (owner addendum 2026-09-18) added the sixth, observation-only
+#: ``computer_zoom``; any tool NOT in this set is still refused.
 EXPECTED_TOOLS = {
     "start_session",
     "stop_session",
     "computer_observe",
     "computer_screenshot",
     "computer_execute",
+    # AL-002 Amendment A1 (owner addendum 2026-09-18): the sixth, observation-only
+    # tool. Additive; the probe still refuses any tool NOT in this set.
+    "computer_zoom",
 }
 
 SERVER_MODULE = "computer_use_mcp.server"
@@ -388,7 +393,7 @@ def probe_server(python_exe: Path | str, cwd: Path, timeout: float = 30.0) -> tu
     for banned in ("anyOf", "$ref"):
         if banned in payload:
             return False, f"forbidden schema token {banned!r} present in tools payload"
-    return True, "OK: exactly 5 tools, 0 anyOf/$ref"
+    return True, f"OK: exactly {len(EXPECTED_TOOLS)} tools, 0 anyOf/$ref"
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +694,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd) if args.cwd else default_repo()
     ok, detail = probe_server(python_exe, cwd, timeout=float(args.timeout))
     if ok:
-        print(f"PROBE PASS — 5 tools: {', '.join(sorted(EXPECTED_TOOLS))}")
+        print(f"PROBE PASS — {len(EXPECTED_TOOLS)} tools: {', '.join(sorted(EXPECTED_TOOLS))}")
         return 0
     print(f"PROBE FAIL — {detail}")
     return 1
@@ -741,10 +746,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_probe = sub.add_parser(
         "probe",
-        help="verify an install: start the server once and check the 5-tool surface",
+        help="verify an install: start the server once and check the registered tool surface",
         epilog=(
-            "Exit code: 0 only on PASS (initialize + tools/list return exactly the 5 tools "
-            "with zero anyOf/$ref in the payload); 1 on any failure (surface mismatch, "
+            "Exit code: 0 only on PASS (initialize + tools/list return exactly the registered "
+            "surface with zero anyOf/$ref in the payload); 1 on any failure (surface mismatch, "
             "forbidden schema token, timeout, no response). Prints exactly one line."
         ),
     )

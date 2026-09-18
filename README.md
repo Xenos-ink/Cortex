@@ -137,7 +137,7 @@ cortex-mcp install [--repo PATH] [--agents a,b|all] [--force] [--dry-run]
 cortex-mcp update  [--repo PATH] [--dry-run]
 ```
 
-- `install` provisions `<repo>/.venv` (editable install), registers the Cortex MCP server into every recognized agent config file it finds (ZCode, Claude, Cursor, Codex, Kimi), and verifies the served surface with a zero-input stdio probe (exactly the five tools).
+- `install` provisions `<repo>/.venv` (editable install), registers the Cortex MCP server into every recognized agent config file it finds (ZCode, Claude, Cursor, Codex, Kimi), and verifies the served surface with a zero-input stdio probe (exactly the six registered tools).
 - Guarantees: every config file is backed up before the first write (`<file>.cortex-backup-<timestamp>`), and an existing cortex entry is never overwritten — entries that already match are left untouched, entries that differ are reported and skipped unless `--force` is passed. Manual config editing remains fully supported.
 - `update` fast-forwards the clone to `origin/main` (it aborts cleanly when the branch is not fast-forwardable and never resets), refreshes the editable installs, and re-verifies.
 - The global `cortex-mcp` command is installed best-effort and may require an elevated terminal; without it, use the fallback `python -m computer_use_mcp.cli`.
@@ -193,8 +193,8 @@ STEP 3 — INSTALL (inside the canonical clone):
       python -m venv .venv
   - Refresh the editable install:
       "<venv python>" -m pip install -e "<canonical>"
-  - Verify with the probe from STEP 1a. It MUST print PASS and list exactly these 5 tools:
-      start_session, stop_session, computer_observe, computer_screenshot, computer_execute
+  - Verify with the probe from STEP 1a. It MUST print PASS and list exactly these 6 tools:
+      start_session, stop_session, computer_observe, computer_screenshot, computer_execute, computer_zoom
     If it prints FAIL: report the printed reason to the user and stop.
 
 STEP 4 — REGISTER THE SERVER FOR YOURSELF (your own config, not anyone else's):
@@ -251,8 +251,8 @@ STEP 2 — RECORD THE CURRENT STATE, THEN FAST-FORWARD:
 STEP 3 — REFRESH AND VERIFY:
   - Refresh the editable install:
       "<venv python>" -m pip install -e "<canonical>"
-  - Re-run the probe. It MUST print PASS (exactly the 5 tools: start_session,
-    stop_session, computer_observe, computer_screenshot, computer_execute).
+  - Re-run the probe. It MUST print PASS (exactly the 6 tools: start_session,
+    stop_session, computer_observe, computer_screenshot, computer_execute, computer_zoom).
     If it prints FAIL: report the printed reason and stop.
 
 STEP 4 — REPORT to the user:
@@ -357,7 +357,7 @@ The `env` block is optional — the five-tool server needs no API key (see the m
 
 ## Tool reference
 
-Cortex exposes exactly five MCP tools (`computer_screenshot` is a compatibility alias of `computer_observe`, making the wire surface five distinct names).
+Cortex exposes exactly six MCP tools (`computer_screenshot` is a compatibility alias of `computer_observe`, and `computer_zoom` is observation-only — no action surface).
 
 **`start_session(dry_run=False, require_approval=True, max_steps=30, max_retries_per_action=1, min_confidence=0.70, allowed_windows=None, allowed_processes=None, limits=None, resume_from_checkpoint=None, interference=None, image_delivery=None)`**
 
@@ -375,9 +375,15 @@ Creates a guarded session and returns the session state plus `allowed_processes`
 }
 ```
 
-**`computer_observe(session_id)`**
+**`computer_observe(session_id, visual_view=None, visual_view_density=None, pixel_evidence=None)`**
 
 Captures the current screen and returns MCP content blocks: one `ImageContent` block carrying the screenshot itself (`image/png`) — so vision-capable client models receive a real image, not text — plus one `TextContent` block with the JSON metadata `{ "observation": ..., "digest": <sha256 of the screenshot payload>, "observation_id": ..., "active_app": ..., "image_format": "image/png", "text_summary": <PERF-004 additive one-line summary> }`. The additive `text_summary` line carries the active window title/process, cursor position, a focused-control hint when the backend supplies `ui_elements` (omitted gracefully when absent), and a changed/unchanged note versus the previous observation of this session. The `observation` object carries dimensions, cursor position, coordinate-space classification, monitor identity (bounds, primary flag, DPI scales), and the full window/process identity; the raw base64 never travels as text. Error paths still return the structured error dict. This explicit tool is not rate-gated — every capture writes an audit row, so hammering clients generate audit volume at their own discretion; the per-call grounding capture is the rate-gated path. `computer_screenshot(session_id)` is a compatibility alias returning the same blocks.
+
+Visual view (v0.7.5, trailing optional): `visual_view` selects the representation of THIS observation — "raw" (the untouched screenshot; the default, byte-identical to pre-`visual_view` behavior) or "grid" (a derived coordinate-grid annotation; labels show canonical screenshot-space coordinates, `displayed + crop_origin = screen` is a reader-side fact). An explicit request — raw OR grid — also attaches the `spatial_text` metadata block (UIA-derived text regions with bboxes in canonical coordinates; `null` plus `spatial_text_available: false` when the read degraded — honest absence, never an empty block). `visual_view_density` selects the grid density — closed enum "coarse" (default) | "standard" | "fine"; raw/absent view requests ignore it silently. Unknown view/density values are rejected fail-closed (`invalid_visual_view`) BEFORE any capture; when a view cannot be derived, the executed result is still returned honestly with NO image block and a `view_derive_failed` marker — never a silent raw substitution. `pixel_evidence` (trailing optional, STRICT boolean) opts into a per-region measured-evidence score on the `spatial_text` block (`"pixel_evidence_mode": "on"`); `false`/absent omits the field entirely and records `"pixel_evidence_mode": "off"`; non-boolean values are rejected fail-closed (`invalid_pixel_evidence`) before any capture.
+
+**`computer_zoom(session_id, region=None, visual_view="raw", visual_view_density=None, pixel_evidence=None)`**
+
+Captures a FRESH observation cropped to a region: the zoom view (v0.7.5, observation-only). `region` is `[left, top, width, height]` in canonical SCREENSHOT space (the same space action coordinates are grounded in). Behavior: a FRESH capture through the existing lifecycle (a new `observation_id` every call, no frame caching across requests; `screenshot_count` increments and the `observation` audit event carries `metadata={"source": "computer_zoom"}`); FAIL-CLOSED region validation — the region must be a 4-int sequence, width > 0, height > 0, fully inside the captured frame, and the coordinate space must NOT be unverifiable; any violation returns the typed `invalid_region` error naming the bounds — NEVER a clipped guess, NEVER a silent full-frame fallback; the served image is the NATIVE-RESOLUTION crop (no downscale, no upscale — the crop itself is the zoom; the outbound budget ladder still governs the served bytes, and `visual_view_scale` reports any ladder-applied scale); `visual_view="grid"` renders the coordinate grid ON the crop at the requested density, with labels showing canonical screenshot-space VALUES (a label at crop-local `(x, y)` displays `(left + x, top + y)`); the `spatial_text` block is ALWAYS attached — UIA text regions whose bboxes intersect the crop, canonical coordinates UNCHANGED, with `crop_region` + `crop_origin` provenance (the result metadata also carries top-level `crop_region`); the per-region `pixel_evidence` score is opt-in (see `computer_observe`). OBSERVATION-ONLY: no action surface, no queue interaction; coordinates read from a zoom are used through the stock ground → validate → safety → execute pipeline exactly like any other observation. Result shape mirrors `computer_observe` (one TextContent metadata + one bounded ImageContent; text-mode sessions get the single-text-block treatment, never an image block). Unknown view/density values (`invalid_visual_view`-class) and non-boolean `pixel_evidence` (`invalid_pixel_evidence`) are rejected BEFORE any capture.
 
 **`computer_execute(session_id, action, x=None, y=None, text=None, keys=None, delta=0, approved=False, expected_effect=None, x2=None, y2=None, target=None, via=None, include_screenshot_after=None, follow_ups=None)`**
 

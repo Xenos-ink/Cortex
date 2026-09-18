@@ -774,18 +774,23 @@ async def test_r2_d11_fault_injection_window_and_focus_change_must_not_verify_ty
 # Attack 6 — schema + served-text invariants
 # =============================================================================================
 
+#: AMENDED (AL-002 Amendment A1, owner addendum 2026-09-18): ``computer_zoom`` joins
+#: as the sixth, observation-only tool; the wire-compat walk covers it identically.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
     "computer_observe",
     "computer_screenshot",
     "computer_execute",
+    "computer_zoom",
 )
 
 
-async def test_r2_surface_is_exactly_five_plain_tools() -> None:
-    """Exactly 5 registered tools; every advertised inputSchema contains ZERO anyOf
-    and ZERO $ref/$defs (the wire-compat contract, re-walked independently)."""
+async def test_r2_surface_is_exactly_six_plain_tools() -> None:
+    """Exactly 6 registered tools (AMENDED by AL-002 Amendment A1, owner addendum
+    2026-09-18: the observation-only ``computer_zoom`` joins the five deterministic
+    tools); every advertised inputSchema contains ZERO anyOf and ZERO $ref/$defs
+    (the wire-compat contract, re-walked independently)."""
     tools = await server.mcp.list_tools()
     assert sorted(tool.name for tool in tools) == sorted(ALL_TOOLS)
     for name in ALL_TOOLS:

@@ -844,7 +844,12 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
         # D1 (ORVEX-CORTEX-056-LIVEFIX): image_delivery joins the trailing set.
         "start_session": {"interference", "image_delivery"},
         # v0.7.1 (Defect C): via joins the trailing set (type-transport selector).
-        "computer_execute": {"via", "include_screenshot_after", "follow_ups"},
+        # AL-002 (MISSION-CRF-AVR-008 W2, 2026-09-17): visual_view joins the trailing
+        # set — a per-call observation view selector whose None default keeps the
+        # legacy byte-identical behavior (documented existing-test change; the tested
+        # property "trailing optional, None == legacy" is unchanged and re-pinned for
+        # visual_view in tests/test_avr_visual_views.py).
+        "computer_execute": {"via", "include_screenshot_after", "follow_ups", "visual_view"},
     }
     for tool_name, new_params in expected_new.items():
         signature = inspect.signature(getattr(server, tool_name))
@@ -863,7 +868,8 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
         "expected_effect", "x2", "y2", "target",
     ]
     # v0.7.1: via is the ONLY new addition (trailing optional, None == legacy sendinput).
-    assert params[12:] == ["via", "include_screenshot_after", "follow_ups"]
+    # AL-002 (W2, 2026-09-17): visual_view joins as the next trailing optional.
+    assert params[12:] == ["via", "include_screenshot_after", "follow_ups", "visual_view"]
 
 
 async def test_rt7_old_client_shapes_accepted_on_the_tool_surface(
