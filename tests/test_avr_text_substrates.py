@@ -287,8 +287,21 @@ def test_a3_pythonpath_side_directory_probe_detects_and_merges(
     package_file.write_text(FAKE_PACKAGE_OK, encoding="utf-8")
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))  # probe 2's ONLY source
     assert str(tmp_path) not in sys.path  # probe 1 (find_spec over sys.path) must miss
-    observation = _observation(ocr_regions=[TextRegion(text="t", x=0, y=0, width=4, height=4)])
-    block = spatial_text_of(observation)
+    saved = sys.modules.get(SIDE_SUBSTRATE_PACKAGE)
+    try:
+        observation = _observation(
+            ocr_regions=[TextRegion(text="t", x=0, y=0, width=4, height=4)]
+        )
+        block = spatial_text_of(observation)
+    finally:
+        # Probe 2 PINS sys.modules[SIDE_SUBSTRATE_PACKAGE] on success (the seam's
+        # _load_side_module probe-2 path). find_spec consults sys.modules FIRST,
+        # so a stale pin flips EVERY later detect_side_substrate() in this pytest
+        # process (order-dependent pollution). Self-clean here, restore-aware, so
+        # this test never depends on fixture teardown order.
+        sys.modules.pop(SIDE_SUBSTRATE_PACKAGE, None)
+        if saved is not None:
+            sys.modules[SIDE_SUBSTRATE_PACKAGE] = saved
     assert block["substrate"] == "ocr:cortex_text_ocr"
     assert block["substrate_merged"] == 1 and block["substrate_deduped"] == 1
     assert [entry["text"] for entry in block["regions"]] == ["t", "novel"]
