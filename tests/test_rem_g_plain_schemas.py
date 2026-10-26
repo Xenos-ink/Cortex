@@ -43,14 +43,17 @@ from test_controller_integration import (
 from computer_use_mcp import server
 from computer_use_mcp.state import SessionRegistry
 
-#: The FIVE deterministic MCP tools exposed on the stdio boundary (fixed contract).
+#: The deterministic MCP tools exposed on the stdio boundary (fixed contract).
 # AMENDED (loop removal): the internal-loop tool family is deleted from the surface.
+# AMENDED (AL-002 Amendment A1, owner addendum 2026-09-18): ``computer_zoom`` joins
+# as the sixth, observation-only tool; the no-anyOf walk covers it identically.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
     "computer_observe",
     "computer_screenshot",
     "computer_execute",
+    "computer_zoom",
 )
 
 
@@ -143,14 +146,14 @@ def _payload(response: Any) -> dict[str, Any]:
 
 
 def test_pin_a_no_anyof_in_any_tool_input_schema(fresh_server: Any) -> None:
-    """No property on ANY of the five tools' advertised inputSchemas uses "anyOf".
+    """No property on ANY registered tool's advertised inputSchema uses "anyOf".
 
     The pre-REM-G wire schema advertised every Optional parameter as
     {"anyOf": [{...}, {"type": "null"}], "default": null} — the exact form the
     live client-side validator rejected. This pin walks the FULL inputSchema of
     each tool (nested, including $defs) through the REAL FastMCP tool metadata.
     """
-    assert len(ALL_TOOLS) == 5  # the fixed five-tool surface (loop family removed)
+    assert len(ALL_TOOLS) == 6  # the fixed surface: five deterministic tools + the A1 observation-only zoom
     total_hits: list[str] = []
     for name in ALL_TOOLS:
         schema = _meta(name).arg_model.model_json_schema()

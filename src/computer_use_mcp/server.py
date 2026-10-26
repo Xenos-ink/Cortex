@@ -7,6 +7,10 @@ order — the internal-LLM loop tool family is REMOVED PERMANENTLY):
   ``stop_session``, ``computer_observe``, ``computer_screenshot``,
   ``computer_execute``. The internal-LLM loop tool family is deleted — the
   host model drives the tools directly; no model-decides loop remains in Cortex.
+  [AMENDMENT A1 (AL-002, owner addendum 2026-09-18): a SIXTH additive tool
+  ``computer_zoom`` joins the observation family — observation-only (no action
+  surface), fresh capture per call, fail-closed region validation; it changes no
+  pre-existing tool's default behavior.]
 - Tool names, stdio transport, and parameter positions are preserved; signatures
   gain TRAILING OPTIONAL params only (``start_session(..., allowed_processes=None,
   limits=None)``, ``computer_execute(..., expected_effect=None, include_screenshot_after=None,
@@ -73,6 +77,7 @@ import math
 import os
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
@@ -100,6 +105,7 @@ from .long_running import LongRunningRuntime
 from .models import (
     MAX_FOLLOW_UPS,
     ActionSpec,
+    CoordinateSpace,
     GroundedAction,
     SessionState,
 )
@@ -109,6 +115,20 @@ from .redaction import redact_text
 from .resume_manager import ResumeBundle, ResumeManager, ResumeRefusalError
 from .safety import SafetyPolicy
 from .state import SessionContext, SessionLimitExceeded, SessionRegistry, TaskStopped
+from .visual_views import (
+    DEFAULT_GRID_DENSITY,
+    InvalidVisualViewError,
+    VisualViewError,
+    ViewDeriveError,
+    crop_observation_frame,
+    encode_png_b64,
+    observation_for_payload,
+    outbound_view_scale,
+    render_crop_grid,
+    resolve_density,
+    resolve_view,
+    spatial_text_of,
+)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -588,7 +608,14 @@ def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str] 
         return None
 
 
-def _execute_response_blocks(response: dict[str, object], frame: Any = None, *, full_resolution: bool = False) -> list[Any]:
+def _execute_response_blocks(
+    response: dict[str, object],
+    frame: Any = None,
+    *,
+    full_resolution: bool = False,
+    view_id: str | None = None,
+    view_payload: tuple[str, Any] | None = None,
+) -> list[Any]:
     """REM-A H3/H5: executed ``computer_execute`` results as MCP content blocks.
 
     Returns one TextContent (the result JSON with the image blob stripped and the
@@ -605,11 +632,27 @@ def _execute_response_blocks(response: dict[str, object], frame: Any = None, *, 
     ``full_resolution=True`` (an explicit ``include_screenshot_after=true`` — the
     documented full-image opt-in — or ``CORTEX_ACTION_IMAGE_FULL=1``) keeps the
     full-resolution ``_bound_outbound_image`` budget path unchanged.
+
+    AL-002 (additive, W2): when the caller requested a ``visual_view``, ``view_id``
+    names the served view and ``view_payload`` is the pre-derived
+    ``(encoded_view_b64, derived_frame)`` pair (derived ONCE by the caller — I-4: the
+    derivation consumed the stash or decoded the payload exactly once). The derived
+    bytes ride the UNCHANGED stock bounding branch below, and the additive
+    ``visual_view``/``visual_view_scale`` keys report what was served
+    (``visual_view_scale=None`` for the pass-through raw view — raw adds no view
+    transform; a header-parse ratio for derived views, 1.0 = undegraded). With
+    ``view_id`` set and ``view_payload=None`` (raw) the stock bytes travel untouched.
+    ``view_id=None`` (the default path) is byte-identical to the pre-AL-002 builder.
     """
     payload = dict(response)
     data_b64 = payload.pop("screenshot_after_base64", None)
     blocks: list[Any] = []
     if data_b64 is not None:
+        if view_payload is not None:
+            # AL-002: the requested view was derived ONCE by the caller; the derived
+            # bytes + frame ride the UNCHANGED stock bounding branch (I-11: the stock
+            # ladder's degradation still applies and is reported via visual_view_scale).
+            data_b64, frame = view_payload
         if full_resolution:
             bounded_b64, mime = _bound_outbound_image(str(data_b64), frame=frame)
         else:
@@ -620,6 +663,15 @@ def _execute_response_blocks(response: dict[str, object], frame: Any = None, *, 
                 bounded_b64, mime = halved
                 payload["image_scale"] = _ACTION_IMAGE_SCALE  # additive truth marker
         payload["image_format"] = mime
+        if view_id is not None:
+            # AL-002 additive truth markers: which view was served, and its outbound
+            # scale (None for raw pass-through; header-parsed ratio for derived views).
+            payload["visual_view"] = view_id
+            payload["visual_view_scale"] = (
+                None
+                if view_payload is None
+                else outbound_view_scale(frame, bounded_b64)
+            )
         blocks.append(ImageContent(type="image", data=bounded_b64, mimeType=mime))
     return [
         TextContent(type="text", text=json.dumps(payload, ensure_ascii=False)),
@@ -641,6 +693,199 @@ def _bound_observe_lists(dump: dict[str, Any]) -> dict[str, Any]:
             dump[field] = value[:OBSERVE_METADATA_ELEMENT_CAP]
             dump[f"{field}_omitted_count"] = omitted
     return dump
+
+
+# --- AL-002 adaptive visual representations (additive; MISSION-CRF-AVR-008 W2) ---------------
+# A per-call, fail-closed view selector on the observe/execute paths: an ABSENT request
+# ships byte-identical results with NO new keys and no new work beyond the None-check
+# (H19/I-1); an EXPLICIT request (raw OR grid) is a view selection by the model — the
+# spatial text layer accompanies EVERY selected representation (owner directive Phase 5,
+# Commander correction 2026-09-17). Unknown names are typed ``invalid_visual_view``
+# errors; impossible derivations are typed ``view_derive_failed`` errors — never a silent
+# raw substitution (I-7). The providers/registry/grid renderer/OCR-once cache live in
+# ``visual_views.py`` (models+stdlib+PIL only, never agent/server/verification).
+
+
+def _resolve_view_param(visual_view: str | None) -> Any:
+    """Resolve an explicit ``visual_view`` request (fail-closed, AL-002 I-7).
+
+    ``None`` (the default path) returns None WITHOUT touching the registry — the
+    None-check is the ONLY added work on the default path (H19). Invalid names raise
+    :class:`InvalidVisualViewError`; callers translate that into the typed
+    ``invalid_visual_view`` error dict naming the available views.
+    """
+    if visual_view is None:
+        return None
+    return resolve_view(visual_view)
+
+
+def _spatial_text_for(
+    observation: Any, bundle: "_SessionBundle", *, pixel_evidence: bool = False
+) -> Any:
+    """Build/reuse the observation's spatial-text block with instrumentation (AL-002).
+
+    Counter ``spatial_text_compute`` + latency ``spatial_text_ms`` ride the
+    create-on-first-use metrics seams (audit.py:200-208); both fire exactly once per
+    actual computation (the OCR-once cache, I-2). Cap = ``OBSERVE_METADATA_ELEMENT_CAP``
+    — the SAME serialized-metadata cap the observe path already applies (I-9), passed
+    through so the lockstep with ``visual_views.SPATIAL_TEXT_CAP`` is structural.
+    ``pixel_evidence`` (A2, owner decision D2) rides the single build: OFF (default)
+    omits the per-region field and skips all sigma computation; ON computes the frozen
+    A1.1 formula inside the SAME build (the flag never changes the computation count).
+    """
+    def _on_compute(elapsed_ms: float) -> None:
+        bundle.metrics.incr("spatial_text_compute")
+        bundle.metrics.record_latency("spatial_text_ms", elapsed_ms)
+
+    try:
+        return spatial_text_of(
+            observation,
+            on_compute=_on_compute,
+            cap=OBSERVE_METADATA_ELEMENT_CAP,
+            pixel_evidence=pixel_evidence,
+        )
+    except Exception as exc:  # noqa: BLE001 - attach failure is typed, never stock-breaking
+        raise ViewDeriveError(f"spatial-text attach failed: {type(exc).__name__}: {exc}") from exc
+
+
+def _view_derive_failed(message: str) -> dict[str, object]:
+    """The typed ``view_derive_failed`` boundary error (AL-002; no silent raw fallback)."""
+    return {"ok": False, "error": "view_derive_failed", "message": message}
+
+
+def _invalid_visual_view(exc: InvalidVisualViewError) -> dict[str, object]:
+    """The typed ``invalid_visual_view`` boundary error (mirrors ``invalid_image_delivery``)."""
+    return {"ok": False, "error": "invalid_visual_view", "message": str(exc)}
+
+
+def _invalid_region(message: str) -> dict[str, object]:
+    """The typed ``invalid_region`` boundary error (A1.3 item 2; never a clipped guess).
+
+    Every ``computer_zoom`` region violation class — malformed shape, non-int entries,
+    non-positive width/height, out-of-bounds, UNVERIFIABLE coordinate space — returns
+    this shape naming the bounds. NO clipping, NO silent full-frame fallback.
+    """
+    return {"ok": False, "error": "invalid_region", "message": message}
+
+
+def _invalid_pixel_evidence(value: Any) -> dict[str, object]:
+    """The typed ``invalid_pixel_evidence`` boundary error (A2; the same fail-closed
+    family as ``invalid_visual_view`` / ``invalid_region``).
+
+    ``pixel_evidence`` is a STRICT boolean (A2, owner decision D2): absent/None and
+    False mean OFF, True computes the frozen A1.1 scores; any other value is rejected
+    here rather than coerced — direct callers bypass MCP validation, so the tool
+    re-checks at the boundary (defense in depth, the ``via`` precedent).
+    """
+    return {
+        "ok": False,
+        "error": "invalid_pixel_evidence",
+        "message": (
+            "pixel_evidence must be a boolean (true = compute the per-region A1.1 "
+            "pixel-evidence scores for this request; false/absent = the field is "
+            f"omitted entirely); got {value!r} ({type(value).__name__})."
+        ),
+    }
+
+
+def _zoom_region_shape_error(region: Any) -> str | None:
+    """Pre-capture shape validation for a zoom region (A1.3 item 2, fail-closed economy).
+
+    Checks everything that needs NO observation (4-sequence of ints, width > 0,
+    height > 0) so a malformed request wastes no capture; the bounds and the
+    coordinate-space doctrine are checked against the FRESH observation by
+    :func:`_zoom_region_bounds_error` after the capture. Returns the error message, or
+    ``None`` when the shape is acceptable.
+    """
+    if region is None or isinstance(region, (str, bytes, dict)) or not isinstance(
+        region, (list, tuple)
+    ):
+        return (
+            "region must be a [left, top, width, height] sequence of 4 ints in canonical "
+            f"screenshot space; got {region!r}."
+        )
+    if len(region) != 4:
+        return (
+            "region must be a [left, top, width, height] sequence of exactly 4 ints; "
+            f"got {len(region)} entries: {region!r}."
+        )
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in region):
+        return (
+            "region entries must all be ints in canonical screenshot space; got "
+            f"{region!r}. Zoom never coerces a guess."
+        )
+    left, top, width, height = region
+    if width <= 0 or height <= 0:
+        return (
+            f"region width and height must be > 0; got {region!r}."
+        )
+    return None
+
+
+def _zoom_region_bounds_error(region: Any, observation: Any) -> str | None:
+    """Post-capture bounds/space validation for a zoom region (A1.3 item 2).
+
+    The region must be FULLY inside the fresh observation's frame
+    (``0 <= left``, ``0 <= top``, ``left+width <= observation.width``,
+    ``top+height <= observation.height``) and the observation's coordinate space must
+    NOT be ``UNVERIFIABLE`` (the same refusal doctrine as coordinate actions). Returns
+    the error message, or ``None`` when the region is acceptable.
+    """
+    left, top, width, height = region
+    if (
+        left < 0
+        or top < 0
+        or left + width > observation.width
+        or top + height > observation.height
+    ):
+        return (
+            f"region {list(region)} is not fully inside the observation frame "
+            f"{observation.width}x{observation.height} (bounds: 0 <= left, 0 <= top, "
+            f"left+width <= {observation.width}, top+height <= {observation.height}); "
+            "zoom never clips and never falls back to a full frame."
+        )
+    if observation.coordinate_space is CoordinateSpace.UNVERIFIABLE:
+        return (
+            "the observation's coordinate space is unverifiable; zoom coordinates cannot "
+            "be trusted (the same refusal doctrine as coordinate actions)."
+        )
+    return None
+
+
+def _zoom_spatial_block(
+    block: dict[str, Any] | None, left: int, top: int, width: int, height: int
+) -> dict[str, Any] | None:
+    """Filter the OCR-once spatial-text block to the zoom crop (A1.3 item 5).
+
+    Regions whose bboxes INTERSECT the crop are included with their canonical
+    screenshot-space coordinates UNCHANGED (never re-based to crop-local — one
+    coordinate space everywhere, I-6), each with its ``pixel_evidence`` computed on the
+    FULL frame by the cached block build (A1.1). The block gains ``crop_region`` next to
+    the usual provenance (``crop_origin`` stays the MONITOR origin — screen =
+    ``crop_origin + screenshot``; screenshot = ``crop_region[:2] + crop-local``).
+    ``region_count``/``omitted_count`` semantics are preserved: ``omitted_count``
+    reports every known-but-unserved region (the cap-dropped AND the non-intersecting)
+    — nothing silently lost (I-9). The cached full block is never mutated (I-2/I-5).
+    """
+    if block is None:
+        return None
+    regions = block.get("regions") or []
+    kept = [
+        dict(entry)
+        for entry in regions
+        if entry["x"] < left + width
+        and entry["y"] < top + height
+        and entry["x"] + entry["width"] > left
+        and entry["y"] + entry["height"] > top
+    ]
+    zoom_block = dict(block)  # the cached OCR-once block stays untouched (I-2)
+    zoom_block["crop_region"] = [left, top, width, height]
+    zoom_block["region_count"] = len(kept)
+    zoom_block["omitted_count"] = int(block.get("omitted_count", 0)) + (
+        len(regions) - len(kept)
+    )
+    zoom_block["regions"] = kept
+    return zoom_block
 
 
 def _parse_limits(limits: dict[str, Any] | None) -> Limits:
@@ -874,6 +1119,12 @@ _PLAIN_WIDENED_NULLABLE_OBJECT_ARRAY = _PlainJsonSchema(
 _PLAIN_NULLABLE_STRING_MAP = _PlainJsonSchema(
     {"type": ["object", "null"], "additionalProperties": True}
 )
+# A1.3: the ``computer_zoom`` region — an advertised 4-integer array in canonical
+# screenshot space. The runtime validation is STRICTER than the wire schema (typed
+# ``invalid_region`` for every violation class, A1.3 item 2 — never a clipped guess).
+_PLAIN_NULLABLE_REGION = _PlainJsonSchema(
+    {"type": ["array", "null"], "items": {"type": "integer"}, "minItems": 4, "maxItems": 4}
+)
 _PLAIN_NULLABLE_NUMBER_MAP = _PlainJsonSchema(
     {"type": ["object", "null"], "additionalProperties": {"type": "number"}}
 )
@@ -936,6 +1187,8 @@ NullableFollowUps = Annotated[TolerantFollowUps | None, _PLAIN_WIDENED_NULLABLE_
 NullableStrMap = Annotated[dict[str, Any] | None, _PLAIN_NULLABLE_STRING_MAP]
 NullableNumberMap = Annotated[dict[str, float] | None, _PLAIN_NULLABLE_NUMBER_MAP]
 NullableKeys = Annotated[TolerantKeys | None, _PLAIN_WIDENED_NULLABLE_STRING_ARRAY]
+# A1.3: the zoom region [left, top, width, height] (canonical screenshot space).
+NullableRegion = Annotated[list[Any] | None, _PLAIN_NULLABLE_REGION]
 
 
 def _coerce_follow_up_entry(item: dict[str, Any]) -> dict[str, Any]:
@@ -1480,7 +1733,12 @@ def stop_session(session_id: str) -> dict[str, object]:
 
 
 @mcp.tool()
-def computer_observe(session_id: str) -> Any:
+def computer_observe(
+    session_id: str,
+    visual_view: NullableStr = None,
+    visual_view_density: NullableStr = None,
+    pixel_evidence: NullableBool = None,
+) -> Any:
     """Return the current observation state used for grounding: screenshot, dimensions, window, and cursor.
 
     On success this returns MCP content blocks: one TextContent carrying the
@@ -1496,6 +1754,36 @@ def computer_observe(session_id: str) -> Any:
     alive; the delivery mode is fixed at start_session (pass image_delivery="text"
     there if your inputs are text-only). Error paths still return the structured
     error dict.
+
+    Visual view (AL-002, trailing optional): ``visual_view`` selects the
+    representation of THIS observation — "raw" (the untouched screenshot) or "grid"
+    (a coordinate-grid annotation aid; labels show canonical screenshot-space
+    coordinates, ``displayed + crop_origin = screen`` is a reader-side fact). An
+    ABSENT request ships byte-identical results with no new keys and no new work
+    (the default never changes). An EXPLICIT request — raw OR grid — also attaches
+    the ``spatial_text`` metadata block (the OCR-once UIA-derived text regions with
+    provenance: observation_id, coordinate space/scale, crop_origin; ``null`` plus
+    ``spatial_text_available: false`` when the read degraded, a truthful
+    ``region_count: 0`` when it read nothing). The server never auto-selects a view;
+    unknown values are rejected fail-closed (``invalid_visual_view``) and impossible
+    derivations with ``view_derive_failed`` — never a silent raw substitution.
+
+    ``visual_view_density`` (A1.2, trailing optional): the grid density for a
+    ``visual_view="grid"`` request — closed enum ``coarse|standard|fine`` (default
+    ``coarse``). Unknown values are rejected with the same typed
+    ``invalid_visual_view``-class error naming the enum. Raw/absent view requests
+    IGNORE the parameter silently (density is meaningless for a pass-through), and
+    cost is REPORTED (visual_view_scale + instrumentation), never gated.
+
+    ``pixel_evidence`` (A2, owner decision D2, trailing optional): OPT-IN measured
+    evidence. ``true`` = every served region in the ``spatial_text`` block carries its
+    A1.1 ``pixel_evidence`` score (frozen formula, σ 0.0/32.535) and the block records
+    ``"pixel_evidence_mode": "on"``. ``false``/absent (the default) = the field is
+    OMITTED entirely (absent, never null), NO sigma computation runs, and the block
+    records ``"pixel_evidence_mode": "off"``. Non-boolean values are rejected
+    fail-closed (``invalid_pixel_evidence``) before any capture. The OCR-once cache
+    semantics are unchanged (H21'): the flag shapes WHAT the single per-observation
+    build computes, never the computation count.
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -1505,6 +1793,27 @@ def computer_observe(session_id: str) -> Any:
     # receiving one ImageContent anywhere in its history gets the whole provider
     # request rejected with a 400 and the session dies permanently.
     image_mode = _session_image_delivery(bundle)
+    # AL-002: resolve an explicit view request BEFORE any capture (fail-closed — a bad
+    # name wastes no capture); the absent request adds only this None-check (H19).
+    try:
+        view_provider = _resolve_view_param(visual_view)
+    except InvalidVisualViewError as exc:
+        return _invalid_visual_view(exc)
+    # A1.2: density resolves ONLY for a derived-view (grid) request — raw/absent
+    # requests ignore it silently (A1.2), so the default path never resolves it (H19).
+    density: str | None = None
+    if view_provider is not None and not view_provider.passthrough:
+        try:
+            density = resolve_density(visual_view_density)
+        except InvalidVisualViewError as exc:
+            return _invalid_visual_view(exc)
+    # A2 (owner decision D2): pixel_evidence is a STRICT boolean — absent/None and
+    # False mean OFF; any non-bool value is rejected fail-closed BEFORE any capture
+    # (the same typed-error family as the other boundary params; direct callers bypass
+    # MCP validation, so the boundary re-check is defense in depth).
+    if pixel_evidence is not None and not isinstance(pixel_evidence, bool):
+        return _invalid_pixel_evidence(pixel_evidence)
+    evidence_requested = pixel_evidence is True
     try:
         observation, digest = bundle.agent.observation.capture_with_digest()
     except Exception as exc:  # noqa: BLE001 - structured error, no traceback
@@ -1549,12 +1858,51 @@ def computer_observe(session_id: str) -> Any:
             # PERF-004 C8 (additive): bounded one-line grounding text for weak models.
             "text_summary": text_summary,
         }
+        if view_provider is not None:
+            # AL-002 (explicit request, text mode): the view keys ride the single text
+            # block; image_format stays "none" and no pixels are derived (there is no
+            # outbound image — visual_view_scale stays None, honest by construction).
+            # W5.1 (R-10): the attach is guarded here EXACTLY like the image branch —
+            # an attach failure degrades to the typed ``view_derive_failed`` error per
+            # the termination table ("any exception inside derive/attach -> typed
+            # error"), never an untyped crash of the text-mode observe.
+            metadata["visual_view"] = view_provider.id
+            metadata["visual_view_scale"] = None
+            try:
+                metadata["spatial_text"] = _spatial_text_for(
+                    observation, bundle, pixel_evidence=evidence_requested
+                )
+            except VisualViewError as exc:
+                return _view_derive_failed(str(exc))
+            if metadata["spatial_text"] is None:
+                metadata["spatial_text_available"] = False  # degraded UIA read (honest)
         return [TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False))]
-    outbound_b64, outbound_mime = _bound_outbound_image(
-        # R-5 (W4): the capture-time frame (backend stash) skips the PNG re-decode on
-        # the JPEG ladder; absent (fakes/legacy) the path decodes exactly as before.
-        observation.image_base64, frame=getattr(observation, "_frame", None)
-    )
+    # AL-002: ABSENT request or an explicit RAW request → today's bytes EXACTLY
+    # (the pass-through branch is the stock call, untouched — I-1 by construction);
+    # an explicit derived-view request (grid) → render + one PNG encode, then the
+    # UNCHANGED stock ladder.
+    view_scale: float | None = None
+    if view_provider is None or view_provider.passthrough:
+        outbound_b64, outbound_mime = _bound_outbound_image(
+            # R-5 (W4): the capture-time frame (backend stash) skips the PNG re-decode on
+            # the JPEG ladder; absent (fakes/legacy) the path decodes exactly as before.
+            observation.image_base64, frame=getattr(observation, "_frame", None)
+        )
+    else:
+        try:
+            started = time.perf_counter()
+            # A1.2: the resolved density rides the derive call (raw ignores it).
+            derived = view_provider.derive(observation, density=density)  # stash-copy or ONE payload decode (I-4)
+            encoded_b64 = encode_png_b64(derived.image)
+            bundle.metrics.record_latency(
+                "view_derive_ms", (time.perf_counter() - started) * 1000.0
+            )
+            outbound_b64, outbound_mime = _bound_outbound_image(encoded_b64, frame=derived.image)
+            view_scale = outbound_view_scale(derived.image, outbound_b64)
+        except VisualViewError as exc:  # fail-closed: typed error, never a raw substitution
+            return _view_derive_failed(str(exc))
+        except Exception as exc:  # noqa: BLE001 - fail-closed: typed error, no traceback
+            return _view_derive_failed(f"{type(exc).__name__}: {exc}")
     metadata = {
         "observation": _bound_observe_lists(observation_dump),
         "digest": digest,
@@ -1564,6 +1912,22 @@ def computer_observe(session_id: str) -> Any:
         # PERF-004 C8 (additive): bounded one-line grounding text for weak models.
         "text_summary": text_summary,
     }
+    if view_provider is not None:
+        # AL-002 (explicit request): the spatial text layer accompanies EVERY selected
+        # representation (raw or grid — owner directive Phase 5, Commander correction
+        # 2026-09-17); the additive keys ship only on explicit requests (absent request
+        # = byte-identical metadata, H19).
+        try:
+            spatial_block = _spatial_text_for(
+                observation, bundle, pixel_evidence=evidence_requested
+            )
+        except VisualViewError as exc:
+            return _view_derive_failed(str(exc))
+        metadata["visual_view"] = view_provider.id
+        metadata["visual_view_scale"] = view_scale
+        metadata["spatial_text"] = spatial_block
+        if spatial_block is None:
+            metadata["spatial_text_available"] = False  # degraded UIA read (honest)
     return [
         TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
         ImageContent(type="image", data=outbound_b64, mimeType=outbound_mime),
@@ -1574,6 +1938,199 @@ def computer_observe(session_id: str) -> Any:
 def computer_screenshot(session_id: str) -> Any:
     """Compatibility alias for the raw screenshot observation."""
     return computer_observe(session_id)
+
+
+@mcp.tool()
+def computer_zoom(
+    session_id: str,
+    region: NullableRegion = None,
+    visual_view: NullableStr = "raw",
+    visual_view_density: NullableStr = None,
+    pixel_evidence: NullableBool = None,
+) -> Any:
+    """Capture a FRESH observation cropped to a region: the zoom view (AL-002 A1.3).
+
+    session_id is REQUIRED on every call: copy it from start_session's result and
+    reuse it for the whole session. ``region`` is ``[left, top, width, height]`` in
+    canonical SCREENSHOT space (the same space coordinates are grounded in — mss
+    convention, matching MonitorInfo.bounds).
+
+    Behavior (spec A1.3 items 1-7):
+    1. FRESH capture through the existing lifecycle (the same path computer_observe
+       uses): a new ``observation_id`` every call, no frame caching across requests;
+       ``screenshot_count`` increments and an ``observation`` audit event with
+       ``metadata={"source": "computer_zoom"}`` is emitted.
+    2. FAIL-CLOSED region validation: the region must be a 4-int sequence, width > 0,
+       height > 0, fully inside the captured frame, and the observation's coordinate
+       space must NOT be unverifiable. Any violation returns the typed
+       ``invalid_region`` error naming the bounds — NEVER a clipped guess, NEVER a
+       silent full-frame fallback.
+    3. The served image is the NATIVE-RESOLUTION crop (no downscale, no upscale — the
+       crop itself is the zoom); the outbound budget ladder still governs the served
+       bytes, and ``visual_view_scale`` reports any ladder-applied scale.
+    4. ``visual_view="grid"`` renders the coordinate grid ON THE CROP at the requested
+       density; labels show CANONICAL SCREENSHOT-space VALUES — a label at crop-local
+       ``(x, y)`` displays ``(left + x, top + y)`` (the crop origin is baked into the
+       label VALUES, unlike the full-frame grid view).
+    5. The ``spatial_text`` block is ALWAYS attached (observe-family rule): UIA text
+       regions whose bboxes intersect the crop, canonical coordinates UNCHANGED; the
+       block carries ``crop_region`` + ``crop_origin`` provenance so a reader can
+       convert (screenshot = crop_region[:2] + crop-local). The result metadata also
+       carries top-level ``crop_region``. The per-region ``pixel_evidence`` score is
+       OPT-IN (A2): pass ``pixel_evidence=true`` to compute it (frozen A1.1 formula,
+       ``"pixel_evidence_mode": "on"``); the default OFF omits the field entirely and
+       records ``"pixel_evidence_mode": "off"`` (no sigma computation, no decode).
+    6. OBSERVATION-ONLY: no action surface, no queue interaction; coordinates read
+       from a zoom are used through the stock ground -> validate -> safety -> execute
+       pipeline exactly like any other observation.
+    7. Result shape mirrors computer_observe's: one TextContent (metadata) + one
+       bounded ImageContent; text-mode sessions get the single-text-block treatment
+       (``image_format: "none"``), never an image block.
+
+    ``visual_view`` accepts "raw" (default) or "grid"; ``visual_view_density``
+    (trailing optional, A1.2) selects the grid density — closed enum
+    ``coarse|standard|fine``, default ``coarse``; raw requests ignore it silently.
+    Unknown view/density values are rejected fail-closed
+    (``invalid_visual_view``-class) BEFORE any capture. ``pixel_evidence`` (A2) is a
+    STRICT boolean: non-boolean values are rejected fail-closed
+    (``invalid_pixel_evidence``) BEFORE any capture.
+    """
+    try:
+        bundle = _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    image_mode = _session_image_delivery(bundle)
+    # Fail-closed view/density resolution BEFORE any capture (a bad name wastes no
+    # capture; the observe-path precedent). Raw/absent views ignore density silently.
+    try:
+        view_provider = _resolve_view_param(visual_view)
+    except InvalidVisualViewError as exc:
+        return _invalid_visual_view(exc)
+    density: str | None = None
+    if view_provider is None or view_provider.passthrough:
+        view_id = "raw"
+    else:
+        view_id = view_provider.id
+        try:
+            density = resolve_density(visual_view_density)
+        except InvalidVisualViewError as exc:
+            return _invalid_visual_view(exc)
+    # A2 (owner decision D2): pixel_evidence is a STRICT boolean — rejected fail-closed
+    # BEFORE any capture (the same typed-error family; the boundary re-check covers
+    # direct callers, the ``via`` precedent).
+    if pixel_evidence is not None and not isinstance(pixel_evidence, bool):
+        return _invalid_pixel_evidence(pixel_evidence)
+    evidence_requested = pixel_evidence is True
+    # A1.3 item 2: pre-capture region shape validation (fail-closed economy — a
+    # malformed region wastes no capture); bounds/space need the fresh observation.
+    shape_error = _zoom_region_shape_error(region)
+    if shape_error is not None:
+        return _invalid_region(shape_error)
+    try:
+        observation, digest = bundle.agent.observation.capture_with_digest()
+    except Exception as exc:  # noqa: BLE001 - structured error, no traceback
+        return _error_response(exc)
+    info = observation.active_window_info
+    # PERF-004 C8: the same additive summary/digest tracking as computer_observe (a
+    # zoom IS an observation request; the next observe's changed/unchanged line
+    # compares against the freshest capture of the session). Recorded BEFORE the
+    # region-bounds verdict: the capture genuinely happened, so the audit event and
+    # the ``screenshot_count`` increment are owed regardless of the outcome
+    # (A1.3 item 7: "screenshot_count increments (a capture happened)").
+    previous_digest = bundle.extra.get("last_observation_digest")
+    text_summary = observation_text_summary(observation, previous_digest=previous_digest)
+    bundle.extra["last_observation_digest"] = digest
+    try:
+        bundle.auditor.emit(
+            "observation",
+            session_id,
+            task_id=bundle.context.task.task_id,
+            observation_id=observation.observation_id,
+            active_app=info.process_name if info is not None else observation.active_window,
+            result="ok",
+            metadata={"source": "computer_zoom"},
+        )
+    except Exception:
+        logger.debug("observation audit failed", exc_info=True)
+    bundle.metrics.incr("screenshot_count")
+    # A1.3 item 2 (continued): the bounds + coordinate-space verdict against the FRESH
+    # observation. A refusal here still leaves the capture honestly recorded above.
+    bounds_error = _zoom_region_bounds_error(region, observation)
+    if bounds_error is not None:
+        return _invalid_region(bounds_error)
+    left, top, width, height = (int(value) for value in region)
+    observation_dump = observation.model_dump(mode="json", exclude={"image_base64"})
+    # A1.3 item 5: the spatial text layer is ALWAYS attached on the observe family.
+    # The OCR-once full block is built/reused here (A2: per-region pixel_evidence only
+    # when the caller opted in), then filtered to the crop for THIS result (the cache
+    # stays full — I-2).
+    try:
+        full_block = _spatial_text_for(
+            observation, bundle, pixel_evidence=evidence_requested
+        )
+    except VisualViewError as exc:
+        return _view_derive_failed(str(exc))
+    zoom_block = _zoom_spatial_block(full_block, left, top, width, height)
+    # D1 text mode: ONE text block only (metadata + mode keys), never an ImageContent.
+    # No pixels are derived for the outbound image (there is none), so
+    # visual_view_scale stays None — honest by construction (the observe precedent).
+    if image_mode == "text":
+        metadata = {
+            "observation": _bound_observe_lists(observation_dump),
+            "digest": digest,
+            "observation_id": observation.observation_id,
+            "active_app": info.process_name if info is not None else observation.active_window,
+            "image_format": "none",  # truthful: no image block was emitted
+            "image_delivery": "text",
+            "image_delivery_note": IMAGE_DELIVERY_TEXT_NOTE,
+            "text_summary": text_summary,
+            "crop_region": [left, top, width, height],
+            "visual_view": view_id,
+            "visual_view_scale": None,
+            "spatial_text": zoom_block,
+        }
+        if zoom_block is None:
+            metadata["spatial_text_available"] = False  # degraded UIA read (honest)
+        return [TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False))]
+    # A1.3 item 3: native-resolution crop (stash or ONE recorded payload decode);
+    # item 4: grid views render ON the crop with canonical-value labels. The UNCHANGED
+    # stock ladder then governs the served bytes exactly as for full-frame views.
+    try:
+        started = time.perf_counter()
+        crop, _crop_provenance = crop_observation_frame(observation, left, top, width, height)
+        served = crop
+        if view_provider is not None and not view_provider.passthrough:
+            served = render_crop_grid(
+                crop, origin_x=left, origin_y=top, density=density or DEFAULT_GRID_DENSITY
+            )
+        encoded_b64 = encode_png_b64(served)
+        bundle.metrics.record_latency(
+            "view_derive_ms", (time.perf_counter() - started) * 1000.0
+        )
+        outbound_b64, outbound_mime = _bound_outbound_image(encoded_b64, frame=served)
+        view_scale = outbound_view_scale(served, outbound_b64)
+    except VisualViewError as exc:  # fail-closed: typed error, never a raw substitution
+        return _view_derive_failed(str(exc))
+    except Exception as exc:  # noqa: BLE001 - fail-closed: typed error, no traceback
+        return _view_derive_failed(f"{type(exc).__name__}: {exc}")
+    metadata = {
+        "observation": _bound_observe_lists(observation_dump),
+        "digest": digest,
+        "observation_id": observation.observation_id,
+        "active_app": info.process_name if info is not None else observation.active_window,
+        "image_format": outbound_mime,
+        "text_summary": text_summary,
+        "crop_region": [left, top, width, height],
+        "visual_view": view_id,
+        "visual_view_scale": view_scale,
+        "spatial_text": zoom_block,
+    }
+    if zoom_block is None:
+        metadata["spatial_text_available"] = False  # degraded UIA read (honest)
+    return [
+        TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
+        ImageContent(type="image", data=outbound_b64, mimeType=outbound_mime),
+    ]
 
 
 @mcp.tool()
@@ -1593,6 +2150,7 @@ async def computer_execute(
     via: NullableStr = None,
     include_screenshot_after: NullableBool = None,
     follow_ups: NullableFollowUps = None,
+    visual_view: NullableStr = None,
 ) -> Any:
     """Validate and execute one grounded action; approval applies only to this action call.
 
@@ -1693,6 +2251,18 @@ async def computer_execute(
     the boundary with the typed ``invalid_action`` error and teach-in-text hints
     listing the valid shapes — nothing dispatches and the queue never starts (R-18;
     never a raw pydantic ValidationError).
+
+    Visual view (AL-002, trailing optional): ``visual_view`` selects the representation
+    of the RETURNED post-action image — "raw" (untouched stock bytes + additive
+    ``visual_view``/``visual_view_scale`` keys) or "grid" (a derived coordinate-grid
+    annotation; derived ONCE per response, then the UNCHANGED stock half-res/ladder
+    bounding). Absent request = byte-identical default behavior; unknown values are
+    rejected fail-closed (``invalid_visual_view``) BEFORE the action runs — a bad view
+    name never dispatches input. If the view cannot be derived from the post-action
+    payload, the executed result is still returned honestly (an executed action's
+    outcome is never hidden) but with NO image block and an additive
+    ``visual_view_error: "view_derive_failed: ..."`` marker — never a silent raw
+    substitution. In text mode (no image is served either way) the keys do not apply.
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -1702,6 +2272,13 @@ async def computer_execute(
     # can only REMOVE bytes, never re-enable an image (a non-vision model passing
     # True must not be able to kill its own session).
     image_mode = _session_image_delivery(bundle)
+    # AL-002: resolve an explicit view request BEFORE anything runs (fail-closed — a
+    # bad view name never dispatches input); the absent request adds only this
+    # None-check (H19).
+    try:
+        view_provider = _resolve_view_param(visual_view)
+    except InvalidVisualViewError as exc:
+        return _invalid_visual_view(exc)
     if follow_ups is not None:
         # REM-F: normalize the tolerant shapes for DIRECT callers too (the boundary
         # coercion already produced list[dict] for MCP callers — idempotent here:
@@ -1845,7 +2422,46 @@ async def computer_execute(
         # the half-res JPEG; CORTEX_ACTION_IMAGE_FULL=1 restores full-res defaults.
         frame = getattr(result, "_frame", None) if result is not None else None
         full_resolution = include_screenshot_after is True or _action_image_full()
-        return _execute_response_blocks(response, frame=frame, full_resolution=full_resolution)
+        # AL-002 (additive): honor an explicit visual_view on the RETURNED image —
+        # derived ONCE per response, then the UNCHANGED stock bounding branch. Raw is
+        # the pass-through (stock bytes + additive keys). If the view cannot be
+        # derived, the executed result is still returned honestly (an executed
+        # action's outcome is never hidden behind an error dict) with NO image block
+        # and the typed ``view_derive_failed`` marker — never a silent raw substitute.
+        view_id: str | None = None
+        view_payload: tuple[str, Any] | None = None
+        if view_provider is not None:
+            view_id = view_provider.id
+            if not view_provider.passthrough:
+                try:
+                    derived = view_provider.derive(
+                        observation_for_payload(str(response["screenshot_after_base64"]), frame)
+                    )
+                    started = time.perf_counter()
+                    encoded_b64 = encode_png_b64(derived.image)
+                    bundle.metrics.record_latency(
+                        "view_derive_ms", (time.perf_counter() - started) * 1000.0
+                    )
+                    view_payload = (encoded_b64, derived.image)
+                except VisualViewError as exc:  # fail-closed: no image, no raw fallback
+                    response.pop("screenshot_after_base64", None)
+                    response["visual_view"] = view_id
+                    response["visual_view_error"] = f"view_derive_failed: {exc}"
+                    return response
+                except Exception as exc:  # noqa: BLE001 - fail-closed, no traceback
+                    response.pop("screenshot_after_base64", None)
+                    response["visual_view"] = view_id
+                    response["visual_view_error"] = (
+                        f"view_derive_failed: {type(exc).__name__}: {exc}"
+                    )
+                    return response
+        return _execute_response_blocks(
+            response,
+            frame=frame,
+            full_resolution=full_resolution,
+            view_id=view_id,
+            view_payload=view_payload,
+        )
     return response
 def main() -> None:
     asyncio.run(mcp.run_stdio_async())

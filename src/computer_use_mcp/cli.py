@@ -8,8 +8,8 @@ Stdlib only (argparse/json/subprocess/pathlib/shutil/tomllib). Three subcommands
   (zcode/claude/cursor/codex/kimi), backs up every file before the first write
   (collision-proof: an existing backup is never overwritten), never clobbers an existing
   cortex entry — nor a non-dict value sitting on the registration path — unless ``--force``,
-  and verifies the built server with a zero-input stdio probe (exactly the 5 tools, zero
-  anyOf/$ref).
+  and verifies the built server with a zero-input stdio probe (exactly the registered
+  tool surface, zero anyOf/$ref).
 - ``update``: fast-forwards the repo to ``origin/main`` (clean abort when not
   fast-forward — no reset anywhere), refreshes both editable installs, verifies the
   package version before/after, and re-probes the server.
@@ -43,13 +43,18 @@ UNCHANGED = "UNCHANGED"
 SKIPPED_EXISTS = "SKIPPED-EXISTS-USE-FORCE"
 SKIPPED_NOT_FOUND = "SKIPPED-NOT-FOUND"
 
-#: The exact 5-tool surface the probe must observe (server invariant).
+#: The exact registered tool surface the probe must observe (server invariant).
+#: AL-002 Amendment A1 (owner addendum 2026-09-18) added the sixth, observation-only
+#: ``computer_zoom``; any tool NOT in this set is still refused.
 EXPECTED_TOOLS = {
     "start_session",
     "stop_session",
     "computer_observe",
     "computer_screenshot",
     "computer_execute",
+    # AL-002 Amendment A1 (owner addendum 2026-09-18): the sixth, observation-only
+    # tool. Additive; the probe still refuses any tool NOT in this set.
+    "computer_zoom",
 }
 
 SERVER_MODULE = "computer_use_mcp.server"
@@ -388,7 +393,7 @@ def probe_server(python_exe: Path | str, cwd: Path, timeout: float = 30.0) -> tu
     for banned in ("anyOf", "$ref"):
         if banned in payload:
             return False, f"forbidden schema token {banned!r} present in tools payload"
-    return True, "OK: exactly 5 tools, 0 anyOf/$ref"
+    return True, f"OK: exactly {len(EXPECTED_TOOLS)} tools, 0 anyOf/$ref"
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +454,64 @@ def _package_version(python_exe: Path | str) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"import computer_use_mcp failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+# The optional OCR text substrate side package (A3 amendment; see
+# sidepackages/cortex_text_ocr/README.md). Default NO everywhere — the UIA read
+# remains the default text substrate; installing the package IS the user's
+# acceptance of the added per-observation OCR latency (reported as substrate_ms).
+SIDE_PACKAGE_DIRNAME = Path("sidepackages") / "cortex_text_ocr"
+
+
+def _offer_text_ocr_side_package(venv_python: Path, repo: Path, dry_run: bool) -> None:
+    """Optional, default-No offer of the OCR text substrate (A3 amendment).
+
+    Asked once at the natural completion point of install/update. Default No; on
+    yes the package is pip-installed into the created/managed venv. Non-interactive
+    runs (stdin not a tty, EOF) always SKIP. A failed install is a warning, never
+    an installer failure (the side package is optional; UIA remains the default).
+    """
+    package_dir = repo / SIDE_PACKAGE_DIRNAME
+    if dry_run:
+        print(f"[DRY-RUN] would offer the optional OCR text substrate ({package_dir})")
+        return
+    if not package_dir.is_dir():
+        return  # source tree without the side package: nothing to offer
+    install_cmd = f'"{venv_python}" -m pip install "{package_dir}"'
+    if not sys.stdin.isatty():
+        print(
+            f"  ocr substrate: skipped (non-interactive); install later with:\n    {install_cmd}\n"
+            "  (cortex-mcp uninstall-ocr removes it again)"
+        )
+        return
+    try:
+        answer = input("Install the optional OCR text substrate (cortex_text_ocr)? [y/N] ")
+    except (EOFError, OSError):
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print(
+            f"  skipped — UIA remains the default text substrate; install later with:\n    {install_cmd}\n"
+            "  (cortex-mcp uninstall-ocr removes it again)"
+        )
+        return
+    print(f"  $ {venv_python} -m pip install {package_dir}")
+    try:
+        subprocess.run(
+            [str(venv_python), "-m", "pip", "install", str(package_dir)], check=True
+        )
+    except subprocess.CalledProcessError as exc:
+        print(
+            f"  warning: cortex_text_ocr install failed (exit {exc.returncode}); "
+            "UIA remains the default text substrate"
+        )
+        return
+    print(
+        "  cortex_text_ocr installed — the Windows.Media.Ocr text substrate is auto-detected\n"
+        "  on the next observation (no server restart needed; UIA regions still serve first,\n"
+        "  OCR adds coverage). Installing it is your acceptance of the added per-observation\n"
+        "  latency, which is reported in the block (substrate_ms). Remove any time with:\n"
+        "    cortex-mcp uninstall-ocr"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +685,8 @@ def cmd_install(args: argparse.Namespace) -> int:
             if status in (SKIPPED_NOT_FOUND, "ERROR"):
                 any_error = any_error or status == "ERROR"
 
+    _offer_text_ocr_side_package(venv_python, repo, dry_run)
+
     if dry_run:
         print("[DRY-RUN] probe skipped (no writes performed)")
         print("Restart each agent to load the new registration.")
@@ -677,10 +742,57 @@ def cmd_update(args: argparse.Namespace) -> int:
     version_after = _package_version(venv_python)
     print(f"version after:  {version_after}")
 
+    _offer_text_ocr_side_package(venv_python, repo, dry_run)
+
     ok, detail = probe_server(venv_python, repo)
     print(f"probe: {detail}")
     print("Restart each agent to load the new registration.")
     return 0 if ok else 1
+
+
+def cmd_uninstall_ocr(args: argparse.Namespace) -> int:
+    """Remove the optional OCR text substrate side package from the managed venv.
+
+    The uninstall counterpart of the install/update OCR offer (A3 amendment): runs
+    ``pip uninstall -y cortex_text_ocr`` in the created/managed venv and prints the
+    honest outcome (removed / not installed / no venv). UIA remains the default text
+    substrate either way. Never interactive (``pip -y``; no prompts), and a missing
+    venv or package is a no-op, not an error.
+    """
+    repo = Path(args.repo).resolve() if args.repo else default_repo()
+    venv_dir = Path(args.venv).resolve() if args.venv else repo / ".venv"
+    venv_python = _venv_python(venv_dir)
+    dry_run = bool(args.dry_run)
+
+    print(f"cortex-mcp uninstall-ocr{' [DRY-RUN]' if dry_run else ''}")
+    print(f"  venv: {venv_dir} (python: {venv_python})")
+
+    if dry_run:
+        print(f"[DRY-RUN] would run: {venv_python} -m pip uninstall -y cortex_text_ocr")
+        return 0
+    if not venv_python.exists():
+        print(f"  no venv at {venv_dir}; nothing to uninstall")
+        print("  UIA remains the default text substrate.")
+        return 0
+    result = subprocess.run(
+        [str(venv_python), "-m", "pip", "uninstall", "-y", "cortex_text_ocr"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    if "not installed" in output.lower():
+        print("  cortex_text_ocr: not installed (nothing to remove)")
+    elif result.returncode == 0:
+        print("  removed: cortex_text_ocr uninstalled from the venv")
+    else:
+        print(f"  warning: pip uninstall failed (exit {result.returncode}):")
+        if output.strip():
+            print(f"{output.strip()}")
+        print("  UIA remains the default text substrate.")
+        return 1
+    print("  UIA remains the default text substrate.")
+    return 0
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
@@ -689,7 +801,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd) if args.cwd else default_repo()
     ok, detail = probe_server(python_exe, cwd, timeout=float(args.timeout))
     if ok:
-        print(f"PROBE PASS — 5 tools: {', '.join(sorted(EXPECTED_TOOLS))}")
+        print(f"PROBE PASS — {len(EXPECTED_TOOLS)} tools: {', '.join(sorted(EXPECTED_TOOLS))}")
         return 0
     print(f"PROBE FAIL — {detail}")
     return 1
@@ -739,12 +851,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_update.set_defaults(func=cmd_update)
 
+    p_uninstall_ocr = sub.add_parser(
+        "uninstall-ocr",
+        help="remove the optional OCR text substrate (cortex_text_ocr); UIA remains the default",
+        epilog=(
+            "Exit code: 0 when the package was removed, was not installed, or the venv is "
+            "missing (an honest no-op); 1 when pip uninstall fails. Never interactive."
+        ),
+    )
+    p_uninstall_ocr.add_argument(
+        "--repo", default=None, help="repo root (default: this package's repo)"
+    )
+    p_uninstall_ocr.add_argument("--venv", default=None, help="venv dir (default: <repo>/.venv)")
+    p_uninstall_ocr.add_argument(
+        "--dry-run", action="store_true", help="print the plan; run nothing"
+    )
+    p_uninstall_ocr.set_defaults(func=cmd_uninstall_ocr)
+
     p_probe = sub.add_parser(
         "probe",
-        help="verify an install: start the server once and check the 5-tool surface",
+        help="verify an install: start the server once and check the registered tool surface",
         epilog=(
-            "Exit code: 0 only on PASS (initialize + tools/list return exactly the 5 tools "
-            "with zero anyOf/$ref in the payload); 1 on any failure (surface mismatch, "
+            "Exit code: 0 only on PASS (initialize + tools/list return exactly the registered "
+            "surface with zero anyOf/$ref in the payload); 1 on any failure (surface mismatch, "
             "forbidden schema token, timeout, no response). Prints exactly one line."
         ),
     )

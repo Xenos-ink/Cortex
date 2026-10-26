@@ -653,17 +653,17 @@ def test_r3_a6_probe_missing_initialize_reason(monkeypatch, tmp_path):
 
 
 def test_r3_a6_probe_duplicate_tool_names_set_semantics_documented(monkeypatch, tmp_path):
-    """Documents current set-semantics: a duplicated name still passes (5 unique names).
+    """Documents current set-semantics: a duplicated name still passes (unique names).
 
-    The 5-tool invariant is enforced as a SET of unique names; a duplicated tools/list
-    entry is a protocol violation the real server never emits. Pinned so any tightening
-    or loosening is a conscious decision.
+    The tool-surface invariant is enforced as a SET of unique names; a duplicated
+    tools/list entry is a protocol violation the real server never emits. Pinned so
+    any tightening or loosening is a conscious decision.
     """
     names = sorted(cli.EXPECTED_TOOLS)
-    tools = [{"name": n} for n in names] + [{"name": names[0]}]  # 6 entries, 5 unique
+    tools = [{"name": n} for n in names] + [{"name": names[0]}]  # duplicate entry
     ok, detail = _run_probe(monkeypatch, tmp_path, _FakeProc(_probe_stdout(tools)))
     assert ok is True
-    assert "5 tools" in detail
+    assert f"{len(cli.EXPECTED_TOOLS)} tools" in detail
 
 
 # ===========================================================================

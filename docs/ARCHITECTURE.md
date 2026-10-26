@@ -12,7 +12,9 @@ block, the provider decide/plan/summarize endpoints, the summarizer plumbing, th
 subtask mutation APIs, and the plan-validator classes removed) — the server exposes
 exactly five tools (start_session, stop_session, computer_observe, computer_screenshot
 alias, computer_execute); the sealed checkpoint/resume machinery on start_session
-survives. The v0.7.0 safety wave adds the `textnorm.py` matching-only normalization
+survives. v0.7.5 adds the sixth, observation-only `computer_zoom` tool (and the
+`visual_view`/`visual_view_density`/`pixel_evidence` observe parameters and the
+OCR-once `spatial_text` layer — §2/§11 below reflect this). The v0.7.0 safety wave adds the `textnorm.py` matching-only normalization
 layer consumed by the safety gate, the classifier, and secret redaction (R-21/R-23:
 destructive-intent grammar, extended redaction families), and tightens the
 Interference Guard's launch-act policy to commit-key arming plus seed correlation
@@ -73,6 +75,13 @@ backend.py         Win32 identity/DPI/monitors,      → models, state (StopToke
                    lookup (find_window_by_title),
                    stop-checked input, fakes
 observation.py     capture orchestration + digest    → backend, models
+visual_views.py    observation view providers        → models, text_substrates
+                   (raw pass-through / coordinate
+                   grid + density; PIL)
+text_substrates.py OCR-once spatial text layer       → models (+PIL)
+                   (TextSubstrate seam; UIA substrate
+                   default, optional side-package
+                   auto-detect; pixel_evidence opt-in)
 grounding.py       GroundingStrategy protocol +      → models
                    coordinate/region impls + OCR/UIA stubs
 validator.py       staleness/binding/allowlists      → models
@@ -84,11 +93,13 @@ agent.py           direct-action pipeline            → audit, backend, groundi
                    (ComputerUseAgent.run_single)       limits, models, observation,
                                                        safety, state, validator,
                                                        verification
-server.py          5 MCP tools + wiring              → agent, audit, backend,
+server.py          6 MCP tools + wiring              → agent, audit, backend,
                                                        checkpoint_manager, limits,
                                                        long_running, models, provider,
                                                        resume_manager, safety, state,
-                                                       subtask_manager (+ mcp SDK)
+                                                       subtask_manager,
+                                                       text_substrates, visual_views
+                                                       (+ mcp SDK)
 
 Removed modules (internals-removal wave, v0.6.0): `recovery.py`
 (RecoveryController/failure classification — the loop's bounded-recovery machinery),
@@ -594,7 +605,8 @@ The three newer actions:
 
 **The internal loop tool — REMOVED (loop-removal wave, user order).** The internal closed-loop
 tool and its subtask-tool family no longer exist;
-tools/list returns exactly the five tools.
+tools/list returns exactly the six tools (v0.7.5 added the observation-only
+`computer_zoom`).
 The loop's historical guarantees live on in the direct path: every `computer_execute`
 call runs the identical §4 pipeline (grounding, validation, risk, approval, execution,
 verification) and returns the per-action result — action record, message, verification

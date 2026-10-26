@@ -109,7 +109,7 @@ def test_probe_pass_prints_one_line_and_exits_zero(monkeypatch, tmp_path, capsys
     assert rc == 0
     lines = out.splitlines()
     assert len(lines) == 1
-    assert lines[0].startswith("PROBE PASS — 5 tools: ")
+    assert lines[0].startswith(f"PROBE PASS — {len(cli.EXPECTED_TOOLS)} tools: ")
     for name in cli.EXPECTED_TOOLS:  # every tool name appears in the pass line
         assert name in lines[0]
 
