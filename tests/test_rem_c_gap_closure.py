@@ -300,9 +300,26 @@ def test_f2_focus_appearing_where_absent_still_verifies() -> None:
     assert result.verification_method == "focus_change"
 
 
-def test_f2_focus_disappearing_still_verifies() -> None:
-    """F2 preservation pin (mirror): a focus marker present BEFORE and absent AFTER
-    is also a real focused-element transition (focus left the control)."""
+def test_f2_focus_disappearing_does_not_verify_the_lost_elements_effect() -> None:
+    """F2 preservation pin (mirror), RE-PINNED by ORVEX-2026-105 (owner-approved
+    C-3b) — the original reasoning is kept verbatim, then superseded:
+
+    > F2 preservation pin (mirror): a focus marker present BEFORE and absent AFTER
+    > is also a real focused-element transition (focus left the control).
+
+    That original assertion was itself the named-identity defect in miniature. It
+    scored ``verified`` for the effect ``"Hex input focused"`` while its own after
+    observation is ``Pane "canvas"`` — the hex field is NOT focused, so the
+    observation CONTRADICTS the effect. What the signal really reported was "the
+    focused element changed", and a changed focus is not the stated effect: every
+    click that merely moves focus anywhere satisfies it.
+
+    Under the ORVEX-2026-105 named-identity binding the transition is still detected
+    and still reported (``changed=True``, the signal line stays in the evidence), but
+    the AFTER identity must NAME something the effect named: ``E = {hex}`` against a
+    novel ``{canvas}`` is empty, so the tier abstains. Owner-approved re-pin
+    (MISSION C-3b) — the scenario is preserved, the verdict is honest.
+    """
     before = _observation(
         _white(),
         ui_elements=[
@@ -316,8 +333,67 @@ def test_f2_focus_disappearing_still_verifies() -> None:
     )
     after = _observation(_white(), ui_elements=_elements(["canvas"]))  # focus gone
     result = FocusChangeStrategy().verify(_focused_intent(), before, after)
-    assert result.outcome == "verified"
+    assert result.outcome == "uncertain"
+    assert result.verified is False
     assert result.verification_method == "focus_change"
+    # The change is still OBSERVED and reported — the abstention is not a denial.
+    assert result.changed is True
+    assert any("focused element" in line for line in result.evidence)
+    # ...but the note never asserts the expectation, exactly as arm (c) never does.
+    assert "Hex input focused" not in result.note, result.note
+    assert any("corroboration searched effect tokens ['hex']" in line for line in result.evidence)
+
+
+def test_f2_focus_disappearing_still_reports_the_transition_it_saw() -> None:
+    """The sibling of the re-pin above: the honest verdict must not become a silent
+    one. A focus marker disappearing is still a real, deterministic transition — it is
+    carried in the evidence (including the same-process precondition and the tokens
+    that were searched), so a host or the owner can see exactly what was observed and
+    why it was not treated as the effect."""
+    before = _observation(
+        _white(),
+        ui_elements=[
+            {
+                "control_type": "Edit",
+                "name": "Hex color input",
+                "automation_id": "hexInput",
+                "focused": True,
+            }
+        ],
+    )
+    after = _observation(_white(), ui_elements=_elements(["canvas"]))
+    evidence = "\n".join(
+        FocusChangeStrategy().verify(_focused_intent(), before, after).evidence
+    )
+    assert "focused element identity disappeared" in evidence
+    assert "Hex color input" in evidence  # the control that lost focus is named
+    assert "same-process precondition" in evidence
+    assert "'hex'" in evidence  # the effect token that was searched for
+
+
+def test_named_identity_focus_disappearing_verifies_when_the_after_identity_does_name_the_effect() -> None:
+    """The same arm-(a) transition, WITH the corroboration the re-pin above lacks: the
+    focus leaves the hex field and lands on a control the effect actually NAMED. The
+    named-identity binding gates on correspondence, it is not a blanket demotion of
+    arm (a) — this is the positive half, and it is why the re-pin above is a verdict
+    change rather than a capability loss."""
+    before = _observation(
+        _white(),
+        ui_elements=[
+            {"control_type": "Edit", "name": "Hex color input", "automation_id": "hexInput", "focused": True}
+        ],
+    )
+    after = _observation(
+        _white(),
+        ui_elements=[
+            {"control_type": "Edit", "name": "Palette", "automation_id": "palette", "focused": True}
+        ],
+    )
+    result = FocusChangeStrategy().verify(
+        _focused_intent("The palette control gains focus"), before, after
+    )
+    assert result.outcome == "verified", result
+    assert any("corroborated by effect token 'palette'" in line for line in result.evidence)
 
 
 def test_f2_no_uia_data_at_all_still_abstains() -> None:

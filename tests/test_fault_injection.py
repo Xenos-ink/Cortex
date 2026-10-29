@@ -341,13 +341,31 @@ async def test_unexpected_dialog_classified_with_bounded_recovery(
     assert executed_summary(backend) == [("type", None, "record name")]  # typed exactly once
 
 
-async def test_dialog_opening_click_verifies_via_window_identity(
+async def test_dialog_opening_without_a_named_dialog_does_not_verify_a_delete_effect(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """REM-B Fix 4 companion: the OLD shape of the test above (click + dialog opens +
-    unchanged pixels) now verifies honestly — the dialog opening IS the deterministic
-    window-identity change (pre-REM-B this false-failed exactly like the logged Paint
-    "Edit colors" click)."""
+    """ORVEX-2026-105 RE-PIN (owner-approved C-3c) — the original reasoning is
+    kept verbatim, then superseded:
+
+    > REM-B Fix 4 companion: the OLD shape of the test above (click + dialog opens +
+    > unchanged pixels) now verifies honestly — the dialog opening IS the deterministic
+    > window-identity change (pre-REM-B this false-failed exactly like the logged Paint
+    > "Edit colors" click).
+
+    That assertion asserted a success its own observation contradicts. A "Confirm
+    Delete?" dialog appearing is a real window-identity change, but the stated effect
+    is *"the record is deleted"* — the dialog is the CONFIRMATION PROMPT, and the
+    before-observation proves the record was still there. The old rule ("the identity
+    changed, therefore the described effect happened") is exactly the ORVEX-2026-105
+    defect: both identity readers read the FOREGROUND window, so any click that
+    activates a window satisfied it.
+
+    Under the named-identity binding the click is NOT reported as deleting anything:
+    the effect's content tokens are ``{record, delet}`` and the novel AFTER identity
+    tokens are ``{confirm, delete}`` — no overlap, so the action is
+    ``uncertain``/``ok: false`` and the host re-drives. The scenario is preserved
+    (same backend, same dialog, same pixels) with the honest verdict.
+    """
     backend = ScriptedBackend(
         flip=False,  # pixels never change — only the window identity moves
         active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="Main"),
@@ -364,6 +382,48 @@ async def test_dialog_opening_click_verifies_via_window_identity(
     )
     response = await server.computer_execute(
         session_id, "click", x=50, y=50, expected_effect="the record is deleted"
+    )
+    payload = _executed_payload(response)
+
+    # The click ran exactly as before — only the VERDICT about it changed.
+    assert executed_summary(backend) == [("click", (50, 50), None)]
+    assert payload["ok"] is False, payload  # a confirm prompt is not a deletion
+    assert payload["verification"]["outcome"] == "uncertain"
+    assert payload["verification"]["verified"] is False
+    events = audit_events(bundle, session_id)
+    verification = [e for e in events if e["event_type"] == "verification"]
+    assert verification and verification[0]["result"] == "uncertain"
+    # The focus tier is still the one that spoke first; it abstained instead of
+    # claiming the effect. (The per-tier evidence lines live in the response's
+    # verification block, not in this audit row — pinned in
+    # tests/test_d1_focus_change_named_identity.py.)
+    assert "focus_change" in verification[0]["metadata"]["method"]
+
+
+async def test_dialog_opening_click_verifies_when_the_effect_names_the_dialog(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sibling of the re-pin above: the SAME backend and the SAME window-identity
+    change still verify when the stated effect names the thing that actually appeared.
+    This is what keeps the ORVEX-2026-105 fix from being a capability loss — the focus
+    tier did not stop detecting the dialog opening, it stopped claiming every dialog
+    proves every effect."""
+    backend = ScriptedBackend(
+        flip=False,  # pixels never change — only the window identity moves
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="Main"),
+    )
+    dialog = WindowInfo(hwnd=2, pid=99, process_name="app.exe", title="Confirm Delete?")
+
+    def spawn_dialog(action: GroundedAction) -> None:
+        backend.set_active_window(dialog)
+
+    backend.execute_hooks.append(spawn_dialog)
+    session_id, bundle, _backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False,
+        limits=FAST_LIMITS,
+    )
+    response = await server.computer_execute(
+        session_id, "click", x=50, y=50, expected_effect="The Confirm dialog appears"
     )
     payload = _executed_payload(response)
 

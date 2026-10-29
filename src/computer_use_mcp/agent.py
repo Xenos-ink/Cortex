@@ -580,11 +580,21 @@ class ComputerUseAgent:
         return verdict
 
     def _guard_rejection_outcome(self, verdict: GuardVerdict) -> SingleActionOutcome:
-        """Structured ``rejected`` outcome carrying the guard's event payload + hints."""
+        """Structured ``rejected`` outcome carrying the guard's event payload + hints.
+
+        ORVEX-2026-105 interference retention (agent side): ``interference_events`` is
+        ADDITIVE here. A pre-dispatch blocking verdict never reaches the post-action
+        assignment (nothing dispatched, so there is no ``after`` frame to inspect),
+        which is why a pre-dispatch event could never surface on the execute/queue
+        reply — ``server`` publishes ``outcome.interference_events`` verbatim — nor,
+        from WP7, on the plan lease. ``reasons`` keeps its exact pre-existing content
+        and order, so every existing reader is unaffected.
+        """
         return SingleActionOutcome(
             kind="rejected",
             reasons=[verdict.event, *verdict.hints],
             message=verdict.message,
+            interference_events=[verdict.event],
         )
 
     @staticmethod

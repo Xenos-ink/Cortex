@@ -41,6 +41,7 @@ from test_controller_integration import (
     FAST_LIMITS,
     ScriptedBackend,
     execute_payload,
+    executed_summary,
     make_session,
 )
 
@@ -1182,3 +1183,148 @@ async def test_invalid_follow_up_entry_field_set_parity(
     assert built["kind"] == "rejected" and built["result"] == "rejected"
     validate_reply(built, "follow_up_item")
     assert set(entry) == set(built), (sorted(entry), sorted(built))
+
+
+# --- WP3 (ORVEX-2026-105): identity-change verification + interference events -----------------
+
+
+def _dialog_backend() -> ScriptedBackend:
+    """A static-screen session (pixels never change) whose click opens a 'Confirm
+    Delete?' dialog — the canonical window-identity-change scenario."""
+    backend = ScriptedBackend(
+        flip=False,  # pixels never change — only the window identity moves
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="Main"),
+    )
+    dialog = WindowInfo(hwnd=2, pid=99, process_name="app.exe", title="Confirm Delete?")
+    backend.execute_hooks.append(lambda action: backend.set_active_window(dialog))
+    return backend
+
+
+async def test_identity_change_with_the_named_identity_evidenced_verifies(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP3 §-node: a click whose stated effect names the thing that ACTUALLY appeared
+    (the after window identity carries it, novel against the before identity) verifies
+    honestly through the deterministic identity tier — ok True via ``verified``."""
+    backend = _dialog_backend()
+    session_id, _bundle, _backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(
+            session_id, "click", x=50, y=50, expected_effect="The Confirm dialog appears"
+        )
+    )
+    validate_reply(payload, "flat_execute")
+    assert payload["result"] == "verified"
+    assert payload["ok"] is True
+    assert payload["verification"]["outcome"] == "verified"
+    assert payload["verification"]["verification_method"] == "focus_change"
+    assert any(
+        "corroborated by effect token" in str(line)
+        for line in payload["verification"]["evidence"]
+    )
+
+
+async def test_identity_change_without_the_named_identity_is_an_honest_uncertain(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP3 §-node: the SAME identity change, but the stated effect names something the
+    after identity does not ('the record is deleted' vs a confirm prompt) — the reply
+    demotes to the honest ``uncertain`` token (ok False, never a silent ok:True), and
+    the verification block carries the demoted outcome."""
+    backend = _dialog_backend()
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(
+            session_id, "click", x=50, y=50, expected_effect="the record is deleted"
+        )
+    )
+    validate_reply(payload, "flat_execute")
+    assert payload["result"] == "uncertain"
+    assert payload["ok"] is False  # a verification demotion is NEVER ok:true
+    assert payload["verification"]["outcome"] == "uncertain"
+    # the click itself still dispatched and ran exactly as before
+    assert executed_summary(backend) == [("click", (50, 50), None)]
+
+
+async def test_rejection_reply_carries_the_retained_interference_events(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP3 §-node: a pre-dispatch guard refusal (foreign foreground steal) surfaces the
+    retained event list on the reply — the same string as the first reason — and the
+    rejection obeys the §1 envelope (reasons, never an ``error`` key)."""
+    from computer_use_mcp.interference import FOCUS_TAKEN_BY
+
+    backend = ScriptedBackend(
+        flip=True, active_window=WindowInfo(hwnd=1, pid=100, process_name="EXCEL.EXE",
+                                            window_class="XLMAIN", title="Book1 - Excel")
+    )
+    session_id, bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    bundle.agent.guard.rebind(
+        WindowInfo(hwnd=1, pid=100, process_name="EXCEL.EXE", window_class="XLMAIN",
+                   title="Book1 - Excel")
+    )
+    backend.set_active_window(
+        WindowInfo(hwnd=9, pid=900, process_name="notepad.exe", window_class="Notepad",
+                   title="user notes - Notepad")
+    )
+    payload = await server.computer_execute(session_id, "click", x=10, y=10)
+    validate_reply(payload, "flat_execute")
+    assert_rejection(payload)
+    event = payload["reasons"][0]
+    assert event.startswith(FOCUS_TAKEN_BY), payload
+    assert payload["interference_events"] == [event], payload
+    assert backend.executed == []  # nothing dispatched on the refusal
+
+
+async def test_verified_follow_up_entry_evidence_names_the_matched_token(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP3 §-node (F5, VAL-WP3): a VERIFIED queued follow-up's entry evidence still
+    names its matched token — the R-9 self-naming corroboration line rides FIRST in the
+    focus_change evidence, so it survives the entry's bounded evidence window (the
+    first three lines)."""
+    backend = ScriptedBackend(
+        flip=False,
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="Main"),
+    )
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False,
+        limits=FAST_LIMITS,
+    )
+    # the dialog opens on the SECOND dispatch only: item 0 (the primary click, no
+    # stated effect) runs against "Main"; item 1's dispatch is the identity change its
+    # effect names
+    dialog = WindowInfo(hwnd=2, pid=99, process_name="app.exe", title="Confirm Delete?")
+    dispatches = {"n": 0}
+
+    def open_dialog_on_second_dispatch(action: Any) -> None:
+        dispatches["n"] += 1
+        if dispatches["n"] == 2:
+            backend.set_active_window(dialog)
+
+    backend.execute_hooks.append(open_dialog_on_second_dispatch)
+    payload = execute_payload(
+        await server.computer_execute(
+            session_id, "click", x=50, y=50, approved=True, include_screenshot_after=False,
+            follow_ups=[
+                {"action": "click", "x": 50, "y": 50,
+                 "expected_effect": "The Confirm dialog appears"},
+            ],
+        )
+    )
+    validate_reply(payload, "flat_execute")
+    entries = payload["follow_up_results"]
+    assert len(entries) == 2, entries  # index 0 = the done marker, 1 = the queued click
+    for entry in entries:
+        validate_reply(entry, "follow_up_item")
+    assert entries[1]["result"] == "verified" and entries[1]["ok"] is True
+    evidence = entries[1]["verification"]["evidence"]
+    assert evidence, entries[1]
+    assert evidence[0].startswith("corroborated by effect token"), evidence
+    assert "'confirm'" in evidence[0]  # the matched token, named inside the cap

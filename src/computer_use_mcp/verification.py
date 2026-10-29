@@ -35,6 +35,7 @@ import base64
 import hashlib
 import io
 import os
+import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -51,6 +52,9 @@ __all__ = [
     "OCR_TEXT_VERIFICATION_ENV",
     "DeterministicPredicateStrategy",
     "FocusChangeStrategy",
+    "IDENTITY_ELEMENT_SCAN_LIMIT",
+    "IDENTITY_MIN_TOKEN_CHARS",
+    "IDENTITY_STOP_TOKENS",
     "ModelJudge",
     "ModelVisualStrategy",
     "ProcessStateStrategy",
@@ -63,6 +67,7 @@ __all__ = [
     "VerificationStrategy",
     "WindowStateStrategy",
     "ocr_text_verification_enabled",
+    "stem",
 ]
 
 #: Pixel mean-difference at or above this value counts as a visual change (legacy threshold).
@@ -1145,6 +1150,325 @@ class UiControlTextStrategy:
         )
 
 
+# =====================================================================================
+# ORVEX-2026-105 — the named-identity binding for the focus/window signals.
+# =====================================================================================
+#
+# THE PRINCIPLE, in one sentence and binding on :class:`FocusChangeStrategy` arms
+# (a)/(b): a focus/window signal may support ``verified`` ONLY when the identity
+# observed AFTER the action corresponds to a specific thing the stated effect NAMED —
+# never merely because the identity changed, and never merely because it changed
+# within one process.
+#
+# Before this rule the tier returned ``verified`` on any identity CHANGE and never
+# opened ``intent.expected_effect``. Both identity readers read the FOREGROUND window
+# (the UIA and the Win32 readers in ``backend.py``) and ``observe()`` reads the
+# foreground window, so ANY click that activated a window moved both signals: clicking
+# a static Tk ``Label`` while claiming *"The Edit Colors dialog opens with a new color
+# swatch"* came back ``verified`` and the dialog never opened. This is the exact
+# counterpart of the digest-arm doctrine, which already refuses to let a pixel
+# magnitude claim a described effect — arm (c) abstains, and now arms (a)/(b) must
+# NAME the thing as well.
+
+#: ORVEX-2026-105 R-3a — the CLOSED stop-list of structural/generic words. A word on
+#: this list can never be a corroborating token, because naming "dialog" or "field"
+#: says which KIND of thing to look for and nothing about which one; an effect whose
+#: every content word is structural therefore yields ``E = {}`` and can never verify.
+#:
+#: GROWTH RULE (binding): a word is added here ONLY together with a failing reproduction
+#: test that shows that word producing a false ``verified`` on a real observation pair,
+#: added in the SAME change. No silent edits, no "while we are here" additions, no
+#: additions driven by intuition alone.
+#:
+#: Considered and DELIBERATELY ABSENT: ``toolbar`` and ``widget``. Neither ships with a
+#: failing reproduction, so the growth rule forbids admitting them. ``widget`` is
+#: additionally a NAMED residual of this fix — an effect naming a generic noun that a
+#: real window happens to be called ("the widget appears" vs a new "Widget Tray") still
+#: corroborates on it — which is accepted and made AUDITABLE by the R-9 evidence line
+#: naming the carrying token on every ``verified``, rather than papered over by a
+#: stop-word that no test earned.
+IDENTITY_STOP_TOKENS: frozenset[str] = frozenset(
+    {
+        # articles, copulas, prepositions, connectives, deictics, aspect adverbs
+        "a", "an", "and", "the", "is", "are", "was", "were", "be", "been", "being",
+        "of", "to", "in", "on", "at", "by", "for", "with", "from", "into", "onto",
+        "it", "its", "this", "that", "these", "those", "now", "then", "when", "while",
+        "after", "before", "up", "down", "over", "under", "out", "off",
+        # appearance verbs and their participles
+        "new", "open", "opens", "opened", "close", "closes", "closed",
+        "show", "shows", "shown",
+        "appear", "appears", "appeared", "disappear", "disappears",
+        # window/UI container structure — the residual-risk class the owner named
+        "dialog", "window", "popup", "modal", "form", "panel", "box", "pane",
+        "frame", "sheet", "banner", "toast",
+        "control", "element", "field", "input", "button", "menu", "item", "entry",
+        "row", "column", "cell",
+        "tab", "page", "screen", "view", "area", "region", "section", "bar",
+        # focus / activation / visibility
+        "focus", "focused", "focusing", "activate", "activated", "bring", "front",
+        "visible",
+        # the interaction itself
+        "click", "clicks", "clicked", "press", "pressed",
+        "select", "selected", "choose", "chosen",
+        # the application / the actor
+        "app", "application", "program", "user", "please",
+        # modality
+        "should", "must", "will", "would", "can", "may", "does", "do", "did",
+        "not", "no", "yes", "ok", "okay", "done",
+        # outcome vocabulary — an effect must name a THING, not a verdict
+        "complete", "completed", "success", "successful", "result", "results",
+        "state", "changes", "changed", "change",
+        "updates", "updated", "update",
+        "sets", "set", "becomes", "become", "remains", "remain",
+        "inserts", "insert", "types", "type", "enters", "enter",
+    }
+)
+
+#: ORVEX-2026-105 R-2.4 — a candidate word shorter than this is dropped before it can
+#: corroborate.
+IDENTITY_MIN_TOKEN_CHARS = 3
+
+#: ORVEX-2026-105 R-1 — identity is read from at most this many ``ui_elements``
+#: entries: the same bound :class:`UiControlTextStrategy` scans, so the two tiers
+#: never disagree about which elements exist.
+IDENTITY_ELEMENT_SCAN_LIMIT = 50
+
+#: ORVEX-2026-105 R-4/R-9 — the three field classes an identity token can belong to.
+#: The order is most-specific-first on purpose: :func:`_novel_tokens` records the
+#: FIRST class that made a token novel, and "focused element" says more than the
+#: population it belongs to.
+_IDENTITY_CLASS_FOCUSED = "focused element"
+_IDENTITY_CLASS_WINDOW = "active window"
+_IDENTITY_CLASS_POPULATION = "ui_elements population"
+
+#: ORVEX-2026-105 R-2.5 — the minimum remainder kept when a trailing plural ``s`` is
+#: stripped (``colors`` -> ``color``), and when a trailing ``es``/``ed`` is stripped
+#: (``deleted`` -> ``delet``). ``delete`` ends in ``te``: neither rule fires, which is
+#: what keeps the Confirm-Delete? re-pin honest (see
+#: ``tests/test_d1_normalizer_keeps_delet_and_delete_distinct.py``).
+_STEM_PLURAL_MIN_REMAINDER = 3
+_STEM_ED_MIN_REMAINDER = 4
+
+#: ORVEX-2026-105 R-9 — the shortest shared prefix at which an observed token counts
+#: as a diagnosable near-miss of an effect token rather than an unrelated word.
+_NEAR_MISS_MIN_PREFIX = 3
+
+
+def stem(token: str) -> str:
+    """Minimal, deterministic suffix stripping (ORVEX-2026-105 R-2.5) — deliberately
+    NOT a stemmer.
+
+    Two rules, applied in this order and in no other: a trailing ``"s"`` is dropped when
+    the remainder keeps :data:`_STEM_PLURAL_MIN_REMAINDER` characters, then a trailing
+    ``"es"``/``"ed"`` is dropped when the remainder keeps
+    :data:`_STEM_ED_MIN_REMAINDER`. A token that does not end in the suffix is returned
+    unchanged — which is exactly what keeps ``delete`` (``te``) and ``deleted`` (``ed``)
+    DISTINCT.
+
+    No general-purpose stemmer, no POS tagger, no new dependency: a library stemmer
+    would make the corroboration rule unauditable, and the whole point of the binding
+    is that a reader can check the rule by reading it. The consequence of the fixed
+    order is worth stating too — ``boxes`` takes the plural rule and becomes ``boxe``,
+    never ``box``."""
+    if token.endswith("s") and len(token) - 1 >= _STEM_PLURAL_MIN_REMAINDER:
+        return token[:-1]
+    for suffix in ("es", "ed"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= _STEM_ED_MIN_REMAINDER:
+            return token[: -len(suffix)]
+    return token
+
+
+def _normalized_words(*values: Any) -> frozenset[str]:
+    """``casefold`` -> non-word characters to spaces -> split (R-2.1/R-2.2/R-2.3).
+
+    A "word character" is ``str.isalnum()`` PLUS the Unicode combining marks
+    (general category ``M*`` — Arabic tashkeel, Devanagari matras, …): a mark
+    modifies the letter it attaches to and must never split its word (F3,
+    VAL-WP3 — before this, a vocalized Arabic word was shattered into fragments,
+    one of which could become a spurious token). Non-``str``/empty values (an
+    element's ``None`` ``name``, a missing ``value``) contribute nothing."""
+    words: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        for chunk in value.casefold().split():
+            words.update(
+                "".join(
+                    char
+                    if char.isalnum() or unicodedata.category(char)[0] == "M"
+                    else " "
+                    for char in chunk
+                ).split()
+            )
+    return frozenset(words)
+
+
+def _content_tokens(*values: Any) -> frozenset[str]:
+    """The R-2 content tokens of ``values`` — ONE rule for BOTH sides of the comparison.
+
+    ``casefold`` -> combining-mark-preserving separator split (R-2.1-R-2.3), then drop
+    words shorter than :data:`IDENTITY_MIN_TOKEN_CHARS`, purely numeric words, and every
+    :data:`IDENTITY_STOP_TOKENS` word on BOTH its raw and its STEMMED form (R-2.4 + F2,
+    VAL-WP3: the stem runs FIRST, so a plural of a structural word — ``dialogs``,
+    ``windows``, ``panels``, ``fields`` — stems onto its stop-listed singular and can
+    never corroborate, exactly like the singular), then keep the stem of what survives
+    (R-2.5).
+
+    The effect prose and the observed identity are built with THIS function and no
+    other. A comparison whose two sides were normalised by different rules would be
+    exactly the silent mismatch this binding exists to close, so there is deliberately
+    no second, looser normaliser in the module — and applying the drops on the identity
+    side as well keeps the reported token sets readable (a window titled
+    ``"orvex-103-d1"`` contributes ``orvex``, not ``103``/``d1``), while being inert for
+    the predicate, since a stopped or numeric token can never appear in ``E``."""
+    tokens: set[str] = set()
+    for word in _normalized_words(*values):
+        if len(word) < IDENTITY_MIN_TOKEN_CHARS or word.isnumeric():
+            continue
+        stemmed = stem(word)
+        if word in IDENTITY_STOP_TOKENS or stemmed in IDENTITY_STOP_TOKENS:
+            continue
+        if len(stemmed) >= IDENTITY_MIN_TOKEN_CHARS:
+            tokens.add(stemmed)
+    return frozenset(tokens)
+
+
+def _effect_tokens(expectation: str | None) -> frozenset[str]:
+    """The stated effect's content tokens ``E`` (R-2) — what the identity must name.
+
+    An effect built entirely from generic/structural words yields ``E = {}``, which can
+    never corroborate anything (R-6.2) — the honest verdict for an effect that names no
+    thing at all, such as ``"the dialog commits"``."""
+    return _content_tokens(expectation)
+
+
+def _identity_token_classes(observation: Observation) -> dict[str, frozenset[str]]:
+    """The observed identity tokens of ``observation``, PER FIELD CLASS (R-1/R-4).
+
+    Three classes, because the novelty contrast has to be evaluated per class and
+    UNITED (R-8): a single global before-contrast would demote the legitimate Paint
+    case, where the BEFORE ``ui_elements`` population already lists the hex field as an
+    UNFOCUSED child and a global contrast would call ``hex`` a constant.
+
+    The R-1 field selection is exact. Window side: ``active_window_info.title``,
+    ``active_window_info.window_class`` and the ``active_window`` fallback. Element side:
+    ``name`` / ``automation_id`` / ``control_type`` / ``value`` of the FOCUS-MARKED
+    element, and the same four fields over the first :data:`IDENTITY_ELEMENT_SCAN_LIMIT`
+    ``ui_elements``. ``ocr_text`` and ``image_base64`` are STRUCTURALLY EXCLUDED — the
+    OCR tier is disabled by default because it returns garbage on the reference machine,
+    and a corroboration rule leaning on it would inherit that unreliability.
+    ``process_name`` / ``exe_path`` / ``pid`` / ``hwnd`` are EVIDENCE-ONLY (R-3): a
+    process name identifies the APPLICATION, not an element indicating the effect
+    occurred, so it can never be a corroborating token.
+
+    ONE pass over ``ui_elements`` produces both element-side classes — the focused
+    element is by construction a member of the population, so deriving it in the same
+    loop is what keeps this to a single scan (a second pass would be pure duplicated
+    copying of data already in hand)."""
+    info = observation.active_window_info
+    window = _content_tokens(
+        info.title if info is not None else None,
+        info.window_class if info is not None else None,
+        observation.active_window,
+    )
+    population: set[str] = set()
+    focused: set[str] | None = None
+    for element in (observation.ui_elements or [])[:IDENTITY_ELEMENT_SCAN_LIMIT]:
+        if not isinstance(element, dict):
+            continue
+        tokens = _content_tokens(
+            element.get("name"),
+            element.get("automation_id"),
+            element.get("control_type"),
+            element.get("value"),
+        )
+        population |= tokens
+        # The FIRST focus-marked element wins, exactly as ``_focus_marked_element``
+        # selects it; a marked element with blank fields still claims the class (and so
+        # contributes an empty set), rather than letting a later sibling take its place.
+        if focused is None and (
+            element.get("focused") or element.get("is_focused") or element.get("has_focus")
+        ):
+            focused = tokens
+    return {
+        _IDENTITY_CLASS_FOCUSED: frozenset(focused if focused is not None else ()),
+        _IDENTITY_CLASS_WINDOW: window,
+        _IDENTITY_CLASS_POPULATION: frozenset(population),
+    }
+
+
+def _novel_tokens(
+    before: dict[str, frozenset[str]], after: dict[str, frozenset[str]]
+) -> dict[str, str]:
+    """``Novel`` as ``{token: the class that made it novel}`` (R-4/R-8).
+
+    ``Novel = union over c of (O_after[c] \\ O_before[c])``. The AFTER side supplies the
+    PRESENCE and the BEFORE side supplies the ABSENCE, so a token that was already there
+    is a constant, not evidence of a transition. The dict maps each novel token to the
+    first class that carried it (the most-specific-first order of
+    :func:`_identity_token_classes`), because R-9 requires a ``verified`` to name WHICH
+    class made it novel. A token novel in ANY ONE class corroborates (R-8) — that
+    per-class union is load-bearing, not a detail."""
+    novel: dict[str, str] = {}
+    for class_name, tokens in after.items():
+        for token in tokens - before.get(class_name, frozenset()):
+            novel.setdefault(token, class_name)
+    return novel
+
+
+def _shared_prefix_length(left: str, right: str) -> int:
+    """Character-wise common-prefix length (diagnostics only, never a verdict input)."""
+    count = 0
+    for first, second in zip(left, right):
+        if first != second:
+            break
+        count += 1
+    return count
+
+
+def _closest_non_match(
+    effect_tokens: frozenset[str],
+    after: dict[str, frozenset[str]],
+    novel: dict[str, str],
+) -> str | None:
+    """The single closest NON-matching candidate, or ``None`` (R-9).
+
+    Two ranked near-misses, because an abstention that cannot say WHY it abstained is
+    the failure mode R-9 exists to remove:
+
+    1. an effect token that IS in the AFTER identity but was already in the BEFORE one —
+       novelty rejected it, and saying so separates "the effect named the wrong thing"
+       from "the effect named a thing that was already true";
+    2. otherwise the novel observed token sharing the longest common prefix with some
+       unmatched effect token — a stem/synonym miss (``swatch`` vs ``swatches``,
+       ``color`` vs ``colour``), which is the other way this rule fails closed."""
+    observed: set[str] = set()
+    for tokens in after.values():
+        observed |= tokens
+    stale = sorted((effect_tokens & observed) - set(novel))
+    if stale:
+        carried_by = next(
+            (name for name, tokens in after.items() if stale[0] in tokens), _IDENTITY_CLASS_WINDOW
+        )
+        return (
+            f"closest non-matching candidate: effect token {stale[0]!r} IS present in the "
+            f"AFTER {carried_by} identity but was ALREADY present in the BEFORE one — a "
+            f"constant, not evidence of a transition"
+        )
+    best: tuple[int, str, str, str] | None = None
+    for candidate in sorted(effect_tokens):
+        for token, class_name in novel.items():
+            shared = _shared_prefix_length(candidate, token)
+            if shared >= _NEAR_MISS_MIN_PREFIX and (best is None or shared > best[0]):
+                best = (shared, candidate, token, class_name)
+    if best is None:
+        return None
+    return (
+        f"closest non-matching candidate: effect token {best[1]!r} vs observed identity "
+        f"token {best[2]!r} (new in the AFTER {best[3]} identity) — no shared effect token"
+    )
+
+
 class FocusChangeStrategy:
     """Deterministic focus/window/digest change verification (REM-B, H2c).
 
@@ -1184,6 +1508,40 @@ class FocusChangeStrategy:
     ScreenshotDiffStrategy, WITHOUT widening this tier's scope), and it never
     upgrades a pixel-proven non-change.
 
+    **ORVEX-2026-105 — arms (a)/(b) are no longer DEFINITIVE on their own.**
+    A changed identity is evidence that SOMETHING moved, and both identity readers
+    read the FOREGROUND window, so every click that merely activates a window moved
+    both signals: a static Tk ``Label`` click claimed *"The Edit Colors dialog opens
+    with a new color swatch"* and came back ``verified`` while nothing opened. The
+    binding is now the named-identity one (see the ORVEX-2026-105 block above this
+    class): a focus/window signal supports ``verified`` only when a CORROBORATION
+    token holds, ``E ∩ Novel ≠ ∅``, where ``E`` is the effect's content tokens and
+    ``Novel`` is the per-class before/after novelty of the observed identity.
+    Concretely:
+
+    - an identity change whose AFTER identity names nothing the effect named is
+      ``uncertain`` — the change is still reported (``changed=True``, and the signal
+      line stays in the evidence), it simply no longer CLAIMS the effect, and the
+      effect string is kept OUT of the note exactly as arm (c) keeps it out;
+    - a corroborated one is ``verified`` and its evidence names the matched token, the
+      field class that made it novel, and that it was novel (R-9), so a wrong
+      corroboration is auditable from the response itself rather than hidden inside a
+      success;
+    - "same process" is a PRECONDITION and no more: it is recorded as a fact and can
+      never, alone, raise ``verified`` (R-5);
+    - both degeneracies resolve to ``uncertain``: no usable identity at all (R-6.1,
+      fail-closed) and an effect naming nothing extractable (R-6.2, e.g. ``"the panel
+      expands"``);
+    - the bias is closed on ``verified`` and open on ``uncertain`` (R-7): a false
+      ``uncertain`` costs one re-drive, a false ``verified`` costs a silent wrong
+      success that propagates into the plan aggregate as ``completed``.
+
+    Both arms are always derived (two bounded in-memory reads of already-captured
+    observations — no capture, no I/O, no input, and only ever reached when
+    :meth:`can_verify` is true, i.e. a CLICK/DOUBLE_CLICK carrying a stated effect).
+    That is what lets a corroboration be accepted from EITHER arm's evidence rather
+    than being missed because the other arm happened to fire first.
+
     Scope gate: only intents flagged ``{FOCUS_CHANGE_INTENT_FLAG}`` in
     ``intent.metadata`` (set by the controller's ``_build_intent`` for CLICK /
     DOUBLE_CLICK actions carrying a stated expected effect — deliberately still
@@ -1207,34 +1565,16 @@ class FocusChangeStrategy:
 
     def verify(self, intent: VerificationIntent, before: Observation, after: Observation) -> VerificationResult:
         expected = intent.expected_effect or ""
-        # (a) UIA focused-element change.
+        # (a) UIA focused-element change, and (b) active-window identity change. Both
+        # are derived before the verdict: the ORVEX-2026-105 predicate is defined over
+        # the UNION of the identity field classes, not per arm, so gating on (a) alone
+        # would miss a corroboration the window side carried. Both reads are bounded
+        # in-memory walks of observations already in hand — no capture, no I/O, no
+        # input.
         focus_signal = self._focused_element_change(before, after)
-        if focus_signal is not None:
-            return _definitive(
-                self.name,
-                "verified",
-                (
-                    f"Expected focus-type change observed: {expected}. "
-                    f"Deterministic signal: focused UI element changed ({focus_signal})."
-                ),
-                [focus_signal, f"expected_effect={expected!r}"],
-                _DETERMINISTIC_CHANGE_CONFIDENCE,
-                changed=True,
-            )
-        # (b) Active-window identity change (title or process).
         window_signal = self._active_window_change(before, after)
-        if window_signal is not None:
-            return _definitive(
-                self.name,
-                "verified",
-                (
-                    f"Expected focus-type change observed: {expected}. "
-                    f"Deterministic signal: active window identity changed ({window_signal})."
-                ),
-                [window_signal, f"expected_effect={expected!r}"],
-                _DETERMINISTIC_CHANGE_CONFIDENCE,
-                changed=True,
-            )
+        if focus_signal is not None or window_signal is not None:
+            return self._verify_identity_change(before, after, expected, focus_signal, window_signal)
         # (c) Observation digest change — REM-C (V-2 F1): the base64 diff is EVIDENCE,
         # not proof: a 1-pixel caret blink also changes the digest, and the pixel tier
         # deliberately distrusts exactly that flicker class (STRONG_CHANGE_MIN_PIXELS
@@ -1305,6 +1645,160 @@ class FocusChangeStrategy:
             [f"expected_effect={expected!r}"],
             0.2,
             changed=False,
+        )
+
+    # --- the ORVEX-2026-105 named-identity binding for arms (a)/(b) --------------------------
+
+    def _verify_identity_change(
+        self,
+        before: Observation,
+        after: Observation,
+        expected: str,
+        focus_signal: str | None,
+        window_signal: str | None,
+    ) -> VerificationResult:
+        """Arms (a)/(b) under the named-identity binding: a change, or a CORROBORATED
+        change.
+
+        The predicate is ``E ∩ Novel ≠ ∅`` where ``E`` is the stated effect's content
+        tokens and ``Novel`` is the union, over the identity field classes, of the tokens
+        present in the AFTER observation and absent from the matching BEFORE one. Both
+        sides of that contrast are read here, once each, in memory.
+
+        The note and the evidence never assert the expectation on the uncorroborated
+        path — the module's standing rule is that a note names what was OBSERVED, and
+        that rule is now applied to arms (a)/(b) exactly as arm (c) applies it. On the
+        corroborated path the effect is quoted, because at that point the identity
+        really does name the thing the effect described."""
+        fired: list[str] = []
+        if focus_signal is not None:
+            fired.append(f"focused UI element changed ({focus_signal})")
+        if window_signal is not None:
+            fired.append(f"active window identity changed ({window_signal})")
+
+        effect_tokens = _effect_tokens(expected)
+        after_classes = _identity_token_classes(after)
+        before_classes = _identity_token_classes(before)
+        novel = _novel_tokens(before_classes, after_classes)
+
+        # The observed signal lines come first and are kept verbatim in BOTH verdicts:
+        # what changed is a fact the host is entitled to, whether or not it corroborates.
+        evidence: list[str] = [
+            line for line in (focus_signal, window_signal) if line is not None
+        ]
+        evidence.append(f"expected_effect={expected!r}")
+        evidence.append(self._same_process_evidence(before, after))
+
+        matched = sorted(effect_tokens & set(novel))
+        if matched:
+            token = matched[0]
+            class_name = novel[token]
+            # R-9: every verified names itself — token, class, novelty. A bad match is
+            # then inspectable from the response instead of hidden inside a success.
+            # With more than one match the line says so rather than letting the reader
+            # assume the named token is the only thing the verdict rested on.
+            #
+            # F5 (VAL-WP3): the corroboration line rides FIRST in the evidence. Bounded
+            # consumers cap the per-item evidence window (queue entries keep the first
+            # three lines), and this is the one line the R-9 auditability promise
+            # cannot afford to lose — every other line (the signal facts, the effect
+            # echo, the same-process precondition) is retained after it, in the same
+            # relative order as before.
+            also = (
+                f" (also matched: {', '.join(repr(item) for item in matched[1:])})"
+                if len(matched) > 1
+                else ""
+            )
+            evidence.insert(
+                0,
+                f"corroborated by effect token {token!r} present in the AFTER "
+                f"{class_name} identity and ABSENT from the BEFORE {class_name} identity "
+                f"(novel){also}; searched effect tokens {sorted(effect_tokens)}",
+            )
+            return _definitive(
+                self.name,
+                "verified",
+                (
+                    f"Stated effect corroborated by the observed identity: {expected}. "
+                    f"Deterministic signal: {'; '.join(fired)}. "
+                    f"Corroborated by novel token {token!r} in the AFTER {class_name} "
+                    f"identity."
+                ),
+                evidence,
+                _DETERMINISTIC_CHANGE_CONFIDENCE,
+                changed=True,
+            )
+
+        # Uncorroborated: the transition really happened, but the identity it produced
+        # names nothing the effect named, so this tier abstains rather than assert the
+        # effect. R-6.1 is a strict subset (no identity at all -> no novel tokens at all),
+        # so the one abstention below covers both.
+        evidence.append(
+            f"corroboration searched effect tokens {sorted(effect_tokens)} against the "
+            f"novel AFTER identity tokens {sorted(novel)} (per class: "
+            + ", ".join(
+                f"{name}: {sorted(after_classes[name] - before_classes.get(name, frozenset()))}"
+                for name in after_classes
+            )
+            + ")"
+        )
+        if effect_tokens:
+            nearest = _closest_non_match(effect_tokens, after_classes, novel)
+            evidence.append(
+                nearest
+                or "no near-miss candidate: no effect token is present in the AFTER identity"
+            )
+        else:
+            # R-6.2: the effect names nothing extractable after stop-listing/stemming, so
+            # there is no token to search for and no candidate to name.
+            evidence.append(
+                "the stated effect yields no content token after stop-listing and "
+                "stemming, so no identity can corroborate it"
+            )
+        return _uncertain(
+            self.name,
+            (
+                "A focus/window identity change was observed, but the identity present "
+                "AFTER the action names nothing the stated effect named; an identity "
+                "change — including one within a single process — is not evidence that "
+                "the described transition occurred. Uncertain is never success."
+            ),
+            evidence,
+            0.2,
+            changed=True,
+        )
+
+    @staticmethod
+    def _same_process_evidence(before: Observation, after: Observation) -> str:
+        """The same-process PRECONDITION, recorded as a fact and never as a verdict (R-5).
+
+        It was once a sufficient condition on its own, which is why it is spelled out
+        here rather than left implicit: a same-process transition is the NORMAL case for
+        a click, so treating it as corroboration made every intra-app click self-
+        confirming. The line always states which way it went, so the host can see that
+        the precondition was met and still got no corroboration from it."""
+        def process_of(observation: Observation) -> str | None:
+            info = observation.active_window_info
+            if info is None:
+                return None
+            if info.process_name:
+                return str(info.process_name).removesuffix(".exe")
+            if info.exe_path:
+                return str(info.exe_path).replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".exe")
+            return str(info.pid) if info.pid is not None else None
+
+        before_process = process_of(before)
+        after_process = process_of(after)
+        if before_process is None or after_process is None:
+            return (
+                "same-process precondition: undeterminable (one side carries no process "
+                "identity); recorded as a fact, never sufficient for verified"
+            )
+        return (
+            f"same-process precondition: "
+            f"{'met' if before_process == after_process else 'NOT met'} "
+            f"(before {before_process!r}, after {after_process!r}); recorded as a fact, "
+            f"never sufficient for verified on its own"
         )
 
     # --- signal extractors (observation fields only; never raise) ----------------------
