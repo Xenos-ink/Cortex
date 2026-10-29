@@ -785,5 +785,5 @@ async def test_computer_execute_focus_window_without_target_fails_closed(
     )
     result = await server.computer_execute(session_id, "focus_window")
     assert result["ok"] is False
-    assert result["error"] == "invalid_action"
+    assert result["result"] == "rejected" and "invalid_action" in result["reasons"]
     assert backend.executed == []

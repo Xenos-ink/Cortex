@@ -103,7 +103,10 @@ async def _drive_audit_scenarios(
     first = await server.computer_execute(sid, "click", x=1, y=1)
     _ = _payload(first)
     limited = await server.computer_execute(sid, "click", x=2, y=2)
-    assert limited.get("error") == "limit_exceeded", limited
+    # §1.4 delta (ORVEX-2026-108): a limit trip is a pre-dispatch gate refusal —
+    # rejection envelope, typed limit as the first reason, no error key.
+    assert limited.get("result") == "rejected", limited
+    assert limited.get("reasons") == ["limit_exceeded: max_actions"], limited
     scenarios.append((sid, bundle))
 
     # 5. Stop: stop + emergency_stop events (stop armed, then a tool call refused).
@@ -112,7 +115,10 @@ async def _drive_audit_scenarios(
     )
     server.stop_session(sid)
     stopped = await server.computer_execute(sid, "wait", delta=1)
-    assert stopped.get("error") == "session_stopped", stopped
+    # §1.4 delta (ORVEX-2026-108): execute-surface stopped refusal = rejection
+    # envelope; the stop itself is what this scenario's audit assertions read below.
+    assert stopped.get("result") == "rejected", stopped
+    assert stopped.get("reasons") == ["session_stopped"], stopped
     scenarios.append((sid, bundle))
 
     # 6. PERF-004 queued host actions: the per-queue summary ("queue") event; every

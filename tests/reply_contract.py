@@ -73,10 +73,12 @@ ENSURE_APP_OUTCOMES: frozenset[str] = frozenset(
     }
 )
 
-#: §1.3 per-surface allowed ``result`` subsets.
+#: §1.3 per-surface allowed ``result`` subsets. ``stopped`` is included on the
+#: execute surfaces for the host-requested stop reply (WP1: the TaskStopped reply
+#: carries the §1.2 token; plan-terminal ``stopped`` lands in WP7).
 SURFACE_RESULT_TOKENS: dict[str, frozenset[str]] = {
-    "flat_execute": frozenset({"verified", "uncertain", "failed", "rejected", "dry_run", "marker"}),
-    "follow_up_item": frozenset({"verified", "uncertain", "failed", "rejected", "dry_run", "marker"}),
+    "flat_execute": frozenset({"verified", "uncertain", "failed", "rejected", "dry_run", "marker", "stopped"}),
+    "follow_up_item": frozenset({"verified", "uncertain", "failed", "rejected", "dry_run", "marker", "stopped"}),
     "plan_step": frozenset({"verified", "uncertain", "failed", "rejected", "not_executed"}),
     "terminal_plan": frozenset({"verified", "unknown", "failed", "stopped"}),
     "wait": frozenset({"marker"}),
@@ -248,8 +250,11 @@ def assert_image_scale_keys(
         )
     scale = reply.get("image_outbound_scale")
     if scale is not None:
-        assert isinstance(scale, (int, float)) and 0.0 < scale <= 1.0, (
-            f"image_outbound_scale must be None or a downscale in (0, 1], got {scale!r}"
+        # MINOR-b (Commander decision): a float ONLY when a downscale was actually
+        # applied (always < 1); 1.0 must be reported as None (raw pass-through).
+        assert isinstance(scale, (int, float)) and 0.0 < scale < 1.0, (
+            f"image_outbound_scale must be None (pass-through) or a downscale in (0, 1), "
+            f"got {scale!r}"
         )
     return scale
 
@@ -336,8 +341,14 @@ def validate_reply(reply: dict[str, Any], surface: str) -> dict[str, Any]:
         assert_envelope(reply)
         assert_ok_rule(reply)
         assert_result_token(reply, surface=surface)
-        if reply["result"] in ("verified", "uncertain", "failed"):
+        if reply["result"] in ("verified", "uncertain"):
             assert_verification_block(reply, required=True)
+        if reply["result"] == "failed":
+            # §1.1 scopes verification to DISPATCHED input actions; a failed reply
+            # from a never-dispatched refusal (operation error) legitimately has no
+            # block — when one IS present it must still be well-formed (VAL-WP1
+            # delta-2 helper amendment, recorded).
+            assert_verification_block(reply, required=False)
         if reply["result"] == "rejected":
             assert_rejection(reply)
         if reply["result"] == "marker":

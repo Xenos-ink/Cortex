@@ -111,6 +111,10 @@ async def test_rt1_smuggled_privilege_fields_in_follow_up_spec_are_ignored(
     assert response["follow_ups_stopped_reason"] == "safety_denied"
     smuggled = response["follow_up_results"][1]
     assert smuggled["kind"] == "safety_denied" and smuggled["ok"] is False
+    # MAJOR-2 strengthening (VAL-WP1): identical field set as flat — result token plus
+    # the gate-named refusal reasons (typed code first, never empty).
+    assert smuggled["result"] == "rejected"
+    assert smuggled["reasons"] and smuggled["reasons"][0].startswith("safety_denied")
     # the third item was flushed: nothing after the denial dispatched
     assert len(executed_summary(backend)) == 1
     # the nested follow_ups key must NOT spawn a nested queue anywhere
@@ -138,7 +142,11 @@ async def test_rt1_critical_follow_up_never_authorized_by_call_level_approved(
     )
     response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["follow_ups_stopped_reason"] == "safety_denied"
-    assert response["follow_up_results"][1]["ok"] is False
+    denied = response["follow_up_results"][1]
+    assert denied["ok"] is False
+    # MAJOR-2 strengthening (VAL-WP1): result token + non-empty gate-named reasons.
+    assert denied["result"] == "rejected"
+    assert denied["reasons"] and denied["reasons"][0].startswith("safety_denied")
     assert len(executed_summary(backend)) == 1
 
 
@@ -166,7 +174,7 @@ async def test_rt1_malformed_spec_matrix_fails_closed_before_any_dispatch(
             session_id, "click", x=10, y=10, follow_ups=[{"action": "wait", "delta": 1}, item]
         )
         assert response["ok"] is False, f"item {index} accepted: {item!r}"
-        assert response["error"] == "invalid_action", f"item {index}: {response}"
+        assert response["result"] == "rejected" and "invalid_action" in response["reasons"], f"item {index}: {response}"
         assert backend.executed == [], f"item {index} dispatched: {item!r}"
     # a VALID follow-up after a malformed one must not rescue the call
     response = await server.computer_execute(
@@ -209,7 +217,7 @@ async def test_rt1_finding_spec_valid_grounded_invalid_items_typed_rejection(
             session_id, "click", x=10, y=10, follow_ups=[spec]
         )
         assert response["ok"] is False, f"item accepted: {spec!r}"
-        assert response["error"] == "invalid_action", f"{spec!r}: {response}"
+        assert response["result"] == "rejected" and "invalid_action" in response["reasons"], f"{spec!r}: {response}"
         assert hint_fragment in " ".join(response["reasons"]), f"{spec!r}: {response}"
     # fail-closed preserved: nothing was dispatched, and the session is still usable
     assert backend.executed == []
@@ -233,7 +241,7 @@ async def test_rt1_queue_cap_enforced_pre_dispatch_with_boundary_exact(
     backend.executed.clear()
     six = five + [{"action": "wait", "delta": 1}]
     response = await server.computer_execute(session_id, "click", x=10, y=10, follow_ups=six)
-    assert response["ok"] is False and response["error"] == "invalid_action"
+    assert response["ok"] is False and response["result"] == "rejected" and "invalid_action" in response["reasons"]
     assert backend.executed == []  # whole call rejected, nothing dispatched
 
 
@@ -318,7 +326,9 @@ async def test_rt1_queue_entries_never_carry_image_payloads(
     assert "screenshot_after_base64" not in payload
     for entry in payload["follow_up_results"]:
         assert "screenshot_after_base64" not in entry
-        assert "result" not in entry  # H6: slim per-item entries, no duplicated blobs
+        # §1 (ORVEX-2026-108): ``result`` IS on every entry — as the closed §1.2
+        # token string, never as a duplicated result blob.
+        assert isinstance(entry["result"], str)
         assert "image" not in json.dumps(entry, default=str)
 
 

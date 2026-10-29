@@ -335,5 +335,5 @@ async def test_computer_execute_hotkey_single_key_fails_closed(
     )
     result = await server.computer_execute(session_id, "hotkey", keys=["ctrl"])
     assert result["ok"] is False
-    assert result["error"] == "invalid_action"
+    assert result["result"] == "rejected" and "invalid_action" in result["reasons"]
     assert backend.executed == []

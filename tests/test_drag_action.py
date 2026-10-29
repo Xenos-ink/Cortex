@@ -570,7 +570,7 @@ async def test_computer_execute_drag_without_end_point_fails_closed(
     )
     result = await server.computer_execute(session_id, "drag", x=10, y=20)  # no x2/y2
     assert result["ok"] is False
-    assert result["error"] == "invalid_action"
+    assert result["result"] == "rejected" and "invalid_action" in result["reasons"]
     assert backend.executed == []
 
 

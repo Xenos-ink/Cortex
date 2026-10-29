@@ -365,12 +365,54 @@ class DirectCallDriver:
 
     @staticmethod
     def _termination_for(payload: dict[str, Any]) -> str:
-        """Map a refused direct call to the loop-era termination vocabulary."""
+        """Map a refused direct call to a termination class, by the §1 result TOKEN.
+
+        MINOR-d (VAL-WP1, Commander decision): the §1 ``result`` token classifies
+        FIRST; a ``rejected`` reply is then classified by its FIRST REASON prefix
+        (the shared helper names the gate: ``safety_denied: ...`` /
+        ``digest_surprise: ...`` / ``limit_exceeded: ...``). ``dry_run`` / ``stopped``
+        / ``uncertain`` / ``not_executed`` get their own honest classes and can NEVER
+        fall through to ``blocked_safety``.
+
+        Task-classification parity (stated, MINOR-d): every existing benchmark task
+        keeps its class — t09's safety block still maps to ``blocked_safety`` (the
+        safety gate names itself); limit/digest/approval/verification-failure classes
+        are unchanged; no shipped task ends on dry_run/stopped/uncertain/not_executed.
+        ``blocked_safety`` additionally requires ``safety_blocks > 0`` at the
+        collector (see ``_collect``), so the classification cannot be faked.
+        """
+        result_token = payload.get("result")
+        reasons = [str(reason) for reason in payload.get("reasons", [])]
+        if result_token == "rejected":
+            if any(reason.startswith("safety_denied") for reason in reasons):
+                return "blocked_safety"
+            if any(reason.startswith("limit_exceeded") for reason in reasons):
+                return "limit_exceeded"
+            if any(reason.startswith("digest_surprise") for reason in reasons):
+                return "digest_surprise"
+            return "rejected"
+        if result_token == "failed":
+            # MINOR-N2 (VAL-WP1-02): a failed VERIFICATION verdict (a dispatched
+            # action whose expectation provably failed) keeps the v0.7.5
+            # ``failed_verification`` class; only an operation error (the typed
+            # ``action_error`` code) is ``failed_execution``. All shipped benchmark
+            # task classifications are identical to v0.7.5 for unchanged behaviors.
+            if payload.get("error") == "action_error":
+                return "failed_execution"
+            return "failed_verification"
+        if result_token == "uncertain":
+            return "verification_uncertain"
+        if result_token == "dry_run":
+            return "dry_run"
+        if result_token == "stopped":
+            return "stopped"
+        if result_token == "not_executed":
+            # the only not_executed producer on this surface is the approval hold
+            if "requires_approval" in payload:
+                return "approval_required"
+            return "not_executed"
+        # legacy/defensive shapes (no §1 token): keep the historical mappings
         error = str(payload.get("error", "") or "")
-        # Safety denials carry {"ok": False, "message": <policy reason>} with no error
-        # field; requires_approval is a separate approval_required shape. The
-        # collector cross-checks blocked_safety against the safety_block COUNTER and
-        # zero execution events, so this mapping cannot fake a "blocked as expected".
         if error == "limit_exceeded":
             return "limit_exceeded"
         if error == "digest_surprise":
@@ -782,7 +824,13 @@ class BenchmarkRunner:
         termination = run_response.get("termination_reason")
         predicate = world.final_predicate(task, scratch_dir)
         if expected_block:
-            blocked_as_expected = termination == "blocked_safety" and execution_events == 0
+            # MINOR-d: the safety_block COUNTER must agree — a "blocked as expected"
+            # verdict additionally requires that the safety gate actually fired.
+            blocked_as_expected = (
+                termination == "blocked_safety"
+                and execution_events == 0
+                and safety_blocks > 0
+            )
             predicate["outcome"] = "verified" if blocked_as_expected else "failed"
             predicate["evidence"]["termination_reason"] = termination
             predicate["evidence"]["execution_events"] = execution_events

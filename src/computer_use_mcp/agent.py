@@ -119,6 +119,7 @@ from .models import (
     Observation,
     Point,
     VerificationResult,
+    ok_from_result,
 )
 from .observation import ObservationEngine, digest_matches
 from .safety import SafetyPolicy
@@ -169,6 +170,153 @@ _INTRA_STEP_EXEMPT_PHASES = frozenset({"validate", "post_action", "revalidate"})
 
 #: Cursor-at-target tolerance for the deterministic ``move`` verification predicate (px).
 _CURSOR_TOLERANCE_PX = 2
+
+# --- unified reply contract (ORVEX-2026-108 MASTER MISSION §1) --------------------------------
+
+#: §1.2 marker kinds — action types that are MARKERS, not screen claims. ``done`` is
+#: the documented completion marker ("it does NOT end the session") and ``wait`` makes
+#: no semantic state claim either: the screen may legitimately change or stay still
+#: during a wait, which is exactly why this module's doctrine has always carved ``wait``
+#: out of "uncertain is never success". Neither kind has a target, a coordinate, an
+#: effect to cause, or a screen transition to judge, so running them through the pixel
+#: ladder could only ever abstain — a STRUCTURALLY GUARANTEED ``uncertain`` that a
+#: driver reads as "this failed" and is then told never to re-issue.
+_NO_OP_MARKER_KINDS = frozenset({ActionType.DONE, ActionType.WAIT})
+
+#: §1.2 marker confidence: high, because nothing was claimed — it is confidence that
+#: the MARKER was handled, not that the task's effect occurred.
+_NO_OP_MARKER_CONFIDENCE = 1.0
+
+#: §1.1 S-12: the closed ``ensure_app_outcome`` vocabulary (mirrors the
+#: :data:`~computer_use_mcp.models.EnsureAppOutcome` Literal enum in models.py).
+ENSURE_APP_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "reattached",        # an existing instance was focused and attached
+        "ambiguous",         # several instances matched; the driver disambiguates
+        "not_found",         # nothing matched; nothing was launched
+        "launched",          # a process was REALLY spawned server-side
+        "launch_rejected",   # the needle failed validation; nothing spawned
+        "launch_unresolved", # a valid needle resolved nowhere; nothing spawned
+    }
+)
+
+#: The abstain-band confidence an ensure_app probe FAILURE (launch_rejected /
+#: launch_unresolved) and the ambiguous outcome land at (§1.3 MAJOR-4: failed /
+#: uncertain are never successes).
+_ENSURE_APP_PROBE_FAILURE_CONFIDENCE = 0.3
+
+#: Launch-failure suffixes a NO_INSTANCE payload may carry (v0.7.1 Defect B honest
+#: payload contract); a payload with ``launched=`` is a spawn, never a probe failure.
+#: (The probe-failure VERIFICATION demotion and its abstain-band confidence are WP4b
+#: scope; the tokens are classified here already so the enum is complete.)
+ENSURE_APP_PROBE_FAILURES: tuple[str, ...] = ("launch_rejected", "launch_unresolved")
+
+
+def _ensure_app_probe_failure(message: str) -> str | None:
+    """Which failure-valued ``ensure_app`` probe this message carries, if any.
+
+    ``None`` means "not a launch failure" — either a plain ``NO_INSTANCE`` /
+    ``AMBIGUOUS_INSTANCE`` probe (which ran, and whose emptiness is the answer), a
+    ``REATTACHED`` payload (never a probe), or a message with no probe at all.
+    """
+    text = str(message or "")
+    for token in ENSURE_APP_PROBE_FAILURES:
+        if f"{token}=" in text:
+            return token
+    return None
+
+
+def ensure_app_outcome(message: str) -> str | None:
+    """The typed outcome of one ``ensure_app`` execution, or ``None`` if it is not one.
+
+    Derived from the payload the backend returns, in one place, so a driver can switch
+    on a field instead of parsing a string. ``None`` means "this message is not an
+    ``ensure_app`` payload" — never a default arm, so an unrecognised shape stays
+    visible rather than being filed under a plausible-looking value.
+
+    ``launched=`` is the only proof a process was REALLY spawned, so it outranks a
+    leading ``NO_INSTANCE`` token (the payload is built before the spawn is attempted).
+
+    ``not_found`` deliberately covers BOTH "nothing matched and nothing was launched"
+    and "a launch was refused by the session's policy or process allowlist": the
+    payload does not distinguish which gate refused (the allowlist denial never reaches
+    the backend at all — ``allow_launch`` is simply ``False``), and this classifier
+    does not invent a value the payload cannot support.
+    """
+    text = str(message or "")
+    # MINOR-a (VAL-WP1): the STRUCTURED prefixes are authoritative and are checked
+    # FIRST — a REATTACHED/AMBIGUOUS payload embeds a window TITLE, which may itself
+    # contain the substring `` launched=``; that substring proves a spawn ONLY inside
+    # a NO_INSTANCE launch payload.
+    if text.startswith("REATTACHED"):
+        return "reattached"
+    if text.startswith("AMBIGUOUS_INSTANCE"):
+        return "ambiguous"
+    if text.startswith("NO_INSTANCE"):
+        if " launched=" in text:
+            return "launched"
+        failure = _ensure_app_probe_failure(text)
+        if failure == "launch_rejected":
+            return "launch_rejected"
+        if failure == "launch_unresolved":
+            return "launch_unresolved"
+        return "not_found"
+    if text.startswith("LAUNCHED"):
+        return "launched"
+    return None
+
+
+def rejection_reasons(outcome: "SingleActionOutcome") -> list[str]:
+    """The §1.1 gate-named refusal reasons, derived in ONE place (ORVEX-2026-108).
+
+    Used by BOTH the flat ``computer_execute`` reply builder (server.py) and the
+    rejection-kind ``follow_up_results[i]`` entries (:meth:`ComputerUseAgent._queue_entry`),
+    so the two surfaces can never disagree. Pattern: the typed code NAMES ITSELF as the
+    first reason — ``safety_denied: <msg>``, ``digest_surprise: <msg>`` — while a plain
+    ``rejected`` outcome keeps its own gate-named reasons verbatim.
+
+    MINOR-N1 (VAL-WP1-02): reasons exist ONLY on rejection kinds. Every other kind
+    returns ``[]`` and its queue entry carries NO ``reasons`` key at all — exactly
+    like the flat reply of the same kind (executed/approval/error replies never had a
+    ``reasons`` key).
+    """
+    kind = outcome.kind
+    if kind == "rejected":
+        return list(outcome.reasons)
+    if kind == "safety_denied":
+        return [f"safety_denied: {outcome.message}"]
+    if kind == "digest_surprise":
+        return [f"digest_surprise: {outcome.message}"]
+    return []
+
+
+def execute_result_token(outcome: "SingleActionOutcome") -> str:
+    """The §1.2 ``result`` token for one ``computer_execute`` outcome (flat or queue item).
+
+    One derivation, used by BOTH the flat reply builder and every
+    ``follow_up_results[i]`` entry, so the two surfaces can never disagree. Executed
+    outcomes derive the token from their own fields (``dry_run`` marker, the
+    ``no_op_marker`` verification method, the verification verdict); every non-executed
+    kind is a gate refusal (``rejected``), an approval hold (``not_executed``), or an
+    operation error (``failed``).
+    """
+    result = outcome.result
+    if outcome.kind == "executed" and result is not None:
+        if result.dry_run:
+            return "dry_run"
+        verification = result.verification
+        if verification is not None and verification.verification_method == "no_op_marker":
+            return "marker"
+        if verification is not None:
+            return verification.outcome  # "verified" | "failed" | "uncertain"
+        return "uncertain"
+    return {
+        "rejected": "rejected",
+        "safety_denied": "rejected",
+        "digest_surprise": "rejected",
+        "approval_required": "not_executed",
+        "error": "failed",
+    }.get(outcome.kind, "uncertain")
 
 # --- capture-source integrity guard (v0.7.1 Defect A) ----------------------------------------
 #
@@ -339,6 +487,11 @@ class SingleActionOutcome:
     T8 (additive): ``interference_events`` carries the Interference Guard's structured
     event payloads observed for this action (MODAL_DIALOG/FOCUS_DRIFTED/...); the
     queue reads them for the named stops (``modal_dialog``/``focus_drifted``).
+
+    ORVEX-2026-108 §1.1 K-05 (additive): on a mid-type focus-drift rejection where at
+    least one chunk already landed in the (now foreign) field, ``partial_delivery``
+    carries ``{"delivered_chars": N}`` — the count of characters actually dispatched
+    before the abort. Absence means "nothing was dispatched".
     """
 
     kind: str
@@ -346,6 +499,7 @@ class SingleActionOutcome:
     reasons: list[str] = field(default_factory=list)
     message: str = ""
     requires_approval: bool = False
+    partial_delivery: dict[str, int] | None = None
     model_confidence: float | None = None
     grounding_confidence: float | None = None
     verification_confidence: float | None = None
@@ -1276,6 +1430,7 @@ class ComputerUseAgent:
                             "index": position,
                             "action_type": spec.action.value,
                             "kind": "rejected",
+                            "result": "rejected",
                             "ok": False,
                             "message": f"{type(exc).__name__}: {str(exc)[:200]}",
                             "reasons": ["invalid_action"],
@@ -1309,18 +1464,52 @@ class ComputerUseAgent:
         for index, (item, item_effect) in enumerate(queue_items):
             self.stop_token.ensure_live()  # P0-C: kill path checked between queue items
             strict_digest = index > 0  # follow-ups stop on attached-window identity change
-            outcome, post = await self._run_single_pipeline(
-                state,
-                item,
-                approved=approved,
-                expected_effect=item_effect,
-                source_observation=source_observation,
-                strict_digest=strict_digest,
-            )
+            # §1.4 delta 2 (MAJOR-1, ORVEX-2026-108): a limit trip on a QUEUED item is
+            # caught HERE so the honest partial history survives. The triggering item
+            # dispatched NOTHING (both raise sites are pre-dispatch: the observation
+            # rate ceiling and ``check_action``), but items 0..N-1 DID dispatch input —
+            # letting the exception escape would label the whole call "rejected, zero
+            # effect" and drop their entries. Item 0 tripping still propagates (the
+            # flat ``rejected`` reply, unchanged). Item N>=1 tripping converts to a
+            # rejection entry below and stops the batch with the named reason.
+            limit_trip: LimitExceeded | None = None
+            try:
+                outcome, post = await self._run_single_pipeline(
+                    state,
+                    item,
+                    approved=approved,
+                    expected_effect=item_effect,
+                    source_observation=source_observation,
+                    strict_digest=strict_digest,
+                )
+            except LimitExceeded as exc:
+                if index == 0:
+                    raise
+                limit_trip = exc
+                outcome = SingleActionOutcome(
+                    kind="rejected",
+                    reasons=[f"limit_exceeded: {exc.limit_name}"],
+                    message=str(exc),
+                )
+                post = None
             if first_outcome is None:
                 first_outcome = outcome  # the legacy response payload stays item 0's
-            executed_count += 1
+            # MINOR-N6 (VAL-WP1-02): the tripped item dispatched NOTHING, so it is not
+            # counted as executed.
+            if limit_trip is None:
+                executed_count += 1
             follow_up_results.append(self._queue_entry(index, item, outcome))
+            if limit_trip is not None:
+                stopped_reason = "limit_exceeded"
+                break
+            # MINOR-N6: an ensure_app item whose TYPED outcome is a failure/ambiguous
+            # (ok False — no target was attached and none can be established) stops the
+            # batch: later speculative items must never run against a target that was
+            # never established.
+            ensure_outcome = outcome.result.ensure_app_outcome if outcome.result is not None else None
+            if ensure_outcome in ("not_found", "launch_rejected", "launch_unresolved", "ambiguous"):
+                stopped_reason = "ensure_app_failed"
+                break
             # T8 named interference stops take precedence over the generic stop reasons:
             # a modal dialog or a post-keyboard focus drift halts the batch with a NAMED
             # reason the driver protocol teaches drivers to react to deliberately.
@@ -1441,17 +1630,44 @@ class ComputerUseAgent:
             "action_id": action.action_id,
             "action_type": action.action.value,
             "kind": outcome.kind,
-            "ok": bool(result.ok) if result is not None else False,
+            # §1 (ORVEX-2026-108): identical envelope on every follow_up_results[i] —
+            # the token comes from the SAME derivation as the flat reply, the reasons
+            # (rejection kinds ONLY, see below) from the SAME shared helper with the
+            # typed code as first reason, and ``ok`` from the SAME shared ok-rule
+            # (ok is True iff result ∈ {verified, marker}).
             "message": outcome.message or (result.message if result is not None else ""),
-            "reasons": list(outcome.reasons),
             "requires_approval": outcome.requires_approval,
             "model_confidence": outcome.model_confidence,
             "grounding_confidence": outcome.grounding_confidence,
             "verification_confidence": outcome.verification_confidence,
         }
+        entry["result"] = execute_result_token(outcome)
+        entry["ok"] = ok_from_result(entry["result"])
+        # §1.1 (identical field set as flat): the typed ensure_app outcome rides the
+        # entry exactly as it rides the flat reply (None on every other action).
+        entry["ensure_app_outcome"] = (
+            result.ensure_app_outcome if result is not None else None
+        )
+        # MINOR-N1 (VAL-WP1-02): reasons exist ONLY on rejection kinds — every other
+        # entry has NO reasons key, exactly like the flat reply of the same kind.
+        if outcome.kind in ("rejected", "safety_denied", "digest_surprise"):
+            entry["reasons"] = rejection_reasons(outcome)
+        if outcome.partial_delivery is not None:
+            entry["partial_delivery"] = dict(outcome.partial_delivery)
         if result is not None and result.verification is not None:
-            entry["verification_outcome"] = result.verification.outcome
-            entry["verification_note"] = result.verification.note[:200]
+            # §1 (ORVEX-2026-108): every follow_up_results[i] carries the SAME
+            # envelope fields as the flat reply — including a compact verification
+            # block (outcome/confidence/evidence/method; never any image bytes, so
+            # REM-A H5 slimness holds).
+            verification = result.verification
+            entry["verification"] = {
+                "outcome": verification.outcome,
+                "confidence": float(verification.confidence),
+                "evidence": [str(item)[:200] for item in verification.evidence[:3]],
+                "verification_method": verification.verification_method,
+            }
+            entry["verification_outcome"] = verification.outcome
+            entry["verification_note"] = verification.note[:200]
         return entry
 
     async def _run_single_pipeline(
@@ -1479,6 +1695,16 @@ class ComputerUseAgent:
         execution happened — dry-run, rejection, stop) so the caller can reuse it.
         """
         try:
+            # §1.2 marker kinds (ORVEX-2026-108): ``done``/``wait`` make no screen
+            # claim, so a DIRECT marker has no premise to capture — its ONE capture is
+            # taken in the rate-exempt ``post_action`` phase and serves as the
+            # pipeline's observation, the post-action observation and the response
+            # image at once. A QUEUED marker reuses the previous item's post-action
+            # capture as its premise (no capture) and still takes its own fresh
+            # post-action frame, so the premise it hands to the NEXT queue item is as
+            # fresh as any other action's — the digest/identity premise check is not
+            # weakened.
+            marker = action.action in _NO_OP_MARKER_KINDS
             if source_observation is not None:
                 observation = source_observation
                 self.metrics.incr("observation_reuse")
@@ -1491,6 +1717,8 @@ class ComputerUseAgent:
                     phase="direct_request",
                     reused=True,
                 )
+            elif marker:
+                observation = self._observe("post_action")
             else:
                 observation = self._observe("direct_request")
             try:
@@ -1535,7 +1763,8 @@ class ComputerUseAgent:
             current: Observation | None = None
             probe_used = False
             if (
-                source_observation is None
+                not marker
+                and source_observation is None
                 and not strict_digest
                 and reuse_window_ms > 0.0
                 and premise_captured_at > 0.0
@@ -1574,7 +1803,13 @@ class ComputerUseAgent:
                             drift=drift,
                         )
             if current is None:
-                current = self._observe("validate")
+                # F2-4: a marker's "current screen" IS its own (fresh) observation —
+                # there is nothing to staleness-check against pixels, so the second
+                # capture would be pure cost. ACCEPTED DEV PARITY (VAL-WP1 MINOR,
+                # Commander decision; dev agent.py:2074): a marker therefore skips the
+                # validate capture and the queue's premise check — a batched marker
+                # absorbs a window change the old pipeline would have stopped.
+                current = observation if marker else self._observe("validate")
             if strict_digest and not _queue_premise_valid(observation, current):
                 # PERF-004 C7: the queued action's premise is no longer
                 # current. Per-item validity: the attached window's identity (hwnd +
@@ -1755,25 +1990,44 @@ class ComputerUseAgent:
                 )
 
             if getattr(state, "dry_run", False):
+                # §1.2/§1.4.3 (ORVEX-2026-108; dev F2-5 decision D-7a): a dry run is
+                # not an execution, on EVERY field that says so. ``ok=True`` next to a
+                # phantom ``failed`` verification asserted both "it worked" and "it
+                # failed" in one payload; ``ok=False`` plus the ``dry_run`` marker and
+                # the top-level ``result:"dry_run"`` token (assigned by the reply
+                # builder through :func:`execute_result_token`) make the row
+                # unambiguous, and the verification is built through the explicit
+                # ``outcome`` form so it reads ``uncertain`` ("cannot determine")
+                # instead of the phantom ``failed`` a never-dispatched action has not
+                # earned, with ``verification_method:"dry_run"`` naming the tier.
+                # This branch is still BEFORE ``_backend_execute`` and before the
+                # post-action capture, so a dry run dispatches no input and performs
+                # no post-action capture.
                 return (
                     SingleActionOutcome(
                         kind="executed",
                         result=ExecutionResult(
-                            ok=True,
+                            ok=False,
                             action=action,
                             message=(
                                 "DRY-RUN (no input dispatched): action validated "
                                 "but not executed."
                             ),
                             verification=VerificationResult(
-                                verified=False,
+                                outcome="uncertain",
                                 changed=False,
                                 note=(
                                     "DRY-RUN (no input dispatched): execution and "
                                     "post-action verification were not performed."
                                 ),
                                 confidence=1.0,
+                                evidence=[
+                                    "dry_run: the action was validated and then "
+                                    "deliberately not dispatched"
+                                ],
+                                verification_method="dry_run",
                             ),
+                            dry_run=True,
                         ),
                         model_confidence=action.confidence,
                         grounding_confidence=grounding.confidence,
@@ -1806,7 +2060,21 @@ class ComputerUseAgent:
                     observation=observation,
                     action=action,
                     result="focus_drifted_mid_type",
-                    metadata={"payload": str(exc)[:400]},
+                    metadata={
+                        "payload": str(exc)[:400],
+                        "delivered_chars": getattr(exc, "delivered_chars", None),
+                    },
+                )
+                # §1.1 K-05 (ORVEX-2026-108): a rejection is zero-effect EXCEPT here —
+                # when the guard aborted after at least one chunk landed, the reply
+                # carries ``partial_delivery.delivered_chars`` so the driver knows the
+                # field holds a partial prefix. Before any chunk -> no key at all
+                # (absence means "nothing dispatched").
+                delivered = getattr(exc, "delivered_chars", None)
+                partial = (
+                    {"delivered_chars": int(delivered)}
+                    if isinstance(delivered, int) and not isinstance(delivered, bool) and delivered > 0
+                    else None
                 )
                 return (
                     SingleActionOutcome(
@@ -1816,6 +2084,7 @@ class ComputerUseAgent:
                             "Focus continuity: focus drifted mid-type; the in-flight type "
                             "was aborted before further chunks could land in a foreign field."
                         ),
+                        partial_delivery=partial,
                     ),
                     None,
                 )
@@ -1840,7 +2109,15 @@ class ComputerUseAgent:
             # observation here, internally — it can never depend on the screenshot the
             # RESPONSE was configured to omit (``include_screenshot_after=false`` pops
             # the image from the response payload only, after verification has run).
-            after = self._observe("post_action")
+            # §1.2 markers (ORVEX-2026-108): a DIRECT marker kind had no premise to
+            # capture, so its ONE capture was already taken in the post_action phase
+            # above and is reused here — a marker makes no screen claim, so there is
+            # no second frame to take.
+            after = (
+                observation
+                if (marker and source_observation is None)
+                else self._observe("post_action")
+            )
             # T8: re-bind after an explicit focus/reattach action; run the sentinel.
             if action.action in {ActionType.FOCUS_WINDOW, ActionType.ENSURE_APP}:
                 self.guard.rebind_from_observation(after)
@@ -1849,18 +2126,95 @@ class ComputerUseAgent:
             post_events, post_annotations, post_stops = self._post_action_guard_events(action, after)
             outcome_message = str(message)
             intent = self._build_intent(action, None, expected_effect)
-            if action.action is ActionType.ENSURE_APP and self._ensure_app_probe_outcome(outcome_message):
-                # A probe outcome (NO_INSTANCE / AMBIGUOUS_INSTANCE) makes no screen
-                # claim; the payload IS the answer the driver acts on.
+            if marker:
+                # §1.2 (ORVEX-2026-108; dev F2-4): a MARKER is verified by
+                # construction, and that is honest: it claimed no screen transition,
+                # so there is nothing to fail to prove. The pixel ladder is skipped
+                # entirely (it could only ever abstain on a screen nobody touched),
+                # and a stated ``expected_effect`` is NOT consulted — a marker cannot
+                # make an effect happen, so claiming to have checked would be the very
+                # lie this contract exists to remove. The confidence is about the
+                # MARKER being handled, not about the task; the reply's top-level
+                # ``result`` token is ``"marker"`` (assigned by the reply builder).
                 verification = VerificationResult(
                     outcome="verified",
                     changed=False,
-                    note=f"ensure_app probe outcome (no screen claim): {outcome_message[:200]}",
-                    confidence=0.9,
-                    evidence=[outcome_message[:400]],
-                    verification_method="ensure_app_probe",
+                    note=(
+                        f"{action.action.value} is a completion marker: it makes no "
+                        "screen claim, so there is no transition to verify and no "
+                        "screenshot-diff tier ran. The marker was dispatched and "
+                        "handled; the task's stated effect is NOT asserted here."
+                    ),
+                    confidence=_NO_OP_MARKER_CONFIDENCE,
+                    evidence=[f"no_op_marker: {action.action.value} dispatched"],
+                    verification_method="no_op_marker",
                     observation_id=after.observation_id,
                 )
+                # the audit event ``_verify`` would have emitted (same shape) — the
+                # marker branch skips the ladder, not the audit trail.
+                self.metrics.incr("verification_verified")
+                self._audit(
+                    "verification",
+                    observation=after,
+                    action=action,
+                    result="verified",
+                    metadata={
+                        "method": "no_op_marker",
+                        "verification_confidence": _NO_OP_MARKER_CONFIDENCE,
+                        "note": verification.note[:200],
+                        "intent_kind": intent.kind,
+                        "ladder_tier": "no_op_marker",
+                    },
+                )
+            elif action.action is ActionType.ENSURE_APP and self._ensure_app_probe_outcome(outcome_message):
+                # §1.3 (ORVEX-2026-108, MAJOR-4): the probe outcome is the answer the
+                # driver acts on — and its VALUE decides the verdict, never a blanket
+                # "verified". reattached/launched prove the attach/spawn (verified);
+                # ambiguous means the tool did NOT establish which window (uncertain,
+                # ok False — uncertain is never success); not_found / launch_rejected /
+                # launch_unresolved are launch FAILURES (failed, ok False) — shipping
+                # them with ok:true was a label lie even before WP4b.
+                probe_outcome = ensure_app_outcome(outcome_message)
+                if probe_outcome in ("not_found", "launch_rejected", "launch_unresolved"):
+                    verification = VerificationResult(
+                        outcome="failed",
+                        changed=False,
+                        note=(
+                            f"ensure_app {probe_outcome}: the probe ran and reported a "
+                            "launch FAILURE, so its outcome is not a success; re-observe "
+                            "and decide (the target was not attached)."
+                        ),
+                        confidence=_ENSURE_APP_PROBE_FAILURE_CONFIDENCE,
+                        evidence=[outcome_message[:400]],
+                        verification_method="ensure_app_probe",
+                        observation_id=after.observation_id,
+                    )
+                elif probe_outcome == "ambiguous":
+                    verification = VerificationResult(
+                        outcome="uncertain",
+                        changed=False,
+                        note=(
+                            "ensure_app ambiguous: several instances matched; the tool "
+                            "did not establish WHICH window is the target — re-observe "
+                            "and disambiguate with a doc-token."
+                        ),
+                        confidence=_ENSURE_APP_PROBE_FAILURE_CONFIDENCE,
+                        evidence=[outcome_message[:400]],
+                        verification_method="ensure_app_probe",
+                        observation_id=after.observation_id,
+                    )
+                else:
+                    # reattached / launched (or an unrecognised shape that still
+                    # carries a probe prefix): the probe ran and proves the outcome.
+                    verification = VerificationResult(
+                        outcome="verified",
+                        changed=False,
+                        note=f"ensure_app probe outcome (no screen claim): {outcome_message[:200]}",
+                        confidence=0.9,
+                        evidence=[outcome_message[:400]],
+                        verification_method="ensure_app_probe",
+                        observation_id=after.observation_id,
+                    )
             else:
                 verification = await self._verify(intent, observation, after, action=action)
                 # T8 B2: an uncertain expected-text verdict (typed text invisible to
@@ -1906,6 +2260,14 @@ class ComputerUseAgent:
                     message=str(message),
                     verification=verification,
                     screenshot_after_base64=after.image_base64,
+                    # §1.1 S-12 (ORVEX-2026-108): the typed outcome, derived where the
+                    # probe shortcut already inspects the message. ``None`` on every
+                    # other action — additive, and the §1.1 ok-rule is unchanged.
+                    ensure_app_outcome=(
+                        ensure_app_outcome(str(message))
+                        if action.action is ActionType.ENSURE_APP
+                        else None
+                    ),
                 ),
                 model_confidence=action.confidence,
                 grounding_confidence=grounding.confidence,

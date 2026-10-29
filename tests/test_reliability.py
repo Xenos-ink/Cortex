@@ -78,9 +78,15 @@ async def test_dry_run_reports_not_verified_and_never_executes() -> None:
         GroundedAction(action="wait", delta=1, confidence=1.0),
     )
     assert outcome.kind == "executed"
-    assert outcome.result is not None and outcome.result.ok is True
+    # §1.4.3 (ORVEX-2026-108): a dry run is NOT an execution — ok=False, the
+    # dry_run marker is on the row, and the verification is the honest
+    # cannot-determine (uncertain) at the dry_run tier, never a phantom failed.
+    assert outcome.result is not None and outcome.result.ok is False
+    assert outcome.result.dry_run is True
     assert outcome.result.verification is not None
     assert outcome.result.verification.verified is False
+    assert outcome.result.verification.outcome == "uncertain"
+    assert outcome.result.verification.verification_method == "dry_run"
     assert backend.executed == []
 
 

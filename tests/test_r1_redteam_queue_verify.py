@@ -581,7 +581,10 @@ async def test_attack6b_driver_policy_restores_never_launch(
     backend = _EnsureAppRecordingBackend(flip=False)
     session_id = _session(monkeypatch, backend, allowed_processes=["mspaint.exe"])
     payload = await _run(session_id, {"action": "ensure_app", "target": "mspaint"})
-    assert payload["ok"] is True
+    # §1.3 MAJOR-4 (VAL-WP1): not_found under the never-launch policy is a launch
+    # FAILURE — ok False, result "failed"; the payload pins below are unchanged.
+    assert payload["ok"] is False
+    assert payload["result"] == "failed"
     message = str(payload["message"])
     assert message.startswith("NO_INSTANCE"), message
     assert "launch=driver" in message, message

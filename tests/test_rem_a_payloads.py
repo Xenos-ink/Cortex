@@ -205,7 +205,9 @@ async def test_follow_up_results_carry_no_images_and_are_slim(
 
     primary = entries[0]
     # H6: the primary action NEVER carries a duplicated result blob...
-    assert "result" not in primary
+    # §1 (ORVEX-2026-108): ``result`` IS on every entry — as the closed §1.2 token
+    # string, never as a duplicated result blob.
+    assert primary["result"] == "verified"
     assert "screenshot_after_base64" not in primary
     # ...its essentials ride the TOP-LEVEL payload instead.
     assert primary["index"] == 0 and primary["ok"] is True
@@ -213,7 +215,7 @@ async def test_follow_up_results_carry_no_images_and_are_slim(
 
     for entry in entries:
         assert "screenshot_after_base64" not in entry
-        assert "result" not in entry
+        assert isinstance(entry["result"], str) and entry["result"] != "result"
         assert entry["verification_outcome"] in {"verified", "failed", "uncertain", None}
     assert _all_base64_images(payload) == []
     assert len(backend.executed) == 3  # the queue really ran every item

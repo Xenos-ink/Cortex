@@ -439,6 +439,52 @@ class VerificationResult(BaseModel):
         return self.outcome == "verified"
 
 
+# --- unified reply contract (ORVEX-2026-108 MASTER MISSION §1) -------------------------------
+
+#: The closed §1.2 ``result`` token set. Every ``computer_execute`` reply (flat and
+#: every ``follow_up_results[i]`` item) carries exactly one of these tokens; plan and
+#: wait surfaces reuse the same set (their per-surface subsets live in the contract).
+RESULT_TOKENS: tuple[str, ...] = (
+    "verified",      # declared effect established by fresh evidence    -> ok True
+    "uncertain",     # dispatched, unproven; never silently upgraded    -> ok False
+    "failed",        # proven not achieved, or operation error          -> ok False
+    "rejected",      # a gate refused (zero effect, except partial)     -> ok False
+    "not_executed",  # intended but never dispatched (approval, cutoff) -> ok False
+    "dry_run",       # validated, deliberately not dispatched           -> ok False
+    "marker",        # intentional non-screen claim (done/wait)         -> ok True
+    "stopped",       # host-requested stop; nothing verified            -> ok False
+    "unknown",       # terminal plan aggregate: >=1 uncertain, none failed -> ok False
+)
+
+#: §1.1 ok-rule inputs: the ONLY result tokens that may pair with ``ok is True``.
+OK_TRUE_RESULTS: frozenset[str] = frozenset({"verified", "marker"})
+
+
+def ok_from_result(result: str | None) -> bool:
+    """The §1.1 ok-rule, in one shared place: ``ok is True`` iff ``result ∈ {verified, marker}``.
+
+    Every reply builder derives ``ok`` from the reply's ``result`` token through THIS
+    function — no per-shape ``ok`` rule may exist anywhere else.
+    """
+    return result in OK_TRUE_RESULTS
+
+
+#: §1.1 S-12: the typed ``ensure_app_outcome`` Literal enum. Before this field the
+#: launch-vs-reattach-vs-ambiguity outcome was conveyed ONLY by a free-text ``message``
+#: prefix; a driver can now switch on a closed enum instead of parsing a string.
+#: ``None`` on every non-``ensure_app`` action (and when the payload is not an
+#: ``ensure_app`` shape at all, so an unrecognised form stays visible instead of being
+#: filed under a plausible-looking value).
+EnsureAppOutcome = Literal[
+    "reattached",
+    "ambiguous",
+    "not_found",
+    "launched",
+    "launch_rejected",
+    "launch_unresolved",
+]
+
+
 class ExecutionResult(BaseModel):
     ok: bool
     action: GroundedAction
@@ -446,6 +492,17 @@ class ExecutionResult(BaseModel):
     verification: VerificationResult | None = None
     screenshot_after_base64: str | None = None
     retry_count: int = 0
+    # ORVEX-2026-108 §1.2: this row was a DRY RUN — the action was validated and then
+    # deliberately NOT dispatched, so no post-action capture and no verification
+    # happened. ``ok`` is False on such a row (§1.1: dry_run is never ok=True); this
+    # marker names WHY, so a host can tell "not executed on purpose" from "executed
+    # and failed" without parsing ``message``. The top-level ``result`` token for the
+    # reply is ``"dry_run"`` (assigned by the reply builder, not here).
+    dry_run: bool = False
+    # §1.1 S-12: the TYPED outcome of an ``ensure_app`` execution (the closed
+    # :data:`EnsureAppOutcome` enum), or ``None`` on every other action. Additive;
+    # ``ok`` semantics are the §1.1 ok-rule, unchanged.
+    ensure_app_outcome: EnsureAppOutcome | None = None
     # R-5 (W4): the post-action capture's RGB frame (never serialized; additive). The
     # server's outbound bounding uses it to skip re-decoding the PNG it just encoded;
     # absent (legacy results, tests) the outbound path decodes exactly as before.

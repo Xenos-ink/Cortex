@@ -92,7 +92,9 @@ async def test_max_actions_limit_trips_cleanly(
     response = await server.computer_execute(session_id, "click", x=20, y=20)
 
     assert response["ok"] is False
-    assert response["error"] == "limit_exceeded"
+    # §1.4 delta (ORVEX-2026-108): rejection envelope, typed limit as first reason.
+    assert response["result"] == "rejected"
+    assert response["reasons"] == ["limit_exceeded: max_actions"]
     assert response["limit"] == "max_actions"
     assert len(executed_summary(backend)) == 1  # the first action ran, nothing further
     events = limit_events(bundle, session_id)
@@ -140,9 +142,14 @@ async def test_screenshot_rate_gate_trips_after_controller_wait_ceiling(
 
     # The host-driven observe path is STILL gated: this capture is far inside the
     # 60s interval, waits past the 2s ceiling, and fails closed.
-    limited = await server.computer_execute(session_id, "wait", delta=1)
+    # RETARGETED (§1.4.2, ORVEX-2026-108): ``wait`` used to drive this call, but a
+    # wait is now a MARKER whose single capture is the rate-exempt post_action
+    # phase — a click drives the gated direct_request path instead.
+    limited = await server.computer_execute(session_id, "click", x=20, y=20)
     assert limited["ok"] is False
-    assert limited["error"] == "limit_exceeded"
+    # §1.4 delta (ORVEX-2026-108): rejection envelope, typed limit as first reason.
+    assert limited["result"] == "rejected"
+    assert limited["reasons"] == ["limit_exceeded: min_screenshot_interval_ms"]
     assert limited["limit"] == "min_screenshot_interval_ms"
     events = limit_events(bundle, session_id)
     assert events and events[-1]["metadata"]["limit"] == "min_screenshot_interval_ms"

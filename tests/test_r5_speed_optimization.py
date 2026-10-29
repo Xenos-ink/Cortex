@@ -415,8 +415,8 @@ def test_w4_outbound_from_raw_frame_byte_identical() -> None:
     png_b64, frame = _oversized_png_b64()
     decoded = base64.b64decode(png_b64, validate=True)
     assert len(decoded) > server._result_image_max_bytes()  # ladder will run
-    slow_b64, slow_mime = server._bound_outbound_image(png_b64)
-    fast_b64, fast_mime = server._bound_outbound_image(png_b64, frame=frame)
+    slow_b64, slow_mime, _slow_scale = server._bound_outbound_image(png_b64)
+    fast_b64, fast_mime, _fast_scale = server._bound_outbound_image(png_b64, frame=frame)
     assert slow_mime == fast_mime
     assert slow_b64 == fast_b64  # exact byte identity
 
@@ -425,7 +425,7 @@ def test_w4_png_under_budget_untouched_both_paths() -> None:
     """A PNG inside the budget is returned AS-IS on both paths (no re-encode ever)."""
     small = Image.new("RGB", (64, 48), "white")
     png_b64 = _png_image_b64(small)
-    out_b64, mime = server._bound_outbound_image(png_b64, frame=small)
+    out_b64, mime, _scale = server._bound_outbound_image(png_b64, frame=small)
     assert out_b64 == png_b64 and mime == "image/png"
 
 
@@ -447,7 +447,7 @@ def test_w4_jpeg_ladder_encodes_linearly_no_reencode_storm(monkeypatch: pytest.M
         return original_save(self, *args, **kwargs)
 
     monkeypatch.setattr(Image.Image, "save", counting_save)
-    out_b64, mime = server._bound_outbound_image(png_b64, frame=frame)
+    out_b64, mime, _scale = server._bound_outbound_image(png_b64, frame=frame)
     assert mime == "image/jpeg"
     assert saves, "ladder never encoded"
     # linear descent: at most one encode per step, monotonically shrinking frames,

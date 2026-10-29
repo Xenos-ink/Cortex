@@ -89,7 +89,7 @@ from mcp.types import ImageContent, TextContent
 from PIL import Image
 from pydantic import BeforeValidator
 
-from .agent import ComputerUseAgent
+from .agent import ComputerUseAgent, execute_result_token, rejection_reasons
 from .audit import AuditLogger, Metrics
 from .backend import ComputerBackend, LocalComputerBackend
 from .checkpoint_manager import (
@@ -108,6 +108,7 @@ from .models import (
     CoordinateSpace,
     GroundedAction,
     SessionState,
+    ok_from_result,
 )
 from .observation import observation_text_summary
 from .provider import OpenAICompatibleVisionProvider
@@ -485,8 +486,37 @@ def _session_image_delivery(bundle: "_SessionBundle") -> str:
     return "text" if mode == "text" else "image"
 
 
-def _bound_outbound_image(data_b64: str, frame: Any = None) -> tuple[str, str]:
-    """Return ``(base64, mimeType)`` for the OUTBOUND copy, under the size budget.
+def _outbound_image_scale(
+    served_width: int, served_height: int, source_width: int, source_height: int
+) -> float | None:
+    """The linear scale an OUTBOUND copy was served at (§1.1 D-3, measured).
+
+    Mirrors the AL-002 reference implementation
+    (:func:`computer_use_mcp.visual_views.outbound_view_scale`) — the same ``min`` of
+    the two axis ratios and the same 4-decimal rounding. §1.1 (MINOR-b, Commander
+    decision): ``None`` means NO downscale was applied (raw pass-through, bytes served
+    as captured); a float is returned only for a real downscale (always < 1). No pixel
+    decode: the caller passes the dimensions the ladder already had in hand.
+    """
+    if source_width <= 0 or source_height <= 0:
+        return None
+    ratio = round(min(served_width / source_width, served_height / source_height), 4)
+    return None if ratio >= 1.0 else ratio
+
+
+#: The ONLY outbound-truth scale key on every image-bearing reply (ORVEX-2026-108
+#: §1.1 D-3 — one key, one meaning; the legacy ``image_scale`` key is deleted). It
+#: carries the scale the image ladder actually applied to the delivered copy, so a
+#: caller can map a coordinate read off the served picture back to the capture.
+#: Deliberately NOT ``visual_view_scale``: that key belongs to AL-002 and means
+#: "the scale of the DERIVED VIEW the host explicitly asked for" (``None`` for a
+#: pass-through raw view) — reusing it here would change an existing key's meaning.
+IMAGE_OUTBOUND_SCALE_KEY = "image_outbound_scale"
+
+
+def _bound_outbound_image(data_b64: str, frame: Any = None) -> tuple[str, str, float | None]:
+    """Return ``(base64, mimeType, appliedScale)`` for the OUTBOUND copy, under the
+    size budget (§1.1 D-3: the scale is REPORTED, not discarded).
 
     H7: the outbound PNG travels as-is while it fits the budget; an oversized PNG is
     re-encoded as JPEG (quality 85, no alpha channel) and, if still over budget,
@@ -494,6 +524,13 @@ def _bound_outbound_image(data_b64: str, frame: Any = None) -> tuple[str, str]:
     never touched: captures, verification pixel-diff, and checkpoints keep PNG exactly
     as today. Degradation (PIL failure) returns the original — an oversized real image
     beats none.
+
+    The ladder's arithmetic and the bytes it produces are UNCHANGED by the third return
+    value: the scale is derived from the dimensions the loop already resizes through
+    (no new maths, no second encode, no pixel decode). Third value semantics
+    (§1.1 MINOR-b + N3): ``float | None`` — ``None`` when the bytes traveled untouched
+    (raw pass-through, no downscale applied), a float < 1 only when the ladder actually
+    downscaled. No path returns ``1.0``.
 
     R-5 (W4): ``frame`` may carry the observation's capture-time RGB frame (the
     backend's private stash). When the PNG is over budget the JPEG ladder then starts
@@ -505,9 +542,11 @@ def _bound_outbound_image(data_b64: str, frame: Any = None) -> tuple[str, str]:
     try:
         decoded = base64.b64decode(data_b64, validate=True)
     except Exception:  # noqa: BLE001 - unusable environment is fail-closed data
-        return data_b64, "image/png"
+        return data_b64, "image/png", None
     if len(decoded) <= _result_image_max_bytes():
-        return data_b64, "image/png"
+        # §1.1 MINOR-b: the bytes travel untouched — a raw PASS-THROUGH, so the
+        # honest report is None (no downscale applied), never 1.0.
+        return data_b64, "image/png", None
     try:
         if (
             frame is not None
@@ -520,6 +559,7 @@ def _bound_outbound_image(data_b64: str, frame: Any = None) -> tuple[str, str]:
             image.load()
             if image.mode not in ("RGB", "L"):
                 image = image.convert("RGB")
+        source_size = (image.width, image.height)
         # Ladder: JPEG q85, then progressive 0.85 downscale; after exhausting the
         # scale steps, quality descent (85 -> 70 -> 55 -> 40 -> 25) on the smallest
         # frame. The ladder terminates well before pixel collapse; the floor path
@@ -538,10 +578,11 @@ def _bound_outbound_image(data_b64: str, frame: Any = None) -> tuple[str, str]:
                     (max(1, int(image.width * 0.85)), max(1, int(image.height * 0.85))),
                     Image.LANCZOS,
                 )
-        return base64.b64encode(last_bytes).decode("ascii"), "image/jpeg"
+        applied_scale = _outbound_image_scale(image.width, image.height, *source_size)
+        return base64.b64encode(last_bytes).decode("ascii"), "image/jpeg", applied_scale
     except Exception:  # noqa: BLE001 - degradation: deliver the original image
         logger.debug("outbound image re-encode failed; delivering original PNG", exc_info=True)
-        return data_b64, "image/png"
+        return data_b64, "image/png", None
 
 
 # --- default action-response image weight ---------------------------------------------------
@@ -567,7 +608,7 @@ def _action_image_full() -> bool:
     return os.environ.get(ACTION_IMAGE_FULL_ENV, "").strip() == "1"
 
 
-def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str] | None:
+def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str, float | None] | None:
     """Half-resolution JPEG encode of the executed response's default image.
 
     Downscale 0.5 (LANCZOS) then JPEG quality 60 — 960x540 at 1920x1080. Prefers the
@@ -575,7 +616,9 @@ def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str] 
     outbound budget still governs: an over-budget half-res result runs through
     :func:`_bound_outbound_image` (which keeps it JPEG and bounded). Returns ``None``
     on any encode failure so the caller falls back to the full-resolution budget
-    ladder — a degraded real image beats none.
+    ladder — a degraded real image beats none. The third value is the MEASURED applied
+    scale (§1.1 D-3): the half-res ratio while the half-res encode fits the budget,
+    the ladder's measured ratio when the budget ladder fires on top of it.
     """
     try:
         if frame is not None and isinstance(frame, Image.Image) and frame.mode in ("RGB", "L"):
@@ -586,6 +629,7 @@ def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str] 
             image.load()
         if image.mode not in ("RGB", "L"):
             image = image.convert("RGB")
+        source_size = (image.width, image.height)
         image = image.resize(
             (
                 max(1, int(image.width * _ACTION_IMAGE_SCALE)),
@@ -600,9 +644,18 @@ def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str] 
         raw = buffer.getvalue()
         encoded = base64.b64encode(raw).decode("ascii")
         if len(raw) <= _result_image_max_bytes():
-            return encoded, "image/jpeg"
-        # H7 budget still governs the outbound copy even at half resolution.
-        return _bound_outbound_image(encoded)
+            scale = _outbound_image_scale(image.width, image.height, *source_size)
+            return encoded, "image/jpeg", scale
+        # H7 budget still governs the outbound copy even at half resolution; the
+        # applied scale composes: half-res step x the budget ladder's own scale,
+        # measured against the capture the encode started from. MINOR-N3
+        # (VAL-WP1-02): None-safe composition — a None factor means "no downscale on
+        # that step" (factor 1.0); the product reports None when NO downscale was
+        # applied overall (e.g. a 1x1 source where the half-res step is a no-op).
+        bounded_b64, mime, ladder_scale = _bound_outbound_image(encoded)
+        half_scale = _outbound_image_scale(image.width, image.height, *source_size)
+        composed = (half_scale or 1.0) * (ladder_scale or 1.0)
+        return bounded_b64, mime, None if composed >= 1.0 else round(composed, 4)
     except Exception:  # noqa: BLE001 - degradation: fall back to the budget ladder
         logger.debug("half-res action-image encode failed; using the budget ladder", exc_info=True)
         return None
@@ -654,15 +707,20 @@ def _execute_response_blocks(
             # ladder's degradation still applies and is reported via visual_view_scale).
             data_b64, frame = view_payload
         if full_resolution:
-            bounded_b64, mime = _bound_outbound_image(str(data_b64), frame=frame)
+            bounded_b64, mime, outbound_scale = _bound_outbound_image(str(data_b64), frame=frame)
         else:
             halved = _half_res_action_image(str(data_b64), frame=frame)
             if halved is None:
-                bounded_b64, mime = _bound_outbound_image(str(data_b64), frame=frame)
+                bounded_b64, mime, outbound_scale = _bound_outbound_image(str(data_b64), frame=frame)
             else:
-                bounded_b64, mime = halved
-                payload["image_scale"] = _ACTION_IMAGE_SCALE  # additive truth marker
+                bounded_b64, mime, outbound_scale = halved
         payload["image_format"] = mime
+        # §1.1 D-3 (ORVEX-2026-108): image_outbound_scale is the ONLY scale key —
+        # the MEASURED scale the image ladder applied to the delivered copy (1.0
+        # when nothing fired). The legacy ``image_scale`` constant-marker key is
+        # deleted: one key, one meaning, and it can no longer lie when the budget
+        # ladder fires on top of the half-res encode.
+        payload[IMAGE_OUTBOUND_SCALE_KEY] = outbound_scale
         if view_id is not None:
             # AL-002 additive truth markers: which view was served, and its outbound
             # scale (None for raw pass-through; header-parsed ratio for derived views).
@@ -1327,7 +1385,15 @@ def _teaching_invalid_action(exc: Exception, action: str | None) -> dict[str, ob
     if shape_hint is not None:
         hints.append(shape_hint)
     message = f"{exc} {ACTION_VOCABULARY}"
-    return {"ok": False, "error": "invalid_action", "message": message, "reasons": hints}
+    # §1.1 rejection envelope (ORVEX-2026-108): a malformed action is a REJECTION —
+    # {ok False, result "rejected", message, reasons}, never an ``error`` key; the
+    # typed ``invalid_action`` code names itself as the first reason.
+    return {
+        "ok": False,
+        "result": "rejected",
+        "message": message,
+        "reasons": ["invalid_action", *hints],
+    }
 
 
 # --- long-running session wiring (master-mission 003, additive) -----------------------------
@@ -1848,12 +1914,17 @@ def computer_observe(
         # ImageContent. Internal capture is UNCHANGED — digest, staleness,
         # pixel-diff, text_summary, metrics, and audit all keep working above.
         metadata = {
+            # §1.1: ok + message on every reply (text mode: metadata-only, no image).
+            "ok": True,
+            "message": "Observation served (text mode: no image block).",
             "observation": _bound_observe_lists(observation_dump),
             "digest": digest,
             "observation_id": observation.observation_id,
             "active_app": info.process_name if info is not None else observation.active_window,
             "image_format": "none",  # truthful: no image block was emitted
             "image_delivery": "text",
+            # §1.1 D-3: no image was served, so no scale was applied — honest None.
+            IMAGE_OUTBOUND_SCALE_KEY: None,
             "image_delivery_note": IMAGE_DELIVERY_TEXT_NOTE,
             # PERF-004 C8 (additive): bounded one-line grounding text for weak models.
             "text_summary": text_summary,
@@ -1883,7 +1954,7 @@ def computer_observe(
     # UNCHANGED stock ladder.
     view_scale: float | None = None
     if view_provider is None or view_provider.passthrough:
-        outbound_b64, outbound_mime = _bound_outbound_image(
+        outbound_b64, outbound_mime, image_scale = _bound_outbound_image(
             # R-5 (W4): the capture-time frame (backend stash) skips the PNG re-decode on
             # the JPEG ladder; absent (fakes/legacy) the path decodes exactly as before.
             observation.image_base64, frame=getattr(observation, "_frame", None)
@@ -1897,18 +1968,25 @@ def computer_observe(
             bundle.metrics.record_latency(
                 "view_derive_ms", (time.perf_counter() - started) * 1000.0
             )
-            outbound_b64, outbound_mime = _bound_outbound_image(encoded_b64, frame=derived.image)
+            outbound_b64, outbound_mime, image_scale = _bound_outbound_image(encoded_b64, frame=derived.image)
             view_scale = outbound_view_scale(derived.image, outbound_b64)
         except VisualViewError as exc:  # fail-closed: typed error, never a raw substitution
             return _view_derive_failed(str(exc))
         except Exception as exc:  # noqa: BLE001 - fail-closed: typed error, no traceback
             return _view_derive_failed(f"{type(exc).__name__}: {exc}")
     metadata = {
+        # §1.1 (ORVEX-2026-108): ok + message on EVERY reply — here ok means "served
+        # as requested" (a read-only surface carries no result token, §1.3).
+        "ok": True,
+        "message": "Observation served.",
         "observation": _bound_observe_lists(observation_dump),
         "digest": digest,
         "observation_id": observation.observation_id,
         "active_app": info.process_name if info is not None else observation.active_window,
         "image_format": outbound_mime,
+        # §1.1 D-3 (ORVEX-2026-108): the ONLY scale key on an image-bearing reply —
+        # the measured applied downscale (1.0 when the copy kept its dimensions).
+        IMAGE_OUTBOUND_SCALE_KEY: image_scale,
         # PERF-004 C8 (additive): bounded one-line grounding text for weak models.
         "text_summary": text_summary,
     }
@@ -2076,12 +2154,17 @@ def computer_zoom(
     # visual_view_scale stays None — honest by construction (the observe precedent).
     if image_mode == "text":
         metadata = {
+            # §1.1: ok + message on every reply (text mode: metadata-only, no image).
+            "ok": True,
+            "message": "Zoom served (text mode: no image block).",
             "observation": _bound_observe_lists(observation_dump),
             "digest": digest,
             "observation_id": observation.observation_id,
             "active_app": info.process_name if info is not None else observation.active_window,
             "image_format": "none",  # truthful: no image block was emitted
             "image_delivery": "text",
+            # §1.1 D-3: no image was served, so no scale was applied — honest None.
+            IMAGE_OUTBOUND_SCALE_KEY: None,
             "image_delivery_note": IMAGE_DELIVERY_TEXT_NOTE,
             "text_summary": text_summary,
             "crop_region": [left, top, width, height],
@@ -2107,18 +2190,25 @@ def computer_zoom(
         bundle.metrics.record_latency(
             "view_derive_ms", (time.perf_counter() - started) * 1000.0
         )
-        outbound_b64, outbound_mime = _bound_outbound_image(encoded_b64, frame=served)
+        outbound_b64, outbound_mime, image_scale = _bound_outbound_image(encoded_b64, frame=served)
         view_scale = outbound_view_scale(served, outbound_b64)
     except VisualViewError as exc:  # fail-closed: typed error, never a raw substitution
         return _view_derive_failed(str(exc))
     except Exception as exc:  # noqa: BLE001 - fail-closed: typed error, no traceback
         return _view_derive_failed(f"{type(exc).__name__}: {exc}")
     metadata = {
+        # §1.1 (ORVEX-2026-108): ok + message on EVERY reply (read-only surface: no
+        # result token, §1.3).
+        "ok": True,
+        "message": "Zoom served.",
         "observation": _bound_observe_lists(observation_dump),
         "digest": digest,
         "observation_id": observation.observation_id,
         "active_app": info.process_name if info is not None else observation.active_window,
         "image_format": outbound_mime,
+        # §1.1 D-3 (ORVEX-2026-108): the ONLY scale key — the measured applied
+        # downscale the outbound budget ladder ran on the served crop.
+        IMAGE_OUTBOUND_SCALE_KEY: image_scale,
         "text_summary": text_summary,
         "crop_region": [left, top, width, height],
         "visual_view": view_id,
@@ -2267,7 +2357,23 @@ async def computer_execute(
     try:
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
-        return _error_response(exc)
+        # §1.1/§1.4 (ORVEX-2026-108), execute surface ONLY: a session-lifecycle
+        # refusal of an ACTION call is a rejection — {ok False, result "rejected",
+        # message, reasons}, the typed code named as the first reason, no ``error``
+        # key. The read-only/lifecycle tools keep the typed ``_error_response``
+        # shapes (§1.3).
+        code = "session_stopped" if isinstance(exc, _StoppedSession) else "unknown_session"
+        return {
+            "ok": False,
+            "result": "rejected",
+            "message": (
+                "Session is stopped; refusing to proceed (fail-closed stopped-session policy)."
+                if isinstance(exc, _StoppedSession)
+                else str(exc)
+            ),
+            "reasons": [code],
+            "session_id": str(exc.args[0]) if exc.args else "",
+        }
     # D1: text mode dominates every executed response shape — include_screenshot_after
     # can only REMOVE bytes, never re-enable an image (a non-vision model passing
     # True must not be able to kill its own session).
@@ -2278,7 +2384,16 @@ async def computer_execute(
     try:
         view_provider = _resolve_view_param(visual_view)
     except InvalidVisualViewError as exc:
-        return _invalid_visual_view(exc)
+        # §1.1/§1.4, execute surface ONLY: the malformed-parameter refusal of an
+        # ACTION call is a rejection (the typed code names itself as the first
+        # reason); observe/zoom keep the typed ``invalid_visual_view`` error (§1.3
+        # read-only refusals).
+        return {
+            "ok": False,
+            "result": "rejected",
+            "message": str(exc),
+            "reasons": [f"invalid_visual_view: {exc}"],
+        }
     if follow_ups is not None:
         # REM-F: normalize the tolerant shapes for DIRECT callers too (the boundary
         # coercion already produced list[dict] for MCP callers — idempotent here:
@@ -2345,33 +2460,94 @@ async def computer_execute(
             follow_ups=specs or None,
         )
     except TaskStopped as exc:
-        return {"ok": False, "stopped": True, "message": str(exc)}
+        # §1.2: a host-requested stop is the ``stopped`` token — nothing verified,
+        # ok=False by the shared ok-rule.
+        stopped_token = "stopped"
+        return {
+            "ok": ok_from_result(stopped_token),
+            "result": stopped_token,
+            "stopped": True,
+            "message": str(exc),
+        }
     except LimitExceeded as exc:
-        return {"ok": False, "error": "limit_exceeded", "limit": exc.limit_name, "message": str(exc)}
+        # §1.1/§1.4: a limit trip is a GATE REFUSAL — verified pre-dispatch (the
+        # observation-phase rate ceiling and ``check_action`` both fire BEFORE the
+        # triggering action dispatches any input), so this is a rejection: the typed
+        # limit named as the first reason, the additive ``limit`` key kept, no
+        # ``error`` key.
+        return {
+            "ok": False,
+            "result": "rejected",
+            "message": str(exc),
+            "reasons": [f"limit_exceeded: {exc.limit_name}"],
+            "limit": exc.limit_name,
+        }
+    # §1 (ORVEX-2026-108 unified reply contract): every reply carries a ``result``
+    # token from the closed §1.2 set, and ``ok`` is derived from that token through
+    # the ONE shared ok-rule (ok is True iff result ∈ {verified, marker}) — never a
+    # per-shape rule.
     if outcome.kind == "rejected":
         response: dict[str, object] = {
             "ok": False,
+            "result": "rejected",
             # T8: rejections carry their SPECIFIC message (e.g. "Focus interference: the
             # OS-focused window is not the session target.") instead of the generic
             # grounding text; the structured event payloads ride in ``reasons``.
             "message": outcome.message or "Action rejected (no gate detail available).",
             "reasons": outcome.reasons,
         }
+        if outcome.partial_delivery is not None:
+            # §1.1 K-05: mid-type focus drift — the reply names what already landed.
+            response["partial_delivery"] = dict(outcome.partial_delivery)
     elif outcome.kind == "safety_denied":
-        response = {"ok": False, "message": outcome.message}
+        # §1.2: the safety gate refused — a rejection; the reasons come from the SAME
+        # shared helper as every queue entry (typed code names itself first).
+        response = {
+            "ok": False,
+            "result": "rejected",
+            "message": outcome.message,
+            "reasons": rejection_reasons(outcome),
+        }
     elif outcome.kind == "approval_required":
-        response = {"ok": False, "requires_approval": True, "message": outcome.message}
+        # §1.1 approval rule: ok=False, result="not_executed", requires_approval=True.
+        response = {
+            "ok": False,
+            "result": "not_executed",
+            "requires_approval": True,
+            "message": outcome.message,
+        }
     elif outcome.kind == "digest_surprise":
-        response = {"ok": False, "error": "digest_surprise", "message": outcome.message}
+        # §1.2: the premise-validity gate refused before dispatch — a rejection; the
+        # reasons come from the SAME shared helper as every queue entry (the ``error``
+        # key is gone: rejected replies carry reasons, never an error key).
+        response = {
+            "ok": False,
+            "result": "rejected",
+            "message": outcome.message,
+            "reasons": rejection_reasons(outcome),
+        }
     elif outcome.kind == "error":
-        response = {"ok": False, "error": "action_error", "message": outcome.message}
+        # §1.2: an operation error is ``failed`` (ok=False); the typed code stays.
+        response = {
+            "ok": False,
+            "result": "failed",
+            "error": "action_error",
+            "message": outcome.message,
+        }
     else:
         result = outcome.result
         if result is None:  # defensive: executed outcomes always carry a result
-            return {"ok": False, "error": "action_error", "message": "Execution produced no result."}
+            return {
+                "ok": False,
+                "result": "failed",
+                "error": "action_error",
+                "message": "Execution produced no result.",
+            }
         payload = result.model_dump()
         # F2: the response path is redacted too (defense in depth).
         payload = _redact_result_payload(payload)
+        payload["result"] = execute_result_token(outcome)
+        payload["ok"] = ok_from_result(payload["result"])
         payload.update(
             {
                 "model_confidence": outcome.model_confidence,
@@ -2389,7 +2565,10 @@ async def computer_execute(
     # PERF-004 C4: host-payload opt-out (additive, off by default) — omit the heavy
     # image from the response entirely when the caller asked for it.
     if include_screenshot_after is False:
-        response.pop("screenshot_after_base64", None)  # also covers any nested path (H5)
+        # MINOR-c (§1.1 one key, one presence rule): an opt-out executed reply serves
+        # no image, so the honest scale report is None (same as text mode).
+        if response.pop("screenshot_after_base64", None) is not None:
+            response[IMAGE_OUTBOUND_SCALE_KEY] = None  # also covers any nested path (H5)
     # PERF-004 C7: additive queue bookkeeping on every response shape.
     if outcome.follow_up_results is not None:
         response["follow_up_results"] = [
@@ -2413,6 +2592,8 @@ async def computer_execute(
         if image_mode == "text":
             response.pop("screenshot_after_base64", None)
             response["image_delivery"] = "text"
+            # MINOR-c: no image served, no scale applied — honest None.
+            response[IMAGE_OUTBOUND_SCALE_KEY] = None
             response["image_delivery_note"] = IMAGE_DELIVERY_TEXT_NOTE
             return response
         # R-5 (W4): the capture-time frame rides along (never serialized; absent for
@@ -2463,6 +2644,8 @@ async def computer_execute(
             view_payload=view_payload,
         )
     return response
+
+
 def main() -> None:
     asyncio.run(mcp.run_stdio_async())
 

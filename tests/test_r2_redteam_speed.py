@@ -405,7 +405,7 @@ async def test_r2_d10_photographic_gradient_default_response_under_100kb(
     raw_bytes = len(base64.b64decode(image_block.data, validate=True))
     assert raw_bytes <= 100_000, raw_bytes
     payload = json.loads(text_block.text)
-    assert payload["image_scale"] == 0.5
+    assert payload["image_outbound_scale"] == 0.5  # §1.1 D-3: the measured key
     assert payload["image_format"] == "image/jpeg"
 
 
@@ -466,7 +466,12 @@ async def test_r2_d10_full_env_plus_explicit_optin_no_double_encode(
     assert _decode_image(image_block.data).size == (1920, 1080)
     payload = json.loads(text_block.text)
     assert payload["image_format"] == "image/png"
-    assert "image_scale" not in payload, "the half-res truth marker must not lie on the full path"
+    # §1.1 D-3 (ORVEX-2026-108): the deleted half-res marker is gone; the reply
+    # carries the MEASURED image_outbound_scale (1.0 — the PNG traveled untouched).
+    assert "image_scale" not in payload
+    # MINOR-b (Commander decision): an untouched PNG is a raw PASS-THROUGH — the
+    # honest report is None (no downscale applied), never 1.0.
+    assert payload["image_outbound_scale"] is None
 
 
 async def test_r2_d10_text_mode_with_explicit_optin_zero_image_blocks(

@@ -523,7 +523,7 @@ def test_raw_key_never_reaches_outbound_paths(monkeypatch: pytest.MonkeyPatch) -
     import computer_use_mcp.server as server_mod
 
     raw_payload = "RAW:AAAA;4x4"
-    out, mime = server_mod._bound_outbound_image(raw_payload)
+    out, mime, _scale = server_mod._bound_outbound_image(raw_payload)
     assert out == raw_payload  # fail-safe: unusable env returns the original
     # the PIL open on b64decode("AAAA") garbage raises -> caught -> original returned
     assert mime in ("image/png",)  # the degraded mimeType is the fail-safe one

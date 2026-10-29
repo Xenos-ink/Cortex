@@ -351,7 +351,7 @@ async def test_follow_ups_garbage_string_fails_with_existing_style(
         # If the boundary passed it through (it must NOT for non-JSON), the body's
         # structured invalid_action teaching shape is required.
         assert response["ok"] is False
-        assert response["error"] == "invalid_action"
+        assert response["result"] == "rejected" and "invalid_action" in response["reasons"]
     except Exception as exc:  # noqa: BLE001 - boundary rejection: clean typed error, no crash
         assert "json" in str(exc).lower() or "follow_ups" in str(exc).lower()
 
@@ -388,7 +388,7 @@ async def test_follow_ups_cap_still_enforced(
             session_id, action="click", x=10, y=10, approved=True, follow_ups=too_many_json
         )
         assert response["ok"] is False
-        assert response["error"] == "invalid_action"
+        assert response["result"] == "rejected" and "invalid_action" in response["reasons"]
         assert str(MAX_FOLLOW_UPS) in response["message"]
     except Exception as exc:  # noqa: BLE001 - boundary cap: equally fail-closed
         assert str(MAX_FOLLOW_UPS) in str(exc) or "follow_ups" in str(exc).lower()

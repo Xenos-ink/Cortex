@@ -310,7 +310,7 @@ async def test_type_action_verified_via_expected_text(
 
 
 async def test_wait_action_uncertain_verification_is_tolerated(
-    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+    fresh_server: Any, monkeypatch: PatchMonkey
 ) -> None:
     # Identical screenshots: the wait's visual-change check is uncertain. Documented
     # carve-out: a wait makes no semantic claim, so uncertain continues (never success).
@@ -325,14 +325,18 @@ async def test_wait_action_uncertain_verification_is_tolerated(
     response = await server.computer_execute(session_id, "wait", delta=0)
     first = execute_payload(response)
 
-    # Direct-path semantics (unchanged from the queue contract, REM-B H2b): an
-    # UNCERTAIN verdict keeps ok=False on the direct single-action response —
-    # uncertain is honest "cannot determine", never success; the loop used to
-    # tolerate it because a wait makes no semantic claim (the same carve-out the
-    # QUEUE applies: uncertain does not stop the queue).
-    assert first["ok"] is False
-    assert first["verification"]["outcome"] == "uncertain"
+    # §1.4.2 (ORVEX-2026-108): ``wait`` is a MARKER, not a screen claim — the old pin
+    # (ok=False + structurally-guaranteed ``uncertain`` from the pixel ladder over a
+    # screen nothing touched) is replaced by the marker contract: ok=True,
+    # verification_method="no_op_marker", top-level result="marker", confidence 1.0,
+    # ONE capture (no premise/validate captures — nothing to ground or staleness-check).
+    assert first["ok"] is True
+    assert first["result"] == "marker"
+    assert first["verification"]["outcome"] == "verified"
+    assert first["verification"]["verification_method"] == "no_op_marker"
+    assert first["verification"]["confidence"] == 1.0
     assert executed_summary(backend) == [("wait", None, None)]
+    assert len(backend.observed) == 1  # one capture: the marker's own post-action frame
 
 # --- recovery paths --------------------------------------------------------------------------
 # REMOVED (loop removal): the four in-loop recovery scenarios below exercised the
@@ -399,7 +403,9 @@ async def test_max_actions_limit_trips_cleanly(
 
     second = await server.computer_execute(session_id, "click", x=20, y=20)
     assert second["ok"] is False
-    assert second["error"] == "limit_exceeded"
+    # §1.4 delta (ORVEX-2026-108): rejection envelope, typed limit as first reason.
+    assert second["result"] == "rejected"
+    assert second["reasons"] == ["limit_exceeded: max_actions"]
     assert len(backend.executed) == 1  # the over-budget action executed NOTHING
     events = audit_events(bundle, session_id)
     assert "limit_exceeded" in audit_types(events)
@@ -449,10 +455,16 @@ async def test_screenshot_rate_limit_trips_cleanly(
     assert len(executed_summary(backend)) == 1
 
     # The next host-driven direct_request capture arrives within the 60s interval
-    # and trips fail-closed.
-    stopped = await server.computer_execute(session_id, "wait", delta=1)
+    # and trips fail-closed. RETARGETED (§1.4.2, ORVEX-2026-108): ``wait`` used to
+    # drive this call, but a wait is now a MARKER whose single capture is the
+    # rate-exempt post_action phase — the marker capture economy means a marker can
+    # no longer stand in for a gated host-driven capture, so the second action is a
+    # click (the same direct_request path the pin protects).
+    stopped = await server.computer_execute(session_id, "click", x=20, y=20)
     assert stopped["ok"] is False
-    assert stopped["error"] == "limit_exceeded"
+    # §1.4 delta (ORVEX-2026-108): rejection envelope, typed limit as first reason.
+    assert stopped["result"] == "rejected"
+    assert stopped["reasons"] == ["limit_exceeded: min_screenshot_interval_ms"]
     assert stopped["limit"] == "min_screenshot_interval_ms"
     events = audit_events(bundle, session_id)
     limit_events = [event for event in events if event["event_type"] == "limit_exceeded"]
@@ -532,9 +544,11 @@ async def test_computer_execute_confidence_semantics_and_expected_effect(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
     # Legacy approval shape preserved: unapproved interactive action requires approval.
+    # §1.4 (ORVEX-2026-108): the approval reply carries result="not_executed".
     denied = await server.computer_execute(session_id, "click", x=10, y=10)
     assert denied == {
         "ok": False,
+        "result": "not_executed",
         "requires_approval": True,
         "message": denied["message"],
     }
@@ -592,7 +606,10 @@ async def test_computer_execute_expected_effect_and_failure_shapes(
 
     invalid = await server.computer_execute(session_id, "teleport")
     assert invalid["ok"] is False
-    assert invalid["error"] == "invalid_action"
+    # §1.4 (ORVEX-2026-108): invalid actions are REJECTED with the typed code as the
+    # first reason — the rejection envelope carries reasons, never an ``error`` key.
+    assert invalid["result"] == "rejected"
+    assert "invalid_action" in invalid["reasons"]
 
     server.stop_session(session_id)
     stopped = await server.computer_execute(session_id, "wait", delta=1)
@@ -612,7 +629,12 @@ async def test_computer_execute_dry_run_never_executes(
     )
     dry = await server.computer_execute(session_id, "wait", delta=1)
     dry = execute_payload(dry)  # REM-A: executed (dry-run stub) -> content blocks
-    assert dry["ok"] is True
+    # §1.4.3 (ORVEX-2026-108): a dry run is NOT an execution — ok=False with the
+    # top-level ``dry_run`` result token and the dry_run verification_method.
+    assert dry["ok"] is False
+    assert dry["result"] == "dry_run"
+    assert dry["dry_run"] is True
+    assert dry["verification"]["verification_method"] == "dry_run"
     # PERF-004 C5: dry-run results are UNMISTAKABLE — the message must start with the
     # banner so no host can misread a no-op as execution.
     assert dry["message"].startswith("DRY-RUN (no input dispatched):")
@@ -652,7 +674,10 @@ async def test_stop_session_removes_bundle_and_blocks_tools(
     assert screenshot["error"] == "session_stopped"
     execute = await server.computer_execute(session_id, "wait", delta=1)
     assert execute["ok"] is False
-    assert execute["error"] == "session_stopped"
+    # §1.4 delta (ORVEX-2026-108): on the EXECUTE surface a stopped-session refusal
+    # is a rejection (typed code as first reason); read-only tools keep the error.
+    assert execute["result"] == "rejected"
+    assert execute["reasons"] == ["session_stopped"]
     # AMENDED (loop removal): the removed loop tool's stopped-session shape check
     # died with the loop; every surviving tool fails closed with session_stopped.
 
@@ -901,7 +926,10 @@ async def test_internal_kill_path_bundle_hygiene(
     assert screenshot["error"] == "session_stopped"
     execute = await server.computer_execute(session_id, "wait", delta=1)
     assert execute["ok"] is False
-    assert execute["error"] == "session_stopped"
+    # §1.4 delta (ORVEX-2026-108): on the EXECUTE surface a stopped-session refusal
+    # is a rejection (typed code as first reason); read-only tools keep the error.
+    assert execute["result"] == "rejected"
+    assert execute["reasons"] == ["session_stopped"]
     # AMENDED (loop removal): the removed loop tool's tail check died with the loop.
 
     assert session_id not in server._bundles  # same cleanup as stop_session

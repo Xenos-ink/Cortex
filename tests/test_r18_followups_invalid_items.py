@@ -103,7 +103,7 @@ async def test_malformed_follow_up_returns_typed_invalid_action_with_hints(
         session_id, {"action": "click", "x": 10, "y": 10}, [follow_up]
     )
     assert payload["ok"] is False, payload
-    assert payload["error"] == "invalid_action", payload
+    assert payload["result"] == "rejected" and "invalid_action" in payload["reasons"], payload
     assert "ValidationError" not in payload["message"], payload
     assert hint_fragment in " ".join(payload["reasons"]), payload
     # the teach-in-text contract: the full valid vocabulary rides the rejection
@@ -133,7 +133,7 @@ async def test_malformed_follow_up_never_starts_the_queue(
         ],
     )
     assert payload["ok"] is False, payload
-    assert payload["error"] == "invalid_action", payload
+    assert payload["result"] == "rejected" and "invalid_action" in payload["reasons"], payload
     assert executed_summary(backend) == [], payload
 
 
@@ -156,7 +156,7 @@ async def test_move_and_ensure_app_grounded_invalid_classes_also_teach(
         payload = await _execute_with_followups(
             session_id, {"action": "click", "x": 10, "y": 10}, [follow_up]
         )
-        assert payload["error"] == "invalid_action", (follow_up, payload)
+        assert payload["result"] == "rejected" and "invalid_action" in payload["reasons"], (follow_up, payload)
         assert fragment in " ".join(payload["reasons"]), (follow_up, payload)
     assert executed_summary(backend) == [], payload
 

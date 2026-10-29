@@ -209,7 +209,9 @@ async def test_removed_session_frees_slot_and_unknown_sessions_fail_closed(
     stopped_tool = server.stop_session("does-not-exist")
     assert stopped_tool["ok"] is False and stopped_tool["error"] == "unknown_session"
     executed = await server.computer_execute("does-not-exist", "wait", delta=1)
-    assert executed["ok"] is False and executed["error"] == "unknown_session"
+    # §1.4 delta (ORVEX-2026-108): execute-surface unknown-session refusal = rejection.
+    assert executed["ok"] is False and executed["result"] == "rejected"
+    assert executed["reasons"] == ["unknown_session"]
     assert "Traceback" not in json.dumps(
         [observe, stopped_tool, executed]
     )
@@ -238,7 +240,9 @@ async def test_tools_on_a_stopped_session_fail_safe(
 
     executed = await server.computer_execute(sid, "click", x=5, y=5)
     assert executed["ok"] is False
-    assert executed["error"] == "session_stopped"
+    # §1.4 delta (ORVEX-2026-108): execute-surface stopped refusal = rejection.
+    assert executed["result"] == "rejected"
+    assert executed["reasons"] == ["session_stopped"]
     assert executed_summary(backend) == []  # a stopped session never produces inputs
 
 
@@ -288,7 +292,9 @@ async def test_stop_session_then_every_tool_says_session_stopped_not_unknown(
         observe = server.computer_observe(session_id)
         assert observe["error"] == "session_stopped"  # NEVER unknown_session
         execute = await server.computer_execute(session_id, "wait", delta=0)
-        assert execute["error"] == "session_stopped"
+        # §1.4 delta (ORVEX-2026-108): execute-surface stopped refusal = rejection.
+        assert execute["result"] == "rejected"
+        assert execute["reasons"] == ["session_stopped"]
 
 
 async def test_teardown_snapshot_failure_still_remembers_session_as_stopped(

@@ -390,7 +390,9 @@ async def test_d10_default_executed_image_is_half_res_jpeg_within_budget(
     noise_bytes = len(base64.b64decode(image_block.data, validate=True))
     assert noise_bytes <= 150_000, noise_bytes
     payload = json.loads(text_block.text)
-    assert payload["image_scale"] == 0.5
+    # §1.1 D-3 (ORVEX-2026-108): the single MEASURED scale key (the legacy
+    # ``image_scale`` constant marker is deleted).
+    assert payload["image_outbound_scale"] == 0.5
 
 
 async def test_d10_include_screenshot_after_true_returns_full_resolution(
@@ -462,8 +464,9 @@ def test_d10_half_res_encoder_unit_contract() -> None:
     noisy = _noisy_png_b64()
     halved = server._half_res_action_image(noisy)
     assert halved is not None
-    data_b64, mime = halved
+    data_b64, mime, applied_scale = halved
     assert mime == "image/jpeg"
+    assert applied_scale == 0.5  # §1.1 D-3: the measured applied downscale
     assert _decode_image(data_b64).size == (960, 540)
     assert len(base64.b64decode(data_b64, validate=True)) <= server._result_image_max_bytes()
     # Garbage input degrades to the budget ladder (None here), never raises.
@@ -539,7 +542,10 @@ async def test_d8_unresolvable_target_never_claims_launched(
     )
     session_id = str(response["session_id"])
     payload = await _run(session_id, {"action": "ensure_app", "target": "nosuchapp"})
-    assert payload["ok"] is True
+    # §1.3 MAJOR-4 (VAL-WP1): not_found is a launch FAILURE — ok False, result
+    # "failed"; the probe's honest payload below is unchanged.
+    assert payload["ok"] is False
+    assert payload["result"] == "failed"
     message = str(payload["message"])
     assert message.startswith("NO_INSTANCE"), message
     assert "launched=" not in message, message  # never a false launch claim

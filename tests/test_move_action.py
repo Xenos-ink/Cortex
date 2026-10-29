@@ -449,5 +449,5 @@ async def test_computer_execute_move_without_x_y_fails_closed(
     )
     result = await server.computer_execute(session_id, "move")
     assert result["ok"] is False
-    assert result["error"] == "invalid_action"
+    assert result["result"] == "rejected" and "invalid_action" in result["reasons"]
     assert backend.executed == []

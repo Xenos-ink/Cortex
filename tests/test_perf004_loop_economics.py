@@ -372,7 +372,7 @@ async def test_include_screenshot_after_false_omits_image_default_is_half_res_jp
     # Half-resolution JPEG by default (JPEG SOI marker) + the additive truth marker.
     assert base64.b64decode(default[1].data, validate=True)[:2] == bytes([0xFF, 0xD8])
     assert default[1].mimeType == "image/jpeg"
-    assert default_payload["image_scale"] == 0.5
+    assert default_payload["image_outbound_scale"] == 0.5  # §1.1 D-3: measured, single key
     trimmed = await server.computer_execute(
         session_id, "click", x=25, y=25, include_screenshot_after=False
     )
@@ -448,7 +448,8 @@ async def test_invalid_action_key_teaches_keypress(
     session_id, _bundle, _backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)
     response = await server.computer_execute(session_id, "key", keys=["a"])
     assert response["ok"] is False
-    assert response["error"] == "invalid_action"
+    assert response["result"] == "rejected"  # §1.4: rejection envelope, no error key
+    assert "invalid_action" in response["reasons"]
     assert "keypress" in response["message"]
     assert "Valid actions" in response["message"]
     assert any("keypress" in hint for hint in response["reasons"])
@@ -459,7 +460,8 @@ async def test_invalid_action_triple_click_teaches_alternative(
 ) -> None:
     session_id, _bundle, _backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)
     response = await server.computer_execute(session_id, "triple_click", x=5, y=5)
-    assert response["error"] == "invalid_action"
+    assert response["result"] == "rejected"  # §1.4: rejection envelope, no error key
+    assert "invalid_action" in response["reasons"]
     assert "double_click" in response["message"]
     assert any("triple_click" in hint for hint in response["reasons"])
 
@@ -471,7 +473,8 @@ async def test_hotkey_word_payload_teaches_key_names(
     # The Session-1 failure mode: a WORD passed as a hotkey payload (1-key hotkey).
     response = await server.computer_execute(session_id, "hotkey", keys=["hello"])
     assert response["ok"] is False
-    assert response["error"] == "invalid_action"
+    assert response["result"] == "rejected"  # §1.4: rejection envelope, no error key
+    assert "invalid_action" in response["reasons"]
     assert "keypress" in response["message"]  # the closest valid shape is taught
     assert any("KEY NAMES" in hint for hint in response["reasons"])
     assert server.ACTION_VOCABULARY.startswith("Valid actions")
@@ -531,6 +534,9 @@ async def test_unsafe_follow_up_rejected_individually_and_stops_queue(
     assert response["follow_ups_stopped_reason"] == "safety_denied"
     unsafe_entry = response["follow_up_results"][1]
     assert unsafe_entry["kind"] == "safety_denied" and unsafe_entry["ok"] is False
+    # MAJOR-2 strengthening (VAL-WP1): result token + non-empty gate-named reasons.
+    assert unsafe_entry["result"] == "rejected"
+    assert unsafe_entry["reasons"] and unsafe_entry["reasons"][0].startswith("safety_denied")
     assert len(executed_summary(backend)) == 1  # the unsafe item AND item 3 never ran
 
 
@@ -720,16 +726,17 @@ async def test_follow_ups_cap_and_malformed_items_fail_closed(
     too_many = [{"action": "wait", "delta": 1} for _ in range(MAX_FOLLOW_UPS + 1)]
     response = await server.computer_execute(session_id, "click", x=10, y=10, follow_ups=too_many)
     assert response["ok"] is False
-    assert response["error"] == "invalid_action"
+    assert response["result"] == "rejected"  # §1.4: rejection envelope, no error key
+    assert "invalid_action" in response["reasons"]
     assert "5" in response["message"]
     malformed = await server.computer_execute(
         session_id, "click", x=10, y=10, follow_ups=[{"not_an_action": True}]
     )
-    assert malformed["error"] == "invalid_action"
+    assert malformed["result"] == "rejected" and "invalid_action" in malformed["reasons"]
     non_list = await server.computer_execute(
         session_id, "click", x=10, y=10, follow_ups="click x=1"
     )
-    assert non_list["error"] == "invalid_action"
+    assert non_list["result"] == "rejected" and "invalid_action" in non_list["reasons"]
     assert backend.executed == []  # fail-closed BEFORE anything was dispatched
 
 

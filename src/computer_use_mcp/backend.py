@@ -498,7 +498,17 @@ class FocusDriftError(BackendError):
     belonging to the bound window: the in-flight ``type`` is aborted immediately (no
     further chunks are dispatched — text must never land in a foreign field). Carries
     the FOCUS_DRIFTED event payload for the controller to surface verbatim.
+
+    ORVEX-2026-108 §1.1 K-05: when the abort happened mid-chunked-type, the raiser
+    also sets ``delivered_chars`` (int) — the number of characters already dispatched
+    in earlier chunks before the abort — so the reply can carry
+    ``partial_delivery.delivered_chars``. ``None``/absent means "nothing was
+    dispatched"; the agent only publishes the partial-delivery block when the count
+    is a positive int.
     """
+
+    #: Chars actually dispatched before the abort (set by the chunked type path).
+    delivered_chars: int | None = None
 
 
 class TextIntegrityError(BackendError):
@@ -1579,10 +1589,20 @@ class PyAutoGuiInputEngine(InputEngine):
         self._perform(lambda: self._pa.mouseUp(button=button))
 
     def type_text(self, text: str, before_chunk: Callable[[], None] | None = None) -> None:
+        sent = 0
         for char in text:
             if before_chunk is not None:
-                before_chunk()
+                try:
+                    before_chunk()
+                except FocusDriftError as exc:
+                    # K-05 (ORVEX-2026-108): this engine dispatches ONE CHARACTER per
+                    # hook call, so `sent` is the exact number of characters already
+                    # landed in THIS call when the focus guard aborted. The caller
+                    # (backend `_execute_type`) adds the offset of earlier chunks.
+                    exc.delivered_chars = sent
+                    raise
             self._perform(lambda char=char: self._pa.write(char))
+            sent += 1
             if self.type_interval > 0:
                 time.sleep(self.type_interval)
 
@@ -1724,10 +1744,40 @@ class SendInputEngine(InputEngine):
         else:
             chunk_size = _SENDINPUT_CHUNK_EVENTS - (_SENDINPUT_CHUNK_EVENTS % 2)
         events = [_key_event(vk, scan, flags) for vk, scan, flags in units]
+
+        def _batch_code_points(unit_batch: list[tuple[int, int, int]]) -> int:
+            """MINOR-N4 (VAL-WP1-02): count CODE POINTS, never UTF-16 code units.
+
+            An astral character travels as a surrogate PAIR — two down events — but is
+            ONE character; the second (low-surrogate) down event must not count, or the
+            engine's inner unit disagrees with the outer chunk offsets (code points).
+            A counted unit is a DOWN event (no KEYUP flag) that is not a low surrogate;
+            ``\\n``/``\\t`` key events count one each.
+            """
+            return sum(
+                1
+                for _vk, code_unit, flags in unit_batch
+                if not flags & _KEYEVENTF_KEYUP
+                and not (flags & _KEYEVENTF_UNICODE and 0xDC00 <= code_unit <= 0xDFFF)
+            )
+
+        sent_chars = 0
         for start in range(0, len(events), chunk_size):
+            batch_units = units[start : start + chunk_size]
             if before_chunk is not None:
-                before_chunk()
+                try:
+                    before_chunk()
+                except FocusDriftError as exc:
+                    # K-05 (ORVEX-2026-108): hook cadence == dispatch cadence (one
+                    # character per paced chunk when type_interval > 0; one BATCH of
+                    # characters per hook call otherwise — and an abort BEFORE
+                    # ``_send`` means that batch contributed nothing). ``sent_chars``
+                    # is the exact CODE POINTS dispatched in THIS call; the caller adds
+                    # the offset of earlier chunks.
+                    exc.delivered_chars = sent_chars
+                    raise
             self._send(events[start : start + chunk_size])
+            sent_chars += _batch_code_points(batch_units)
             if self.type_interval > 0:
                 time.sleep(self.type_interval)
 
@@ -4151,15 +4201,38 @@ class LocalComputerBackend(ComputerBackend):
             # default sendinput path touches (a single string compare).
             return self._execute_type_via_clipboard(action, stop, focus_hook)
         if not TYPE_INTEGRITY_ENABLED or not text:
-            self._engine.type_text(text, before_chunk=before_chunk)
+            # Legacy single-call path. K-05: the shipped engines attach their exact
+            # intra-call dispatched count to the FocusDriftError; an engine that does
+            # not report leaves the class default (None -> 0 -> no partial_delivery
+            # key), which is the conservative "no completed dispatch known" answer.
+            try:
+                self._engine.type_text(text, before_chunk=before_chunk)
+            except FocusDriftError as exc:
+                intra = exc.delivered_chars
+                exc.delivered_chars = intra if isinstance(intra, int) and intra > 0 else 0
+                raise
             self._last_key_dispatch = time.monotonic()
             return "Executed type."
 
         total = len(text)
+        delivered = 0
         for chunk in _split_type_chunks(text, TYPE_CHUNK_CHARS):
             if stop is not None:
                 stop.ensure_live()  # between chunks (existing discipline)
-            self._engine.type_text(chunk, before_chunk=before_chunk)
+            try:
+                self._engine.type_text(chunk, before_chunk=before_chunk)
+            except FocusDriftError as exc:
+                # §1.1 K-05 (ORVEX-2026-108): the abort happened INSIDE this engine
+                # call — every EARLIER chunk fully landed (`delivered`), and the
+                # engine reports the exact prefix it dispatched within its own call
+                # (per-character granularity on both shipped engines). The aborting
+                # unit contributed nothing. Compose, never undercount completed work.
+                intra = exc.delivered_chars
+                exc.delivered_chars = delivered + (
+                    intra if isinstance(intra, int) and intra > 0 else 0
+                )
+                raise
+            delivered += len(chunk)
             self._last_key_dispatch = time.monotonic()
 
         # --- end-of-action verification: FAST PATH FIRST (bounded drain poll) -----
@@ -4201,7 +4274,18 @@ class LocalComputerBackend(ComputerBackend):
             missing = text[_typed_index_for_norm_len(text, matched) :]
             if stop is not None:
                 stop.ensure_live()  # before the verified retype
-            self._engine.type_text(missing, before_chunk=before_chunk)
+            try:
+                self._engine.type_text(missing, before_chunk=before_chunk)
+            except FocusDriftError as exc:
+                # §1.1 K-05 (ORVEX-2026-108), N5 semantics (VAL-WP1-02): at this point
+                # ``len(text) - len(missing)`` characters were CONFIRMED landed by
+                # read-back, and the retype's already-dispatched prefix may still land
+                # late (drain lag). Per the truthfulness rule — never report fewer
+                # characters than may have landed — the count is the UPPER BOUND
+                # ``len(text)`` (everything dispatched), not the read-back-confirmed
+                # prefix.
+                exc.delivered_chars = len(text)
+                raise
             self._last_key_dispatch = time.monotonic()
             if TYPE_VERIFY_SETTLE_SECONDS > 0:
                 time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
@@ -4342,6 +4426,14 @@ class LocalComputerBackend(ComputerBackend):
             if stop is not None:
                 stop.ensure_live()
             if focus_hook is not None:
+                # §1.1 K-05 (ORVEX-2026-108) delivered-chars rule for the PASTE
+                # transport: the paste chord is all-or-nothing and the focus probe
+                # runs exactly once BEFORE it — a FocusDriftError here means the
+                # paste was never sent, so zero characters landed (delivered_chars
+                # stays unset -> no partial_delivery key). There is no hook AFTER
+                # the chord, so a post-paste drift cannot raise on this path; if the
+                # chord was dispatched, the FULL text may have landed (upper bound:
+                # len(text)) — an amount the reply already states via action.text.
                 focus_hook()
             self._engine.chord(["ctrl", "v"])
             self._last_key_dispatch = time.monotonic()

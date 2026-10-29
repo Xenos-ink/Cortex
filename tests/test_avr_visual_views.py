@@ -69,22 +69,34 @@ import test_controller_integration as tci
 
 FAST_LIMITS = {"min_screenshot_interval_ms": 0}
 
-#: The stock observe metadata key sets (the pre-AL-002 shapes; H19 pins these exactly).
+#: §1.1 (ORVEX-2026-108) also adds ok + message to EVERY reply (incl. read-only
+#: metadata) — recorded alongside the D-3 exception below.
+#: The stock observe metadata key sets. §1.1 D-3 (ORVEX-2026-108) adds the single
+#: measured scale key ``image_outbound_scale`` to every image-bearing reply — a
+#: recorded, deliberate exception to the H19 "absent request = byte-identical shape"
+#: doctrine (the unified reply contract mandates the key). Text mode carries it as
+#: ``None`` (honest: no image served, no scale applied).
 STOCK_IMAGE_KEYS = [
+    "ok",
+    "message",
     "observation",
     "digest",
     "observation_id",
     "active_app",
     "image_format",
+    "image_outbound_scale",
     "text_summary",
 ]
 STOCK_TEXT_KEYS = [
+    "ok",
+    "message",
     "observation",
     "digest",
     "observation_id",
     "active_app",
     "image_format",
     "image_delivery",
+    "image_outbound_scale",
     "image_delivery_note",
     "text_summary",
 ]
@@ -239,7 +251,7 @@ def test_item1_absent_request_observe_image_mode_byte_identical_shape(
     assert list(metadata.keys()) == STOCK_IMAGE_KEYS
     assert list(metadata["observation"].keys()) == STOCK_OBSERVATION_KEYS
     observation = backend.observed[-1]
-    expected_b64, expected_mime = server._bound_outbound_image(
+    expected_b64, expected_mime, _expected_scale = server._bound_outbound_image(
         observation.image_base64, frame=getattr(observation, "_frame", None)
     )
     assert blocks[1].data == expected_b64  # stock outbound bytes, untouched
@@ -275,7 +287,8 @@ async def test_item1_absent_request_execute_byte_identical_shape(
     assert "visual_view" not in payload
     assert "visual_view_scale" not in payload
     assert "spatial_text" not in payload
-    assert payload["image_scale"] == 0.5  # the stock half-res default marker, untouched
+    # §1.1 D-3 (ORVEX-2026-108): the measured scale key (image_scale deleted).
+    assert payload["image_outbound_scale"] == 0.5
     counters = bundle.metrics.snapshot()["counters"]
     assert counters.get("spatial_text_compute", 0) == 0
 
@@ -671,7 +684,11 @@ async def test_item10_invalid_view_on_execute_never_dispatches(
     session_id, _bundle, backend = make_session(monkeypatch)
     result = await server.computer_execute(session_id, "click", x=10, y=10, visual_view="3d")
     assert result["ok"] is False
-    assert result["error"] == "invalid_visual_view"
+    # §1.4 delta (ORVEX-2026-108): on the EXECUTE surface the malformed-parameter
+    # refusal is a rejection (typed code as first reason); observe/zoom keep the
+    # typed invalid_visual_view error (read-only refusals, §1.3).
+    assert result["result"] == "rejected"
+    assert result["reasons"][0].startswith("invalid_visual_view")
     assert backend.executed == []  # nothing dispatched, fail-closed
 
 
@@ -812,7 +829,8 @@ async def test_item14_stock_action_markers_intact_with_views_absent(
     default = tci.execute_payload(
         await server.computer_execute(session_id, "click", x=10, y=10)
     )
-    assert default["ok"] is True and default["image_scale"] == 0.5  # stock default image
+    # §1.1 D-3 (ORVEX-2026-108): the single MEASURED scale key (image_scale deleted).
+    assert default["ok"] is True and default["image_outbound_scale"] == 0.5
     assert "visual_view" not in default
     opt_out = tci.execute_payload(
         await server.computer_execute(session_id, "click", x=10, y=10,
@@ -835,7 +853,7 @@ async def test_item14_execute_path_visual_view_grid(
     assert payload["ok"] is True
     assert payload["visual_view"] == "grid"
     assert payload["visual_view_scale"] == 0.5  # the stock half-res policy, reported
-    assert payload["image_scale"] == 0.5  # the stock marker coexists
+    assert payload["image_outbound_scale"] == 0.5  # the measured key rides beside it
     assert payload["image_format"] == "image/jpeg"
     assert len(response) == 2  # TextContent + the GRID ImageContent
     served = Image.open(io.BytesIO(base64.b64decode(response[1].data)))
@@ -1266,7 +1284,8 @@ def test_a1_zoom_metadata_shape(fresh_server: Any, monkeypatch: pytest.MonkeyPat
     assert isinstance(blocks, list) and len(blocks) == 2
     meta = observe_metadata(blocks)
     assert list(meta.keys()) == [
-        "observation", "digest", "observation_id", "active_app", "image_format",
+        "ok", "message", "observation", "digest", "observation_id", "active_app", "image_format",
+        "image_outbound_scale",
         "text_summary", "crop_region", "visual_view", "visual_view_scale", "spatial_text",
     ]
     assert meta["visual_view"] == "raw"  # the zoom default view
