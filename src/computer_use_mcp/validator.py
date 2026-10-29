@@ -38,6 +38,8 @@ from __future__ import annotations
 from pydantic import ConfigDict, Field, PrivateAttr
 
 from .models import (
+    MAX_DURATION_MS,
+    MAX_HOLD_MS,
     ActionType,
     CoordinateSpace,
     GroundedAction,
@@ -163,7 +165,8 @@ class ValidationOutcome(GroundingValidation):
     ``confidence_below_floor``, ``coordinate_space_unverifiable``,
     ``window_not_allowed``, ``window_identity_unavailable``, ``point_out_of_bounds``,
     ``missing_point``, ``missing_text``, ``missing_keys``, ``missing_target``,
-    ``via_not_allowed``, ``via_invalid``).
+    ``via_not_allowed``, ``via_invalid``, ``hold_ms_not_allowed``, ``hold_ms_invalid``,
+    ``duration_ms_not_allowed``, ``duration_ms_invalid``).
     ``error`` (private, never serialized) carries the first typed rejection instance
     for controllers that branch on exception type.
     """
@@ -405,6 +408,60 @@ class GroundingValidator:
                 reject(
                     "via_invalid",
                     f"via must be {allowed}; received {action.via!r}.",
+                )
+        # --- WP2 (ORVEX-2026-101 Batch 1, P1.2): hold_ms legal on the HOLD_ACTIONS
+        # --- family, int, in range ----------------------------------------------------------
+        # Defense in depth: GroundedAction construction already fails closed on a
+        # hold_ms misuse (models.GroundedAction._hold_ms_hold_family_only) and pydantic
+        # ge/le bounds the value; this pipeline-side check catches model_construct-style
+        # bypasses so an invalid hold_ms can never reach the backend through any path.
+        # A held dispatch differs from a legacy dispatch ONLY after the identical
+        # safety/approval decision; hold_ms=None rides the legacy path untouched.
+        # ORVEX-2026-107 widened the legal set to the click family plus keypress/hotkey.
+        # The ``hold_ms_not_allowed``/``hold_ms_invalid`` codes are UNCHANGED (D7: the
+        # typed vocabulary is additive-only, so a client matching on them keeps working).
+        if action.hold_ms is not None:
+            if action.action not in GroundedAction.HOLD_ACTIONS:
+                reject(
+                    "hold_ms_not_allowed",
+                    f"hold_ms is only valid on click/right_click/keypress/hotkey actions; "
+                    f"received hold_ms={action.hold_ms} on action=\""
+                    f'{action.action.value if hasattr(action.action, "value") else action.action}".',
+                )
+            elif (
+                not isinstance(action.hold_ms, int)
+                or isinstance(action.hold_ms, bool)
+                or not 0 <= action.hold_ms <= MAX_HOLD_MS
+            ):
+                reject(
+                    "hold_ms_invalid",
+                    f"hold_ms must be an integer between 0 and {MAX_HOLD_MS}; "
+                    f"received {action.hold_ms!r}.",
+                )
+        # --- WP2 DELTA 1 (VAL-WP2 F4): duration_ms move-only, int, in range --------------
+        # The validator-side gate SYMMETRIC to the hold gate (the backend defense gate
+        # stays as the last line): a model_construct-style bypass carrying duration_ms
+        # on a non-move action, or a non-int/out-of-band value, is rejected here so it
+        # can never reach the backend through any path. duration_ms=None (the legacy
+        # jump) is never rejected. The codes are additive-only vocabulary like the
+        # hold pair.
+        if action.duration_ms is not None:
+            if action.action is not ActionType.MOVE:
+                reject(
+                    "duration_ms_not_allowed",
+                    f"duration_ms is only valid on move actions; received "
+                    f'duration_ms={action.duration_ms} on action="'
+                    f'{action.action.value if hasattr(action.action, "value") else action.action}".',
+                )
+            elif (
+                not isinstance(action.duration_ms, int)
+                or isinstance(action.duration_ms, bool)
+                or not 0 <= action.duration_ms <= MAX_DURATION_MS
+            ):
+                reject(
+                    "duration_ms_invalid",
+                    f"duration_ms must be an integer between 0 and {MAX_DURATION_MS}; "
+                    f"received {action.duration_ms!r}.",
                 )
         if action.action in {ActionType.KEYPRESS, ActionType.HOTKEY} and not action.keys:
             reject("missing_keys", "Keypress/hotkey actions require at least one key.")

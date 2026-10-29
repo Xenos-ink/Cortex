@@ -1428,6 +1428,14 @@ class ComputerUseAgent:
                     follow_up_results=[
                         {
                             "index": position,
+                            # VAL-WP1 carry-over: the hand-built pre-dispatch entry
+                            # carries the SAME field set every pipeline-built entry
+                            # has — ``action_id`` (nothing dispatched, so no action
+                            # exists to own an id) and ``ensure_app_outcome`` (None)
+                            # are filled as None so entry field-set parity holds
+                            # across the whole ``follow_up_results`` surface (pinned
+                            # by tests/test_reply_contract.py).
+                            "action_id": None,
                             "action_type": spec.action.value,
                             "kind": "rejected",
                             "result": "rejected",
@@ -1435,6 +1443,7 @@ class ComputerUseAgent:
                             "message": f"{type(exc).__name__}: {str(exc)[:200]}",
                             "reasons": ["invalid_action"],
                             "requires_approval": False,
+                            "ensure_app_outcome": None,
                             "model_confidence": None,
                             "grounding_confidence": None,
                             "verification_confidence": None,
@@ -1648,6 +1657,16 @@ class ComputerUseAgent:
         entry["ensure_app_outcome"] = (
             result.ensure_app_outcome if result is not None else None
         )
+        # WP2 (ORVEX-2026-101 Batch 2, additive, present only when set — entries for
+        # calls without hold/duration are byte-identical): a queued held/timed input
+        # reports the per-item durations so the caller's evidence names them.
+        if action.hold_ms is not None:
+            entry["hold_ms"] = action.hold_ms
+        if action.duration_ms is not None:
+            entry["duration_ms"] = action.duration_ms
+        repositions = list(getattr(action, "_repositions", []) or [])
+        if repositions:
+            entry["repositions"] = repositions
         # MINOR-N1 (VAL-WP1-02): reasons exist ONLY on rejection kinds — every other
         # entry has NO reasons key, exactly like the flat reply of the same kind.
         if outcome.kind in ("rejected", "safety_denied", "digest_surprise"):
@@ -2102,7 +2121,12 @@ class ComputerUseAgent:
                 action=action,
                 result="ok",
                 duration_ms=duration_ms,
-                metadata={"message": str(message)[:200]},
+                metadata={
+                    "message": str(message)[:200],
+                    # WP2 (Batch 5 decision 2): the timed-motion interference evidence
+                    # rides the audit event too (additive; empty list = none).
+                    "repositions": list(getattr(action, "_repositions", []) or []),
+                },
             )
 
             # B1 GUARANTEE (T8): verification ALWAYS captures its own fresh post-action

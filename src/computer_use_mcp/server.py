@@ -1282,12 +1282,25 @@ ACTION_VOCABULARY = (
     "drag (x,y start + x2,y2 end, both required), "
     "move (x,y), type (text required), keypress (keys=[\"<one key name>\"]), "
     "hotkey (keys=[2-12 key names], e.g. [\"ctrl\",\"a\"]), scroll (delta -20..20), "
-    "wait (delta 0..20 seconds), focus_window (target = window title), "
+    "wait (delta seconds; this flat action is capped at 10 s and reports "
+    "waited_seconds when the cap bites), focus_window (target = window title), "
     "ensure_app (target = \"process\" or \"process|doc-token\"; attaches to an EXISTING "
     "instance — REATTACHED/AMBIGUOUS_INSTANCE/NO_INSTANCE — and may launch the target "
     "server-side when no instance matches, the target is allowlisted, and the "
     "launch=\"server\" policy holds (the default; CORTEX_ATTACH_OR_LAUNCH=driver "
-    "restores never-launch)), done."
+    "restores never-launch)), done. "
+    # WP2 (ORVEX-2026-107): the vocabulary must not disagree with the three production
+    # guards, which all read "hold_ms is only valid on click/right_click/keypress/
+    # hotkey actions" (models.py, backend.py, validator.py). Kept to the enforced
+    # rule: the legal set, the press/hold/release reading, the reverse-order hotkey
+    # release, ``0`` as an explicit zero hold, and omitted-is-legacy.
+    "hold_ms (0..5000 ms, optional, carried on an individual action — a follow_ups "
+    "entry) is valid on click/right_click/keypress/hotkey ONLY and is rejected on "
+    "every other action, including double_click, move, scroll and type: the input is "
+    "pressed, stays down for the duration, then released — on a hotkey every named "
+    "key goes down SIMULTANEOUSLY and comes up in REVERSE order — never a chord "
+    "followed by a wait — and hold_ms=0 is that same path with a zero-duration hold, "
+    "while omitting it keeps the ordinary immediate dispatch."
 )
 
 #: Key-name rule taught alongside the vocabulary (Session 1 failure class: text sent
@@ -2285,6 +2298,25 @@ async def computer_execute(
     ``via`` on any non-type action, or an unknown value, is a typed ``invalid_action``
     rejection (fail closed).
 
+    Held input duration (WP2, ORVEX-2026-107): ``hold_ms`` is an OPTIONAL integer,
+    0..5000 MILLISECONDS, carried on an INDIVIDUAL ACTION — a ``follow_ups`` entry —
+    and legal on ``click``,
+    ``right_click``, ``keypress`` and ``hotkey`` ONLY. Every other action
+    (``double_click``, ``move``, ``scroll``, ``type``, ...) is rejected fail-closed
+    with the typed ``invalid_action`` whose message reads "hold_ms is only valid on
+    click/right_click/keypress/hotkey actions". On a key action it presses the key,
+    keeps it down for the duration, then releases it; on ``hotkey`` it holds EVERY
+    named key down SIMULTANEOUSLY for the duration and releases them in REVERSE
+    order — a ``shift`` a member requires is synthesized and released right after
+    every key that required it, never before one, so a chord like ``["ctrl","A"]``
+    releases shift before ctrl. It is NOT "chord, then wait" — that would hold
+    nothing, because a chord has already released every key by the time it returns.
+    ``hold_ms=0`` is an explicit zero-duration press/release through that SAME path,
+    not a fast-path chord; OMITTING it (or ``null``) keeps the ordinary immediate
+    dispatch unchanged — for a key action, the existing atomic chord. It is a
+    duration on ONE input and never a motion path: ``duration_ms`` is a SEPARATE,
+    ``move``-only field, and the two must not be conflated.
+
     REM-F weak-model tolerance (boundary only): integer coordinates also accept
     integral floats (1343.0) and numeric strings ("1343"); NON-INTEGRAL values ROUND
     to the nearest int (a vision model aiming at pixel 1343.7 must not hard-fail).
@@ -2314,7 +2346,11 @@ async def computer_execute(
 
     Queued actions (PERF-004, trailing optional): ``follow_ups`` is a list of at most 5
     action specs (same fields as this tool's action parameters, e.g.
-    {"action": "click", "x": 10, "y": 20, "expected_effect": "..."}). Each follow-up
+    {"action": "click", "x": 10, "y": 20, "expected_effect": "..."}), PLUS the two
+    duration fields that cannot be passed as tool parameters: ``hold_ms`` (held
+    input, click/right_click/keypress/hotkey only) and ``duration_ms`` (timed
+    ``move`` motion) — so a queued item behaves EXACTLY like the equivalent flat
+    action. Each follow-up
     passes the FULL independent pipeline (validate -> safety -> approval semantics ->
     execute -> verify) exactly like a single action — zero bypass. The queue CONTINUES
     while the attached window stays the same (ordinary pixel changes from

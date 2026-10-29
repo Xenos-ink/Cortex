@@ -717,8 +717,15 @@ def test_focus_window_on_already_foreground_window_is_idempotent_success(
     info = query_foreground_window()
     if info is None or not (info.title or "").strip():
         pytest.skip("No foreground window with a title available.")
+    # WP2 environment adaptation (recorded in gates/wp2-notes.md): a live desktop can
+    # carry a foreground title longer than the model's pre-existing 200-char target
+    # bound (observed: a browser tab title), which fails GroundedAction CONSTRUCTION
+    # — a test-setup artifact, not the behavior under test. Build the action from the
+    # declared-bound prefix; find_window_by_title's exact > prefix > substring
+    # precedence still resolves the same window, and the B7 idempotency assertion is
+    # untouched (the model bound itself is unchanged).
     message = real_backend._execute_focus_window(
-        GroundedAction(action="focus_window", target=info.title, confidence=1.0)
+        GroundedAction(action="focus_window", target=info.title[:200], confidence=1.0)
     )
     assert message.startswith("Focused window")
 

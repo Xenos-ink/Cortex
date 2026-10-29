@@ -48,6 +48,7 @@ import base64
 import ctypes
 import hashlib
 import io
+import math
 import os
 import platform
 import re
@@ -65,6 +66,9 @@ from typing import Any
 from PIL import Image
 
 from .models import (
+    MAX_DURATION_MS,
+    MAX_HOLD_MS,
+    MAX_PLAN_SETTLE_MS,
     CoordinateSpace,
     GroundedAction,
     MonitorInfo,
@@ -84,12 +88,15 @@ DEFAULT_DPI = 96
 DPI_AWARENESS_CONTEXT_PER_MONITOR_V2 = -4
 WAIT_MAX_SECONDS = 10.0
 WAIT_SLICE_SECONDS = 0.1
+#: WP2 (F3 fix 5.4, C11/C·N3): the additive ``waited_seconds`` marker emitted in the
+#: wait action's message ONLY when the request was outside ``[0, WAIT_MAX_SECONDS]``
+#: and was therefore clamped.
+WAIT_CLAMPED_MARKER = "waited_seconds"
 _TYPE_INTERVAL_SECONDS = 0.01  # legacy per-char pacing (pyautogui fallback parity)
 _DRAG_SEGMENT_PIXELS = 40  # stroke interpolation granularity (~one segment per 40 px)
 _DRAG_MIN_SEGMENTS = 4  # even tiny drags get a visibly interpolated stroke
 _DRAG_STEP_PAUSE_SECONDS = 0.01  # per-segment pacing (same cadence as type)
 _SCALE_TOLERANCE = 0.02
-_MOVE_SETTLE_SECONDS = 0.05  # settle after a cursor reposition (not an input pause)
 _SW_RESTORE = 9  # ShowWindow(nCmdShow) restore for a minimized window
 _VK_MENU = 0x12  # ALT virtual key (foreground-switch nudge)
 _KEYEVENTF_KEYUP = 0x02  # keybd_event flag: key release
@@ -851,6 +858,58 @@ def _sleep_for_wait_action(total_seconds: float, stop: StopToken) -> None:
         remaining -= slice_seconds
 
 
+def _wait_clamp_note(requested: float, effective: float) -> str:
+    """The additive ``waited_seconds`` suffix, or ``""`` when the clamp did not bite.
+
+    WP2 (F3 fix 5.4, C11 / C·N3). Emitted ONLY when the request was outside
+    ``[0, WAIT_MAX_SECONDS]`` and was therefore clamped — an in-range ``delta`` produces
+    the byte-identical ``Executed wait.`` it always did, so this costs a host nothing on
+    the common path and tells a caller that asked for 15 s (and got 10) what it got.
+    The leading space keeps the composed message a single space-separated suffix chain.
+    """
+    try:
+        asked = float(requested)
+        got = float(effective)
+    except (TypeError, ValueError):  # pragma: no cover - delta is a validated number
+        return ""
+    if asked < 0.0 or asked > WAIT_MAX_SECONDS:
+        return f" {WAIT_CLAMPED_MARKER}={got:g}"
+    return ""
+
+
+#: WP2 (ORVEX-2026-101 Batch 1, P1.3): hold-wait slice. Finer than the ``wait``-action
+#: slice (0.1 s) so a stop arriving mid-hold is honored within <= one 50 ms slice
+#: (the documented 25-50 ms band); ``stop.wait`` also wakes the instant the stop
+#: event arms, so the slice bounds only the worst case, not the common path.
+HOLD_SLICE_SECONDS = 0.05
+
+
+def _sleep_for_hold(hold_seconds: float, stop: StopToken) -> None:
+    """Slice-sleep for a held click (``hold_ms``); raises ``TaskStopped`` as soon as
+    the stop fires — the button is released by the caller's ``finally`` either way."""
+    remaining = hold_seconds
+    while remaining > 0:
+        stop.ensure_live()
+        slice_seconds = min(HOLD_SLICE_SECONDS, remaining)
+        if stop.wait(slice_seconds):
+            stop.ensure_live()  # stop fired mid-slice: raise immediately
+        remaining -= slice_seconds
+
+
+def _wait_for_hold(hold_seconds: float, stop: StopToken | None) -> None:
+    """The ONE hold wait every held action uses (click, key, and the fake alike).
+
+    WP2 (ORVEX-2026-107): the click branch's inline ``stop is None`` fork, hoisted so a
+    held KEY is not a second copy of it. The sliced ``_sleep_for_hold`` above is reused
+    verbatim (D4) — a bare uninterruptible ``time.sleep`` is only correct when there is
+    no token to honour, which is exactly what the caller passing ``None`` asserts.
+    """
+    if stop is None:
+        time.sleep(hold_seconds)
+    else:
+        _sleep_for_hold(hold_seconds, stop)
+
+
 def _drag_segment_points(
     start: tuple[int, int], end: tuple[int, int], *, step_pixels: int = 0
 ) -> list[tuple[int, int]]:
@@ -879,6 +938,191 @@ def _drag_segment_points(
         )
         for index in range(1, segments + 1)
     ]
+
+
+# --- WP2 (ORVEX-2026-101 Batch 2, P2.2): the deterministic timed-motion path builder ---------
+# An ADDITION next to the drag builder — not one line of the drag behavior above is
+# touched. Pure, deterministic, zero randomness (the repository carries no `random` in
+# src/): the same inputs always produce the same point list, byte-identically.
+
+#: Motion shapes (D6): the linear target equation plus the quadratic Bezier family.
+_MOTION_SHAPES: tuple[str, ...] = ("linear", "quadratic_bezier")
+#: Motion easings (D20): the identity and the closed-form smoothstep polynomial.
+_MOTION_EASINGS: tuple[str, ...] = ("linear", "smoothstep")
+#: Hard cap on returned points per motion. The segment count is capped one below so
+#: the inclusive start sample never pushes the list past 128 points.
+_MOTION_MAX_POINTS = 128
+#: Two-slice floor: even the shortest timed motion gets start/mid/end.
+_MOTION_MIN_SEGMENTS = 2
+
+
+def _motion_path_points(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    duration_ms: int,
+    shape: str = "linear",
+    bend_px: int = 0,
+    easing: str = "linear",
+    target_interval_ms: int = 12,
+    bounds: tuple[int, int, int, int] | None = None,
+) -> list[tuple[int, int]]:
+    """Deterministic timed-motion waypoints from ``start`` to ``end`` (inclusive).
+
+    WP2 (ORVEX-2026-101 Batch 2, P2.2); the formulas:
+
+    - linear geometry: ``x(u') = x0 + (x1-x0)·u'``; the simple bend adds
+      ``y(u') += 4h·u'(1-u')`` — the peak displacement is exactly ``h`` at the
+      midpoint (``u'=0.5``) and zero at both ends; ``h > 0`` displaces toward ``+y``
+      (screen-down; decision D19).
+    - quadratic Bezier: ``P(u') = (1-u')²P0 + 2(1-u')u'C + u'²P1`` — the control
+      point ``C`` is derived internally from ``h`` (``C = mid + 2h·n̂``, ``n̂`` the
+      unit normal chosen with a non-negative y-component), so ``B(0.5) = mid + h·n̂``:
+      the peak magnitude is exactly ``|h|``. No control-point parameter exists on any
+      surface.
+    - easing re-schedules TIME only (D20): ``u' = easing(u)`` with ``linear`` the
+      identity and ``smoothstep = 3u²-2u³``; the geometric curve is unchanged.
+    - sampling: ``segments = clamp(ceil(duration_ms / target_interval_ms), 2, 127)``
+      -> 3..128 points (two-slice floor, 128-point cap). The FIRST sample is
+      ``start`` exactly and the LAST is ``end`` exactly (the drag builder's
+      final-point discipline): arrival accuracy is independent of shape/easing.
+    - screen envelope (decision 5): when ``bounds=(left, top, width, height)`` is
+      supplied in PHYSICAL virtual-screen pixels, ``bend_px`` is silently reduced
+      (never rejected) to the largest same-sign value whose complete sampled path
+      remains inside that rectangle. The reduction is a bounded search over the
+      declared room, not a fixed pixel cap. Endpoints remain exact and take
+      precedence if a caller supplies an already out-of-screen endpoint.
+
+    Arguments are validated fail-closed (garbage raises ``ValueError``, never a
+    silently degraded path); ``start == end`` returns ``[]`` (the zero-length
+    ``_drag_waypoints`` precedent); ``duration_ms <= 0`` raises — the caller only
+    invokes this function on the timed branch (the legacy jump never calls it).
+    All coordinates are PHYSICAL virtual-screen pixels: every path point is computed
+    AFTER the single ``_map_to_physical`` transform — no scaling inside the engine.
+    """
+    if not isinstance(start, tuple) or not isinstance(end, tuple) or len(start) != 2 or len(end) != 2:
+        raise ValueError("start and end must be (x, y) tuples")
+    for name, value in (("start", start), ("end", end)):
+        for component in value:
+            if isinstance(component, bool) or not isinstance(component, int):
+                raise ValueError(  # noqa: TRY004 - mirrors the models' ValueError style
+                    f"{name} coordinates must be integers; got {component!r}"
+                )
+    if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms <= 0:
+        raise ValueError(f"duration_ms must be a positive integer; got {duration_ms!r}")
+    if isinstance(bend_px, bool) or not isinstance(bend_px, int):
+        raise ValueError(  # noqa: TRY004 - mirrors the models' ValueError style
+            f"bend_px must be an integer; got {bend_px!r}"
+        )
+    if (
+        isinstance(target_interval_ms, bool)
+        or not isinstance(target_interval_ms, int)
+        or target_interval_ms <= 0
+    ):
+        raise ValueError(
+            f"target_interval_ms must be a positive integer; got {target_interval_ms!r}"
+        )
+    if shape not in _MOTION_SHAPES:
+        allowed = " or ".join(f'"{value}"' for value in _MOTION_SHAPES)
+        raise ValueError(f"shape must be {allowed}; received {shape!r}")
+    if easing not in _MOTION_EASINGS:
+        allowed = " or ".join(f'"{value}"' for value in _MOTION_EASINGS)
+        raise ValueError(f"easing must be {allowed}; received {easing!r}")
+    if bounds is not None and (
+        not isinstance(bounds, (tuple, list))
+        or len(bounds) != 4
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in bounds)
+        or bounds[2] <= 0
+        or bounds[3] <= 0
+    ):
+        raise ValueError(
+            "bounds must be a (left, top, width, height) tuple of positive integers"
+        )
+    if start == end:
+        return []
+
+    # Decision 5: the screen is the only bend envelope. A bounded binary search over
+    # the same-sign bend magnitude finds the largest value whose *complete sampled*
+    # path fits the physical rectangle. This is deliberately independent of a fixed
+    # pixel ceiling and works for both the simple bend and the quadratic control hull.
+    if bounds is not None and bend_px:
+        left, top, width, height = bounds
+        right, bottom = left + width, top + height
+
+        def _fits(candidate: int) -> bool:
+            candidate_points = _motion_path_points(
+                start,
+                end,
+                duration_ms,
+                shape=shape,
+                bend_px=candidate,
+                easing=easing,
+                target_interval_ms=target_interval_ms,
+                bounds=None,
+            )
+            return all(
+                left <= point_x < right and top <= point_y < bottom
+                for point_x, point_y in candidate_points
+            )
+
+        if not _fits(bend_px):
+            sign = 1 if bend_px > 0 else -1
+            low, high = 0, abs(bend_px)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if _fits(sign * middle):
+                    low = middle
+                else:
+                    high = middle - 1
+            bend_px = sign * low
+
+    x0, y0 = start
+    x1, y1 = end
+    dx = x1 - x0
+    dy = y1 - y0
+    length = math.hypot(dx, dy)
+
+    def _ease(u: float) -> float:
+        if easing == "linear":
+            return u
+        return 3.0 * u * u - 2.0 * u * u * u  # smoothstep (closed form, deterministic)
+
+    def _point(u: float) -> tuple[int, int]:
+        eased = _ease(u)
+        if shape == "quadratic_bezier":
+            if length > 0:
+                normal_x, normal_y = -dy / length, dx / length
+                if normal_y < 0:  # D19: keep the normal whose y-component points +y
+                    normal_x, normal_y = -normal_x, -normal_y
+                # ny == 0 (a perfectly vertical move): the only normal is horizontal —
+                # kept as-is (deterministic); the peak magnitude is |h| either way.
+                control_x = (x0 + x1) / 2 + 2 * bend_px * normal_x
+                control_y = (y0 + y1) / 2 + 2 * bend_px * normal_y
+            else:
+                control_x, control_y = float(x0), float(y0)
+            one_minus = 1.0 - eased
+            x = (
+                one_minus * one_minus * x0
+                + 2 * one_minus * eased * control_x
+                + eased * eased * x1
+            )
+            y = (
+                one_minus * one_minus * y0
+                + 2 * one_minus * eased * control_y
+                + eased * eased * y1
+            )
+        else:
+            x = x0 + dx * eased
+            y = y0 + dy * eased
+            if bend_px:
+                y += 4.0 * bend_px * eased * (1.0 - eased)
+        return (round(x), round(y))
+
+    segments = -(-duration_ms // target_interval_ms)  # ceil(duration/interval)
+    segments = max(_MOTION_MIN_SEGMENTS, min(segments, _MOTION_MAX_POINTS - 1))
+    points = [_point(index / segments) for index in range(segments + 1)]
+    points[0] = (x0, y0)  # start exact: 0.0 px at the path origin
+    points[-1] = (x1, y1)  # end exact: 0.0 px arrival, independent of shape/easing
+    return points
 
 
 # --- input engines (PERF-004): raw SendInput default, pyautogui fallback ----------------------
@@ -944,43 +1188,112 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _env_nonnegative_float(name: str, default: float) -> float:
-    """Read a non-negative float env value; garbage/negative falls back to default."""
+    """Read a finite non-negative float env value; invalid/negative -> default."""
+    value = _env_finite_float(name)
+    if value is None or value < 0:
+        return default
+    return value
+
+
+def _env_finite_float(name: str) -> float | None:
+    """Read a finite float env value; unset/blank/non-finite -> ``None`` (WP2 port)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except (ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _env_bounded_float(name: str, default: float, low: float, high: float) -> float:
+    """Read a finite float only when it is inside the declared range.
+
+    WP2 (ORVEX-2026-101 Batch 5 decision 4) deliberately uses fallback (rather than
+    clamping) for out-of-range motion durations/settle values: an operator typo cannot
+    silently turn a plan into a long wait. This helper is range-validation, not a
+    fixed motion cap; the caller chooses the range from the governing contract.
+    """
+    value = _env_finite_float(name)
+    if value is None or not (low <= value <= high):
+        return default
+    return value
+
+
+def _env_bounded_int(name: str, default: int, low: int, high: int) -> int:
+    """Read a finite integer env value only when it is inside ``[low, high]``."""
+    value = _env_finite_float(name)
+    if value is None or not (low <= value <= high):
+        return default
+    try:
+        parsed = int(value)
+    except (OverflowError, ValueError):
+        return default
+    return parsed if low <= parsed <= high else default
+
+
+def _env_nonnegative_int(name: str, default: int) -> int:
+    """Read a finite non-negative int env value; invalid/zero/negative -> default."""
+    value = _env_finite_float(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (OverflowError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a finite signed int env value; invalid input falls back to default."""
+    value = _env_finite_float(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (OverflowError, ValueError):
+        return default
+
+
+def _env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    """Read an enum env value; garbage/unknown falls back to default."""
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    return value if value >= 0 else default
+    value = raw.strip().lower()
+    return value if value in allowed else default
 
 
 def _env_positive_int(name: str, default: int) -> int:
-    """Read a positive int env value; garbage/zero/negative falls back to default."""
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
+    """Read a positive int env value; garbage/zero/negative/non-finite -> default."""
+    value = _env_finite_float(name)
+    if value is None:
         return default
     try:
-        value = int(float(raw))
-    except ValueError:
+        parsed = int(value)
+    except (OverflowError, ValueError):
         return default
-    return value if value > 0 else default
+    return parsed if parsed > 0 else default
 
 
 def _env_int_in_range(name: str, default: int | None, low: int, high: int) -> int | None:
-    """Read an int env value clamped to ``[low, high]``; unset/garbage -> default.
+    """Read a finite int env value clamped to ``[low, high]``; invalid -> default.
 
     R-5 helper for the PNG compress-level knob: the default (``None``) means "PIL's
     own default" so the encoded bytes stay byte-identical unless the operator opts in.
+    WP2 port alignment: reads through ``_env_finite_float`` so a non-finite payload
+    (``1e400`` -> inf) falls back to the default instead of raising ``OverflowError``
+    at import time.
     """
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
+    value = _env_finite_float(name)
+    if value is None:
         return default
     try:
-        value = int(float(raw))
-    except ValueError:
+        parsed = int(value)
+    except (OverflowError, ValueError):
         return default
-    return max(low, min(high, value))
+    return max(low, min(high, parsed))
 
 
 #: Settle/gap policy between queued final-Enter-ish keystrokes (B3, T8): a terminal-key
@@ -1034,6 +1347,67 @@ TYPE_VERIFY_STABILITY_SECONDS = _env_nonnegative_float("CORTEX_TYPE_VERIFY_STABI
 #: after the double-read-stable buffer PROVED text is missing (verified retype — never
 #: blind). A confirmed still-wrong buffer raises :class:`TextIntegrityError`.
 TYPE_MAX_RETYPES_PER_CHUNK = 1
+
+# --- WP2 (ORVEX-2026-101 Batch 2, P2.2/P2.3): internal motion-engine configuration ----------
+# Motion is an INTERNAL detail (the governing user clarification: the model declares
+# locations and actions only). These keys are the internal optional overrides — the
+# only host-facing override surface is the optional ``duration_ms`` field on move
+# actions / plan points. Defaults are the RFC §3.6 approved values.
+MOVE_DURATION_ENV = "CORTEX_MOVE_DURATION_MS"  # ms; default 0 = the legacy jump (outside plans)
+PLAN_MOVE_DURATION_ENV = "CORTEX_PLAN_MOVE_DURATION_MS"  # ms; the in-plan transition default
+MOVE_SHAPE_ENV = "CORTEX_MOVE_SHAPE"  # "linear" | "quadratic_bezier"
+MOVE_BEND_PX_ENV = "CORTEX_MOVE_BEND_PX"  # signed peak offset; +h displaces toward +y (D19)
+MOVE_EASING_ENV = "CORTEX_MOVE_EASING"  # "linear" | "smoothstep" (timing-only, D20)
+PLAN_SAMPLE_INTERVAL_ENV = "CORTEX_PLAN_SAMPLE_INTERVAL_MS"  # sampling cadence, band 8-16
+MOVE_SETTLE_ENV = "CORTEX_MOVE_SETTLE_MS"  # cursor-reposition settle (P3.2/D15)
+
+#: WP2 (ORVEX-2026-101 Batch 2, P2.2/P2.3): resolved motion-engine defaults (RFC §3.6).
+#: Outside plans, a ``move`` without ``duration_ms`` reads this. Decision 4 declares
+#: accepted operator values 200..500ms; the commander-approved Batch-5 scope keeps the
+#: *unset* default at 0 so legacy instant moves remain intact.
+#: ORVEX-2026-102 §5.1 / SPEC 5.1 leaves this at 0 — the outside-plan move is
+#: INSTANT by policy, and this is the value that must never be "fixed" upward.
+MOVE_DURATION_MS = _env_bounded_int(MOVE_DURATION_ENV, 0, 200, 500)
+#: Inside plans, an unset transition duration reads this. ORVEX-2026-102 §5.2 /
+#: SPEC 5.2 (conflict C3): inside a plan the duration is REQUIRED FROM THE MODEL,
+#: so this constant is a FAIL-SAFE for an unstated value, not a behaviour. The
+#: default is 0 (an instant jump) and the accepted band is 0..500. Consulted ONLY by
+#: the plan normalizer (WP7-SEAM(plan-normalizer): plan.py does not exist yet; the
+#: constant ships now so the WP7 seam has its policy value ready).
+PLAN_MOVE_DURATION_MS = _env_bounded_int(PLAN_MOVE_DURATION_ENV, 0, 0, 500)
+#: Motion shape family (D6): linear by default — the functional benefit of curves is
+#: NOT PROVEN; the jump already lands with 0 px error.
+MOVE_SHAPE = _env_choice(MOVE_SHAPE_ENV, "linear", ("linear", "quadratic_bezier"))
+#: Default signed bend in px (0 = straight). +h displaces the path peak toward +y (D19).
+#: DELTA 1 (F7): the knob is BOUNDED — band -5000..5000 px, out-of-band falls back to
+#: the 0 default (fallback-not-clamp, like every motion knob). The SCREEN envelope is
+#: the real bound and stays: path construction still silently reduces any bend (in-band
+#: or not) to the largest same-sign value whose complete sampled path fits the monitor
+#: rectangle (decision 5; see ``_motion_path_points``).
+MOVE_BEND_PX = _env_bounded_int(MOVE_BEND_PX_ENV, 0, -5_000, 5_000)
+#: Default easing (D20, timing-only): linear identity; "smoothstep" = 3u²-2u³.
+MOVE_EASING = _env_choice(MOVE_EASING_ENV, "linear", ("linear", "smoothstep"))
+#: Motion sampling cadence in ms. DELTA 1 (F7): fallback-NOT-clamp in the declared
+#: 8..16 band — an out-of-band value falls back to the 12 default instead of being
+#: silently clamped to an edge (the K-12 class: with clamping, an operator typo
+#: silently means a different cadence; with fallback it means the shipped cadence).
+#: Consumed by the flat timed-move sampling (NOT plan-only), so the knob stays.
+PLAN_SAMPLE_INTERVAL_MS = _env_bounded_int(PLAN_SAMPLE_INTERVAL_ENV, 12, 8, 16)
+#: Cursor-reposition settle in MILLISECONDS. ORVEX-2026-102 §5.1 / SPEC 5.1
+#: (conflict C3) reverses the legacy 50ms default: outside plans the move is
+#: INSTANT and the settle is 0ms, so the DEFAULT is 0.0 and the accepted band is
+#: 0..200 — range-validation-with-fallback, not clamping (an out-of-band value falls
+#: back to the default). An operator who WANTS a settle sets ``CORTEX_MOVE_SETTLE_MS``
+#: to 1..200. THIS IS A BEHAVIOR CHANGE vs v0.7.5: the unconditional 50 ms
+#: post-move settle is gone (recorded for the VERSIONS Compatibility notes).
+MOVE_SETTLE_MS = _env_bounded_float(MOVE_SETTLE_ENV, 0.0, 0.0, 200.0)
+#: Seconds form consumed by the dispatch paths (the historical module constant, now
+#: env-resolved; kept under the same name so every existing reference holds).
+#: With the shipped 0.0 default both guarded settle sites below (``execute()``'s
+#: plan-point tail and the unmarked move branch) are short-circuited by their
+#: ``> 0`` guards: zero settle sleep on every path, with NO new branch and NO new
+#: ``time.sleep`` site.
+_MOVE_SETTLE_SECONDS = MOVE_SETTLE_MS / 1000.0  # settle after a cursor reposition
 #: Control types whose value is ALWAYS exposed by both read paths when the control is
 #: readable — a ``None`` value on these means the control is EMPTY, not unreadable.
 _ALWAYS_VALUED_CONTROL_TYPES = frozenset({"Edit", "Document"})
@@ -1472,6 +1846,24 @@ def _chord_key_units(keys: list[str]) -> list[tuple[int, int, int]]:
     return units
 
 
+def _chord_key_halves(keys: list[str]) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
+    """Split :func:`_chord_key_units` into its ``(press, release)`` halves at the first key-up.
+
+    WP2 (ORVEX-2026-107): a HELD key is this split, not a new event model.
+    ``_chord_key_units`` already emits the press half with ``flags == 0`` and the
+    release half in reverse order with each synthesized shift released immediately
+    after every key that required it, so splitting inherits reverse-order release and
+    that per-key shift hygiene for free — a rewrite of the event model would only risk
+    regressing an invariant that is already correct.
+    """
+    units = _chord_key_units(keys)
+    first_up = next(
+        (index for index, (_vk, _scan, flags) in enumerate(units) if flags & _KEYEVENTF_KEYUP),
+        len(units),
+    )
+    return units[:first_up], units[first_up:]
+
+
 class InputEngine(ABC):
     """Physical-input contract used by :class:`LocalComputerBackend.execute`.
 
@@ -1521,6 +1913,41 @@ class InputEngine(ABC):
     @abstractmethod
     def chord(self, keys: list[str]) -> None:
         """Press and release a chord of key names (pyautogui vocabulary)."""
+
+    # WP2 (ORVEX-2026-107, D3): the held-key half of the contract. These are the
+    # snake_case mirror of ``mouse_down``/``mouse_up``: a held key is the EXISTING
+    # ``chord`` event list split at its midpoint (see :func:`_chord_key_halves`), so an
+    # engine dispatches one half per call and the BACKEND owns the wait between them —
+    # the same division of labour the proven held-click path already has.
+    #
+    # DELTA 1 (VAL-WP2 F3): the base implementations FAIL HONESTLY instead of silently
+    # succeeding. The no-op default let an engine that never implemented the pair
+    # return "Executed keypress." while nothing was pressed — success reported for
+    # input that never happened. Still deliberately NOT ``@abstractmethod`` (that
+    # would break third-party and stub engines at CONSTRUCTION time); the failure is
+    # moved to CALL time as a typed :class:`UnsupportedActionError`, which the
+    # pipeline maps onto a §1 failed reply. Both shipped engines override the pair,
+    # and the suite's test engines implement them.
+    def key_down(self, key: str) -> None:
+        """Press ``key`` and LEAVE IT DOWN.
+
+        The caller is responsible for a matching :meth:`key_up` —
+        ``LocalComputerBackend`` guarantees it in a ``finally``, including on a
+        mid-hold stop. A key left physically down rewrites every subsequent user
+        keystroke machine-wide, so an implementation that cannot honour that contract
+        must not be selected.
+        """
+        raise UnsupportedActionError(
+            "this input engine does not implement key_down/key_up; "
+            "held-key input cannot be dispatched on it"
+        )
+
+    def key_up(self, key: str) -> None:
+        """Release ``key`` (the mirror of :meth:`key_down`)."""
+        raise UnsupportedActionError(
+            "this input engine does not implement key_down/key_up; "
+            "held-key input cannot be dispatched on it"
+        )
 
     @abstractmethod
     def scroll(self, delta: int) -> None:
@@ -1574,6 +2001,26 @@ class PyAutoGuiInputEngine(InputEngine):
                 "pyautogui failsafe triggered (mouse in a screen corner); physical input halted."
             ) from exc
 
+    def _perform_release(self, release_call: Callable[[], None]) -> None:
+        """Run one pyautogui RELEASE with FAILSAFE suspended around that single call.
+
+        DELTA 1 (VAL-WP2 F1 BLOCKER): pyautogui's own FAILSAFE fires INSIDE
+        ``keyUp``/``mouseUp`` — the corner is the user's abort gesture, and refusing a
+        release would leave a button or key physically DOWN (stuck input rewrites all
+        later keystrokes system-wide). So release primitives suspend
+        ``self._pa.FAILSAFE`` for the duration of the one release call and restore the
+        EXACT previous value in a ``finally``. Everything else is unchanged: any other
+        pyautogui failure still propagates (and a FailSafeException is still mapped if
+        an implementation ignores the suspension), so the error contract for releases
+        is identical apart from the corner.
+        """
+        previous = getattr(self._pa, "FAILSAFE", True)
+        self._pa.FAILSAFE = False
+        try:
+            self._perform(release_call)
+        finally:
+            self._pa.FAILSAFE = previous
+
     def move(self, x: int, y: int) -> None:
         self._perform(lambda: self._pa.moveTo(x, y))
 
@@ -1586,7 +2033,8 @@ class PyAutoGuiInputEngine(InputEngine):
         self._perform(lambda: self._pa.mouseDown(button=button))
 
     def mouse_up(self, button: str = "left") -> None:
-        self._perform(lambda: self._pa.mouseUp(button=button))
+        # DELTA 1 (F1): the halt-safe action — failsafe suspended for this one call.
+        self._perform_release(lambda: self._pa.mouseUp(button=button))
 
     def type_text(self, text: str, before_chunk: Callable[[], None] | None = None) -> None:
         sent = 0
@@ -1609,10 +2057,23 @@ class PyAutoGuiInputEngine(InputEngine):
     def chord(self, keys: list[str]) -> None:
         self._perform(lambda: self._pa.hotkey(*keys))
 
+    def key_down(self, key: str) -> None:
+        # Routed through _perform so a failsafe triggered DURING a hold maps onto the
+        # same InputBlockedError every other pyautogui dispatch raises (WP2, 107).
+        self._perform(lambda: self._pa.keyDown(key))
+
+    def key_up(self, key: str) -> None:
+        # DELTA 1 (F1): the halt-safe action — failsafe suspended for this one call.
+        self._perform_release(lambda: self._pa.keyUp(key))
+
     def release_modifiers(self, keys: list[str]) -> None:
-        """Key-up each named modifier via pyautogui (release mode, T8)."""
+        """Key-up each named modifier via pyautogui (release mode, T8).
+
+        DELTA 1 (F1): each release is the halt-safe action — failsafe suspended for
+        that one call (restored exactly afterwards, even on failure).
+        """
         for key in keys:
-            self._perform(lambda key=key: self._pa.keyUp(key))
+            self._perform_release(lambda key=key: self._pa.keyUp(key))
 
     def scroll(self, delta: int) -> None:
         self._perform(lambda: self._pa.scroll(delta))
@@ -1688,6 +2149,26 @@ class SendInputEngine(InputEngine):
             raise InputBlockedError(
                 "SendInput failsafe triggered (mouse in a screen corner); physical input halted."
             )
+        self._send_release(events)
+
+    def _send_release(self, events: list[_INPUT]) -> None:
+        """Dispatch one RELEASE batch, SKIPPING ONLY the failsafe corner check.
+
+        WP2 DELTA 1 (VAL-WP2 F1 BLOCKER): a release is the HALT-SAFE action. The
+        failsafe corner is the user's own abort gesture (fling the mouse into a
+        corner); if ``mouse_up``/``key_up``/``release_modifiers`` refused there, the
+        abort would leave a button or keys PHYSICALLY DOWN — stuck input rewrites
+        every later keystroke system-wide, which is strictly worse than the input the
+        user is aborting. So every release primitive routes through THIS path: the
+        corner check is skipped, and everything else is IDENTICAL to ``_send`` — the
+        non-Windows guard and the zero-return fail-closed check (``InputBlockedError``
+        when SendInput is blocked by UIPI or another input source) both stay.
+        Press/down/move/click/type/chord/scroll keep the corner check unchanged.
+        """
+        if not events:
+            return
+        if not IS_WINDOWS or _user32 is None:
+            raise InputBlockedError("Physical input requires Windows.")
         if self._dispatch(events) == 0:
             raise InputBlockedError(
                 "SendInput was blocked (UIPI or another input source); physical input halted."
@@ -1733,7 +2214,9 @@ class SendInputEngine(InputEngine):
             _down_flag, up_flag = _MOUSE_BUTTON_FLAGS[button]
         except KeyError as exc:
             raise ValueError(f"unsupported mouse button: {button!r}") from exc
-        self._send([_mouse_flag_event(up_flag)])
+        # DELTA 1 (F1): a release is the halt-safe action — skips the failsafe corner
+        # check ONLY (the zero-return fail-closed check stays); see ``_send_release``.
+        self._send_release([_mouse_flag_event(up_flag)])
 
     def type_text(self, text: str, before_chunk: Callable[[], None] | None = None) -> None:
         if not text:
@@ -1784,13 +2267,37 @@ class SendInputEngine(InputEngine):
     def chord(self, keys: list[str]) -> None:
         self._send([_key_event(vk, scan, flags) for vk, scan, flags in _chord_key_units(keys)])
 
+    def key_down(self, key: str) -> None:
+        """Press-half of the existing chord event list for one key (WP2, ORVEX-2026-107).
+
+        A key that needs shift (``VkKeyScanW``) has shift pressed FIRST here and it is
+        released LAST by ``key_up`` — the same stuck-modifier hygiene ``chord`` already
+        gets, inherited by the split rather than reinvented. Routing through ``_send``
+        keeps failsafe and zero-return fail-closed parity for free.
+        """
+        press, _release = _chord_key_halves([key])
+        self._send([_key_event(vk, scan, flags) for vk, scan, flags in press])
+
+    def key_up(self, key: str) -> None:
+        """Release-half of the existing chord event list for one key (WP2).
+
+        DELTA 1 (F1): a release is the halt-safe action — skips the failsafe corner
+        check ONLY (the zero-return fail-closed check stays); see ``_send_release``.
+        """
+        _press, release = _chord_key_halves([key])
+        self._send_release([_key_event(vk, scan, flags) for vk, scan, flags in release])
+
     def release_modifiers(self, keys: list[str]) -> None:
-        """Key-up each named modifier in ONE SendInput batch (release mode, T8)."""
+        """Key-up each named modifier in ONE SendInput batch (release mode, T8).
+
+        DELTA 1 (F1): a release is the halt-safe action — skips the failsafe corner
+        check ONLY; see ``_send_release``.
+        """
         events: list[_INPUT] = []
         for key in keys:
             vk, _needs_shift = _resolve_key_events(key)
             events.append(_key_event(vk, 0, _KEYEVENTF_KEYUP))
-        self._send(events)
+        self._send_release(events)
 
     def scroll(self, delta: int) -> None:
         self._send([_mouse_flag_event(_MOUSEEVENTF_WHEEL, (delta * _WHEEL_DELTA) & 0xFFFFFFFF)])
@@ -2931,6 +3438,88 @@ class _CaptureContext:
         )
 
 
+def _validate_action_defense(action: GroundedAction) -> None:
+    """WP2: fail-closed optional-field gate shared by real and fake backends.
+
+    The third enforcement site for the new optional fields (after the models'
+    construction validators and the pipeline validator's hold gate): a
+    ``model_construct``-style bypass carrying a misuse past both upstream gates dies
+    HERE, before a single engine call could be made. ``hold_ms=None`` /
+    ``duration_ms=None`` / absent plan markers ride through untouched.
+    """
+    if action.hold_ms is not None:
+        if action.action not in GroundedAction.HOLD_ACTIONS:
+            # ORVEX-2026-107: message only — the legal set is
+            # click/right_click/keypress/hotkey now; the type/range gate below is
+            # untouched, so a bad hold_ms is still stopped for the reason that matters.
+            raise ValueError("hold_ms is only valid on click/right_click/keypress/hotkey actions")
+        if (
+            isinstance(action.hold_ms, bool)
+            or not isinstance(action.hold_ms, int)
+            or not 0 <= action.hold_ms <= MAX_HOLD_MS
+        ):
+            raise ValueError(
+                f"hold_ms must be an integer between 0 and {MAX_HOLD_MS}; "
+                f"got {action.hold_ms!r}"
+            )
+    if action.duration_ms is not None:
+        if action.action != "move":
+            raise ValueError("duration_ms is only valid on move actions")
+        if (
+            isinstance(action.duration_ms, bool)
+            or not isinstance(action.duration_ms, int)
+            or not 0 <= action.duration_ms <= MAX_DURATION_MS
+        ):
+            raise ValueError(
+                f"duration_ms must be an integer between 0 and {MAX_DURATION_MS}; "
+                f"got {action.duration_ms!r}"
+            )
+    if (
+        isinstance(action.delta, bool)
+        or not isinstance(action.delta, int)
+        or not -20 <= action.delta <= 20
+    ):
+        raise ValueError(f"delta must be an integer between -20 and 20; got {action.delta!r}")
+    if action.plan_point_settle is not None and not isinstance(
+        action.plan_point_settle, bool
+    ):
+        raise ValueError(
+            "plan_point_settle must be a boolean when present; "
+            f"got {action.plan_point_settle!r}"
+        )
+    if action.plan_point_settle_ms is not None and (
+        isinstance(action.plan_point_settle_ms, bool)
+        or not isinstance(action.plan_point_settle_ms, int)
+        or not 0 <= action.plan_point_settle_ms <= MAX_PLAN_SETTLE_MS
+    ):
+        raise ValueError(
+            "plan_point_settle_ms must be an integer between 0 and "
+            f"{MAX_PLAN_SETTLE_MS}; got {action.plan_point_settle_ms!r}"
+        )
+
+
+def _plan_point_settle_seconds(action: GroundedAction) -> float:
+    """The settle a marked plan-point item owes, in seconds (WP2, SPEC 5.2).
+
+    The settle is a thing the MODEL STATES inside a plan: the effective value is the
+    point's declared ``settle_ms`` (carried on the internal, plan-only
+    ``GroundedAction.plan_point_settle_ms`` — E-01's wiring) when one was stated, and
+    otherwise the module policy ``_MOVE_SETTLE_SECONDS`` — which is ``0.0`` on the
+    shipped path. This helper deliberately does NOT introduce a new sleep site: the
+    settle branch still calls the one ``time.sleep`` it always called, now with the
+    resolved per-action value.
+    """
+    declared = action.plan_point_settle_ms
+    if declared is None:
+        return _MOVE_SETTLE_SECONDS
+    return declared / 1000.0
+
+
+def _mark_action_dispatched(action: GroundedAction) -> None:
+    """Record private B4-8 evidence after an input/fake dispatch actually returns."""
+    action._dispatch_started = True
+
+
 class ComputerBackend(ABC):
     """Platform contract: observation capture, stop-checked input, interruptible waiting."""
 
@@ -4025,7 +4614,39 @@ class LocalComputerBackend(ComputerBackend):
         call before), and engines raise :class:`InputBlockedError` on failsafe/blocked
         input, preserving the pre-SendInput error semantics. ``focus_hook`` (T8) runs
         before every ``type`` dispatch chunk after the stop check (focus continuity).
+
+        WP2 (ORVEX-2026-101 Batch 3, P3.2/D15): an action the plan queue marked with
+        ``plan_point_settle=True`` (its plan point's LAST item) settles ONCE here —
+        after the dispatch, before the pipeline's post-action observation, the same
+        position the legacy move settle occupied. Unmarked actions keep the exact
+        legacy behavior. The settle DURATION is the declared
+        ``plan_point_settle_ms`` (E-01's wiring: the model-stated value, consumed by
+        :func:`_plan_point_settle_seconds`); ``None`` falls back to the module policy.
+        WP7-SEAM(plan-settle-stamping): the producer that stamps
+        ``plan_point_settle``/``plan_point_settle_ms`` from a waypoint's ``settle_ms``
+        is the WP7 plan normalizer (plan.py does not exist yet); this consumer side is
+        complete and proven by tests/test_plan_settle_wiring.py.
         """
+        _validate_action_defense(action)
+        message = self._execute_dispatched(action, stop, focus_hook, allow_launch)
+        if action.plan_point_settle and _plan_point_settle_seconds(action) > 0:
+            # D15: a plan point settles ONCE after its LAST action — never per motion
+            # element. A raw sleep like the legacy settle (the queue re-checks the
+            # stop token between items). SPEC 5.1: the module policy default is 0.0 ms
+            # (the outside-plan move is instant), so this guard is false on the
+            # shipped path unless a settle was declared or configured.
+            time.sleep(_plan_point_settle_seconds(action))
+        return message
+
+    def _execute_dispatched(
+        self,
+        action: GroundedAction,
+        stop: StopToken | None = None,
+        focus_hook: Callable[[], None] | None = None,
+        allow_launch: bool = False,
+    ) -> str:
+        """Dispatch body of :meth:`execute` (WP2 Batch 3 split: the plan-point settle
+        tail lives in ``execute`` so it covers every branch, including early returns)."""
         if stop is not None:
             stop.ensure_live()
         engine = self._engine
@@ -4035,7 +4656,7 @@ class LocalComputerBackend(ComputerBackend):
                 time.sleep(total)
             else:
                 _sleep_for_wait_action(total, stop)
-            return f"Executed {action.action}."
+            return f"Executed {action.action}.{_wait_clamp_note(action.delta, total)}"
         if action.action in {"click", "double_click", "right_click"}:
             if action.point is None:
                 raise ValueError("A point is required for click actions")
@@ -4046,7 +4667,48 @@ class LocalComputerBackend(ComputerBackend):
             # same stop-check/single-transform discipline as the left-button clicks.
             clicks = 2 if action.action == "double_click" else 1
             button = "right" if action.action == "right_click" else "left"
-            engine.click(physical[0], physical[1], clicks=clicks, button=button)
+            if action.hold_ms is not None:
+                # WP2 (ORVEX-2026-101 Batch 1, P1.3): explicit press duration — move,
+                # press, sliced interruptible wait, release. Engine-agnostic: consumes
+                # the existing mouse_down/mouse_up contract primitives (P1.4: no engine
+                # change, both engines comply). Schema (P1.1) + validator (P1.2) already
+                # reject hold_ms on double_click before any motion; this fail-closed
+                # guard is the last line so a model_construct bypass can never be
+                # silently re-interpreted as a single held press. The computed duration
+                # is resolved BEFORE the press so even malformed bypass payloads fail
+                # with zero input dispatched.
+                if action.action == "double_click":
+                    raise ValueError("hold_ms is not valid on double_click actions")
+                hold_seconds = action.hold_ms / 1000.0
+                engine.move(physical[0], physical[1])
+                _mark_action_dispatched(action)
+                button_down = False
+                hold_error: BaseException | None = None
+                try:
+                    if stop is not None:
+                        stop.ensure_live()  # before mouse_down
+                    engine.mouse_down(button)
+                    button_down = True
+                    _wait_for_hold(hold_seconds, stop)
+                    if stop is not None:
+                        stop.ensure_live()  # before mouse_up
+                except BaseException as error:
+                    hold_error = error
+                    raise
+                finally:
+                    # The button is ALWAYS released — including on a mid-hold
+                    # TaskStopped (the stop is the kill path and must never leave
+                    # input held). A failing release never masks an in-flight error
+                    # such as TaskStopped.
+                    if button_down:
+                        try:
+                            engine.mouse_up(button)
+                        except Exception:
+                            if hold_error is None:
+                                raise
+            else:
+                engine.click(physical[0], physical[1], clicks=clicks, button=button)
+                _mark_action_dispatched(action)
         elif action.action == "drag":
             if action.point is None or action.to_point is None:
                 raise ValueError("Both a start point and an end point are required for drag actions")
@@ -4055,6 +4717,7 @@ class LocalComputerBackend(ComputerBackend):
             if stop is not None:
                 stop.ensure_live()  # before move(start)
             engine.move(start[0], start[1])
+            _mark_action_dispatched(action)
             if stop is not None:
                 stop.ensure_live()  # before mouseDown
             button_down = False
@@ -4087,10 +4750,123 @@ class LocalComputerBackend(ComputerBackend):
             if action.point is None:
                 raise ValueError("A point is required for move actions")
             physical = self._map_to_physical(action.point.x, action.point.y)
-            if stop is not None:
-                stop.ensure_live()  # before the single cursor reposition
-            engine.move(physical[0], physical[1])
-            time.sleep(_MOVE_SETTLE_SECONDS)  # settle only; a move is not an input press
+            # WP2 (ORVEX-2026-101 Batch 2, P2.3): the timed branch fires ONLY when a
+            # duration exists (an explicit field value, or the outside-plans env
+            # default when the field is absent). A bypass payload with a non-int or
+            # negative duration fails closed here — the last line before dispatch.
+            duration_ms = action.duration_ms
+            if duration_ms is not None and (
+                isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms < 0
+            ):
+                raise ValueError(
+                    f"duration_ms must be a non-negative integer; got {duration_ms!r}"
+                )
+            if duration_ms is None:
+                duration_ms = MOVE_DURATION_MS
+            if duration_ms > 0:
+                # Timed connected motion — the proven drag-loop pattern (points +
+                # per-point stop check + pacing), consuming the UNCHANGED engine.move
+                # primitive (P2.5: no InputEngine contract change; engine-agnostic so
+                # both engines comply). The path is computed in PHYSICAL pixels AFTER
+                # the single _map_to_physical transform (F1) — start from the actual
+                # cursor position, arrival exact regardless of shape/easing.
+                start = get_cursor_position()
+                if start is None:
+                    raise RuntimeError(
+                        "cursor position unavailable; cannot build a timed motion path"
+                    )
+                context = self._active_context
+                if context is None:
+                    context = self._build_default_context()
+                    self._active_context = context
+                path = _motion_path_points(
+                    start,
+                    physical,
+                    duration_ms,
+                    shape=MOVE_SHAPE,
+                    bend_px=MOVE_BEND_PX,
+                    easing=MOVE_EASING,
+                    target_interval_ms=PLAN_SAMPLE_INTERVAL_MS,
+                    bounds=context.monitor.bounds,
+                )
+                if not path:
+                    # DELTA 1 (F6): a timed move to the CURRENT position builds an empty
+                    # path — parity with the instant path: issue ONE engine.move to the
+                    # endpoint and mark dispatched, instead of silently looping zero
+                    # samples and never dispatching.
+                    if stop is not None:
+                        stop.ensure_live()
+                    engine.move(physical[0], physical[1])
+                    _mark_action_dispatched(action)
+                else:
+                    # DELTA 1 (F5): the pacing is DERIVED from the requested duration —
+                    # duration_ms / SEGMENTS (segments = samples - 1) — so the declared
+                    # duration is honoured across the whole legal band (a 5000 ms move
+                    # now costs ~5000 ms of pacing, not the fixed 12 ms slice that
+                    # capped it near ~1.5 s). Sample COUNT is unchanged (the 3..128
+                    # cap keeps determinism) and the 120 ms example stays 11 samples x
+                    # 12 ms, byte-identical (duration/segments = 120/10 = 12 ms).
+                    pacing = duration_ms / max(len(path) - 1, 1) / 1000.0
+                    for point_x, point_y in path:
+                        if stop is not None:
+                            stop.ensure_live()  # before every motion sample (drag-loop discipline)
+                        engine.move(point_x, point_y)
+                        _mark_action_dispatched(action)
+                        # Decision 2 (Batch 5): after each physical sample, best-effort
+                        # probe the existing physical cursor primitive. A foreign/user move
+                        # beyond the same ±2px predicate tolerance is corrected
+                        # immediately; no model round-trip and no timeout is involved. A
+                        # backend without the probe (a test double) simply degrades to the
+                        # normal path.
+                        probe = None
+                        try:
+                            probe = self.probe_cursor_position()
+                        except Exception:  # noqa: BLE001 - probe is best effort by contract
+                            probe = None
+                        if (
+                            isinstance(probe, tuple)
+                            and len(probe) == 2
+                            and all(
+                                isinstance(value, int) and not isinstance(value, bool)
+                                for value in probe
+                            )
+                            and (
+                                abs(probe[0] - point_x) > 2
+                                or abs(probe[1] - point_y) > 2
+                            )
+                        ):
+                            # Reassert the CURRENT deterministic sample immediately. The
+                            # next iteration continues toward the same endpoint; this
+                            # avoids a blind second full path while still restoring the
+                            # expected position without waiting for the model.
+                            if stop is not None:
+                                stop.ensure_live()
+                            engine.move(point_x, point_y)
+                            _mark_action_dispatched(action)
+                            action._repositions.append(
+                                {
+                                    "observed": [probe[0], probe[1]],
+                                    "expected": [point_x, point_y],
+                                    "attempt": len(action._repositions) + 1,
+                                }
+                            )
+                            continue  # no pacing wait after an immediate correction
+                        time.sleep(pacing)
+            else:
+                if stop is not None:
+                    stop.ensure_live()  # before the single cursor reposition
+                engine.move(physical[0], physical[1])
+                _mark_action_dispatched(action)
+            # WP2 (ORVEX-2026-101 Batch 3, P3.2/D15 + SPEC 5.1): the settle stays here
+            # — after the dispatch, once per move — ONLY for unmarked actions (the
+            # legacy policy: outside plans, and any action the queue did not mark). A
+            # plan transition move (marker False) settles NOT here; its point settles
+            # ONCE after the point's LAST action via the execute() tail. The DEFAULT
+            # policy is 0.0 ms (SPEC 5.1: the outside-plan move is instant — a
+            # behavior change vs v0.7.5's unconditional 50 ms); an operator who wants
+            # a settle sets ``CORTEX_MOVE_SETTLE_MS`` to 1..200.
+            if action.plan_point_settle is None and _MOVE_SETTLE_SECONDS > 0:
+                time.sleep(_MOVE_SETTLE_SECONDS)  # settle ONCE (both paths); a move is not an input press
         elif action.action == "type":
             if action.text is None:
                 raise ValueError("Text is required for type actions")
@@ -4102,7 +4878,15 @@ class LocalComputerBackend(ComputerBackend):
                 stop.ensure_live()
             self._apply_focus_settle()  # B8 settle after a recent focus transition
             self._apply_key_dispatch_gap(action.keys)  # B3 settle/gap policy
-            engine.chord(list(action.keys))
+            # WP2 (ORVEX-2026-107): hold_ms=None keeps the legacy single atomic chord
+            # batch byte-identical (D5); hold_ms=0 is an explicit zero-duration SPLIT
+            # press, not a chord fast-path (D2), so adjacent values never diverge in
+            # call count or release order.
+            if action.hold_ms is not None:
+                self._dispatch_held_keys(action, list(action.keys), stop)
+            else:
+                engine.chord(list(action.keys))
+                _mark_action_dispatched(action)
             self._last_key_dispatch = time.monotonic()
         elif action.action == "hotkey":
             # Sibling of keypress for COMPOUND chords (2..12 keys, passed verbatim in
@@ -4114,12 +4898,22 @@ class LocalComputerBackend(ComputerBackend):
                 stop.ensure_live()  # immediately before the single chord input
             self._apply_focus_settle()  # B8 settle after a recent focus transition
             self._apply_key_dispatch_gap(guard_keys)  # B3 settle/gap policy
-            engine.chord(list(action.keys))
+            # WP2 (ORVEX-2026-107): a held hotkey holds EVERY key SIMULTANEOUSLY for
+            # the duration and releases them in reverse order — "chord, then wait"
+            # would be vacuous, because a chord has already released everything by the
+            # time it returns (D1). hold_ms=None keeps the legacy chord
+            # byte-identical (D5).
+            if action.hold_ms is not None:
+                self._dispatch_held_keys(action, list(action.keys), stop)
+            else:
+                engine.chord(list(action.keys))
+                _mark_action_dispatched(action)
             self._last_key_dispatch = time.monotonic()
         elif action.action == "scroll":
             if stop is not None:
                 stop.ensure_live()
             engine.scroll(action.delta)
+            _mark_action_dispatched(action)
         elif action.action == "focus_window":
             return self._execute_focus_window(action)
         elif action.action == "ensure_app":
@@ -4136,6 +4930,70 @@ class LocalComputerBackend(ComputerBackend):
         else:
             raise UnsupportedActionError(f"Unsupported action: {action.action}")
         return f"Executed {action.action}."
+
+    def probe_cursor_position(self) -> tuple[int, int] | None:
+        """WP2 (Batch 5 decision 2): best-effort PHYSICAL cursor position probe.
+
+        Consumed by the timed-move interference check (the immediate re-assert).
+        Returns the same physical virtual-screen coordinates ``get_cursor_position``
+        reports, or ``None`` when the probe is unavailable (a backend/test double
+        without the capability degrades to the normal path — never raises).
+        """
+        return get_cursor_position()
+
+    def _dispatch_held_keys(
+        self, action: GroundedAction, keys: list[str], stop: StopToken | None
+    ) -> None:
+        """WP2 (ORVEX-2026-107): key-DOWN -> sliced interruptible wait -> key-UP
+        (reverse order).
+
+        The held-click discipline (Batch 1 P1.3) applied to keys, verbatim: the
+        duration is resolved BEFORE the first press so even a malformed bypass payload
+        dispatches nothing; ``stop.ensure_live()`` runs before every key-down AND
+        before the release; ``_mark_action_dispatched`` fires the moment the down-half
+        returns (input has physically left the process, so a mid-hold stop is honestly
+        "dispatched but unverified", never "cancelled before dispatch"); the wait is
+        the EXISTING ``_sleep_for_hold``/``HOLD_SLICE_SECONDS`` machinery (D4), never a
+        key-specific fork.
+
+        THE RELEASE IS UNCONDITIONAL. A key left physically down rewrites every
+        subsequent user keystroke on the operator's machine system-wide — this
+        ``finally`` is the whole reason the feature is safe, so it runs on EVERY exit
+        path: a mid-hold ``TaskStopped``, an engine or wait exception, or a stop
+        arriving between the last key-down and the wait. Every pressed key is released
+        in reverse press order (D1), each release is ATTEMPTED even if an earlier one
+        raises, and a failing release never masks the in-flight error.
+        """
+        hold_seconds = action.hold_ms / 1000.0
+        engine = self._engine
+        keys_down = 0
+        hold_error: BaseException | None = None
+        try:
+            for key in keys:
+                if stop is not None:
+                    stop.ensure_live()  # before every key_down: no orphan half-pressed chord
+                engine.key_down(key)
+                keys_down += 1
+            _mark_action_dispatched(action)
+            _wait_for_hold(hold_seconds, stop)
+            if stop is not None:
+                stop.ensure_live()  # before the first key_up
+        except BaseException as error:
+            hold_error = error
+            raise
+        finally:
+            release_error: BaseException | None = None
+            for index in range(keys_down - 1, -1, -1):
+                try:
+                    engine.key_up(keys[index])
+                except BaseException as error:  # noqa: BLE001 - a release must never abort the sweep
+                    # ``BaseException``, not ``Exception``: one key-up raising must not
+                    # abandon the remaining keys still physically down. The first
+                    # failure is recorded and re-raised only if nothing was in flight.
+                    if release_error is None:
+                        release_error = error
+            if release_error is not None and hold_error is None:
+                raise release_error
 
     def _execute_type(
         self,
@@ -4933,6 +5791,17 @@ class FakeComputerBackend(ComputerBackend):
         self.executed: list[GroundedAction] = []
         self.drags: list[tuple[tuple[int, int], tuple[int, int]]] = []
         self._drag_button_down = False
+        # WP2 (ORVEX-2026-107): the simulated keyboard — keys currently held by a
+        # ``hold_ms`` keypress/hotkey. Always cleared by ``_simulate_held_keys``'s
+        # ``finally``, including on a mid-hold stop (an aborted hold must not leave a
+        # simulated key stuck, the fake-side twin of a physically stuck key).
+        self.held_keys: list[str] = []
+        # DELTA 1 (F2): the simulated mouse buttons currently held by a ``hold_ms``
+        # click/right_click (same discipline as ``held_keys``: always cleared in the
+        # ``finally``, including on a mid-hold stop), and the timed moves RECORDED by
+        # duration-bearing ``move`` actions (endpoints + the declared duration).
+        self.held_buttons: list[str] = []
+        self.timed_moves: list[tuple[tuple[int, int], tuple[int, int], int]] = []
         self.observed: list[Observation] = []
         self._active_context: _CaptureContext | None = None
         # --- T8 interference-probe surface (inert by default; tests inject state) ---
@@ -5226,6 +6095,7 @@ class FakeComputerBackend(ComputerBackend):
         allow_launch: bool = False,
     ) -> str:
         """Record and simulate one action; the stop token gates every simulated input."""
+        _validate_action_defense(action)
         if stop is not None:
             stop.ensure_live()
         if action.action == "wait":
@@ -5235,7 +6105,8 @@ class FakeComputerBackend(ComputerBackend):
             else:
                 _sleep_for_wait_action(total, stop)
             self.executed.append(action)
-            return f"Simulated {action.action}."
+            _mark_action_dispatched(action)
+            return f"Simulated {action.action}.{_wait_clamp_note(action.delta, total)}"
         if self._input_blocked:
             raise InputBlockedError("FakeComputerBackend is configured to block physical input.")
         if action.action in {"click", "double_click", "right_click"}:
@@ -5244,12 +6115,29 @@ class FakeComputerBackend(ComputerBackend):
             # right_click parity: the fake performs the identical screenshot->physical
             # transform a real right-button press would (cursor lands on the point).
             self._cursor_physical = self._map_to_physical(action.point.x, action.point.y)
+            # DELTA 1 (F2): the fake MODELS a held click like it models a held key —
+            # record the hold (sliced, stop-honouring, always recorded as released).
+            # A fake that silently ignored hold_ms would let the unit suite diverge
+            # from the real backend (the divergence class this repo forbids).
+            if action.hold_ms is not None:
+                if action.action == "double_click":
+                    # Unreachable through every gate (model + validator + defense);
+                    # kept as the same last-line refusal the real path has.
+                    raise ValueError("hold_ms is not valid on double_click actions")
+                self._simulate_held_click(action, "right" if action.action == "right_click" else "left", stop)
         elif action.action == "move":
             if action.point is None:
                 raise ValueError("A point is required for move actions")
             # Unverifiable coordinate spaces raise CoordinateSpaceError identically to
             # click (shared _map_to_physical refusal) and record nothing.
+            previous = self._cursor_physical
             self._cursor_physical = self._map_to_physical(action.point.x, action.point.y)
+            # DELTA 1 (F2): a duration-bearing move is RECORDED as a timed move (the
+            # O3 precedent: the fake simulates no motion physics — harness only — but
+            # the timed intent and its endpoints are observable, so a test can tell a
+            # timed move from a jump).
+            if action.duration_ms:
+                self.timed_moves.append((previous, self._cursor_physical, action.duration_ms))
         elif action.action == "focus_window":
             target = (action.target or "").strip()
             candidate = self.find_window_by_title(target)
@@ -5270,6 +6158,13 @@ class FakeComputerBackend(ComputerBackend):
                 stop.ensure_live()
             self._apply_focus_settle()
             self._apply_key_dispatch_gap(keys)
+            # WP2 (ORVEX-2026-107): the fake MODELS the hold rather than skipping it —
+            # a fake that silently ignored hold_ms would let the whole unit suite
+            # diverge from the real backend, which is the divergence class this repo
+            # forbids. The wait is the SAME shared ``_sleep_for_hold`` the real path
+            # uses (D4), so slicing and cancellation behave identically on both sides.
+            if action.hold_ms is not None:
+                self._simulate_held_keys(action, keys, stop)
             self._last_key_dispatch = time.monotonic()
         elif action.action == "type":
             if action.text is None:
@@ -5283,6 +6178,7 @@ class FakeComputerBackend(ComputerBackend):
                 # paste/restore discipline as the real ctypes path, including the
                 # mid-transport abort restore (a pre-stopped token raises AFTER the set).
                 self.executed.append(action)  # this branch returns before the shared append
+                _mark_action_dispatched(action)
                 return self._simulate_type_clipboard(action, stop)
             if not action.text or not TYPE_INTEGRITY_ENABLED:
                 message = "Simulated type."
@@ -5328,6 +6224,7 @@ class FakeComputerBackend(ComputerBackend):
                                 0, total, mismatch=total, unverified=0, healed=0
                             )
             self.executed.append(action)  # this branch returns before the shared append
+            _mark_action_dispatched(action)
             return message
         elif action.action == "drag":
             if action.point is None or action.to_point is None:
@@ -5340,6 +6237,7 @@ class FakeComputerBackend(ComputerBackend):
             if stop is not None:
                 stop.ensure_live()  # before mouseDown
             self._drag_button_down = True
+            _mark_action_dispatched(action)
             try:
                 for segment_x, segment_y in _drag_segment_points(start, end):
                     if stop is not None:
@@ -5353,7 +6251,65 @@ class FakeComputerBackend(ComputerBackend):
                 self._drag_button_down = False
             self.drags.append((start, end))
         self.executed.append(action)
+        _mark_action_dispatched(action)
         return f"Simulated {action.action}."
+
+    def _simulate_held_keys(
+        self, action: GroundedAction, keys: list[str], stop: StopToken | None
+    ) -> None:
+        """WP2 (ORVEX-2026-107): fake parity for a held keypress/hotkey.
+
+        Mirrors the real ``_dispatch_held_keys`` discipline exactly — stop-checked
+        key-downs, ``_mark_action_dispatched`` once the keys are down (so an
+        interrupted hold is reported as dispatched-but-incomplete rather than
+        never-sent), the shared sliced ``_sleep_for_hold`` wait, and a ``finally`` that
+        ALWAYS clears the simulated keyboard. An aborted hold must not be recorded in
+        ``executed``: the append happens after this returns, which is the fake's
+        version of the real backend's "dispatched but not verified" split.
+        """
+        hold_seconds = action.hold_ms / 1000.0
+        keys_down = 0
+        try:
+            for key in keys:
+                if stop is not None:
+                    stop.ensure_live()  # before every simulated key_down
+                self.held_keys.append(key)
+                keys_down += 1
+            _mark_action_dispatched(action)
+            _wait_for_hold(hold_seconds, stop)
+            if stop is not None:
+                stop.ensure_live()  # before the first simulated key_up
+        finally:
+            # The simulated keyboard is ALWAYS cleared, including on a mid-hold
+            # TaskStopped; reverse press order, so this is also the release order.
+            del self.held_keys[len(self.held_keys) - keys_down :]
+
+    def _simulate_held_click(self, action: GroundedAction, button: str, stop: StopToken | None) -> None:
+        """DELTA 1 (F2): fake parity for a held click/right_click.
+
+        The held-click discipline of the real backend, in memory: the simulated button
+        goes DOWN (recorded in ``held_buttons``), ``_mark_action_dispatched`` fires once
+        the press is down, the wait is the SAME shared sliced ``_sleep_for_hold`` the
+        real path uses, and the ``finally`` ALWAYS releases the button — including on a
+        mid-hold ``TaskStopped`` (the stop is the kill path and must never leave input
+        held). An aborted hold must not be recorded in ``executed``: the shared append
+        happens after this returns, the fake's version of "dispatched but not
+        verified".
+        """
+        hold_seconds = action.hold_ms / 1000.0
+        pressed = False
+        try:
+            if stop is not None:
+                stop.ensure_live()  # before the simulated press
+            self.held_buttons.append(button)
+            pressed = True
+            _mark_action_dispatched(action)
+            _wait_for_hold(hold_seconds, stop)
+            if stop is not None:
+                stop.ensure_live()  # before the simulated release
+        finally:
+            if pressed:
+                self.held_buttons.remove(button)  # the release ALWAYS runs
 
     def _simulate_type_clipboard(self, action: GroundedAction, stop: StopToken | None) -> str:
         """Fake parity for ``via="clipboard"`` (v0.7.1 Defect C): save/set/paste/restore.

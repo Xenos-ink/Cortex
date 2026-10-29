@@ -172,6 +172,25 @@ class GroundingResult(BaseModel):
     notes: str | None = Field(default=None, max_length=1_000)
 
 
+#: WP2 (ORVEX-2026-101 Batch 1, P1.1): hard cap for the explicit click/key press
+#: duration. ``hold_ms`` above this is rejected fail-closed at construction (and
+#: again at the validator gate); ``None``/absent keeps the legacy press behavior
+#: byte-identical.
+MAX_HOLD_MS = 5_000
+
+#: WP2 (ORVEX-2026-101 Batch 2, P2.1): hard cap for the explicit transition duration
+#: (``duration_ms``, move-only). ``None``/absent keeps the legacy jump behavior
+#: byte-identical; ``0`` is an explicit zero-duration jump.
+MAX_DURATION_MS = 5_000
+
+#: WP2 (ORVEX-2026-102 §5.2, SPEC 5.2): hard band for the EXPLICIT per-point settle a
+#: plan declares (a waypoint's ``settle_ms``; the plan surface itself lands in WP7).
+#: ``0`` is a legal, meaningful value — it says "this point settles not at all". The
+#: upper edge is the ORVEX-2026-101 decision-4 ceiling, so a plan may still ask for
+#: the longest settle that was ever configurable.
+MAX_PLAN_SETTLE_MS = 200
+
+
 class GroundedAction(BaseModel):
     """A validated, executable action proposal.
 
@@ -191,6 +210,42 @@ class GroundedAction(BaseModel):
     chord through the existing hotkey path, for OpenGL/console apps whose input stack
     does not process per-character injection. The transport NEVER bypasses any gate:
     classification, redaction, and approval run on ``text`` identically for both values.
+
+    ``hold_ms`` (WP2, ORVEX-2026-101 Batch 1, additive; widened by ORVEX-2026-107 to
+    ``click``/``right_click``/``keypress``/``hotkey``) is an explicit press duration
+    in milliseconds. On a click it dispatches press -> sliced interruptible wait ->
+    release instead of the legacy single click event (whose physical down->up gap
+    measures ~0.03-0.16 ms). On a key action it holds EVERY named key down
+    simultaneously for the duration and releases them in reverse order (ORVEX-2026-107
+    D1 — "chord, then wait" would be vacuous, because a chord has already released
+    everything by the time it returns). ``None`` (absent) keeps the legacy path
+    byte-identical (still ONE atomic ``chord`` batch); ``0`` is an explicit zero hold
+    through the SAME split press/release path, never a chord fast-path (D2 — adjacent
+    values must not diverge in call count or release order). Bounds are fail-closed
+    (``0..MAX_HOLD_MS``); ``double_click`` is deliberately excluded — a two-click
+    duration is a different, deferred semantic. The duration NEVER bypasses any gate:
+    classification, redaction, and approval run identically for held and legacy
+    dispatches.
+
+    ``duration_ms`` (WP2, ORVEX-2026-101 Batch 2, additive; ``move`` actions ONLY) is
+    an explicit CONNECTED-MOTION duration in milliseconds: the backend interpolates a
+    deterministic path from the current cursor position to the target and dispatches
+    it over the requested time (the internal motion engine) instead of the legacy
+    single absolute jump. ``None`` (absent) keeps the legacy jump byte-identical;
+    ``0`` is an explicit zero-duration jump. Bounds are fail-closed
+    (``0..MAX_DURATION_MS``). Motion is an INTERNAL detail: the model declares
+    locations and actions only, and the duration NEVER bypasses any gate —
+    classification, redaction, and approval run identically for timed and legacy moves.
+
+    ``plan_point_settle`` (WP2, ORVEX-2026-101 Batch 3, P3.2/D15) is an INTERNAL
+    queue-attached marker — deliberately NOT mirrored on ``ActionSpec``, so no host
+    payload can carry it (P3.2 item 9: no surface). The plan queue sets it on plan
+    elements only: ``True`` on a plan point's LAST item (the backend settles ONCE
+    there, after that dispatch and before its post-action observation), ``False`` on
+    the transition moves of points that HAVE actions (they settle NOT after the move;
+    the point settles at its last action), and ``None`` (absent — every non-plan
+    action and every ``to_grounded`` conversion) keeps the legacy settle policy
+    byte-identical. There is no validator by design: the marker is never host data.
     """
 
     action: ActionType
@@ -205,12 +260,52 @@ class GroundedAction(BaseModel):
     expected_effect: str | None = Field(default=None, max_length=500)
     target: str | None = Field(default=None, max_length=200)
     via: str | None = Field(default=None, max_length=20)
+    # WP2 (ORVEX-2026-101 Batch 1): explicit press duration in ms; valid ONLY on the
+    # HOLD_ACTIONS family (fail-closed validator below); None keeps the legacy path.
+    hold_ms: int | None = Field(default=None, ge=0, le=MAX_HOLD_MS)
+    # WP2 (ORVEX-2026-101 Batch 2): explicit transition duration in ms; move-only
+    # (fail-closed validator below); None keeps the legacy jump.
+    duration_ms: int | None = Field(default=None, ge=0, le=MAX_DURATION_MS)
+    # WP2 (ORVEX-2026-101 Batch 3, P3.2/D15): INTERNAL plan-settle marker (see the
+    # docstring above). Never host-visible: ActionSpec does not mirror it, and
+    # to_grounded leaves it None (the legacy settle policy).
+    plan_point_settle: bool | None = Field(default=None)
+    # WP2 (ORVEX-2026-102 §5.2, SPEC 5.2): INTERNAL, plan-only, exactly like
+    # ``plan_point_settle`` above — ActionSpec deliberately does NOT mirror it, so no
+    # host payload on the flat surface can carry a settle, and ``to_grounded`` leaves
+    # it None. Set ONLY by the plan normalizer from the point's declared ``settle_ms``
+    # (WP7-SEAM(plan-settle-stamping): plan.py does not exist yet; this field and the
+    # backend consumer are the WP2 side of that seam). ``None`` means "no declared
+    # settle" and the dispatch path falls back to the module policy.
+    plan_point_settle_ms: int | None = Field(default=None, ge=0, le=MAX_PLAN_SETTLE_MS)
     action_id: str = Field(default_factory=_new_id)
     risk: RiskLevel | None = None
     grounding: GroundingResult | None = None
+    # Internal B4-8 evidence only: set after an input-engine call actually returns.
+    # Private attributes are excluded from model_dump/JSON, so this cannot become a
+    # host-visible plan marker; the queue uses it solely to distinguish a cancellation
+    # before dispatch from an input that was sent but could not be verified.
+    _dispatch_started: bool = PrivateAttr(default=False)
+    # WP2 (ORVEX-2026-101 Batch 5, decision 2): bounded internal evidence for a timed
+    # motion that observed cursor interference and immediately re-asserted its sample
+    # target. It is private so the established ActionSpec/JSON surface is unchanged;
+    # the agent copies it into the additive queue-entry/audit ``repositions`` field
+    # after execution.
+    _repositions: list[dict[str, Any]] = PrivateAttr(default_factory=list)
 
     #: v0.7.1: the ONLY valid non-None ``via`` values, and only on ``type`` actions.
     VIA_TRANSPORTS: ClassVar[tuple[str, ...]] = ("sendinput", "clipboard")
+
+    #: WP2 (ORVEX-2026-101 Batch 1, widened by ORVEX-2026-107): the ONLY actions a
+    #: non-None ``hold_ms`` is valid on. ``keypress``/``hotkey`` joined because a held
+    #: KEY is the capability the objective needs (continuous motion); the click pair
+    #: keeps the ORVEX-2026-101 hold. ``double_click`` is deliberately NOT here.
+    HOLD_ACTIONS: ClassVar[tuple[ActionType, ...]] = (
+        ActionType.CLICK,
+        ActionType.RIGHT_CLICK,
+        ActionType.KEYPRESS,
+        ActionType.HOTKEY,
+    )
 
     @model_validator(mode="after")
     def _via_type_only_known_values(self) -> GroundedAction:
@@ -232,6 +327,50 @@ class GroundedAction(BaseModel):
         if self.via not in self.VIA_TRANSPORTS:
             allowed = " or ".join(f'"{value}"' for value in self.VIA_TRANSPORTS)
             raise ValueError(f"via must be {allowed}; received {self.via!r}")
+        return self
+
+    @model_validator(mode="after")
+    def _hold_ms_hold_family_only(self) -> GroundedAction:
+        """``hold_ms`` is a press/hold duration: fail closed on any misuse.
+
+        WP2 (ORVEX-2026-101 Batch 1, P1.1), same additive-failure precedent as
+        ``via``, and the same fail-closed shape it keeps after ORVEX-2026-107 widened
+        the legal set from the click family to the click family PLUS
+        ``keypress``/``hotkey``: a ``hold_ms`` on ANY action outside ``HOLD_ACTIONS``
+        is a malformed action and fails construction (surfacing as the typed
+        ``invalid_action`` boundary error) so it can never reach the backend silently
+        ignored. ``double_click`` stays deliberately excluded — an explicit duration
+        for a two-click sequence is a different, deferred semantic. ``None`` (absent)
+        is the legacy path (one atomic ``chord``) and is never rejected.
+        """
+        if self.hold_ms is None:
+            return self
+        allowed = " or ".join(f'"{value.value}"' for value in self.HOLD_ACTIONS)
+        if self.action not in self.HOLD_ACTIONS:
+            raise ValueError(
+                "hold_ms is only valid on click/right_click/keypress/hotkey actions; "
+                f'received hold_ms={self.hold_ms} on action="{self.action.value}" '
+                f"(valid on: {allowed})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _duration_ms_move_only(self) -> GroundedAction:
+        """``duration_ms`` is a transition (move) duration: fail closed on any misuse.
+
+        WP2 (ORVEX-2026-101 Batch 2, P2.1), the same additive-failure precedent as
+        ``hold_ms``: a ``duration_ms`` on ANY non-move action is a malformed action
+        and fails construction (surfacing as the typed ``invalid_action`` boundary
+        error) so it can never reach the backend silently ignored. ``None`` (absent)
+        is the legacy jump and never rejected.
+        """
+        if self.duration_ms is None:
+            return self
+        if self.action is not ActionType.MOVE:
+            raise ValueError(
+                "duration_ms is only valid on move actions; "
+                f'received duration_ms={self.duration_ms} on action="{self.action.value}"'
+            )
         return self
 
     @model_validator(mode="after")
@@ -545,6 +684,17 @@ class ActionSpec(BaseModel):
     # {"action": "type", "via": "clipboard"} entry behaves EXACTLY like the equivalent
     # single action. Validation (type-only + known values) happens in GroundedAction.
     via: str | None = Field(default=None, max_length=20)
+    # WP2 (ORVEX-2026-101 Batch 1, P1.1): pass-through of the explicit press duration
+    # so a queued {"action": "click", "hold_ms": 250} entry behaves EXACTLY like the
+    # equivalent single action. Validation (HOLD_ACTIONS-only + bounds) happens in
+    # GroundedAction; None keeps the legacy queued behavior byte-identical.
+    hold_ms: int | None = Field(default=None, ge=0, le=MAX_HOLD_MS)
+    # WP2 (ORVEX-2026-101 Batch 2, P2.1): pass-through of the explicit transition
+    # duration so a queued {"action": "move", "duration_ms": 200} entry behaves
+    # EXACTLY like the equivalent single action. Validation (move-only + bounds)
+    # happens in GroundedAction; None keeps the legacy queued-move jump
+    # byte-identical.
+    duration_ms: int | None = Field(default=None, ge=0, le=MAX_DURATION_MS)
 
     def to_grounded(self, *, reason_prefix: str = "Explicit MCP action") -> GroundedAction:
         """Build the :class:`GroundedAction` this spec denotes (validation happens there)."""
@@ -560,6 +710,8 @@ class ActionSpec(BaseModel):
             expected_effect=self.expected_effect,
             target=self.target,
             via=self.via,
+            hold_ms=self.hold_ms,
+            duration_ms=self.duration_ms,
         )
 
 

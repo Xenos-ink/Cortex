@@ -1006,3 +1006,179 @@ async def test_mid_batch_limit_does_not_count_the_tripped_item_as_executed(
     queue_events = [e for e in events if e["event_type"] == "queue"]
     assert queue_events and queue_events[-1]["metadata"]["stopped_reason"] == "limit_exceeded"
     assert queue_events[-1]["metadata"]["executed"] == 1  # item 1 dispatched nothing
+
+
+
+
+# --- WP2: the input-engine duration fields on the contract surfaces --------------------------
+
+
+async def test_held_click_follow_up_item_reply_verified(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP2 §-node: a queued HELD click's reply obeys the §1 contract on the
+    follow_up_item surface (pixel-flip fake -> verified), and the echo names the
+    hold exactly. The primary flat reply is validated too."""
+    backend = ScriptedBackend(flip=True)
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(
+            session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
+            follow_ups=[{"action": "click", "x": 30, "y": 30, "hold_ms": 250}],
+        )
+    )
+    validate_reply(payload, "flat_execute")
+    entries = payload["follow_up_results"]
+    assert len(entries) == 2  # index 0 = the primary, index 1 = the queued held click
+    for entry in entries:
+        validate_reply(entry, "follow_up_item")
+    assert entries[1]["result"] == "verified"
+    assert entries[1]["ok"] is True
+    assert entries[1]["hold_ms"] == 250
+    assert backend.executed[1].hold_ms == 250  # the dispatched twin
+
+
+async def test_held_click_follow_up_item_reply_uncertain(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP2 §-node: the same held click against the static-screen fake -> the honest
+    ``uncertain`` token (never upgraded), still contract-valid."""
+    backend = ScriptedBackend(flip=False)
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(
+            session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
+            follow_ups=[{"action": "click", "x": 30, "y": 30, "hold_ms": 100}],
+        )
+    )
+    entries = payload["follow_up_results"]
+    for entry in entries:
+        validate_reply(entry, "follow_up_item")
+    assert entries[1]["result"] == "uncertain"
+    assert entries[1]["ok"] is False
+    assert entries[1]["hold_ms"] == 100
+
+
+async def test_hold_ms_misuse_is_a_rejection_envelope(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP2 §-node: ``hold_ms`` on a non-hold action is a §1 rejection —
+    {ok False, result 'rejected', reasons[...]}, the typed ``invalid_action`` code
+    first, the enforcing rule named in the message, NEVER an ``error`` key.
+    Zero items run (the boundary pre-validates every queue item)."""
+    backend = ScriptedBackend(flip=True)
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(
+            session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
+            follow_ups=[{"action": "move", "x": 30, "y": 30, "hold_ms": 250}],
+        )
+    )
+    validate_reply(payload, "flat_execute")
+    assert payload["result"] == "rejected"
+    assert_rejection(payload)
+    assert payload["reasons"][0] == "invalid_action"
+    assert "hold_ms is only valid on click/right_click/keypress/hotkey actions" in payload["message"]
+    assert backend.executed == []  # nothing dispatched
+
+
+async def test_duration_ms_misuse_is_a_rejection_envelope(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP2 §-node: ``duration_ms`` on a non-move action is the same §1 rejection."""
+    backend = ScriptedBackend(flip=True)
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(
+            session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
+            follow_ups=[{"action": "click", "x": 30, "y": 30, "duration_ms": 200}],
+        )
+    )
+    validate_reply(payload, "flat_execute")
+    assert payload["result"] == "rejected"
+    assert_rejection(payload)
+    assert payload["reasons"][0] == "invalid_action"
+    assert "duration_ms is only valid on move actions" in payload["message"]
+    assert backend.executed == []
+
+
+async def test_queued_hold_ms_out_of_band_is_a_rejection_envelope(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP2 §-node: an out-of-band ``hold_ms`` (over MAX_HOLD_MS) is rejected at the
+    ActionSpec schema itself — the same §1 rejection envelope."""
+    backend = ScriptedBackend(flip=True)
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(
+            session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
+            follow_ups=[{"action": "keypress", "keys": ["a"], "hold_ms": 9999}],
+        )
+    )
+    validate_reply(payload, "flat_execute")
+    assert payload["result"] == "rejected"
+    assert_rejection(payload)
+    assert backend.executed == []
+
+
+async def test_invalid_follow_up_entry_field_set_parity(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VAL-WP1 carry-over: the hand-built pre-dispatch ``invalid_follow_up`` queue
+    entry carries the SAME field set as every pipeline-built entry — ``action_id``
+    and ``ensure_app_outcome`` present (None: nothing dispatched, nothing to own a
+    value). Pinned on the agent-level outcome (the boundary answers the same wire
+    condition with the teaching rejection before the queue ever runs)."""
+    from computer_use_mcp.agent import ComputerUseAgent
+    from computer_use_mcp.models import ActionSpec, ActionType, GroundedAction
+
+    backend = ScriptedBackend(flip=False)
+    _session_id, bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    agent: ComputerUseAgent = bundle.agent
+    primary = GroundedAction(
+        action=ActionType.CLICK, point={"x": 10, "y": 10}, reason="parity pin", confidence=1.0
+    )
+    outcome = await agent.run_single(
+        bundle.state,
+        primary,
+        approved=True,
+        follow_ups=[ActionSpec(action=ActionType.FOCUS_WINDOW)],  # no target: invalid
+    )
+    assert outcome.kind == "rejected"
+    assert outcome.follow_ups_stopped_reason == "invalid_follow_up"
+    entry = (outcome.follow_up_results or [])[0]
+    assert entry["action_id"] is None
+    assert entry["ensure_app_outcome"] is None
+    assert entry["result"] == "rejected" and entry["ok"] is False
+    # DELTA 1 (F8): the hand-built entry must satisfy the §1 follow_up_item contract
+    # on its own (rejection envelope, no error key), and its KEY SET must equal a
+    # PIPELINE-BUILT rejected entry's key set exactly — parity is not established by
+    # subtracting keys, only by comparing the real shapes.
+    validate_reply(entry, "follow_up_item")
+
+    rejected_outcome = await agent.run_single(
+        bundle.state,
+        GroundedAction(
+            action=ActionType.CLICK, point={"x": 14, "y": 14}, reason="parity twin", confidence=1.0
+        ),
+        approved=True,
+        # a pipeline-built REJECTION: the item passes conversion but fails grounding
+        # validation in the pipeline (missing keys), so it gets the full §1 treatment
+        follow_ups=[ActionSpec(action=ActionType.KEYPRESS, keys=[])],
+    )
+    built = (rejected_outcome.follow_up_results or [])[1]
+    assert built["kind"] == "rejected" and built["result"] == "rejected"
+    validate_reply(built, "follow_up_item")
+    assert set(entry) == set(built), (sorted(entry), sorted(built))
