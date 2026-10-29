@@ -171,6 +171,38 @@ _INTRA_STEP_EXEMPT_PHASES = frozenset({"validate", "post_action", "revalidate"})
 #: Cursor-at-target tolerance for the deterministic ``move`` verification predicate (px).
 _CURSOR_TOLERANCE_PX = 2
 
+# --- WP4a (ORVEX-2026-108): F2-1 mismatch veto + F2-3/E-02 late-repaint re-capture ------------
+
+#: F2-1 — confidence an R-04 ``integrity=mismatch`` demotion lands at. A disagreement
+#: about the FOCUSED CONTROL is a failure to prove, not a definitive failure of the
+#: action, so the verdict becomes the abstain band and ``ok`` becomes False.
+_TYPE_MISMATCH_DEMOTION_CONFIDENCE = 0.4
+
+#: F2-3 — settle BEFORE the single late-repaint re-capture, in seconds. The
+#: post-action capture lands 16-32 ms after dispatch and is rate-exempt
+#: (:data:`_INTRA_STEP_EXEMPT_PHASES`), so a UI that repaints a millisecond later used
+#: to be missed forever with no retry at all — the measured cliff was 0 ms -> verified,
+#: 1 ms -> uncertain.  When the verdict is ``uncertain`` **specifically** because the
+#: two frames were byte-identical, the agent waits this long and takes exactly ONE more
+#: ``post_action`` capture, so the cliff moves from "1 ms" to "past the settle".
+#: Sized after the measured dispatch->capture gap (16-32 ms) and the repo's own
+#: ``TYPE_VERIFY_SETTLE_SECONDS = 0.05``.
+_IDENTICAL_FRAME_RECHECK_SETTLE_SECONDS = 0.05
+
+#: E-02 hard bound on the late-repaint recovery: exactly ONE re-capture, ever. A world
+#: that repaints later than the settle stays ``uncertain`` — a single bounded retry,
+#: never a poll loop.
+_IDENTICAL_FRAME_RECHECK_LIMIT = 1
+
+#: E-02 conditioning: the ONE late-repaint re-capture fires ONLY when a fresh frame
+#: could plausibly carry NEW evidence — i.e. the intent states an ``expected_effect``
+#: (the verdict is about a described transition, so a late repaint can still prove it)
+#: OR the action class is repaint-prone (``type``/``scroll``: the screen keeps moving
+#: after dispatch by the nature of the action). An effect-less ``click``/``move``/
+#: ``keypress`` on a static screen performs ZERO extra captures — captures/action
+#: stays at the WP0 baseline (3.0 on the fake backend).
+_REPAINT_PRONE_ACTIONS = frozenset({ActionType.TYPE, ActionType.SCROLL})
+
 # --- unified reply contract (ORVEX-2026-108 MASTER MISSION §1) --------------------------------
 
 #: §1.2 marker kinds — action types that are MARKERS, not screen claims. ``done`` is
@@ -465,6 +497,125 @@ def _cursor_predicate(
         )
 
     return _cursor_at_target, "cursor_at_target"
+
+
+# --- F2-1 / F2-3 (ORVEX-2026-108 WP4a) ---------------------------------------------------------
+
+
+def _is_identical_frame_uncertain(result: VerificationResult) -> bool:
+    """Whether this ``uncertain`` is specifically "the two frames were byte-identical".
+
+    F2-3's trigger condition, decided from evidence ALREADY IN HAND: the visual tier
+    computes ``CaptureProvenance`` (sha256 + byte size of each of the two frames it
+    diffed) and the combined all-uncertain result carries it forward
+    (``VerificationEngine._combine``), so "the screen did not move at all" is a free
+    read.  ``None`` provenance (a deterministic tier decided first, a starved ladder)
+    and a NON-identical pair (a sub-threshold change, which is a different evidence
+    class) both return False — the re-capture is reserved for the case where one more
+    frame could plausibly carry NEW evidence.
+    """
+    if result.outcome != "uncertain":
+        return False
+    provenance = result.capture_provenance
+    if provenance is None:
+        return False
+    return (
+        provenance.before_bytes == provenance.after_bytes
+        and provenance.before_sha256 == provenance.after_sha256
+    )
+
+
+def _type_integrity_status(message: str) -> str | None:
+    """The bare R-04 status token out of a ``type`` action message suffix.
+
+    ``backend.py:_format_integrity_status`` appends ``integrity=<status>(<n>/<total>)``
+    (plus optional ``healed=``) to the ``Executed type.`` message.  Returns ``None``
+    when the message carries no integrity suffix at all (a non-type action, or a
+    backend that does not run the R-04 reader).
+    """
+    text = str(message or "")
+    marker = "integrity="
+    if marker not in text:
+        return None
+    return text.split(marker, 1)[1].split()[0].split("(")[0] or None
+
+
+def _apply_type_integrity_status(
+    result: VerificationResult, message: str, *, changed: bool
+) -> VerificationResult:
+    """Let the R-04 read-back status annotate — and, on ``mismatch``, veto — a verdict.
+
+    Two producers answer two different questions about one ``type`` action and their
+    answers used to be able to contradict each other in the SAME payload:
+
+    * R-04 (``backend.py:_execute_type``) asks the FOCUSED CONTROL — the authoritative,
+      target-scoped reader — "does your read-back end with what we typed?".  It
+      reports ``verified | partial | unverified | mismatch`` and deliberately refuses
+      to repair a disagreement (a masked/transformed buffer would double-apply), so
+      ``mismatch`` is a strong statement: the text is not in the control.
+    * the agent's ladder (``verification.py:UiControlTextStrategy``) asks a WEAKER
+      question — "does the needle appear in the window TITLE or any of the first 50
+      UI-control name/value fields" — and a title that merely mirrors the typed text
+      matched it, producing ``ok=True / outcome=verified / confidence 0.9`` beside
+      ``integrity=mismatch(0/4)``.
+
+    Decision D-2a: the strong, target-scoped read-back outranks the substring match, so
+    ``mismatch`` is NOT ``verified``.  The status is added as an **additive** evidence
+    line (and named in the note) so the driver learns WHY, not merely that it failed.
+
+    **``unverified`` is deliberately NOT a veto** and that co-occurrence is
+    intentional: "no read-back was possible" is an ABSENCE of evidence about the
+    focused control, not a disagreement, so a title/control match is still a
+    legitimate uncontradicted answer.  It is annotated on the same additive channel
+    (the split is disclosed, never silent) and its verdict is untouched.
+    """
+    status = _type_integrity_status(message)
+    if status is None:
+        return result
+    if status == "mismatch" and result.outcome == "verified":
+        line = (
+            f"type_integrity={status}: the FOCUSED CONTROL's read-back does not end "
+            "with the typed text, so the window-title/UI-control match cannot stand "
+            "as proof that the text landed."
+        )
+        return VerificationResult(
+            outcome="uncertain",
+            changed=changed,
+            note=(
+                "A window-title/UI-control match reported the typed text as found, but "
+                f"the focused control's read-back says {status} — the strong, "
+                "target-scoped read-back outranks a substring match, so the action is "
+                "not verified. Re-observe and decide; a masked or transformed field "
+                "may legitimately hold something else. Uncertain is never success. | "
+                f"{line}"
+            )[:900],
+            confidence=min(result.confidence, _TYPE_MISMATCH_DEMOTION_CONFIDENCE),
+            evidence=[*result.evidence, line],
+            verification_method=result.verification_method,
+            observation_id=result.observation_id,
+            capture_provenance=result.capture_provenance,
+        )
+    if status in {"unverified", "partial"}:
+        # Annotate only: the verdict is exactly what the ladder decided.
+        line = (
+            f"type_integrity={status}: the focused control's read-back "
+            + (
+                "could not be obtained, which is an absence of evidence about that "
+                "control and does not contradict the verdict above."
+                if status == "unverified"
+                else "matched only part of the typed text; the verdict above is the "
+                "ladder's own and is unchanged by this status."
+            )
+        )
+        if line in result.evidence:
+            return result
+        return result.model_copy(
+            update={
+                "evidence": [*result.evidence, line],
+                "note": f"{result.note} | {line}"[:900],
+            }
+        )
+    return result
 
 
 @dataclass
@@ -1261,8 +1412,20 @@ class ComputerUseAgent:
         before: Observation,
         after: Observation,
         action: GroundedAction | None = None,
-    ) -> VerificationResult:
-        """VERIFY phase: strategy chain or provider judge; uncertain never becomes success."""
+        *,
+        record: bool = True,
+        return_tier: bool = False,
+    ) -> Any:
+        """VERIFY phase: strategy chain or provider judge; uncertain never becomes success.
+
+        ``record=False`` runs the ladder WITHOUT emitting the metrics/audit event, so a
+        caller that may run it MORE THAN ONCE for one action (F2-3's single
+        late-repaint re-capture, the expected-text fallback) can record the FINAL
+        verdict exactly once via :meth:`_record_verification` instead of one event per
+        attempt. ``return_tier=True`` returns ``(result, ladder_tier)`` so that single
+        record names the tier that actually decided. Both default off, so every
+        existing caller is byte-identical.
+        """
         started = time.perf_counter()
         ladder_tier = "engine"
         try:
@@ -1295,6 +1458,41 @@ class ComputerUseAgent:
         # the verdict; the verdict itself is never altered).
         result, capture_marker = self._capture_source_guard(action, result)
         duration_ms = (time.perf_counter() - started) * 1000.0
+        if record:
+            self._record_verification(
+                result,
+                intent,
+                after,
+                action,
+                ladder_tier=ladder_tier,
+                duration_ms=duration_ms,
+                capture_marker=capture_marker,
+            )
+        return (result, ladder_tier) if return_tier else result
+
+    def _record_verification(
+        self,
+        result: VerificationResult,
+        intent: VerificationIntent,
+        after: Observation,
+        action: GroundedAction | None,
+        *,
+        ladder_tier: str,
+        duration_ms: float,
+        capture_marker: str | None,
+    ) -> None:
+        """Emit the ONE metrics + audit record for one action's verification.
+
+        Split out of :meth:`_verify` (F2-3) so a verification that runs the ladder more
+        than once for a single action — the one late-repaint re-capture, the
+        expected-text fallback — still produces exactly one audit event carrying the
+        FINAL verdict, and exactly one latency sample for the whole verification. The
+        audit ``result`` and the reply verdict are produced from the same object at
+        record time, so they agree HERE. The ONE known exception is pre-existing
+        (v0.7.5) ordering, owned by WP4b / E-05: the post-action FOCUS_DRIFTED
+        demotion (verified -> failed) runs AFTER this record, so on that path the
+        audit row says ``verified`` while the reply says ``failed`` (F2, VAL-WP4a).
+        """
         self.metrics.record_latency("verification_ms", duration_ms)
         if result.outcome == "verified":
             self.metrics.incr("verification_verified")
@@ -1327,7 +1525,6 @@ class ComputerUseAgent:
                 "capture_source_suspected": capture_marker,
             },
         )
-        return result
 
     # ------------------------------------------------------------------ direct actions
 
@@ -2250,7 +2447,47 @@ class ComputerUseAgent:
                         observation_id=after.observation_id,
                     )
             else:
-                verification = await self._verify(intent, observation, after, action=action)
+                # F2-3: the ladder may run more than once for ONE action (the single
+                # late-repaint re-capture below, the expected-text fallback), so the
+                # ladder runs unrecorded and the FINAL verdict is audited exactly once
+                # by ``_record_verification`` after the block.
+                verify_started = time.perf_counter()
+                ladder_tier = "engine"
+                # F1 (VAL-WP4a): the primary ladder run returns its REAL tier so the
+                # single audit record names it (v0.7.5 behaviour), exactly like the
+                # recapture and fallback branches below.
+                verification, ladder_tier = await self._verify(
+                    intent, observation, after, action=action, record=False, return_tier=True
+                )
+                # F2-3 + E-02: an ``uncertain`` that is SPECIFICALLY "the two frames
+                # were byte-identical" earns ONE late-repaint re-capture — but only
+                # when a fresh frame could plausibly carry NEW evidence (E-02
+                # conditioning): a stated ``expected_effect`` (the verdict is about a
+                # described transition a late repaint can still prove) or a
+                # repaint-prone action class (type/scroll). An effect-less
+                # click/move/keypress on a static screen performs ZERO extra captures
+                # (captures/action stays at the WP0 baseline). Bounded to exactly ONE
+                # re-capture (``_IDENTICAL_FRAME_RECHECK_LIMIT``); the capture phase is
+                # the rate-exempt ``post_action``. A NON-identical uncertain is
+                # deliberately left alone: re-capturing there would let noise upgrade a
+                # verdict, which the doctrine forbids.
+                if (
+                    _is_identical_frame_uncertain(verification)
+                    and (
+                        # F6 (VAL-WP4a): read the INTENT's effect — ``_build_intent``
+                        # merges the parameter AND ``action.expected_effect``, so an
+                        # effect riding only on the action conditions the recapture too.
+                        bool(intent.expected_effect)
+                        or action.action in _REPAINT_PRONE_ACTIONS
+                    )
+                ):
+                    if self.stop_token.wait(_IDENTICAL_FRAME_RECHECK_SETTLE_SECONDS):
+                        self.stop_token.ensure_live()
+                    after = self._observe("post_action")
+                    self.metrics.incr("verification_recapture")
+                    verification, ladder_tier = await self._verify(
+                        intent, observation, after, action=action, record=False, return_tier=True
+                    )
                 # T8 B2: an uncertain expected-text verdict (typed text invisible to
                 # window/UI-control evidence) routes to the reliable pixel-diff tier.
                 if (
@@ -2261,9 +2498,31 @@ class ComputerUseAgent:
                     # deterministic visual-change check; the final outcome still comes
                     # from evidence; uncertain is never upgraded.
                     fallback_intent = self._build_intent(action, "visual_change", expected_effect)
-                    verification = await self._verify(
-                        fallback_intent, observation, after, action=action
+                    verification, ladder_tier = await self._verify(
+                        fallback_intent, observation, after, action=action, record=False, return_tier=True
                     )
+                if action.action is ActionType.TYPE:
+                    # F2-1: the focused control's R-04 read-back outranks a title/control
+                    # substring match — an ``integrity=mismatch`` vetoed verified to the
+                    # honest §1 token (uncertain, ok False), never ok:true. Applied
+                    # BEFORE the single audit record so the audit 'verification' event
+                    # and the reply verdict agree here (contract item d; the ONE
+                    # remaining audit/reply disagreement — the post-action drift
+                    # demotion after the record — is pre-existing ordering owned by
+                    # WP4b / E-05, F2 VAL-WP4a).
+                    verification = _apply_type_integrity_status(
+                        verification, outcome_message, changed=verification.changed
+                    )
+                _, capture_marker = self._capture_source_guard(action, verification)
+                self._record_verification(
+                    verification,
+                    intent,
+                    after,
+                    action,
+                    ladder_tier=ladder_tier,
+                    duration_ms=(time.perf_counter() - verify_started) * 1000.0,
+                    capture_marker=capture_marker,
+                )
             if pre_annotation:
                 post_annotations.insert(0, pre_annotation)
             if post_annotations:

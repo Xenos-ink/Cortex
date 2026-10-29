@@ -470,7 +470,10 @@ def test_focus_change_signal_verdict_identical_png_vs_rawkey() -> None:
     strategy = FocusChangeStrategy()
     png_result = strategy.verify(intent, png_obs(before_img), png_obs(after_img))
     key_result = strategy.verify(intent, rawkey_obs(before_img), rawkey_obs(after_img))
-    assert png_result.outcome == key_result.outcome == "verified"
+    # F1 fix 1.1 (WP4a/E-03 port): the corroborated-digest signal now abstains (a
+    # pixel magnitude is not the described effect).  The POINT of this pin is
+    # unchanged — the two payload forms must reach the SAME verdict.
+    assert png_result.outcome == key_result.outcome == "uncertain"
     assert png_result.changed == key_result.changed
     # the diff tier itself is payload-agnostic (frames stash): identical verdicts
     diff = ScreenshotDiffStrategy()

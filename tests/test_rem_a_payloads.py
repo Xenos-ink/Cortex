@@ -198,7 +198,11 @@ async def test_follow_up_results_carry_no_images_and_are_slim(
     assert isinstance(result, list) and len(result) == 2
     text_block, image_block = result
     payload = json.loads(text_block.text)
-    assert payload["ok"] is True
+    # F1 fix 1.1 (WP4a/E-03 port): the actions state effects, so their verdicts
+    # abstain (uncertain). What this test pins — the entries are SLIM (no image blob,
+    # no duplicated result) — is asserted below and is unchanged.
+    assert payload["result"] == "uncertain"
+    assert payload["ok"] is False
     assert payload["follow_ups_stopped_reason"] is None
     entries = payload["follow_up_results"]
     assert len(entries) == 3
@@ -207,10 +211,10 @@ async def test_follow_up_results_carry_no_images_and_are_slim(
     # H6: the primary action NEVER carries a duplicated result blob...
     # §1 (ORVEX-2026-108): ``result`` IS on every entry — as the closed §1.2 token
     # string, never as a duplicated result blob.
-    assert primary["result"] == "verified"
+    assert primary["result"] == "uncertain"
     assert "screenshot_after_base64" not in primary
     # ...its essentials ride the TOP-LEVEL payload instead.
-    assert primary["index"] == 0 and primary["ok"] is True
+    assert primary["index"] == 0 and primary["ok"] is False
     assert primary["action_type"] == "click"
 
     for entry in entries:

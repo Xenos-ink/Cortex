@@ -510,7 +510,10 @@ async def test_blocked_input_dismisses_then_succeeds(
     assert blocked["error"] == "action_error"
     assert "InputBlockedError" in blocked["message"]
 
-    # The host-driven dismiss then re-click (the documented live pattern) succeeds.
+    # The host-driven dismiss then re-click (the documented live pattern): the re-click
+    # still dispatches exactly once. RE-PINNED by WP4a (E-03): its stated effect over a
+    # generic flip is the honest ``uncertain`` (ok False), not a pixel-laundered
+    # ok=True — the dispatch/audit guarantees this test pins are unchanged.
     dismissed = await server.computer_execute(session_id, "keypress", keys=["esc"])
     dismissed_payload = _executed_payload(dismissed)
     assert dismissed_payload["ok"] is True, dismissed_payload
@@ -518,7 +521,8 @@ async def test_blocked_input_dismisses_then_succeeds(
         session_id, "click", x=70, y=90, expected_effect="dialog handled"
     )
     retry_payload = _executed_payload(retry)
-    assert retry_payload["ok"] is True, retry_payload
+    assert retry_payload["result"] == "uncertain", retry_payload
+    assert retry_payload["ok"] is False, retry_payload
     assert executed_summary(backend) == [
         ("keypress", None, None),
         ("click", (70, 90), None),

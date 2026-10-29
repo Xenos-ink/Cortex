@@ -411,16 +411,20 @@ def test_frozen_source_marks_third_distinct_action_and_verdicts_stay_honest() ->
         assert provenance_meta.startswith("before=") and "after=" in provenance_meta
 
 
-def test_live_capture_never_marks_and_changed_pairs_verify() -> None:
+def test_live_capture_never_marks_and_changed_pairs_stay_honest() -> None:
     # a genuinely LIVE source: every action's post-capture differs from its premise,
-    # so no identical pair ever accumulates and every stated change verifies.
+    # so no identical pair ever accumulates. RE-PINNED by WP4a (E-03): the stated
+    # effect is no longer verified by the generic pixel change — the verdict is the
+    # honest ``uncertain`` (ok False); the detector's own pins (never marks, differing
+    # provenance, zero counter) are unchanged.
     backend = _CaptureCountingBackend(flip_script=[True, True, True, True])
     agent = _agent(backend)
     outcomes = _run_actions(agent, [_keypress() for _ in range(4)])
 
     for outcome in outcomes:
         verification = outcome.result.verification
-        assert verification is not None and verification.outcome == "verified"
+        assert verification is not None and verification.outcome == "uncertain"
+        assert outcome.result.ok is False
         assert verification.capture_provenance is not None
         assert verification.capture_provenance.before_sha256 != (
             verification.capture_provenance.after_sha256
@@ -447,26 +451,40 @@ def test_reset_after_real_change_restarts_the_count_at_three() -> None:
         False, False, False, False, False, True,
     ]
     assert f"{CAPTURE_SOURCE_SUSPECTED} identical_pairs=3" in markers[-1]
-    # the reset action itself verified the real change
-    assert outcomes[2].result.verification.outcome == "verified"  # type: ignore[union-attr]
+    # the reset action itself SAW the real change (differing pair). RE-PINNED by WP4a
+    # (E-03): a stated effect over a real pixel change is ``uncertain``, not verified.
+    assert outcomes[2].result.verification.outcome == "uncertain"  # type: ignore[union-attr]
+    assert outcomes[2].result.verification.capture_provenance is not None  # type: ignore[union-attr]
+    assert outcomes[2].result.verification.capture_provenance.before_sha256 != (  # type: ignore[union-attr]
+        outcomes[2].result.verification.capture_provenance.after_sha256  # type: ignore[union-attr]
+    )
 
 
 def test_detector_and_provenance_perform_zero_new_captures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The guard consumes frames ALREADY in hand: observe-call counts must be byte-for-
-    byte equal with the detector active vs fully disabled (provenance stubbed to None)."""
+    """The guard consumes frames ALREADY in hand: observe-call counts must attribute
+    EVERY extra capture to the bounded late-repaint re-capture (a separate consumer
+    of the same provenance, F6: the keypress's action-level stated effect conditions
+    it) and NONE to the detector — with provenance stubbed to None AND the recovery
+    disabled, the observe count is the WP0 floor exactly."""
     frozen_backend = _CaptureCountingBackend()
     agent_with = _agent(frozen_backend)
     _run_actions(agent_with, [_keypress() for _ in range(4)])
     with_markers = frozen_backend.observe_calls
+    # every one of the 4 stated-effect keypresses hit an identical-frame uncertain,
+    # so each earned exactly the ONE bounded re-capture on top of the 3-capture floor
+    assert with_markers == 4 * 3 + 4, with_markers
 
     disabled_backend = _CaptureCountingBackend()
     agent_without = _agent(disabled_backend)
     monkeypatch.setattr(verification_module, "_capture_provenance", lambda before, after: None)
+    import computer_use_mcp.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "_is_identical_frame_uncertain", lambda result: False)
     _run_actions(agent_without, [_keypress() for _ in range(4)])
-    assert disabled_backend.observe_calls == with_markers
-    # and the disabled run produced no marker (the counter saw no provenance at all)
+    assert disabled_backend.observe_calls == with_markers - 4  # minus the 4 re-captures
+    assert disabled_backend.observe_calls == 12  # the WP0 floor: 3 captures x 4 actions
     assert all(
         event.get("metadata", {}).get("capture_source_suspected") is None
         for event in _verification_events(agent_without)

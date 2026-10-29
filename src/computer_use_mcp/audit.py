@@ -170,6 +170,9 @@ class Metrics:
         "verification_verified",
         "verification_failed",
         "verification_uncertain",
+        # WP4a (F2-3/E-02): counts the ONE bounded late-repaint re-capture when it
+        # fires (identical-frame uncertain + stated effect / repaint-prone class).
+        "verification_recapture",
         "grounding_failure",
         "safety_block",
         "approval_requested",

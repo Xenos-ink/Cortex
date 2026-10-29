@@ -64,7 +64,11 @@ def test_verification_detects_visual_change() -> None:
     after = backend.observe()
     result = VerificationEngine().compare(before, after, expected_change="window changes")
     assert result.changed is True
-    assert result.verified is True
+    # F1 fix 1.1 (decision D-1(a), WP4a/E-03 port): the string form DESCRIBES an
+    # effect, and a changed screen is not that effect — the legacy facade now
+    # abstains. The boolean form (a bare change expectation) still verifies.
+    assert result.verified is False
+    assert VerificationEngine().compare(before, after, expected_change=True).verified is True
 
 
 async def test_dry_run_reports_not_verified_and_never_executes() -> None:

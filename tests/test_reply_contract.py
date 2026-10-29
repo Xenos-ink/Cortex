@@ -40,6 +40,7 @@ from reply_contract import (
 from test_controller_integration import (
     FAST_LIMITS,
     ScriptedBackend,
+    audit_events,
     execute_payload,
     executed_summary,
     make_session,
@@ -1234,7 +1235,7 @@ async def test_identity_change_without_the_named_identity_is_an_honest_uncertain
     demotes to the honest ``uncertain`` token (ok False, never a silent ok:True), and
     the verification block carries the demoted outcome."""
     backend = _dialog_backend()
-    session_id, _bundle, backend, _ = make_session(
+    session_id, bundle, backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
@@ -1248,6 +1249,10 @@ async def test_identity_change_without_the_named_identity_is_an_honest_uncertain
     assert payload["verification"]["outcome"] == "uncertain"
     # the click itself still dispatched and ran exactly as before
     assert executed_summary(backend) == [("click", (50, 50), None)]
+    # F8 (VAL-WP4a DELTA 2): the stated-effect static-screen click takes the ONE
+    # bounded late-repaint re-capture, and the single-record structure still yields
+    # exactly ONE verification latency sample for the whole (recaptured) verification.
+    assert bundle.metrics.snapshot()["latencies"]["verification_ms"]["count"] == 1
 
 
 async def test_rejection_reply_carries_the_retained_interference_events(
@@ -1328,3 +1333,128 @@ async def test_verified_follow_up_entry_evidence_names_the_matched_token(
     assert evidence, entries[1]
     assert evidence[0].startswith("corroborated by effect token"), evidence
     assert "'confirm'" in evidence[0]  # the matched token, named inside the cap
+
+
+# --- WP4a (ORVEX-2026-108): verification accuracy on the reply surface ----------------------------
+
+
+async def test_identity_change_plus_strong_pixel_change_with_unrelated_effect_is_uncertain(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP4a §-node (the reply-level shape of the flipped WP3 xfail): a click that BOTH
+    changes the window identity AND strongly repaints the screen (flip fake: white ->
+    black, far above the corroboration floor) never verifies an unrelated stated
+    effect — ok False / result ``uncertain`` — and the audit 'verification' event
+    agrees with the reply verdict."""
+    backend = ScriptedBackend(
+        flip=True,  # the dispatch strongly repaints the screen
+        active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="Main"),
+    )
+    dialog = WindowInfo(hwnd=2, pid=99, process_name="app.exe", title="Confirm Delete?")
+    backend.execute_hooks.append(lambda action: backend.set_active_window(dialog))
+    session_id, bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(
+            session_id, "click", x=50, y=50, expected_effect="the record is deleted"
+        )
+    )
+    validate_reply(payload, "flat_execute")
+    assert payload["result"] == "uncertain"
+    assert payload["ok"] is False  # a contradicted/uncorroborated effect is NEVER ok:true
+    assert payload["verification"]["outcome"] == "uncertain"
+    assert payload["verification"]["verified"] is False
+    assert executed_summary(backend) == [("click", (50, 50), None)]  # the click ran once
+    verification_events = [
+        e for e in audit_events(bundle, session_id) if e["event_type"] == "verification"
+    ]
+    # F8 (VAL-WP4a DELTA 2): exactly ONE verification audit event...
+    assert len(verification_events) == 1, verification_events
+    assert verification_events[-1]["result"] == "uncertain", verification_events[-1]
+
+
+class _MaskedPinWorld(ScriptedBackend):
+    """A login dialog whose focused-control read-back models the R-04 reader (the
+    tests/test_a3_mismatch_blocks_verified.py world, on the server surface)."""
+
+    def __init__(self, *, title: str, focused_control_value: str | None) -> None:
+        super().__init__(
+            flip=False,
+            active_window=WindowInfo(
+                hwnd=777, pid=555, process_name="login.exe", window_class="LoginWnd",
+                title=title, bounds=(0, 0, 1280, 720),
+            ),
+        )
+        self.focused_control_value = focused_control_value
+
+    def observe(self) -> Any:
+        observation = super().observe()
+        import base64 as _b64
+        import io as _io
+
+        from PIL import Image as _Image
+
+        image = _Image.new("RGB", (1280, 720), (250, 250, 250))
+        buffer = _io.BytesIO()
+        image.save(buffer, format="PNG")
+        observation.image_base64 = _b64.b64encode(buffer.getvalue()).decode("ascii")
+        return observation
+
+
+async def test_type_integrity_mismatch_vetoes_verified_and_audit_agrees(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP4a §-node (F2-1): a masked PIN field (read-back ``integrity=mismatch``) plus a
+    window title that mirrors the typed text never answers ``ok:true`` — the
+    strong, target-scoped read-back vetoes the weak substring match, the reply is the
+    honest ``uncertain`` token, and the audit 'verification' event (written AFTER the
+    veto) carries the SAME verdict."""
+    backend = _MaskedPinWorld(title="Sign in - account 1234", focused_control_value="••••")
+    session_id, bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(session_id, "type", text="1234", approved=True)
+    )
+    validate_reply(payload, "flat_execute")
+    assert "integrity=mismatch" in payload["message"], payload["message"]
+    assert payload["result"] == "uncertain"
+    assert payload["ok"] is False  # a contradicted expected effect is NEVER ok:true
+    assert payload["verification"]["outcome"] == "uncertain"
+    assert payload["verification"]["verified"] is False
+    evidence = " | ".join(payload["verification"]["evidence"])
+    assert "mismatch" in evidence, payload["verification"]["evidence"]
+    verification_events = [
+        e for e in audit_events(bundle, session_id) if e["event_type"] == "verification"
+    ]
+    # F8 (VAL-WP4a DELTA 2): exactly ONE verification audit event...
+    assert len(verification_events) == 1, verification_events
+    assert verification_events[-1]["result"] == "uncertain", verification_events[-1]
+    assert executed_summary(backend) == [("type", None, "1234")]  # typed exactly once
+
+
+async def test_verification_audit_names_the_real_ladder_tier_on_the_plain_path(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1 (VAL-WP4a DELTA 2): the PRIMARY ladder run records its REAL tier in the
+    verification audit metadata — on this plain path (no late-repaint recapture: no
+    stated effect; no expected-text fallback: the intent is visual_change) the tier
+    is the engine facade, and the sample count is exactly one."""
+    backend = ScriptedBackend(flip=True)  # dispatch flips pixels -> provable change
+    session_id, bundle, backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(session_id, "click", x=10, y=10)
+    )
+    validate_reply(payload, "flat_execute")
+    assert payload["result"] == "verified"
+    assert payload["ok"] is True
+    events = [
+        e for e in audit_events(bundle, session_id) if e["event_type"] == "verification"
+    ]
+    assert len(events) == 1, events
+    assert events[0]["result"] == "verified", events[0]
+    assert events[0]["metadata"]["ladder_tier"] == "engine", events[0]
+    assert bundle.metrics.snapshot()["latencies"]["verification_ms"]["count"] == 1

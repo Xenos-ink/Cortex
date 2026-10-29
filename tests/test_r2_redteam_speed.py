@@ -683,12 +683,15 @@ async def test_r2_d11_drag_zero_diff_with_window_swap_is_uncertain(
     )
 
 
-async def test_r2_d11_real_change_with_stated_effect_drag_still_verified(
+async def test_r2_d11_real_change_with_stated_effect_drag_now_abstains_to_uncertain(
     monkeypatch: pytest.MonkeyPatch, fresh_server: Any
 ) -> None:
-    """The verified path is intact for the extended kinds: a stated-effect DRAG over a
-    REAL above-threshold change is verified (ok=True) exactly as before — the doctrine
-    degraded only the ABSENT-evidence case."""
+    """RE-PINNED by WP4a (E-03, the authorized verdict change): a stated-effect DRAG
+    over a REAL above-threshold change used to verify (ok=True) off the generic
+    "pixels changed" branch — a flip is not "the marquee stretches". The pixel tier
+    now abstains on ANY stated effect, so the honest verdict is ``uncertain`` (ok
+    False) with the change still reported (``changed=True``). The ABSENT-evidence
+    degrade and the BARE-expectation verified path are unchanged (the sibling pins)."""
     backend = ScriptedBackend(flip=True)  # every execute flips white -> black
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, backend=backend, provider=ScriptedProvider([]),
@@ -699,8 +702,10 @@ async def test_r2_d11_real_change_with_stated_effect_drag_still_verified(
         {"action": "drag", "x": 5, "y": 5, "x2": 40, "y2": 30,
          "expected_effect": "the marquee stretches", "include_screenshot_after": False},
     )
-    assert payload["ok"] is True, payload
-    assert payload["verification"]["outcome"] == "verified", payload.get("verification")
+    assert payload["ok"] is False, payload
+    assert payload["result"] == "uncertain", payload.get("result")
+    assert payload["verification"]["outcome"] == "uncertain", payload.get("verification")
+    assert payload["verification"]["changed"] is True, payload.get("verification")
 
 
 def test_r2_d11_subthreshold_diff_bare_fails_while_stated_degrades() -> None:

@@ -600,10 +600,14 @@ async def test_attack6b_driver_policy_restores_never_launch(
 async def test_attack7_flagged_degrade_adds_no_extra_captures(
     monkeypatch: pytest.MonkeyPatch, fresh_server: Any, flagged: bool
 ) -> None:
-    """A single click performs exactly 3 captures (direct_request + validate +
-    post_action) whether the intent is focus-flagged or not: the W-1 uncertain
-    degrade reuses the diff computed from the ALREADY-captured frames
-    (verification.py:382-391,448-454) — no new capture anywhere."""
+    """Capture-floor pin, RE-ADAPTED by WP4a per the E-02 spec (the only approved
+    re-adaptation). UNFLAGGED (no stated effect): a single click on the static fake
+    performs exactly 3 captures (direct_request + validate + post_action) — the
+    E-02-conditioned late-repaint re-capture never fires (no stated effect, click is
+    not repaint-prone), so the WP0 baseline holds. FLAGGED (a stated effect): the
+    identical-frame uncertain earns EXACTLY ONE bounded late-repaint re-capture
+    (F2-3/E-02: a described transition may still be proven by a frame taken past the
+    repaint), so the count is 4 with a second ``post_action`` phase and never more."""
     monkeypatch.delenv(QUEUE_ENV, raising=False)
     backend = ScriptedBackend(flip=False)
     spec: dict[str, Any] = {
@@ -616,11 +620,17 @@ async def test_attack7_flagged_degrade_adds_no_extra_captures(
         spec["expected_effect"] = "Hex input focused"
     session_id = _session(monkeypatch, backend)
     await _run(session_id, spec)
-    assert len(backend.observed) == 3, len(backend.observed)
+    expected_captures = 4 if flagged else 3
+    assert len(backend.observed) == expected_captures, len(backend.observed)
     bundle = server._get_bundle(session_id)
     phases = [
         (event.get("metadata") or {}).get("phase")
         for event in audit_events(bundle, session_id)
         if event["event_type"] == "observation"
     ]
-    assert phases == ["direct_request", "validate", "post_action"], phases
+    expected_phases = (
+        ["direct_request", "validate", "post_action", "post_action"]
+        if flagged
+        else ["direct_request", "validate", "post_action"]
+    )
+    assert phases == expected_phases, phases

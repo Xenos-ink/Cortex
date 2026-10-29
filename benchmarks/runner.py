@@ -316,8 +316,28 @@ class DirectCallDriver:
             )
             executed += 1
             if not ok:
-                # A refused/failed action ends the host script: map the typed outcome
-                # to the loop-era termination vocabulary the collector understands.
+                # ORVEX-2026-108 WP4a DELTA 1 (E-03 consequence; proof recorded in
+                # .orvex/mission/artifacts/gates/wp4a-notes.md): ``uncertain`` is the
+                # §1.2 "dispatched, unproven" token — the input DISPATCHED and the
+                # task's real assertion is its final predicate — so an uncertain step
+                # no longer ENDS the host script. Ending on it conflated unproven
+                # with failed: after the E-03 abstention, every stated effect that no
+                # deterministic tier can corroborate (t03's clicks into the
+                # already-focused window, t04's calculator display clicks — neither
+                # world produces any deterministic before/after identity delta) came
+                # back honestly uncertain, and the old stop discarded the rest of the
+                # script AND the predicate. The step's miss still rides the recorded
+                # result (ok False above) and the collector's verification_counts.
+                if payload.get("result") == "uncertain" and self.resolver.mode == "fake":
+                    # F3 (VAL-WP4a DELTA 2): the continue is FAKE-MODE ONLY. In fake
+                    # mode this is harness validation against a modeled world whose
+                    # task predicate (checked harness-side) is the task's real
+                    # assertion. A LIVE run keeps the conservative halt: it must never
+                    # keep dispatching real input after an unproven step.
+                    continue
+                # A refused/failed action still ends the host script: map the typed
+                # outcome to the loop-era termination vocabulary the collector
+                # understands.
                 termination = self._termination_for(payload)
                 break
         return {
@@ -836,6 +856,17 @@ class BenchmarkRunner:
             predicate["evidence"]["execution_events"] = execution_events
         completed = termination == "completed"
         predicate_ok = predicate["outcome"] in {"verified", "not_determined"}
+        # F3 (VAL-WP4a DELTA 2): once ANY step was uncertain (dispatched, unproven),
+        # the task may read ``completed`` only on a POSITIVELY satisfied predicate. A
+        # ``not_determined`` predicate after uncertain steps means nothing was proven,
+        # so ``completed`` would claim a success the evidence does not hold. The
+        # vocabulary is the runner's own existing non-completed one: ``failed`` is the
+        # honest record for an executed task that was not proven (the only other
+        # non-completed statuses, requires_env / safety_blocked_as_expected, are
+        # collector-level and inapplicable here).
+        uncertain_steps = verification_counts["uncertain"]
+        if uncertain_steps and predicate["outcome"] != "verified":
+            predicate_ok = False
         status = "completed" if completed and predicate_ok else "failed"
         if expected_block and predicate["outcome"] == "verified":
             status = "safety_blocked_as_expected"
@@ -850,6 +881,8 @@ class BenchmarkRunner:
             "executed_actions": executed_actions,
             "max_actions": task.max_actions,
             "verification_outcomes": verification_counts,
+            # F3 (VAL-WP4a DELTA 2): the per-task count of honestly-unproven steps.
+            "uncertain_steps": uncertain_steps,
             "grounding": {
                 "strategies": grounding_strategies,
                 "avg_confidence": (
@@ -887,6 +920,12 @@ class BenchmarkRunner:
             "tasks_requires_env": len(results) - len(actionable),
             "completed": completed,
             "failed": len(actionable) - completed,
+            # F3 (VAL-WP4a DELTA 2): unproven steps are counted, never laundered into
+            # completed or failed task statuses.
+            "uncertain_steps_total": sum(
+                (item.get("verification_outcomes") or {}).get("uncertain", 0)
+                for item in actionable
+            ),
             "recovery_events_total": sum(item.get("recovery_events", 0) for item in actionable),
             "safety_blocks_total": sum(item.get("safety_blocks", 0) for item in actionable),
             "false_safety_blocks_total": sum(item.get("false_safety_blocks", 0) for item in actionable),

@@ -229,9 +229,16 @@ async def test_redaction_enforced_for_secrets_in_goal_through_runtime(
     """RETARGETED (loop removal): the goal channel died with the loop; the same
     sink guarantee is driven through the direct surface — a host-supplied
     ``expected_effect`` carrying secrets is redacted in the audit rows and never
-    appears raw in the tool response."""
+    appears raw in the tool response. (WP4a runs this variant with flip=False so the
+    effect prose rides the absent-evidence NOTE path — "No pixel evidence of the
+    stated expectation: …" — which the response sink redacts; F5 (VAL-WP4a): the
+    flip=True sibling below proves the response redaction on the digest-arm EVIDENCE
+    channel instead, and ``test_audit_sink_redacts_effect_bearing_fields`` keeps the
+    audit-sink placeholder assertion non-vacuous now that the abstention notes no
+    longer echo the effect into the audit ``note``.)"""
     sid, bundle, _, _ = make_session(
-        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch, backend=ScriptedBackend(flip=False), dry_run=False,
+        require_approval=False, limits=FAST_LIMITS
     )
     response = await server.computer_execute(
         sid,
@@ -241,7 +248,10 @@ async def test_redaction_enforced_for_secrets_in_goal_through_runtime(
         expected_effect="configure api_key=AKIAIOSFODNN7EXAMPLE and use password=hunter2secret to sign in",
     )
     response = _payload(response)
-    assert response["ok"] is True, response
+    # RE-PINNED by WP4a (E-03): the stated effect over a generic flip is the honest
+    # ``uncertain`` (ok False) — the redaction guarantees below are unchanged.
+    assert response["ok"] is False, response
+    assert response["result"] == "uncertain", response.get("result")
 
     payload = json.dumps(response["verification"])
     assert "AKIAIOSFODNN7EXAMPLE" not in payload
@@ -249,7 +259,71 @@ async def test_redaction_enforced_for_secrets_in_goal_through_runtime(
     content = bundle.auditor.path_for(sid).read_text(encoding="utf-8")
     assert "AKIAIOSFODNN7EXAMPLE" not in content  # redacted at the audit sink
     assert "hunter2secret" not in content
+    # The placeholders actually fired on this path (WP4a re-pin: the E-03 abstention
+    # notes no longer assert the effect into the audit `note`, so the tool RESPONSE —
+    # whose absent-evidence note still echoes the effect prose — is the surface this
+    # scenario proves the placeholder machinery on; the audit sink guarantee (secret
+    # raw NOWHERE on disk) is asserted above on both sinks).
+    assert "[REDACTED:" in payload
+
+
+async def test_redaction_enforced_on_the_flip_screen_evidence_channel(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F5 (VAL-WP4a DELTA 2): the flip=True sibling. On a flipping screen the E-03
+    abstention NOTE never echoes the effect, but the identity tier's evidence channel
+    still does (``expected_effect=…`` lines) — and the response sink redacts evidence
+    item-wise, so the placeholder machinery is proven on THIS channel too, with the
+    secret raw nowhere (response payload or audit file)."""
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=ScriptedBackend(flip=True), dry_run=False,
+        require_approval=False, limits=FAST_LIMITS
+    )
+    response = await server.computer_execute(
+        sid,
+        "click",
+        x=10,
+        y=10,
+        expected_effect="configure api_key=AKIAIOSFODNN7EXAMPLE and use password=hunter2secret to sign in",
+    )
+    response = _payload(response)
+    assert response["ok"] is False, response
+    assert response["result"] == "uncertain", response.get("result")
+
+    payload = json.dumps(response["verification"])
+    assert "AKIAIOSFODNN7EXAMPLE" not in payload
+    assert "hunter2secret" not in payload
+    assert "[REDACTED:" in payload  # the evidence channel carried the effect prose
+    content = bundle.auditor.path_for(sid).read_text(encoding="utf-8")
+    assert "AKIAIOSFODNN7EXAMPLE" not in content  # raw nowhere at the audit sink
+    assert "hunter2secret" not in content
+
+
+def test_audit_sink_redacts_effect_bearing_fields(tmp_path: Any) -> None:
+    """F5 (VAL-WP4a DELTA 2): the audit-sink placeholder assertion stays NON-vacuous.
+    The E-03 abstention notes no longer echo a stated effect into the audit ``note``,
+    so the runtime scenario above can no longer exercise the sink's placeholder on
+    that field — this test drives the exact effect-bearing field shape through
+    :class:`AuditLogger` directly and proves the sink still replaces the secrets with
+    placeholders (never raw) and never drops the row."""
+    logger = AuditLogger(tmp_path / "audit-effect-field")
+    logger.emit(
+        "verification",
+        "sess-effect-field",
+        result="uncertain",
+        metadata={
+            "note": (
+                "No pixel evidence of the stated expectation: configure "
+                "api_key=AKIAIOSFODNN7EXAMPLE and use password=hunter2secret to sign "
+                "in; absent pixels are not proof of absence."
+            ),
+        },
+    )
+    content = logger.path_for("sess-effect-field").read_text(encoding="utf-8")
+    assert "AKIAIOSFODNN7EXAMPLE" not in content
+    assert "hunter2secret" not in content
     assert "[REDACTED:" in content
+    assert '"result": "uncertain"' in content  # the row itself still landed
 
 
 # --- metrics sanity ------------------------------------------------------------------------------
@@ -267,7 +341,12 @@ async def test_metrics_snapshot_invariants_after_scripted_runs(
     )
     response = await server.computer_execute(sid, "click", x=10, y=10, expected_effect="window appears")
     response = _payload(response)
-    assert response["ok"] is True, response
+    # RE-PINNED by WP4a (E-03): the stated effect over a generic flip is the honest
+    # ``uncertain`` (ok False, uncertain is never success) — the counter/latency
+    # invariants below are unchanged (and the single-record structure keeps exactly
+    # one verification latency sample per action).
+    assert response["ok"] is False, response
+    assert response["result"] == "uncertain", response.get("result")
     snapshot = bundle.metrics.snapshot()
     counters = snapshot["counters"]
     for name in Metrics.COUNTER_NAMES:

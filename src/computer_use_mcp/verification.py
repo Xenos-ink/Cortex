@@ -20,8 +20,10 @@ before pixels run). For ``type`` the default intent is ``expected_text`` decided
 text — see the controller's ``_build_intent``); for ``keypress``/``hotkey`` the
 deterministic default is the launch-prefix ``window_state`` promotion, and a stated
 effect keeps the pixel band honest in the escalation role only: absent/sub-threshold
-evidence degrades to ``uncertain`` (never the historical false ``failed``), a real
-above-floor change still verifies. The focus-change transition signals stay
+OR above-floor evidence alike degrades to ``uncertain`` (F1 fix 1.1 / E-03 — the
+pixel tier measures "some pixels moved", which is not the described effect, so it
+never claims one; the deterministic tiers are the verify path for a stated effect).
+The focus-change transition signals stay
 CLICK-scoped deliberately: a window/element identity change must never verify a
 non-click effect (an unrelated foreground steal would become a false success).
 
@@ -430,14 +432,13 @@ class ScreenshotDiffStrategy:
       threshold OR at least ``STRONG_CHANGE_MIN_PIXELS`` pixels changed by
       ``STRONG_PIXEL_DELTA`` or more (mean alone cannot see compact changes such as
       drawn strokes or small controls);
-    - ``expected_change=True``: change detected -> ``verified``; none ->
-      ``failed`` — except an intent carrying a stated ``expected_effect``, whose
-      not-observed zero/sub-threshold diff degrades to ``uncertain`` (scoped to
-      flagged clicks; extended to ANY stated effect on any
-      action kind: absent pixel evidence is not proof of absence, and uncertain is
-      never success; a real above-threshold change still ``verified``). A BARE
-      change expectation (``expected_change=True`` with no described effect) keeps
-      the legacy definitive ``failed`` — there the pixel change is the whole claim;
+    - ``expected_change=True``: a BARE change expectation (no described effect):
+      change detected -> ``verified``; none -> ``failed``. An intent carrying a
+      stated ``expected_effect`` abstains in BOTH directions (F1 fix 1.1 / E-03):
+      absent pixel evidence is not proof of absence, and a present change is only
+      "some pixels moved" — not proof that the described effect happened — so both
+      degrade to ``uncertain`` and this tier never names the effect; the
+      deterministic tiers are the verify path for stated effects;
     - ``expected_change=False``: no change detected -> ``verified``; change ->
       ``failed``;
     - ``expected_change=None`` (no expectation stated): change detected ->
@@ -534,6 +535,31 @@ class ScreenshotDiffStrategy:
         change_confidence = min(max(mean_difference / 32.0, strongly_changed / 400.0), 1.0)
         if expected is True:
             if changed:
+                # F1 fix 1.1 (decision D-1(a), ORVEX-2026-108 WP4a / E-03): the stated
+                # effect is authoritative WHEN PRESENT, and "some pixels changed" is
+                # not it.  This tier compares two frames and nothing else — the effect
+                # string is never read here — so a verified verdict would be a claim
+                # the evidence cannot support, and the note used to assert the effect
+                # out loud.  Absent change and present change are the SAME evidence
+                # class for a DESCRIBED effect (both are a generic pixel measurement),
+                # so they abstain identically.  A BARE change expectation (no
+                # described effect) is untouched below: there a pixel change IS the
+                # whole claim.
+                if intent.expected_effect:
+                    return _uncertain(
+                        self.name,
+                        (
+                            "A visual change was observed (mean pixel difference "
+                            f"{mean_difference:.6f}, {strongly_changed} strongly-changed "
+                            f"pixels), which is NOT proof of the stated expectation; many "
+                            "unrelated redraws (cursors, clocks, tooltips, another window) "
+                            "move pixels too. This tier cannot compare the described "
+                            "effect, so it abstains. Uncertain is never success."
+                        ),
+                        evidence,
+                        0.4,
+                        changed=True,
+                    )
                 return _definitive(
                     self.name,
                     "verified",
@@ -1492,16 +1518,17 @@ class FocusChangeStrategy:
     (b) active-window identity change: the active window title OR process changed
         between the two observations (dialog-open signature);
     (c) observation digest change: the screenshots are not pixel-identical
-        (REM-C F1: evidence only by default — it may VERIFY solely when
-        corroborated by real changed-pixel magnitude, at least
-        ``STRONG_CHANGE_MIN_PIXELS`` strongly-changed pixels as the pixel tier
-        defines them; an uncorroborated digest change — a caret blink, a clock
-        tick, another app's toast — degrades to ``uncertain`` so the
-        screenshot-diff tier decides, preserving that tier's deliberate
-        flicker exclusion instead of bypassing it).
+        (REM-C F1: evidence only — F1 fix 1.1 (E-03): even a CORROBORATED digest
+        change (at least ``STRONG_CHANGE_MIN_PIXELS`` strongly-changed pixels) is a
+        real REDRAW, not the described effect, so this arm abstains
+        (``uncertain``, ``changed=True``) in both directions and never asserts the
+        expectation; an uncorroborated digest change — a caret blink, a clock tick,
+        another app's toast — stays ``changed=False`` so the screenshot-diff tier
+        decides, preserving that tier's deliberate flicker exclusion).
 
-    Any one of (a)/(b) showing change, or a CORROBORATED (c), is DEFINITIVE ``verified`` with a note naming
-    the signal that fired. NO signal showing change leaves the verdict to the
+    Arms (a)/(b) showing a change — corroborated or not by the named-identity
+    binding below — decide the verdict. Arm (c) NEVER verifies (it abstains in both
+    directions; see above). NO signal showing change leaves the verdict to the
     next tiers — for a flagged intent the screenshot-diff strategy degrades a
     sub-threshold diff to ``uncertain`` (never ``failed`` from absent
     evidence; the doctrine extends that degrade to ANY stated effect directly in
@@ -1589,44 +1616,79 @@ class FocusChangeStrategy:
         ):
             magnitude = self._digest_change_magnitude(before, after)
             threshold = max(intent.diff_threshold, 0.0)
-            if magnitude is not None and (
-                magnitude[0] >= threshold or magnitude[1] >= STRONG_CHANGE_MIN_PIXELS
-            ):
-                return _definitive(
+            # F3 fix 5.5: ``_digest_change_magnitude`` returns a 0..1 normalised mean
+            # while ``threshold`` is the pixel tier's 0..255-scale value, so the note
+            # used to print ``mean 0.000383 >= 1`` — a comparison that cannot hold.
+            # The notes convert the threshold onto the magnitude's own scale and name
+            # ONLY the disjunct that actually fired. SCOPE: note strings only —
+            # ``_digest_change_magnitude`` still returns the 0..1 form and the branch
+            # condition is unchanged.
+            mean_255 = magnitude[0] * 255.0 if magnitude is not None else 0.0
+            mean_arm_fired = magnitude is not None and magnitude[0] >= threshold
+            strong_arm_fired = magnitude is not None and magnitude[1] >= STRONG_CHANGE_MIN_PIXELS
+            if mean_arm_fired or strong_arm_fired:
+                # F1 fix 1.1 (E-03): corroboration upgrades a bare digest change to a
+                # REAL change, not to the DESCRIBED effect. This signal compares
+                # payload text and pixel magnitude and nothing else, so it abstains
+                # (``uncertain``, changed=True) and the note names what was OBSERVED —
+                # it never asserts the expectation. Signals (a)/(b) keep verifying:
+                # a changed focused ELEMENT or a changed window IDENTITY is evidence
+                # about the substrate the effect lives on, not about pixels.
+                if mean_arm_fired and strong_arm_fired:
+                    fired = (
+                        f"mean {mean_255:.6g}/255 >= threshold {threshold:.6g}/255 "
+                        f"and strongly-changed pixels {magnitude[1]} >= "
+                        f"{STRONG_CHANGE_MIN_PIXELS}"
+                    )
+                elif mean_arm_fired:
+                    fired = f"mean {mean_255:.6g}/255 >= threshold {threshold:.6g}/255"
+                else:
+                    fired = (
+                        f"strongly-changed pixels {magnitude[1]} >= "
+                        f"{STRONG_CHANGE_MIN_PIXELS}"
+                    )
+                return _uncertain(
                     self.name,
-                    "verified",
                     (
-                        f"Expected focus-type change observed: {expected}. "
-                        "Deterministic signal: observation digest changed and the pixel "
-                        f"change is corroborated (mean {magnitude[0]:.6f} >= {threshold:.6g} "
-                        f"or strongly-changed pixels {magnitude[1]} >= {STRONG_CHANGE_MIN_PIXELS})."
+                        "The observation digest changed and the pixel change is "
+                        f"corroborated ({fired}), which is a real redraw but NOT "
+                        "proof of the stated expectation — pixels cannot be compared "
+                        "against a described effect. Uncertain is never success."
                     ),
                     [
                         "observation digest changed between before and after",
                         (
-                            f"corroborated pixel magnitude: mean {magnitude[0]:.6f}, "
-                            f"strongly-changed pixels {magnitude[1]} "
-                            f"(floor {STRONG_CHANGE_MIN_PIXELS})"
+                            f"corroborated pixel magnitude: mean {magnitude[0]:.6f} "
+                            f"(= {mean_255:.6g}/255), strongly-changed pixels "
+                            f"{magnitude[1]} (floor {STRONG_CHANGE_MIN_PIXELS})"
                         ),
                         f"expected_effect={expected!r}",
                     ],
-                    _DETERMINISTIC_CHANGE_CONFIDENCE,
+                    0.4,
                     changed=True,
                 )
             # Uncorroborated digest change: ambiguous flicker (caret blink, clock
             # tick, foreign toast) — carry the evidence, defer the verdict. The
             # strategy still never emits ``failed``; the pixel tier decides.
-            uncorroborated_note = (
-                "Observation digest changed but the pixel change is BELOW the "
-                "corroboration floor (strongly-changed "
-                f"{magnitude[1] if magnitude is not None else 'uncomputable'} < "
-                f"{STRONG_CHANGE_MIN_PIXELS}, mean "
-                f"{magnitude[0]:.6f} < {threshold:.6g}); ambiguous flicker is never "
-                "proof of a transition — deferring to the pixel-diff tier."
-                if magnitude is not None
-                else "Observation digest changed but the pixel magnitude could not be "
-                "computed for corroboration; deferring to the pixel-diff tier."
-            )
+            #
+            # F3 fix 5.5: this note names only the comparisons that are actually
+            # true, with the mean reported on the threshold's own 0..255 scale.
+            if magnitude is not None:
+                arms = []
+                if magnitude[1] < STRONG_CHANGE_MIN_PIXELS:
+                    arms.append(f"strongly-changed {magnitude[1]} < {STRONG_CHANGE_MIN_PIXELS}")
+                if magnitude[0] < threshold:
+                    arms.append(f"mean {mean_255:.6g}/255 < threshold {threshold:.6g}/255")
+                uncorroborated_note = (
+                    "Observation digest changed but the pixel change is BELOW the "
+                    f"corroboration floor ({' and '.join(arms)}); ambiguous flicker is "
+                    "never proof of a transition — deferring to the pixel-diff tier."
+                )
+            else:
+                uncorroborated_note = (
+                    "Observation digest changed but the pixel magnitude could not be "
+                    "computed for corroboration; deferring to the pixel-diff tier."
+                )
             return _uncertain(
                 self.name,
                 uncorroborated_note,

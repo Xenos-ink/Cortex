@@ -193,33 +193,31 @@ def test_clipboard_type_stated_effect_all_three_diagnostic_layers_coexist() -> N
             # coexistence pin: verdict value unchanged by the marker
             assert verification.outcome == "uncertain"
 
-    # audit parity: a TYPE action's verification runs the pixel tier TWICE (once under
-    # the expected-text intent's ladder, once under the explicit visual fallback), so
-    # 6 provenance-bearing audit events for 3 actions. The guard's action-id dedup
-    # counts ONE pair per action regardless (verdicts above), and the marker appears
-    # on both events of the 3rd action only.
+    # audit parity (RE-PINNED by WP4a, F2-3 single-record structure): the ladder may
+    # run more than once per action (the ONE late-repaint re-capture, the expected-text
+    # fallback) but is recorded EXACTLY ONCE — one provenance-bearing audit event per
+    # action, so 3 events for 3 actions. The guard's action-id dedup counts ONE pair
+    # per action regardless (verdicts above), and the marker appears on the 3rd only.
     events = _verification_events(agent)
     visual_events = [
         event for event in events if event.get("metadata", {}).get("capture_provenance")
     ]
-    assert len(visual_events) == 6
+    assert len(visual_events) == 3
     for event in visual_events:
         assert str(event.get("metadata", {}).get("capture_provenance")).startswith("before=")
     assert [event.get("metadata", {}).get("capture_source_suspected") for event in visual_events] == [
         None,
         None,
-        None,
-        None,
-        f"{CAPTURE_SOURCE_SUSPECTED} identical_pairs=3",
         f"{CAPTURE_SOURCE_SUSPECTED} identical_pairs=3",
     ]
 
 
-def test_clipboard_type_real_change_verifies_and_never_marks() -> None:
+def test_clipboard_type_real_change_stays_honest_and_never_marks() -> None:
     # a genuinely LIVE source through the clipboard transport: every pre/post pair
-    # differs, so the stated effect VERIFIES, the detector never marks, and the
-    # execution message still honestly reports the blind paste (both layers coexist
-    # without lying in either direction).
+    # differs. RE-PINNED by WP4a (E-03): the stated effect is no longer verified by
+    # the generic pixel change — the verdict is the honest ``uncertain`` (ok False) —
+    # while the execution message still honestly reports the blind paste (both layers
+    # coexist without lying in either direction) and the detector never marks.
     backend = _FrozenOrFlippedBackend(flip_script=[True, True])
     agent = _agent(backend)
     outcomes = _run_actions(
@@ -233,8 +231,8 @@ def test_clipboard_type_real_change_verifies_and_never_marks() -> None:
         assert TYPE_UNCONFIRMED_MARKER in result.message  # blind target, honestly stated
         verification = result.verification
         assert verification is not None
-        assert verification.outcome == "verified"  # the real pixel change is honored
-        assert result.ok is True
+        assert verification.outcome == "uncertain"  # pixels alone never prove the effect
+        assert result.ok is False
         assert verification.capture_provenance is not None
         assert verification.capture_provenance.before_sha256 != (
             verification.capture_provenance.after_sha256
@@ -266,19 +264,27 @@ def test_clipboard_transport_feeds_the_detector_reset_discipline(
         f"{CAPTURE_SOURCE_SUSPECTED} identical_pairs=3"
         in outcomes[-1].result.verification.note  # type: ignore[union-attr]
     )
-    # the reset action itself verified the real change
-    assert outcomes[2].result.verification.outcome == "verified"  # type: ignore[union-attr]
-    # and the provenance performed ZERO extra captures: the same six actions on an
-    # identical backend with provenance stubbed out observe exactly as many times
+    # the reset action itself SAW the real change (differing pair). RE-PINNED by WP4a
+    # (E-03): a stated effect over a real pixel change is ``uncertain``, not verified.
+    assert outcomes[2].result.verification.outcome == "uncertain"  # type: ignore[union-attr]
+    # and the provenance DETECTOR itself performed ZERO extra captures: on an
+    # identical backend with provenance stubbed out AND the E-02 recovery (a separate
+    # consumer of the same provenance) explicitly disabled, the observe count is
+    # byte-for-byte equal — the extra captures in the run above belong to the bounded
+    # late-repaint re-capture (one per identical-frame stated-effect action: 5 here),
+    # never to the detector.
     parity_backend = _FrozenOrFlippedBackend(flip_script=[False, False, True, False, False, False])
     import computer_use_mcp.verification as verification_module
+    import computer_use_mcp.agent as agent_module
 
     monkeypatch.setattr(
         verification_module, "_capture_provenance", lambda before, after: None
     )
+    monkeypatch.setattr(agent_module, "_is_identical_frame_uncertain", lambda result: False)
     agent_without = _agent(parity_backend)
     _run_actions(
         agent_without,
         [_clipboard_type(f"row {i}", "the console echoes the value") for i in range(6)],
     )
-    assert parity_backend.observe_calls == backend.observe_calls
+    assert parity_backend.observe_calls == backend.observe_calls - 5  # 5 bounded re-captures
+    assert parity_backend.observe_calls == 18  # the WP0 floor: 3 captures x 6 actions

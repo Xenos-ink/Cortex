@@ -501,10 +501,20 @@ async def test_follow_ups_run_full_pipeline_and_verify_each_item(
         ],
     )
     response = execute_payload(response)  # REM-A: executed -> content blocks
-    assert response["ok"] is True
+    # RE-PINNED by WP4a (E-03): the two stated-effect clicks over a generic flip can no
+    # longer answer ok=True off "pixels changed" — they are honest ``uncertain``
+    # entries; the wait item stays a marker (ok True). Uncertain never stops the
+    # batch, so every item still ran the full pipeline exactly once.
+    assert response["result"] == "uncertain"
+    assert response["ok"] is False
     assert response["follow_ups_stopped_reason"] is None
     assert len(response["follow_up_results"]) == 3
-    assert all(item["ok"] for item in response["follow_up_results"])
+    assert response["follow_up_results"][0]["result"] == "uncertain"
+    assert response["follow_up_results"][0]["ok"] is False
+    assert response["follow_up_results"][1]["result"] == "uncertain"
+    assert response["follow_up_results"][1]["ok"] is False
+    assert response["follow_up_results"][2]["result"] == "marker"
+    assert response["follow_up_results"][2]["ok"] is True
     assert len(executed_summary(backend)) == 3
     events = audit_events(bundle, session_id)
     assert len([e for e in events if e["event_type"] == "execution"]) == 3

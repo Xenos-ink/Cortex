@@ -199,11 +199,15 @@ def test_f1_real_focus_change_still_verifies_with_identical_pixels() -> None:
     assert engine.verify(_focused_intent("Hex input focused"), before, after).outcome == "verified"
 
 
-def test_f1_digest_change_with_strong_pixel_magnitude_verifies() -> None:
-    """F1 positive pin: the digest change IS corroborated by real changed-pixel
-    magnitude (>= STRONG_CHANGE_MIN_PIXELS strongly-changed pixels) — a real
-    focus-invisible transition (e.g. the dialog opened after the capture while the
-    focus/window fields are unchanged) may verify through the digest signal again."""
+def test_f1_corroborated_digest_change_abstains_and_never_claims_the_effect() -> None:
+    """F1 positive pin, RE-PINNED by WP4a (the digest-arm verdict change, upstream
+    F1 fix 1.1): the digest change IS corroborated by real changed-pixel magnitude
+    (>= STRONG_CHANGE_MIN_PIXELS strongly-changed pixels) — a real redraw — but a
+    pixel magnitude is evidence about PIXELS, not about the described effect. The
+    digest arm therefore abstains (``uncertain``, ``changed=True``) and never asserts
+    the expectation; the redraw fact stays on the evidence channel. The deterministic
+    identity signals (a)/(b) remain the only verify path in this tier (the positive
+    siblings above)."""
     before = _observation(_white(), ui_elements=_elements(["canvas"], focused=True))
     after_image = _white()
     changed = STRONG_CHANGE_MIN_PIXELS * 3
@@ -214,9 +218,18 @@ def test_f1_digest_change_with_strong_pixel_magnitude_verifies() -> None:
     result = FocusChangeStrategy().verify(
         _focused_intent("Edit colors dialog opens"), before, after
     )
-    assert result.outcome == "verified", (
-        f"a strongly-corroborated digest change must still verify: {result.outcome} ({result.note})"
+    assert result.outcome == "uncertain", (
+        f"a corroborated digest change must abstain, not verify: {result.outcome} ({result.note})"
     )
+    assert result.changed is True  # the redraw is reported, not claimed as the effect
+    assert "Edit colors dialog opens" not in result.note, result.note
+    evidence = " | ".join(result.evidence)
+    assert "corroborated pixel magnitude" in evidence, result.evidence
+    # the engine chain agrees: focus tier abstains, pixel tier cannot claim a stated
+    # effect either (F1 fix 1.1), so the chain lands on the honest combined uncertain
+    engine = VerificationEngine(judge=None)
+    chain = engine.verify(_focused_intent("Edit colors dialog opens"), before, after)
+    assert chain.outcome == "uncertain", chain
 
 
 def test_f1_subthreshold_digest_change_degrades_to_uncertain_not_failed() -> None:

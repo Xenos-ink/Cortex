@@ -270,14 +270,22 @@ def test_stated_effect_type_and_keypress_absent_evidence_is_uncertain_not_failed
         else:
             assert abs(absent.confidence - 0.4) < 1e-9, (action.action, absent)
 
-    # The positive band is intact: a real pixel transition verifies.
+    # F1 fix 1.1 (decision D-1(a), WP4a/E-03 port): the positive band is intact ONLY
+    # for a bare change expectation. This intent STATES an effect, and a real pixel
+    # transition is not that effect, so the tier now abstains in BOTH directions —
+    # present evidence and absent evidence are the same evidence class for a
+    # described effect.
     before_big = Observation(image_base64=_png("white", 320, 240), width=320, height=240)
     after_big = Observation(image_base64=_stroke_png(320, 240), width=320, height=240)
     keypress_intent = _build_intent(
         _pressed("enter", effect="the dialog commits"), None, "the dialog commits"
     )
     real = engine.verify(keypress_intent, before_big, after_big)
-    assert real.outcome == "verified", real
+    assert real.outcome == "uncertain", real
+    assert real.changed is True  # the redraw was observed and reported
+    # the carve-out: no stated effect -> the pixel proxy still verifies a real change
+    bare_intent = _build_intent(_pressed("enter"), None, None)
+    assert engine.verify(bare_intent, before_big, after_big).outcome == "verified"
 
 
 def test_pixel_tier_stated_effect_absent_evidence_degrades_to_uncertain() -> None:

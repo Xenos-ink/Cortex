@@ -173,7 +173,9 @@ async def test_d9_batch_survives_per_item_pixel_changes_window_constant(
     (the premise of each queued item no longer matches the screen pixel-for-pixel)
     completes while the attached window's identity stays constant — all 3 items
     execute, ``follow_ups_stopped_reason`` is None, and each item carries an honest
-    verdict (the screen change is real and above threshold -> verified)."""
+    verdict (F9, VAL-WP4a: since the WP4a/E-03 abstention, all three items STATE an
+    effect, so all three resolve ``uncertain`` — the assertions below are the
+    authority, not the historical "verified" wording this docstring once carried)."""
     monkeypatch.delenv(QUEUE_STRICT_DIGEST_ENV, raising=False)
     backend = LagRenderBackend(
         active_window=WindowInfo(hwnd=1, pid=10, process_name="mspaint.exe", title="Untitled - Paint")
@@ -205,14 +207,15 @@ async def test_d9_batch_survives_per_item_pixel_changes_window_constant(
         "click",
     ]
     # Honest per-item verdicts with a lagging canvas: item 0's own before/after are
-    # pixel-identical (its render lands late), so its stated effect degrades to
-    # uncertain (verdict-honesty, ok=False — never the old false "failed"); items 1-2 SEE the
-    # landed changes (their before/after straddle a render) and verify honestly.
+    # pixel-identical (its render lands late), and items 1-2 SEE the landed changes —
+    # but all three STATE an effect, and F1 fix 1.1 (decision D-1(a), WP4a/E-03 port)
+    # made a stated effect unsatisfiable by pixel movement, so all three abstain.
+    # What this test pins — the batch SURVIVES the first uncertain verdict and runs
+    # all three items — is unchanged (that is why ``follow_ups_stopped_reason`` is
+    # still None).
     outcomes = [item["verification_outcome"] for item in payload["follow_up_results"]]
-    assert outcomes == ["uncertain", "verified", "verified"], outcomes
-    assert payload["follow_up_results"][0]["ok"] is False
-    assert payload["follow_up_results"][1]["ok"] is True
-    assert payload["follow_up_results"][2]["ok"] is True
+    assert outcomes == ["uncertain", "uncertain", "uncertain"], outcomes
+    assert all(item["ok"] is False for item in payload["follow_up_results"])
 
 
 async def test_d9_window_title_change_between_items_stops_batch(
@@ -630,13 +633,22 @@ async def test_d11_stated_effect_keypress_zero_diff_degrades_to_uncertain(
     assert backend.executed, "the input still dispatched (the verdict is about verification)"
 
 
-async def test_d11_stated_effect_genuine_change_still_verified(
+async def test_d11_stated_effect_genuine_change_degrades_to_uncertain(
     monkeypatch: pytest.MonkeyPatch, fresh_server: Any
 ) -> None:
-    """The verified path is unchanged: a stated effect with a REAL above-threshold
-    screen change is ``verified`` (ok=True) exactly as before."""
+    """F1 fix 1.1 (decision D-1(a), WP4a/E-03 port) — this pin is INVERTED and
+    renamed on purpose.
+
+    Before: "a stated effect with a REAL above-threshold screen change is
+    ``verified`` (ok=True) exactly as before".  That IS claim A1: the pixel tier
+    never compares the effect string, so a full-screen inversion satisfied any
+    stated effect.  Now the tier abstains, and the input is still dispatched.
+
+    The D-1(a) carve-out — a host that states NO effect keeps the pixel proxy —
+    is pinned by ``test_d11_bare_change_expectation_*`` and by
+    ``tests/test_expected_effect_not_satisfied.py``."""
     backend = ScriptedBackend(flip=True)  # every execute flips white -> black
-    session_id, _bundle, _backend, _ = make_session(
+    session_id, _bundle, backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
@@ -649,8 +661,16 @@ async def test_d11_stated_effect_genuine_change_still_verified(
             "include_screenshot_after": False,
         },
     )
-    assert payload["ok"] is True, payload
-    assert payload["verification"]["outcome"] == "verified", payload.get("verification")
+    assert payload["ok"] is False, payload
+    assert payload["verification"]["outcome"] == "uncertain", payload.get("verification")
+    assert payload["verification"]["changed"] is True  # the redraw was observed
+    assert executed_summary(backend), "the input still dispatched"
+    # the same world WITHOUT a stated effect keeps verifying (the carve-out)
+    bare = await _run(
+        session_id,
+        {"action": "keypress", "keys": ["enter"], "include_screenshot_after": False},
+    )
+    assert bare["verification"]["outcome"] == "verified", bare.get("verification")
 
 
 def test_d11_bare_change_expectation_keeps_legacy_definitive_failed() -> None:

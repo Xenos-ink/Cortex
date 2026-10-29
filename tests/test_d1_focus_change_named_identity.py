@@ -338,27 +338,22 @@ def test_the_binding_never_reads_ocr_text() -> None:
 def test_the_binding_never_launder_a_stated_effect_through_pixels() -> None:
     """A real redraw changes the digest and the effect names nothing the new identity
     carries. The identity arms never see pixels at all — no focus/window signal fires
-    here — so the verdict comes from the digest arm alone, which on a sub-corroboration
-    redraw defers (uncertain) exactly as the caret-blink doctrine requires.
-
-    PORT ADAPTATION (WP3 seam, recorded in the gate notes): the upstream tree's copy of
-    this node uses a full-corroboration redraw and relies on the digest arm ABSTAINING
-    on a corroborated magnitude — a behavior owned by the verification-accuracy work
-    package (the digest-arm verdict change). Until that lands, the stable digest arm
-    still verifies a corroborated redraw, so this node pins the same property (no pixel
-    magnitude may launder a described effect through the IDENTITY binding; no
-    focus/window signal fires on a pixels-only transition) at a redraw strength below
-    the corroboration floor. The upstream strengthening is deferred to the digest-arm
-    owner together with its own re-pin."""
+    here — and the digest arm, even when the redraw is CORROBORATED by pixel magnitude
+    (the full-redraw shape, restored by WP4a together with its digest-arm verdict
+    change), abstains: a corroborated magnitude upgrades a bare digest change to a
+    REAL change (``changed=True``), never to the DESCRIBED effect. The note never
+    asserts the expectation."""
     before = _observation(_white())
-    # 12 strongly-changed pixels: below STRONG_CHANGE_MIN_PIXELS (50) AND below the
-    # mean-diff threshold — a real digest change the corroboration floor rejects.
-    after = _observation(_changed(12))
+    # 150 strongly-changed pixels: a full-corroboration redraw, far above
+    # STRONG_CHANGE_MIN_PIXELS (50) — a real digest change WITH corroborated magnitude.
+    after = _observation(_changed(150))
     assert before.image_base64 != after.image_base64  # the precondition really holds
     result = _verify(before, after, "the Shapes dialog opens")
 
     assert result.outcome == "uncertain", result
+    assert result.changed is True  # the redraw is reported as a change, not a claim
     assert "the Shapes dialog opens" not in result.note
+    assert "corroborated pixel magnitude" in " | ".join(result.evidence), result.evidence
 
 
 # --- R-8: the novelty contrast is PER FIELD CLASS, then united ------------------------------
@@ -682,33 +677,28 @@ def test_confirm_dialog_whose_surface_repeats_the_noun_is_a_documented_residual(
     )
 
 
-# --- F1 (VAL-WP3): the WP4a-owned gap, pinned honestly as a strict xfail ---------------------
+# --- F1 (VAL-WP3 -> WP4a): the pixel-tier abstention is LANDED, the xfail is FLIPPED ----------
 
-@pytest.mark.xfail(
-    reason="WP4a: pixel tier must abstain on uncorroborated identity change",
-    strict=True,
-)
+
 def test_a_strong_pixel_change_does_not_verify_an_unrelated_identity_effect() -> None:
-    """WP4a-OWNED (F1, VAL-WP3) — the ONE allowed xfail; strict, so it FAILS LOUDLY the
-    moment WP4a fixes the pixel tier and must be updated then.
+    """WP4a (F1, VAL-WP3) — the former ONE strict xfail, now a PASSING pin.
 
     The identity tier's demotion is TIER-LEVEL only. On a window-activating click that
     ALSO moves pixels above the corroboration floor, this tier abstains (uncertain,
-    changed=True) and the chain falls through to :class:`ScreenshotDiffStrategy`, which
-    still returns ``verified`` ("Visual state changed.") for ANY stated effect on an
-    above-floor pixel change. The desired end state — pinned here — is that the ENGINE
-    chain comes back ``uncertain``: a pixel magnitude must no more claim a described
-    effect on the chain path than it does inside the identity tier. Until WP4a lands its
-    pixel-tier abstention (upstream F1 fix 1.1) this assertion is expected to fail."""
+    changed=True) and the chain falls through to :class:`ScreenshotDiffStrategy`. WP4a
+    landed the pixel-tier abstention (upstream F1 fix 1.1): a stated effect plus a
+    strong pixel change is still only "some pixels moved", so the ENGINE chain comes
+    back ``uncertain`` — a pixel magnitude no more claims a described effect on the
+    chain path than it does inside the identity tier. Both levels are pinned here."""
     before = _observation(_white(), title="Main", process="app.exe")
     after = _observation(_changed(150), title="Confirm Delete?", process="app.exe")
 
-    # the tier-level demotion itself already holds unconditionally ...
+    # the tier-level demotion holds unconditionally ...
     tier = _verify(before, after, "the record is deleted")
     assert tier.outcome == "uncertain", tier
     assert tier.changed is True
 
-    # ... but the ENGINE chain still verifies through the pixel tier (the F1 gap)
+    # ... and the ENGINE chain no longer verifies through the pixel tier (WP4a)
     engine = VerificationEngine(judge=None)
     chain = engine.verify(_focus_intent("the record is deleted"), before, after)
     assert chain.outcome == "uncertain", chain
@@ -771,7 +761,14 @@ def test_the_binding_costs_no_extra_capture_or_input() -> None:
     assert classes["focused element"] <= classes["ui_elements population"]
     assert _novel_tokens(_identity_token_classes(before), classes)["hex"] == "focused element"
 
-    # --- the counted half ---------------------------------------------------------------
+    # --- the counted half (N1, VAL-WP3 carry-over, WP4a) ---------------------------------
+    # The counted run now exercises a REAL window/focus change through an execute hook
+    # (the tests/test_fault_injection.py seam): the click's dispatch moves the active
+    # window to one whose title carries the effect's token, so the with-binding run
+    # actually reaches ``FocusChangeStrategy._verify_identity_change`` (its verdict is
+    # pinned ``verified`` via ``focus_change`` below) instead of skating past the tier.
+    # The equal-count assertion is kept: the binding is pure, so the real identity
+    # change costs no extra capture and no extra input either way.
     from types import SimpleNamespace
 
     from computer_use_mcp.agent import ComputerUseAgent
@@ -783,6 +780,7 @@ def test_the_binding_costs_no_extra_capture_or_input() -> None:
     from test_controller_integration import ScriptedBackend
 
     window = WindowInfo(hwnd=1, pid=7, process_name="mspaint.exe", title="Untitled - Paint")
+    hex_field = WindowInfo(hwnd=2, pid=8, process_name="mspaint.exe", title="Hex color input - Paint")
 
     class CountingBackend(ScriptedBackend):
         """Counts captures (observe calls) alongside the engine-level executed list."""
@@ -795,8 +793,10 @@ def test_the_binding_costs_no_extra_capture_or_input() -> None:
             self.captures += 1
             return super().observe()
 
-    def _counted_run(*, expected_effect: str | None) -> tuple[int, int]:
+    def _counted_run(*, expected_effect: str | None) -> tuple[int, int, Any]:
         backend = CountingBackend(flip=False, active_window=window)
+        # the REAL identity change: the click's own dispatch moves the foreground window
+        backend.execute_hooks.append(lambda action: backend.set_active_window(hex_field))
         agent = ComputerUseAgent(
             backend,
             provider=None,
@@ -811,10 +811,22 @@ def test_the_binding_costs_no_extra_capture_or_input() -> None:
             max_steps=5, step_count=0, require_approval=False, max_retries_per_action=1,
         )
         action = GroundedAction(action="click", point={"x": 10, "y": 10}, confidence=1.0)
-        asyncio.run(agent.run_single(state, action, approved=True, expected_effect=expected_effect))
-        return backend.captures, len(backend.executed)
+        outcome = asyncio.run(
+            agent.run_single(state, action, approved=True, expected_effect=expected_effect)
+        )
+        return backend.captures, len(backend.executed), outcome
 
     with_binding = _counted_run(expected_effect="Hex input focused")
     without_binding = _counted_run(expected_effect=None)
     assert with_binding[1] == without_binding[1] == 1  # exactly one input either way
+    # N1: the with-binding run really reached the identity binding ...
+    with_binding_verification = with_binding[2].result.verification
+    assert with_binding_verification is not None
+    assert with_binding_verification.outcome == "verified", with_binding_verification
+    assert with_binding_verification.verification_method == "focus_change", (
+        with_binding_verification
+    )
+    # ... and the REAL window change costs the same captures with and without the
+    # binding: equal counts pin contract item (e) end to end (F7, VAL-WP3).
+    assert with_binding[0] == without_binding[0], (with_binding, without_binding)
     assert with_binding[0] == without_binding[0]  # exactly the same capture count

@@ -224,7 +224,12 @@ async def test_scaled_125_percent_executes_origin_plus_screenshot_times_scale_on
     )
     response = _executed_payload(response)
 
-    assert response.get("ok") is True, response
+    # F1 fix 1.1 (decision D-1(a), WP4a/E-03 port): a STATED effect is no longer
+    # satisfiable by "some pixels changed", so this flipping world now yields
+    # ``uncertain`` instead of ``verified``.  The contract under test — the composed
+    # physical point — is untouched, and the input is still dispatched.
+    assert response.get("ok") is False, response
+    assert response["verification"]["outcome"] == "uncertain", response
     # The recorded action point stays in SCREENSHOT space end-to-end (grounding records
     # the scale; it never rewrites the point).
     assert executed_points(backend) == [("click", (100, 200))]
@@ -253,7 +258,9 @@ async def test_scaled_150_percent_executes_origin_plus_screenshot_times_scale_on
     )
     response = _executed_payload(response)
 
-    assert response.get("ok") is True, response
+    # F1 fix 1.1 (WP4a/E-03 port): stated effect + pixels changed => uncertain (not
+    # verified); the transform assertions below are the contract under test.
+    assert response["verification"]["outcome"] == "uncertain", response
     assert executed_points(backend) == [("click", (640, 360))]
     assert_single_transform(backend, screenshot_point=(640, 360), monitor_origin=(0, 0), scale=1.5)
     assert backend._cursor_physical == (960, 540)
@@ -281,7 +288,9 @@ async def test_negative_origin_secondary_monitor_executes_origin_plus_screenshot
     )
     response = _executed_payload(response)
 
-    assert response.get("ok") is True, response
+    # F1 fix 1.1 (WP4a/E-03 port): stated effect + pixels changed => uncertain (not
+    # verified); the transform assertions below are the contract under test.
+    assert response["verification"]["outcome"] == "uncertain", response
     assert executed_points(backend) == [("click", (960, 540))]
     assert_single_transform(backend, screenshot_point=(960, 540), monitor_origin=(-1920, -1080), scale=1.25)
     assert backend._cursor_physical == (-720, -405)
@@ -342,7 +351,9 @@ async def test_passthrough_scale_one_applies_no_transform(
     )
     response = _executed_payload(response)
 
-    assert response.get("ok") is True, response
+    # F1 fix 1.1 (WP4a/E-03 port): stated effect + pixels changed => uncertain (not
+    # verified); the transform assertions below are the contract under test.
+    assert response["verification"]["outcome"] == "uncertain", response
     assert executed_points(backend) == [("click", (300, 400))]
     assert backend._cursor_physical == (300, 400)
 

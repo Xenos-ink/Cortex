@@ -874,7 +874,8 @@ async def test_response_path_redacts_secret_shaped_text(
     note/evidence — and is REDACTED at the response sink. (A secret-shaped ``type``
     payload is now stopped even earlier, at the safety gate — defense in depth.)"""
     session_id, bundle, _backend, _ = make_session(
-        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch, backend=ScriptedBackend(flip=False), dry_run=False,
+        require_approval=False, limits=FAST_LIMITS
     )
     response = await server.computer_execute(
         session_id,
@@ -884,7 +885,16 @@ async def test_response_path_redacts_secret_shaped_text(
         expected_effect="window shows API_KEY=supersecretvalue123 after click",
     )
     response = execute_payload(response)
-    assert response["ok"] is True, response
+    # WP4a (E-03) re-pin: the honest verdict for a stated effect over a static screen
+    # is ``uncertain`` (ok False); flip=False keeps the effect prose on the
+    # absent-evidence NOTE path ("No pixel evidence of the stated expectation: …") —
+    # the exact surface the response-sink redaction below must catch. (F5, VAL-WP4a:
+    # on a flipping screen the abstention NOTE never echoes the effect, but the
+    # digest-arm EVIDENCE channel does — pinned by
+    # tests/test_audit_compliance.py::test_redaction_enforced_on_the_flip_screen_
+    # evidence_channel.)
+    assert response["ok"] is False, response
+    assert response["result"] == "uncertain", response.get("result")
 
     # The response's MESSAGE/verification surfaces are redacted at the sink; the
     # action dict echoes the caller's own expected_effect verbatim (same-party

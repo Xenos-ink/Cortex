@@ -165,15 +165,30 @@ def test_focus_click_pixel_identical_degrades_to_uncertain_not_failed():
 
 
 def test_genuine_visible_change_still_verifies():
-    """Scope guard: a real visual transition (drawn stroke) still verifies via the pixel
-    tier's strong-pixel path — the fix must not downgrade genuine evidence."""
+    """Scope guard for the F1 fix 1.1 re-pin (WP4a/E-03 port): a real visual transition
+    (drawn stroke) still verifies through the pixel tier — for an intent that states
+    NO effect.
+
+    With a stated effect the SAME stroke now abstains (claim A1: the pixel tier cannot
+    compare a described effect, so it must not claim one), and the focus tier's
+    corroborated-digest signal abstains with it. The D-1(a) carve-out keeps the
+    expectation-less host exactly as it was."""
     engine = VerificationEngine()
     intent = _direct_path_click_intent("Line segment drawn on canvas")
     result = engine.verify(intent, _observation(_base_frame()), _observation(_stroke_frame()))
-    assert result.outcome == "verified", (
-        f"genuine change lost its verdict: outcome={result.outcome!r} note={result.note!r}"
+    assert result.outcome == "uncertain", (
+        f"stated effect satisfied by pixels: outcome={result.outcome!r} note={result.note!r}"
     )
-    assert result.changed is True
+    assert result.changed is True  # the real change is still OBSERVED and reported
+
+    bare = VerificationIntent(
+        kind=VerificationKind.VISUAL_CHANGE.value,
+        expected_change=True,
+        metadata={FOCUS_CHANGE_INTENT_FLAG: True},
+    )
+    assert engine.verify(
+        bare, _observation(_base_frame()), _observation(_stroke_frame())
+    ).outcome == "verified"
 
 
 def test_default_thresholds_unchanged():
