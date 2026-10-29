@@ -10,9 +10,11 @@ intentionally excluded); full actions belong in the redaction-enforced audit sin
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from collections import deque
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -143,12 +145,71 @@ class TaskState(BaseModel):
 
 @dataclass
 class SessionContext:
-    """Everything isolated per session: task state, stop signal, and creation time."""
+    """Everything isolated per session: task state, stop signal, and creation time.
+
+    Idle-timeout bookkeeping (WP-S): ``created_monotonic`` / ``last_activity_monotonic``
+    are MONOTONIC-clock anchors (wall-clock changes cannot fake idleness) and
+    ``in_flight`` counts tool calls / waits currently running on the session — a
+    session with anything in flight is never idle-reaped, and its idle clock is
+    re-based to the END of the last call (``touch_activity`` at call exit). The
+    mutations are guarded by a tiny dedicated lock so concurrent tool calls (and the
+    WP6 blocking-wait hook) can mark/unmark from any thread; the server's own lock
+    discipline still governs registry/bundle-map consistency on top.
+    """
 
     session_id: str
     task: TaskState
     stop: StopToken
     created_at: datetime = field(default_factory=_utc_now)
+    # Lambdas (not bare time.monotonic) so the attribute lookup happens at call time
+    # and tests can patch the monotonic clock.
+    created_monotonic: float = field(default_factory=lambda: time.monotonic())
+    last_activity_monotonic: float = field(default_factory=lambda: time.monotonic())
+    _in_flight: int = 0
+    _activity_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
+    def touch_activity(self) -> None:
+        """Re-base the idle clock to NOW (start AND end of every tool call)."""
+        with self._activity_lock:
+            self.last_activity_monotonic = time.monotonic()
+
+    def mark_busy(self) -> None:
+        """Count one tool call / wait as in flight (never reaped while > 0)."""
+        with self._activity_lock:
+            self._in_flight += 1
+
+    def mark_idle(self) -> None:
+        """Release one in-flight mark (never below zero — defensive against bugs)."""
+        with self._activity_lock:
+            self._in_flight = max(0, self._in_flight - 1)
+
+    def in_flight_count(self) -> int:
+        with self._activity_lock:
+            return self._in_flight
+
+    def idle_seconds(self, now: float | None = None) -> float:
+        """Seconds since the last activity anchor (negative never reported)."""
+        current = time.monotonic() if now is None else now
+        return max(0.0, current - self.last_activity_monotonic)
+
+    @contextmanager
+    def in_flight_call(self) -> Iterator[SessionContext]:
+        """The WP6 hook: mark a running background wait as in-flight tool work.
+
+        Touches activity at enter AND exit, so a session blocked inside a wait
+        accumulates ZERO idle time while the wait runs and the idle count starts
+        only when the wait ends. Use as ``with context.in_flight_call(): ...``
+        around the blocking segment.
+        """
+        self.touch_activity()
+        self.mark_busy()
+        try:
+            yield self
+        finally:
+            self.touch_activity()
+            self.mark_idle()
 
 
 class SessionLimitExceeded(RuntimeError):

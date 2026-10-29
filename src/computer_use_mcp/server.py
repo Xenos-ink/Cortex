@@ -70,6 +70,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
+import inspect
 import io
 import json
 import logging
@@ -78,7 +80,8 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
@@ -278,7 +281,13 @@ def _get_live_bundle(session_id: str) -> _SessionBundle:
 
 
 def _close_stopped_bundle(
-    session_id: str, bundle: _SessionBundle, *, source: str, audit_stop_events: bool = True
+    session_id: str,
+    bundle: _SessionBundle,
+    *,
+    source: str,
+    audit_stop_events: bool = True,
+    audit_metadata: dict[str, Any] | None = None,
+    snapshot_extra: dict[str, Any] | None = None,
 ) -> None:
     """Shared kill-path cleanup (F7): one stopping flavor, one hygiene outcome.
 
@@ -286,6 +295,13 @@ def _close_stopped_bundle(
     the stop, removes the bundle from the store AND the registry, and records the
     bounded stopped-session snapshot. ``audit_stop_events=False`` is used when the stop
     was already audited by another path (in-run emergency_stop, detection event).
+
+    WP-S (idle reaper): ``audit_metadata`` is merged into BOTH stop events' metadata
+    (the idle reaper adds ``idle_seconds``); ``snapshot_extra`` is merged into the
+    remembered stopped-session snapshot (the reaper adds ``stop_reason`` +
+    ``idle_seconds`` so a later call's ``session_stopped`` message can say the session
+    was stopped for inactivity after N seconds). Both default to None — existing
+    callers (stop_session, internal kill path) are byte-identical.
 
     B4 (T8): teardown is ATOMIC under the lock and the stopped-session snapshot is
     remembered FIRST, with every fallible piece guarded — a failure inside the audit
@@ -297,6 +313,9 @@ def _close_stopped_bundle(
     bundle.state.stopped = True
     bundle.state.pending_approval_token = None
     if audit_stop_events:
+        metadata: dict[str, Any] = {"source": source}
+        if audit_metadata:
+            metadata.update(audit_metadata)
         for event_type in ("stop", "emergency_stop"):
             try:
                 bundle.auditor.emit(
@@ -304,7 +323,7 @@ def _close_stopped_bundle(
                     session_id,
                     task_id=bundle.context.task.task_id,
                     result="stopped",
-                    metadata={"source": source},
+                    metadata=metadata,
                 )
             except Exception:
                 logger.debug("stop audit failed", exc_info=True)
@@ -319,6 +338,8 @@ def _close_stopped_bundle(
         except Exception:
             logger.debug("stopped-session snapshot failed", exc_info=True)
             snapshot = {"task_id": bundle.context.task.task_id}
+        if snapshot_extra:
+            snapshot.update(snapshot_extra)
         _remember_stopped(session_id, snapshot)
         _bundles.pop(session_id, None)
         _registry.remove(session_id)
@@ -344,10 +365,179 @@ def _error_response(exc: Exception) -> dict[str, object]:
     if isinstance(exc, (_UnknownSession, _StoppedSession)):
         payload["session_id"] = str(exc.args[0]) if exc.args else ""
     if isinstance(exc, _StoppedSession):
-        payload["message"] = (
-            "Session is stopped; refusing to proceed (fail-closed stopped-session policy)."
-        )
+        payload["message"] = _stopped_session_message(str(exc.args[0]) if exc.args else "")
     return payload
+
+
+# --- WP-S idle-session reaper (Addendum 2 + follow-up, ORVEX-2026-108) ------------------------
+# A session the agent started and forgot (or whose stop failed) used to sit in the
+# registry forever: SessionRegistry is fail-closed (never evicts), so forgotten
+# sessions piled up until start_session was refused permanently. The reaper stops an
+# idle session through the SAME kill path as stop_session (``_close_stopped_bundle`` —
+# audited, bundle + registry removed, stopped snapshot remembered with
+# ``stop_reason``), sweeping lazily at the entry of every tool call and inside
+# start_session BEFORE the limit check, so a full registry of forgotten sessions
+# frees itself. NOTHING that is actually running is ever reaped: a session with an
+# in-flight tool call (or a WP6 blocking wait via ``SessionContext.in_flight_call``)
+# is skipped, and its idle clock is re-based to the END of the last call.
+
+#: Env knob: idle timeout in seconds. Default 900 (15 minutes, per the user's
+#: follow-up). Band 60..86400; ``0`` = disabled. Out-of-band or unparsable values
+#: FALL BACK to the default (fallback-not-clamp, the WP2 knob style) — a typo can
+#: never silently arm an aggressive reaper.
+SESSION_IDLE_TIMEOUT_ENV = "CORTEX_SESSION_IDLE_TIMEOUT_SECONDS"
+SESSION_IDLE_TIMEOUT_DEFAULT_SECONDS = 900.0
+SESSION_IDLE_TIMEOUT_MIN_SECONDS = 60.0
+SESSION_IDLE_TIMEOUT_MAX_SECONDS = 86400.0
+
+
+def _session_idle_timeout() -> float:
+    """Resolve the idle timeout in seconds: env > default, fallback-not-clamp.
+
+    Unset/empty → default; unparsable, non-finite, or out-of-band (excluding the
+    explicit ``0`` = disabled) → default, never clamped into the band.
+    """
+    raw = os.environ.get(SESSION_IDLE_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return SESSION_IDLE_TIMEOUT_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return SESSION_IDLE_TIMEOUT_DEFAULT_SECONDS
+    if not math.isfinite(value):
+        return SESSION_IDLE_TIMEOUT_DEFAULT_SECONDS
+    if value == 0.0:
+        return 0.0  # explicitly disabled
+    if value < SESSION_IDLE_TIMEOUT_MIN_SECONDS or value > SESSION_IDLE_TIMEOUT_MAX_SECONDS:
+        return SESSION_IDLE_TIMEOUT_DEFAULT_SECONDS
+    return value
+
+
+def _stopped_session_message(session_id: str) -> str:
+    """The ``session_stopped`` message, naming the inactivity stop when the reaper did it."""
+    base = "Session is stopped; refusing to proceed (fail-closed stopped-session policy)."
+    snapshot = _stopped_sessions.get(session_id)
+    if isinstance(snapshot, dict) and snapshot.get("stop_reason") == "idle_timeout":
+        return (
+            f"{base} This session was stopped automatically for inactivity "
+            f"(idle_timeout) after {snapshot.get('idle_seconds')} seconds without "
+            "any tool call on it."
+        )
+    return base
+
+
+def _sweep_idle_sessions(*, exclude: str | None = None) -> list[str]:
+    """Stop every session idle past the timeout with nothing in flight; return the ids.
+
+    O(live sessions) ≤ max_sessions (≤ 64), so sweeping lazily at every tool entry is
+    cheap and no background thread is needed. Runs under the server lock; reaping goes
+    through ``_close_stopped_bundle`` (the stop_session kill path — audited ``stop`` +
+    ``emergency_stop`` with ``source="idle_timeout"`` and ``idle_seconds`` in the
+    metadata, stopped snapshot remembered with ``stop_reason="idle_timeout"``).
+    ``exclude`` keeps the session the CURRENT call addresses from being judged before
+    its own activity is recorded (it is also touched first by :func:`_session_call`).
+    """
+    timeout = _session_idle_timeout()
+    if timeout <= 0:
+        return []
+    reaped: list[str] = []
+    with _lock:
+        now = time.monotonic()
+        for session_id, bundle in list(_bundles.items()):
+            if session_id == exclude:
+                continue
+            context = bundle.context
+            if context.in_flight_count() > 0:
+                continue  # never reap a session with work in flight
+            idle = now - context.last_activity_monotonic
+            if idle >= timeout:
+                _close_stopped_bundle(
+                    session_id,
+                    bundle,
+                    source="idle_timeout",
+                    audit_metadata={"idle_seconds": round(idle, 3)},
+                    snapshot_extra={"stop_reason": "idle_timeout", "idle_seconds": round(idle, 3)},
+                )
+                reaped.append(session_id)
+    if reaped:
+        logger.info(
+            "Idle-session reaper stopped %d forgotten session(s): %s", len(reaped), reaped
+        )
+    return reaped
+
+
+def _live_sessions_payload() -> tuple[list[dict[str, Any]], float]:
+    """Snapshot of the live sessions for the ``session_limit_exceeded`` reply.
+
+    Returns ``(entries, effective_idle_timeout)`` with entries sorted MOST-IDLE first
+    so an agent that lost its session ids can see exactly what to ``stop_session``.
+    """
+    timeout = _session_idle_timeout()
+    with _lock:
+        now = time.monotonic()
+        entries = [
+            {
+                "session_id": session_id,
+                "idle_seconds": round(bundle.context.idle_seconds(now), 3),
+                "in_flight": bundle.context.in_flight_count(),
+                "age_seconds": round(max(0.0, now - bundle.context.created_monotonic), 3),
+            }
+            for session_id, bundle in _bundles.items()
+        ]
+    entries.sort(key=lambda entry: (entry["idle_seconds"], entry["age_seconds"]), reverse=True)
+    return entries, timeout
+
+
+@contextmanager
+def _session_call(session_id: str) -> Iterator[None]:
+    """Enter/exit bookkeeping for EVERY session-scoped tool call (WP-S, one helper).
+
+    Enter: touch the session's activity (a call is activity even when it is later
+    rejected or refused), mark it in-flight, then sweep idle sessions — excluding the
+    addressed session, which was just touched. Exit: touch activity again (idle time
+    is measured from the END of the last call) and release the in-flight mark. All
+    bookkeeping is under the server lock; a session stopped mid-call decrements the
+    captured context so the counter can never leak upward.
+    """
+    with _lock:
+        entered = _bundles.get(session_id)
+        if entered is not None:
+            entered.context.touch_activity()
+            entered.context.mark_busy()
+    try:
+        _sweep_idle_sessions(exclude=session_id)
+        yield
+    finally:
+        with _lock:
+            current = _bundles.get(session_id)
+            target = current if current is not None else entered
+            if target is not None:
+                target.context.touch_activity()
+                target.context.mark_idle()
+
+
+def _session_scoped(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Decorator: wrap a session-scoped tool with :func:`_session_call` bookkeeping.
+
+    Applied UNDER ``@mcp.tool()`` so the MCP-registered callable is the wrapper;
+    ``functools.wraps`` preserves name/docstring/annotations, and ``inspect.signature``
+    resolves through ``__wrapped__``, so the advertised tool schema is unchanged.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(session_id: str, *args: Any, **kwargs: Any) -> Any:
+            with _session_call(session_id):
+                return await fn(session_id, *args, **kwargs)
+
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def wrapper(session_id: str, *args: Any, **kwargs: Any) -> Any:
+        with _session_call(session_id):
+            return fn(session_id, *args, **kwargs)
+
+    return wrapper
 
 
 def _redact_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1574,6 +1764,16 @@ def start_session(
     receive images pass "image" (or omit) for real image blocks.
     Precedence: param > env ``CORTEX_IMAGE_DELIVERY`` ("text"/"image") > default
     "image"; invalid values are rejected fail-closed (``invalid_image_delivery``).
+
+    Idle-session reaper (WP-S, trailing behavior): sessions idle for more than 15
+    minutes (env ``CORTEX_SESSION_IDLE_TIMEOUT_SECONDS``, band 60..86400, ``0`` =
+    disabled) with no tool call in flight are STOPPED automatically through the same
+    kill path as stop_session; any tool call on a session (including a rejected one)
+    resets the count, and idle sessions are swept here BEFORE the session limit is
+    checked — a full registry of forgotten sessions frees itself. When the limit is
+    still reached, this reply lists the live sessions (``live_sessions``, most idle
+    first, with ``idle_seconds``/``in_flight``/``age_seconds`` plus the effective
+    ``idle_timeout_seconds``): call stop_session on one of them to free a slot.
     """
     try:
         # D9 precedence (documented): the legacy ``max_retries_per_action`` parameter and
@@ -1616,13 +1816,31 @@ def start_session(
     except ValueError as exc:
         return {"ok": False, "error": "invalid_limits", "message": str(exc)}
     try:
+        # WP-S: sweep idle sessions BEFORE the limit check — a full registry of
+        # forgotten sessions frees itself here instead of refusing forever.
+        _sweep_idle_sessions()
         context = _registry.create()
     except SessionLimitExceeded as exc:
+        # WP-S: the refusal lists the live sessions (most idle first) so an agent
+        # that lost its session ids can stop_session one to free a slot. Additive
+        # keys only — ok/error/max_sessions unchanged.
+        live_sessions, idle_timeout = _live_sessions_payload()
+        message = (
+            f"{exc} Live sessions are listed in ``live_sessions`` (most idle first); "
+            "call stop_session on one of them to free a slot."
+        )
+        if idle_timeout > 0:
+            message += (
+                f" Sessions idle past {idle_timeout:g}s with nothing in flight are "
+                "stopped automatically."
+            )
         return {
             "ok": False,
             "error": "session_limit_exceeded",
-            "message": str(exc),
+            "message": message,
             "max_sessions": exc.max_sessions,
+            "live_sessions": live_sessions,
+            "idle_timeout_seconds": idle_timeout,
         }
     session_id = context.session_id
     try:
@@ -1770,6 +1988,7 @@ def start_session(
 
 
 @mcp.tool()
+@_session_scoped
 def stop_session(session_id: str) -> dict[str, object]:
     """Arm the kill path: no further input is performed after this returns.
 
@@ -1777,6 +1996,15 @@ def stop_session(session_id: str) -> dict[str, object]:
     before every physical input, at every loop checkpoint, and inside waits, and it
     audits stop + emergency_stop events. The session bundle is closed and removed from
     the registry (D1): subsequent tool calls fail closed with ``session_stopped``.
+
+    Idle-session reaper (WP-S): the same kill path stops a session automatically after
+    15 minutes without any tool call on it (env
+    ``CORTEX_SESSION_IDLE_TIMEOUT_SECONDS``, band 60..86400, ``0`` = disabled; ANY
+    call — even a rejected one — resets the count; a call in flight is never
+    interrupted and re-bases the idle clock to its END). An idle-reaped session is
+    audited with ``source="idle_timeout"`` and later calls say it was stopped for
+    inactivity after N seconds. Hitting the session limit? start_session's refusal
+    lists the live sessions (most idle first) so you can stop_session one.
     """
     bundle = _bundles.get(session_id)
     if bundle is None:
@@ -1812,6 +2040,7 @@ def stop_session(session_id: str) -> dict[str, object]:
 
 
 @mcp.tool()
+@_session_scoped
 def computer_observe(
     session_id: str,
     visual_view: NullableStr = None,
@@ -2026,12 +2255,14 @@ def computer_observe(
 
 
 @mcp.tool()
+@_session_scoped
 def computer_screenshot(session_id: str) -> Any:
     """Compatibility alias for the raw screenshot observation."""
     return computer_observe(session_id)
 
 
 @mcp.tool()
+@_session_scoped
 def computer_zoom(
     session_id: str,
     region: NullableRegion = None,
@@ -2237,6 +2468,7 @@ def computer_zoom(
 
 
 @mcp.tool()
+@_session_scoped
 async def computer_execute(
     session_id: str,
     action: str,
@@ -2403,7 +2635,7 @@ async def computer_execute(
             "ok": False,
             "result": "rejected",
             "message": (
-                "Session is stopped; refusing to proceed (fail-closed stopped-session policy)."
+                _stopped_session_message(str(exc.args[0]) if exc.args else "")
                 if isinstance(exc, _StoppedSession)
                 else str(exc)
             ),
