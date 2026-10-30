@@ -1568,6 +1568,13 @@ class ComputerUseAgent:
         )
         return outcome
 
+    # WP7b-SEAM(plan-queue): the plan path enters HERE — WP7b adds the additive
+    # ``plan_policies`` / ``plan_context`` parameters (dev agent.py shape), stamps the
+    # INTERNAL settle markers from computer_use_mcp.plan (``stamped_plan_actions`` or
+    # the per-policy stamp: ``item.plan_point_settle = policies[i] is not None`` and
+    # ``item.plan_point_settle_ms = policies[i]["settle_ms"]``), and retains the step's
+    # ``interference_events`` on the lease at this boundary. plan.py supplies
+    # plan_step_context / plan_cursor_after (K-53) / merge_plan_step_prefix.
     async def _run_action_queue(
         self,
         state: Any,

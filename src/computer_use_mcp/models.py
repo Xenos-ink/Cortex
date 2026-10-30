@@ -277,10 +277,11 @@ class GroundedAction(BaseModel):
     # WP2 (ORVEX-2026-102 §5.2, SPEC 5.2): INTERNAL, plan-only, exactly like
     # ``plan_point_settle`` above — ActionSpec deliberately does NOT mirror it, so no
     # host payload on the flat surface can carry a settle, and ``to_grounded`` leaves
-    # it None. Set ONLY by the plan normalizer from the point's declared ``settle_ms``
-    # (WP7-SEAM(plan-settle-stamping): plan.py does not exist yet; this field and the
-    # backend consumer are the WP2 side of that seam). ``None`` means "no declared
-    # settle" and the dispatch path falls back to the module policy.
+    # it None. Set ONLY by the plan normalizer's stamping producer
+    # (``computer_use_mcp.plan.stamped_plan_actions``, from the point's declared
+    # ``settle_ms`` — the WP7a producer this field's WP2 comment originally deferred
+    # as a seam). ``None`` means "no declared settle" and the dispatch path falls
+    # back to the module policy.
     plan_point_settle_ms: int | None = Field(default=None, ge=0, le=MAX_PLAN_SETTLE_MS)
     action_id: str = Field(default_factory=_new_id)
     risk: RiskLevel | None = None

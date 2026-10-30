@@ -661,7 +661,13 @@ def _redact_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _redact_queue_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    """F2 defense-in-depth for PERF-004 C7 queue entries: redact text at the sink."""
+    """F2 defense-in-depth for PERF-004 C7 queue entries: redact text at the sink.
+
+    WP7b-SEAM(redact-delegate): the plan layer's ``computer_use_mcp.plan.redact_queue_entry``
+    is the SAME behavior (same three text keys, same ``redact_text`` sink); WP7b
+    delegates this function to it so the two sinks cannot drift, and WP8's dead-code
+    sweep owns any leftover duplicate.
+    """
     redacted = dict(entry)
     if redacted.get("message"):
         redacted["message"] = redact_text(str(redacted["message"]))[0]
@@ -1535,6 +1541,11 @@ NullableBool = Annotated[bool | None, _PLAIN_NULLABLE_BOOLEAN]
 NullableCoordinate = Annotated[TolerantInt | None, _PLAIN_WIDENED_NULLABLE_COORDINATE]
 NullableStrList = Annotated[TolerantStrList | None, _PLAIN_WIDENED_NULLABLE_STRING_ARRAY]
 NullableFollowUps = Annotated[TolerantFollowUps | None, _PLAIN_WIDENED_NULLABLE_OBJECT_ARRAY]
+# WP7b-SEAM(plan-param): attach the S-10 typed advertised schema from plan.py here —
+# `NullablePlan = Annotated[dict[str, Any] | None, _PlainJsonSchema(plan.PLAN_PARAM_PLAIN_SCHEMA)]`
+# (object-only, no anyOf/$ref/string arm; the JSON-string tolerance stays runtime-only
+# via plan.coerce_tolerant_plan) — plus the `plan`/`plan_action` trailing-optional
+# parameters on computer_execute (the rt7 trailing-pin).
 NullableStrMap = Annotated[dict[str, Any] | None, _PLAIN_NULLABLE_STRING_MAP]
 NullableNumberMap = Annotated[dict[str, float] | None, _PLAIN_NULLABLE_NUMBER_MAP]
 NullableKeys = Annotated[TolerantKeys | None, _PLAIN_WIDENED_NULLABLE_STRING_ARRAY]
@@ -2706,7 +2717,7 @@ async def computer_wait(
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
-    # WP7-SEAM(wait-lease): when the waypoint-plan lease lands (WP7), a plan-lease
+    # WP7b-SEAM(wait-lease): when the waypoint-plan lease lands (WP7), a plan-lease
     # refusal for computer_wait/computer_cancel_wait goes HERE (status stays allowed
     # during a lease — it is read-only). Recorded in wp6-notes.md for WP7.
     if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, (int, float)):
@@ -4035,7 +4046,7 @@ def _record_observation_evidence(
     )
 
 
-# WP7-SEAM(evidence-by-backend): the store read API WP7 consumes already exists —
+# WP7b-SEAM(evidence-by-backend): the store read API WP7 consumes already exists —
 # ``EvidenceStore.captures()`` (evidence.py) returns bounded per-frame metadata for
 # every retained capture, on BOTH backends (it is filled by the reply hooks above,
 # never by backend-specific attributes — no fake-only ``executed``/``observed``
@@ -4145,7 +4156,13 @@ async def _fetch_image_response(store: EvidenceStore, image_id: str) -> Any:
     metadata: dict[str, Any] = {
         "ok": True,
         "result": "verified",
-        "message": "Stored frame served (a stored capture is not necessarily current).",
+        "message": (
+            "Stored frame served (a stored capture is not necessarily current). "
+            "A fetched frame may be served at a different resolution than the reply "
+            "that published it — the reply that published the image_id may have "
+            "carried a downscaled/JPEG copy, while this tool re-bounds the stored "
+            "pre-ladder original and discloses its own image_outbound_scale."
+        ),
         "session_id": frame.session_id,
         "image_id": frame.image_id,
         "image_format": mime_type,
@@ -4224,7 +4241,7 @@ async def computer_fetch_image(session_id: str, image_id: str) -> Any:
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
-    # WP7-SEAM(fetch-lease): a fetch is a READ-ONLY retrieval of evidence this
+    # WP7b-SEAM(fetch-lease): a fetch is a READ-ONLY retrieval of evidence this
     # session already holds — it is ALLOWED while a plan lease is active (S-04) and
     # must stay allowed.  WP7 must NOT add a lease refusal here (the observe/zoom
     # lease-refusal placement deliberately does NOT extend to this tool); if WP7's

@@ -533,7 +533,15 @@ def register_frame(
 ) -> dict[str, Any]:
     """Retain one frame and return the additive reply block (``{}`` when there is
     nothing to do: no payload means no capture, and a missing store means the session
-    is already gone — both are cases where adding keys would be a lie)."""
+    is already gone — both are cases where adding keys would be a lie).
+
+    N2 normalization (VAL-WP5-02, fixed in WP7a DELTA 1): THIS is the single storage
+    point for ``visual_view`` — the raw/pass-through convention is ``None``
+    everywhere, so a caller whose explicit view selector is the literal ``"raw"``
+    (observe/zoom/execute all accept it) stores ``None``, never the string. A
+    derived view keeps its id (``"grid"``, ...), so a fetched frame is
+    self-describing about derivations only.
+    """
     store = evidence_store(extra)
     if store is None or not payload:
         return {}
@@ -549,6 +557,6 @@ def register_frame(
         coordinate_scale_y=coordinate_scale_y,
         coordinate_space=coordinate_space,
         crop_region=crop_region,
-        visual_view=visual_view,
+        visual_view=None if visual_view == "raw" else visual_view,
         redactions_applied=redactions_applied,
     )

@@ -1414,8 +1414,9 @@ MOVE_DURATION_MS = _env_bounded_int(MOVE_DURATION_ENV, 0, 200, 500)
 #: SPEC 5.2 (conflict C3): inside a plan the duration is REQUIRED FROM THE MODEL,
 #: so this constant is a FAIL-SAFE for an unstated value, not a behaviour. The
 #: default is 0 (an instant jump) and the accepted band is 0..500. Consulted ONLY by
-#: the plan normalizer (WP7-SEAM(plan-normalizer): plan.py does not exist yet; the
-#: constant ships now so the WP7 seam has its policy value ready).
+#: the plan normalizer (``computer_use_mcp.plan.normalize_plan`` — WP7a owns the
+#: consumer; a flat action never touches this constant, pinned by
+#: tests/test_w5_motion_policy.py).
 PLAN_MOVE_DURATION_MS = _env_bounded_int(PLAN_MOVE_DURATION_ENV, 0, 0, 500)
 #: Motion shape family (D6): linear by default — the functional benefit of curves is
 #: NOT PROVEN; the jump already lands with 0 px error.
@@ -4846,10 +4847,11 @@ class LocalComputerBackend(ComputerBackend):
         legacy behavior. The settle DURATION is the declared
         ``plan_point_settle_ms`` (E-01's wiring: the model-stated value, consumed by
         :func:`_plan_point_settle_seconds`); ``None`` falls back to the module policy.
-        WP7-SEAM(plan-settle-stamping): the producer that stamps
-        ``plan_point_settle``/``plan_point_settle_ms`` from a waypoint's ``settle_ms``
-        is the WP7 plan normalizer (plan.py does not exist yet); this consumer side is
-        complete and proven by tests/test_plan_settle_wiring.py.
+        The producer is ``computer_use_mcp.plan.stamped_plan_actions`` (WP7a): it
+        stamps ``plan_point_settle``/``plan_point_settle_ms`` from a waypoint's
+        declared ``settle_ms`` during plan normalization; this consumer side is
+        complete and proven by tests/test_plan_settle_wiring.py plus the WP7a
+        stamping tests.
         """
         _validate_action_defense(action)
         message = self._execute_dispatched(action, stop, focus_hook, allow_launch)

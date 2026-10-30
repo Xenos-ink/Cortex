@@ -867,13 +867,13 @@ def test_a_late_spatial_text_failure_stores_nothing(
 
 
 def test_the_two_wp7_seam_markers_exist_exactly_once() -> None:
-    """Exactly one ``WP7-SEAM(fetch-lease)`` (where WP7 keeps the fetch ALLOWED
-    during a plan lease, S-04) and one ``WP7-SEAM(evidence-by-backend)`` (where WP7
+    """Exactly one ``WP7b-SEAM(fetch-lease)`` (where WP7 keeps the fetch ALLOWED
+    during a plan lease, S-04) and one ``WP7b-SEAM(evidence-by-backend)`` (where WP7
     builds the plan evidence block from the store + lease, S-03).  The plans
     themselves do not exist yet — WP7 owns them; this pins the seams, not the plans."""
     source = SERVER_PATH.read_text(encoding="utf-8")
-    assert source.count("WP7-SEAM(fetch-lease)") == 1
-    assert source.count("WP7-SEAM(evidence-by-backend)") == 1
+    assert source.count("WP7b-SEAM(fetch-lease)") == 1
+    assert source.count("WP7b-SEAM(evidence-by-backend)") == 1
 
 
 def test_the_store_read_api_for_evidence_by_backend_exists_and_is_backend_agnostic() -> None:
