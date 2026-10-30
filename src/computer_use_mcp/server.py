@@ -80,10 +80,12 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+import uuid
+import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -288,7 +290,7 @@ def _close_stopped_bundle(
     audit_stop_events: bool = True,
     audit_metadata: dict[str, Any] | None = None,
     snapshot_extra: dict[str, Any] | None = None,
-) -> None:
+) -> list["_WaitHandle"]:
     """Shared kill-path cleanup (F7): one stopping flavor, one hygiene outcome.
 
     Arms the token (idempotent), mirrors the flag onto the legacy session state, audits
@@ -308,6 +310,14 @@ def _close_stopped_bundle(
     or the metrics snapshot can never again leave the registry/bundle store popped
     WITHOUT the stopped memory (the exact state that surfaces to clients as a
     bogus ``unknown_session`` for a session that was already stopped).
+
+    WP6: every live background wait of the session is cancelled HERE, inside the
+    locked teardown and BEFORE the bundle is popped (the dev ``_cancel_all_waits``
+    anchor), so a wait can never outlive the session that owns it; the session's
+    tombstone ring is dropped with it (a stopped session performs no further work).
+    The cancelled handles are RETURNED — the caller MUST join them OUTSIDE the
+    server lock (K-5: the workers' own ``finally`` needs that lock; joining under
+    it deadlocks). ``_join_wait_threads`` is the bounded join helper.
     """
     bundle.context.stop.stop()
     bundle.state.stopped = True
@@ -328,6 +338,9 @@ def _close_stopped_bundle(
             except Exception:
                 logger.debug("stop audit failed", exc_info=True)
     with _lock:
+        # WP6: cancel-and-detach the session's waits while the teardown is atomic
+        # (cancel flags set + registries cleaned under ``_lock``, before the pop).
+        cancelled_wait_handles = _cancel_all_waits(session_id)
         snapshot: dict[str, Any] = {}
         try:
             snapshot = {
@@ -343,6 +356,7 @@ def _close_stopped_bundle(
         _remember_stopped(session_id, snapshot)
         _bundles.pop(session_id, None)
         _registry.remove(session_id)
+    return cancelled_wait_handles
 
 
 def _error_response(exc: Exception) -> dict[str, object]:
@@ -430,12 +444,19 @@ def _sweep_idle_sessions(*, exclude: str | None = None) -> list[str]:
     """Stop every session idle past the timeout with nothing in flight; return the ids.
 
     O(live sessions) ≤ max_sessions (≤ 64), so sweeping lazily at every tool entry is
-    cheap and no background thread is needed. Runs under the server lock; reaping goes
-    through ``_close_stopped_bundle`` (the stop_session kill path — audited ``stop`` +
+    cheap and no background thread is needed. Reaping goes through
+    ``_close_stopped_bundle`` (the stop_session kill path — audited ``stop`` +
     ``emergency_stop`` with ``source="idle_timeout"`` and ``idle_seconds`` in the
     metadata, stopped snapshot remembered with ``stop_reason="idle_timeout"``).
     ``exclude`` keeps the session the CURRENT call addresses from being judged before
-    its own activity is recorded (it is also touched first by :func:`_session_call`).
+    its own activity is recorded (it is also touched first by :func:`_session_enter`).
+
+    WP-S carry-over (2)+(3)+(4): eligibility is decided ATOMICALLY per session
+    (``SessionContext.claim_for_reap`` — in-flight + last activity read together, and
+    the claim fences tool entry), the audited/metrics close runs OUTSIDE the server
+    lock so one slow audit sink can never stall unrelated tool calls, and each
+    individual reap is guarded — one failing reap never aborts the sweep or an
+    unrelated session's tool call.
     """
     timeout = _session_idle_timeout()
     if timeout <= 0:
@@ -443,22 +464,38 @@ def _sweep_idle_sessions(*, exclude: str | None = None) -> list[str]:
     reaped: list[str] = []
     with _lock:
         now = time.monotonic()
+        candidates: list[tuple[str, _SessionBundle, float]] = []
         for session_id, bundle in list(_bundles.items()):
             if session_id == exclude:
                 continue
-            context = bundle.context
-            if context.in_flight_count() > 0:
-                continue  # never reap a session with work in flight
-            idle = now - context.last_activity_monotonic
-            if idle >= timeout:
-                _close_stopped_bundle(
-                    session_id,
-                    bundle,
-                    source="idle_timeout",
-                    audit_metadata={"idle_seconds": round(idle, 3)},
-                    snapshot_extra={"stop_reason": "idle_timeout", "idle_seconds": round(idle, 3)},
-                )
-                reaped.append(session_id)
+            try:
+                claimed_idle = bundle.context.claim_for_reap(now=now, timeout=timeout)
+            except Exception:  # noqa: BLE001 - one broken context never aborts the sweep
+                logger.warning("idle-reap eligibility check failed for %s", session_id, exc_info=True)
+                continue
+            if claimed_idle is not None:
+                candidates.append((session_id, bundle, claimed_idle))
+    for session_id, bundle, idle in candidates:
+        try:
+            with _lock:
+                current = _bundles.get(session_id)
+                if current is not bundle:
+                    bundle.context.release_reap_claim()
+                    continue  # already stopped/replaced by someone else
+            _close_stopped_bundle(
+                session_id,
+                bundle,
+                source="idle_timeout",
+                audit_metadata={"idle_seconds": round(idle, 3)},
+                snapshot_extra={"stop_reason": "idle_timeout", "idle_seconds": round(idle, 3)},
+            )
+            reaped.append(session_id)
+        except Exception:  # noqa: BLE001 - one failing reap never aborts the sweep
+            logger.warning("idle reap of %s failed; session left live", session_id, exc_info=True)
+            try:
+                bundle.context.release_reap_claim()
+            except Exception:  # noqa: BLE001 - defensive
+                logger.debug("reap-claim release failed for %s", session_id, exc_info=True)
     if reaped:
         logger.info(
             "Idle-session reaper stopped %d forgotten session(s): %s", len(reaped), reaped
@@ -488,36 +525,54 @@ def _live_sessions_payload() -> tuple[list[dict[str, Any]], float]:
     return entries, timeout
 
 
-@contextmanager
-def _session_call(session_id: str) -> Iterator[None]:
-    """Enter/exit bookkeeping for EVERY session-scoped tool call (WP-S, one helper).
+def _session_enter(session_id: str) -> tuple[_SessionBundle | None, dict[str, object] | None]:
+    """Enter bookkeeping for EVERY session-scoped tool call (WP-S, one helper).
 
-    Enter: touch the session's activity (a call is activity even when it is later
-    rejected or refused), mark it in-flight, then sweep idle sessions — excluding the
-    addressed session, which was just touched. Exit: touch activity again (idle time
-    is measured from the END of the last call) and release the in-flight mark. All
-    bookkeeping is under the server lock; a session stopped mid-call decrements the
-    captured context so the counter can never leak upward.
+    Touch the session's activity (a call is activity even when it is later rejected
+    or refused), mark it in-flight, then return the captured context for the matching
+    :func:`_session_exit`. All bookkeeping is under the server lock.
+
+    WP-S carry-over (2)+(3): if a reaper currently HOLDS a claim on this session
+    (it was selected as idle-expired and is about to be closed), the call refuses
+    with ``session_stopped`` WITHOUT marking busy — the session really did time out,
+    and the refusal keeps the in-flight count at zero so the close outside the lock
+    can never race a session that just became busy.
+
+    Returns ``(captured_bundle, refusal)``; ``refusal`` is a ready-made
+    ``session_stopped`` error payload the decorator returns directly. A unknown
+    session returns ``(None, None)`` — the tool body owns the ``unknown_session``
+    answer, and no bookkeeping is created for it.
     """
     with _lock:
         entered = _bundles.get(session_id)
         if entered is not None:
             entered.context.touch_activity()
+            if entered.context.reap_claimed:
+                return None, _error_response(_StoppedSession(session_id))
             entered.context.mark_busy()
-    try:
-        _sweep_idle_sessions(exclude=session_id)
-        yield
-    finally:
-        with _lock:
-            current = _bundles.get(session_id)
-            target = current if current is not None else entered
-            if target is not None:
-                target.context.touch_activity()
-                target.context.mark_idle()
+    return entered, None
+
+
+def _session_exit(session_id: str, entered: _SessionBundle | None) -> None:
+    """Exit bookkeeping matching :func:`_session_enter` (WP-S, one helper).
+
+    Touch activity again (idle time is measured from the END of the last call) and
+    release the in-flight mark on the context CAPTURED AT ENTRY (carry-over 5: the
+    decrement always pairs with the increment, even if the bundle was reaped and a
+    new context was created under the same id mid-call — that new context is touched
+    so it starts its idle window fresh).
+    """
+    with _lock:
+        if entered is not None:
+            entered.context.touch_activity()
+            entered.context.mark_idle()
+        current = _bundles.get(session_id)
+        if current is not None and current is not entered:
+            current.context.touch_activity()
 
 
 def _session_scoped(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Decorator: wrap a session-scoped tool with :func:`_session_call` bookkeeping.
+    """Decorator: wrap a session-scoped tool with WP-S session bookkeeping.
 
     Applied UNDER ``@mcp.tool()`` so the MCP-registered callable is the wrapper;
     ``functools.wraps`` preserves name/docstring/annotations, and ``inspect.signature``
@@ -527,15 +582,27 @@ def _session_scoped(fn: Callable[..., Any]) -> Callable[..., Any]:
 
         @functools.wraps(fn)
         async def async_wrapper(session_id: str, *args: Any, **kwargs: Any) -> Any:
-            with _session_call(session_id):
+            entered, refusal = _session_enter(session_id)
+            if refusal is not None:
+                return refusal
+            try:
+                _sweep_idle_sessions(exclude=session_id)
                 return await fn(session_id, *args, **kwargs)
+            finally:
+                _session_exit(session_id, entered)
 
         return async_wrapper
 
     @functools.wraps(fn)
     def wrapper(session_id: str, *args: Any, **kwargs: Any) -> Any:
-        with _session_call(session_id):
+        entered, refusal = _session_enter(session_id)
+        if refusal is not None:
+            return refusal
+        try:
+            _sweep_idle_sessions(exclude=session_id)
             return fn(session_id, *args, **kwargs)
+        finally:
+            _session_exit(session_id, entered)
 
     return wrapper
 
@@ -1150,6 +1217,16 @@ def _parse_limits(limits: dict[str, Any] | None) -> Limits:
     for key, value in limits.items():
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise TypeError(f"Limit {key!r} must be a number, got {type(value).__name__}.")
+        # F3 fix 3.4 (B·N5), ported with WP6: ``math.isfinite`` guard. ``Limits._clamp``
+        # cannot detect a non-finite value — ``min(hi, nan)`` is ``hi`` — so e.g.
+        # ``max_wait_seconds=nan`` would silently resolve to the CEILING (10800), the
+        # most PERMISSIVE value the field allows. A non-finite value is a CLIENT ERROR
+        # here, so the fail-closed answer is a typed rejection, never a substitution.
+        if not math.isfinite(float(value)):
+            raise ValueError(
+                f"Limit {key!r} must be a finite number; got {value!r} "
+                "(nan/inf are not accepted — omit the field for its default)."
+            )
         kwargs[str(key)] = float(value)
     return Limits(**kwargs).validate()  # type: ignore[arg-type]
 
@@ -1473,7 +1550,8 @@ ACTION_VOCABULARY = (
     "move (x,y), type (text required), keypress (keys=[\"<one key name>\"]), "
     "hotkey (keys=[2-12 key names], e.g. [\"ctrl\",\"a\"]), scroll (delta -20..20), "
     "wait (delta seconds; this flat action is capped at 10 s and reports "
-    "waited_seconds when the cap bites), focus_window (target = window title), "
+    "waited_seconds when the cap bites — for a LONG wait use the computer_wait tool, "
+    "not a large delta), focus_window (target = window title), "
     "ensure_app (target = \"process\" or \"process|doc-token\"; attaches to an EXISTING "
     "instance — REATTACHED/AMBIGUOUS_INSTANCE/NO_INSTANCE — and may launch the target "
     "server-side when no instance matches, the target is allowlisted, and the "
@@ -1989,13 +2067,15 @@ def start_session(
 
 @mcp.tool()
 @_session_scoped
-def stop_session(session_id: str) -> dict[str, object]:
+async def stop_session(session_id: str) -> dict[str, object]:
     """Arm the kill path: no further input is performed after this returns.
 
     Shape-compatible with the legacy tool; it now arms the thread-safe StopToken checked
     before every physical input, at every loop checkpoint, and inside waits, and it
     audits stop + emergency_stop events. The session bundle is closed and removed from
     the registry (D1): subsequent tool calls fail closed with ``session_stopped``.
+    (DELTA 1/F4: the tool is ASYNC — its bounded wait-worker join runs OFF the loop
+    thread via ``asyncio.to_thread`` — with the same parameters and reply shape.)
 
     Idle-session reaper (WP-S): the same kill path stops a session automatically after
     15 minutes without any tool call on it (env
@@ -2027,7 +2107,14 @@ def stop_session(session_id: str) -> dict[str, object]:
         except Exception:  # durability failure must not block stopping
             logger.debug("before_session_end checkpoint failed", exc_info=True)
     # D1/F7: shared kill-path cleanup — bundle store and registry stay consistent.
-    _close_stopped_bundle(session_id, bundle, source="stop_session")
+    # WP6: the cancelled waits are joined so no worker thread survives the stop.
+    # DELTA 1/F4: the tool is ASYNC and the bounded join (S-16, 5 s cap) runs OFF
+    # the loop thread via asyncio.to_thread — starvation-safe because the F1
+    # loop-signal design never uses the default executor for waits, so one short
+    # bounded join thread can never delay a wait wake.
+    cancelled_wait_handles = _close_stopped_bundle(session_id, bundle, source="stop_session")
+    if cancelled_wait_handles:
+        await asyncio.to_thread(_join_wait_threads, cancelled_wait_handles)
     return {
         "ok": True,
         "session_id": session_id,
@@ -2037,6 +2124,883 @@ def stop_session(session_id: str) -> dict[str, object]:
         if bundle.context.task.termination_reason
         else None,
     }
+
+
+# --- WP6 (ORVEX-2026-108, goal Addendum 2 follow-up): the cancellable background wait ------
+# The user's requirement: an agent that must wait before deciding calls
+# ``computer_wait(duration)`` and BLOCKS — in segments that never trip the MCP client's
+# 60 s tool timeout — until it is TOLD the wait is over; it can cancel early; the
+# waiting time is TOOL-RUNNING time, never idle time (a running wait holds the WP-S
+# in-flight mark, so the session is never idle-reaped mid-wait and the idle count
+# starts only when the wait ends); and ``stop_session`` tears every wait down.
+#
+# Architecture: ONE bounded daemon worker thread per wait (the worker sleeps in
+# ``WAIT_CANCEL_SLICE_SECONDS`` slices on its OWN thread — never on the event loop).
+# The tool functions are ASYNC and block ON the event loop via a per-call
+# asyncio.Event that the worker (and the cancel/stop paths) signal through
+# ``loop.call_soon_threadsafe`` (DELTA 1/F1: the executor is NEVER used — any
+# number of concurrently blocked wait calls costs the loop zero threads, so the
+# default pool can never be starved and no call can exceed its segment cap).
+# The event loop stays free, so ``stop_session``, ``computer_cancel_wait`` and
+# every other tool on any session are served while a wait call is blocked. Cancel/
+# stop set the worker's cancel event AND signal the loop events directly; the
+# worker retires within one slice (≤ 0.1 s) and — F2 ordering — retires its
+# terminal state BEFORE signalling, so a woken caller always reads the tombstone.
+# A client-side cancellation of the blocking MCP call only abandons that call's
+# await — the wait itself keeps running and stays queryable.
+#
+# Registry/tombstone design is the dev (ORVEX-2026-102) port: an entry in
+# ``_WAITS_IN_FLIGHT`` exists IFF a worker is alive; terminal outcomes live in the
+# bounded ``_WAIT_TOMBSTONES`` ring; every terminal path funnels through
+# ``_retire_wait``. S-15 is fixed here: the concurrent-wait caps are checked BEFORE
+# any ``setdefault``, so a refused wait leaves no empty per-session dict behind.
+
+#: Env knob: how long ONE blocking segment may last, in seconds. Default 45; band
+#: 1..55 — every value keeps a call comfortably under the MCP client's 60 s tool
+#: timeout. Out-of-band / unparsable / non-finite values FALL BACK to the default
+#: (fallback-not-clamp, the WP-S knob style) — a typo can never silently arm a
+#: call-blocking 55+ s segment.
+WAIT_SEGMENT_ENV = "CORTEX_WAIT_SEGMENT_SECONDS"
+WAIT_SEGMENT_DEFAULT_SECONDS = 45.0
+WAIT_SEGMENT_MIN_SECONDS = 1.0
+WAIT_SEGMENT_MAX_SECONDS = 55.0
+
+
+def _wait_segment_seconds() -> float:
+    """Resolve the blocking-segment length in seconds: env > default, fallback-not-clamp."""
+    raw = os.environ.get(WAIT_SEGMENT_ENV, "").strip()
+    if not raw:
+        return WAIT_SEGMENT_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return WAIT_SEGMENT_DEFAULT_SECONDS
+    if not math.isfinite(value):
+        return WAIT_SEGMENT_DEFAULT_SECONDS
+    if value < WAIT_SEGMENT_MIN_SECONDS or value > WAIT_SEGMENT_MAX_SECONDS:
+        return WAIT_SEGMENT_DEFAULT_SECONDS
+    return value
+
+
+#: Concurrent waits allowed on ONE session (K-18: a named constant, not derived from
+#: ``max_sessions`` — that is the concurrent-SESSION cap; deriving a per-session wait
+#: cap from it was a category error).
+MAX_WAITS_PER_SESSION = 4
+#: Concurrent waits allowed process-wide. At the default ``max_sessions=4`` the
+#: product-wide cap (4 x 4 = 16) is the one that binds.
+MAX_WAITS_GLOBAL = 16
+#: Retained terminal outcomes per session (K-6): the ring is what makes the
+#: ``completed`` and ``already_cancelled`` rows answerable after the live entry is gone.
+WAIT_TOMBSTONES_PER_SESSION = 8
+#: The hard ceiling one request may name. The EFFECTIVE cap is
+#: ``min(bundle.limits.max_wait_seconds, WAIT_HARD_MAX_SECONDS)`` and the refusal
+#: message names THAT value, not this constant (K-19).
+WAIT_HARD_MAX_SECONDS = 10800.0
+#: Cancellation granularity: the worker re-checks its deadline and its cancel event
+#: every ``WAIT_CANCEL_SLICE_SECONDS``, so cancellation latency is ≤ 100 ms and a
+#: blocked caller wakes in well under the 1 s contract.
+WAIT_CANCEL_SLICE_SECONDS = 0.1
+#: Bounded join budget for the teardown path (S-16): a worker is woken by its own
+#: cancel event within ``WAIT_CANCEL_SLICE_SECONDS`` and retires in one ``finally``,
+#: so this is ~50x the observed cost; it exists so a wedged worker can never hang
+#: ``stop_session`` forever.
+WAIT_JOIN_TIMEOUT_SECONDS = 5.0
+
+#: session_id -> wait_id -> live handle. An entry exists IFF a worker is alive (K-6:
+#: the terminal outcome lives in ``_WAIT_TOMBSTONES``).
+_WAITS_IN_FLIGHT: dict[str, dict[str, "_WaitHandle"]] = {}
+#: session_id -> ordered wait_id -> terminal outcome, bounded at
+#: ``WAIT_TOMBSTONES_PER_SESSION`` with the OLDEST evicted first.
+_WAIT_TOMBSTONES: dict[str, dict[str, "_WaitTombstone"]] = {}
+
+
+@dataclass
+class _WaitHandle:
+    """One in-flight background wait.
+
+    Deliberately holds NO strong reference to the session bundle — only a WEAK
+    reference to its ``SessionContext`` (for the WP-S in-flight mark) — so a handle
+    that lives up to 3 h can never keep a stopped session's backend/agent/audit
+    memory alive. It holds its own identity, its own timing, and its own events.
+    Terminal state is NOT a field here — it lives in the bounded
+    ``_WAIT_TOMBSTONES`` ring, which is what makes a cancel arriving after the
+    worker exited answerable at all (K-6).
+    """
+
+    wait_id: str
+    session_id: str
+    requested_seconds: float
+    label: str | None
+    started_at: str
+    started_monotonic: float
+    deadline_monotonic: float
+    context_ref: "weakref.ref[Any] | None" = None
+    # F1 (VAL-WP6-01): the event loop the blocking call ran on, plus the per-call
+    # asyncio.Events the worker signals through ``call_soon_threadsafe``. Blocking
+    # NEVER occupies an executor thread — any number of concurrently blocked wait
+    # calls costs the loop zero threads, so the default pool can never be starved.
+    loop: Any | None = None
+    waiters: "set[Any]" = field(default_factory=set)
+    waiters_lock: threading.Lock = field(default_factory=threading.Lock)
+    cancel: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+
+
+@dataclass(frozen=True)
+class _WaitTombstone:
+    """A bounded record of one finished wait, so a late cancel stays honest."""
+
+    outcome: str  # completed | cancelled | wait_failed
+    elapsed_seconds: float
+    remaining_seconds: float
+    at: str
+    message: str | None = None
+
+
+def _wait_now() -> float:
+    """The monotonic clock every wait decision reads (injectable in tests).
+
+    Every deadline, elapsed and remaining value on this path is derived from this
+    one function — a worker can never mix a wall clock into a duration decision.
+    """
+    return time.monotonic()
+
+
+def _wait_iso_utc() -> str:
+    """ISO-8601 UTC wall-clock stamp, used only for the human-readable echoes."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _wait_rejection(code: str, message: str) -> dict[str, object]:
+    """The gate-refusal envelope for the wait family (unified contract §1.3).
+
+    A refused wait (bad duration, over cap, too many waits, unknown id) is a
+    ``rejected`` reply: ``{ok: False, result: "rejected", reasons: [<code>],
+    message}`` — never an ``error`` key. The message text is byte-identical to dev
+    wherever dev has the rejection.
+    """
+    return {
+        "ok": False,
+        "result": "rejected",
+        "reasons": [code],
+        "message": message,
+    }
+
+
+def _wait_verification() -> dict[str, Any]:
+    """The marker verification block: a wait is a non-screen claim, verified by
+    construction (same semantics as the flat ``done``/``wait`` markers)."""
+    return {
+        "outcome": "verified",
+        "changed": False,
+        "confidence": 1.0,
+        "evidence": ["no_op_marker: computer_wait bookkeeping, no screen claim"],
+        "verification_method": "no_op_marker",
+        "note": (
+            "A wait is an intentional non-screen claim: nothing was dispatched and "
+            "no screen transition is asserted, so there is nothing to verify."
+        ),
+    }
+
+
+def _wait_marker_reply(
+    *,
+    session_id: str,
+    wait_id: str,
+    status: str,
+    message: str,
+    handle: _WaitHandle | None = None,
+    elapsed: float = 0.0,
+    remaining: float = 0.0,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """The unified §1.3 marker envelope for wait/cancel/status replies: ``ok`` true,
+    ``result`` ``marker``, a ``status`` field (running/completed/cancelled)."""
+    reply: dict[str, object] = {
+        "ok": True,
+        "result": "marker",
+        "session_id": session_id,
+        "wait_id": wait_id,
+        "status": status,
+        "elapsed_seconds": round(max(0.0, elapsed), 3),
+        "remaining_seconds": round(max(0.0, remaining), 3),
+        "message": message,
+        "verification": _wait_verification(),
+    }
+    if handle is not None:
+        reply["requested_seconds"] = handle.requested_seconds
+        reply["label"] = handle.label
+        reply["started_at"] = handle.started_at
+    if extra:
+        reply.update(extra)
+    return reply
+
+
+def _wait_failed_reply(
+    session_id: str, wait_id: str, elapsed: float, remaining: float, detail: str | None
+) -> dict[str, object]:
+    """A wait whose worker raised: operation error → ``failed`` + ``wait_failed``."""
+    reply: dict[str, object] = {
+        "ok": False,
+        "result": "failed",
+        "error": "wait_failed",
+        "session_id": session_id,
+        "wait_id": wait_id,
+        "status": "failed",
+        "elapsed_seconds": round(max(0.0, elapsed), 3),
+        "remaining_seconds": round(max(0.0, remaining), 3),
+        "message": (
+            "The wait ended with an internal error; the wait is retired either way "
+            "(never a silent leak)."
+            + (f" Detail: {detail}" if detail else "")
+        ),
+    }
+    return reply
+
+
+def _effective_wait_cap(bundle: Any) -> float:
+    """The cap a request is measured against: the session's own limit, capped by
+    the hard ceiling. The refusal message names THIS value, so a session
+    configured to 60 s is told 60 and never 10 800 (K-19 / B-18)."""
+    configured = float(getattr(bundle.limits, "max_wait_seconds", WAIT_HARD_MAX_SECONDS))
+    return max(0.0, min(configured, WAIT_HARD_MAX_SECONDS))
+
+
+def _retire_wait(handle: _WaitHandle, outcome: str, message: str | None) -> None:
+    """THE single terminal path for a wait: tombstone it, then drop the entry.
+
+    Every terminal condition — natural expiry, cancel, session stop, an exception
+    inside the worker — funnels through here, so a wait can never leave a registry
+    entry behind. The tombstone is written ONLY while the session is still live:
+    ``_close_stopped_bundle`` clears the ring under ``_lock`` before the bundle is
+    popped, and this runs under ``_lock`` too, so a worker that retires after a
+    stop cannot resurrect the ring it was supposed to release.
+    """
+    with _lock:
+        now = _wait_now()
+        if handle.session_id in _bundles:
+            ring = _WAIT_TOMBSTONES.setdefault(handle.session_id, {})
+            ring[handle.wait_id] = _WaitTombstone(
+                outcome=outcome,
+                elapsed_seconds=max(0.0, now - handle.started_monotonic),
+                remaining_seconds=max(0.0, handle.deadline_monotonic - now),
+                at=_wait_iso_utc(),
+                message=message,
+            )
+            while len(ring) > WAIT_TOMBSTONES_PER_SESSION:
+                del ring[next(iter(ring))]
+        registry = _WAITS_IN_FLIGHT.get(handle.session_id)
+        if registry is not None:
+            registry.pop(handle.wait_id, None)
+            if not registry:
+                _WAITS_IN_FLIGHT.pop(handle.session_id, None)
+
+
+def _wait_worker(handle: _WaitHandle) -> None:
+    """The wait thread: bounded SOLELY by its own deadline and its cancel event.
+
+    Never by anything client-derived (A-9): a dropped connection must not leave a
+    thread sleeping for three hours holding a slot. Never holds the module ``_lock``
+    while sleeping either — it takes ``_lock`` only inside the terminal ``finally``,
+    which is precisely why the canceller must NOT join while holding that same lock
+    (K-5 / C7 / A-1).
+
+    WP-S in-flight integration: the worker holds the session's in-flight mark (via
+    the weak-referenced context) for the WHOLE wait — the session is never
+    idle-reaped while a wait runs, and the worker's exit ``touch_activity`` re-bases
+    the idle clock so idle counting starts when the wait ENDS. The mark is balanced
+    on every exit path (expiry, cancel, stop, worker exception) because the
+    touch/mark_idle pair sits in the same ``finally``.
+    """
+    context = handle.context_ref() if handle.context_ref is not None else None
+    if context is not None:
+        context.touch_activity()
+        context.mark_busy()
+    outcome = "completed"
+    message: str | None = None
+    try:
+        while True:
+            remaining = handle.deadline_monotonic - _wait_now()
+            if remaining <= 0.0:
+                break
+            if handle.cancel.wait(min(WAIT_CANCEL_SLICE_SECONDS, remaining)):
+                outcome = "cancelled"
+                break
+    except Exception as exc:  # noqa: BLE001 - a worker fault is a typed outcome
+        outcome = "wait_failed"
+        message = f"{type(exc).__name__}: {exc}"
+        logger.warning("wait worker failed", exc_info=True)
+    finally:
+        try:
+            # F2 (VAL-WP6-01): the terminal state is retired BEFORE anything wakes
+            # a caller, so a woken computer_wait/computer_wait_status/cancel always
+            # reads the tombstone — never a bogus `running` with remaining 0.
+            _retire_wait(handle, outcome, message)
+        finally:
+            # DELTA 2: release the WP-S in-flight mark BEFORE waking anyone — when a
+            # blocked caller returns, the idle clock is already re-based to the
+            # wait's END and the counter is already balanced (a caller can never
+            # observe a stale in-flight count for a wait it just saw finish).
+            if context is not None:
+                context.touch_activity()
+                context.mark_idle()
+            handle.done.set()
+            _signal_loop_waiters(handle)
+
+
+def _cancel_all_waits(session_id: str) -> list[_WaitHandle]:
+    """Flag every live wait of a session for cancellation.  SET ONLY, NEVER JOINS.
+
+    Called from ``_close_stopped_bundle`` INSIDE the locked teardown and BEFORE the
+    bundle is popped, so a wait can never outlive the session that owns it. Joining
+    a worker HERE would deadlock (K-5 / C7 / A-1): this holds ``_lock`` while the
+    worker's own ``finally`` blocks on that same lock. The join belongs outside the
+    lock (``_join_wait_threads``, called by the teardown's callers). The session's
+    tombstone ring is dropped here too, because a stopped session performs no
+    further work of any kind and a later cancel against it is refused with
+    ``session_stopped`` before it ever reaches the ring.
+    """
+    with _lock:
+        registry = _WAITS_IN_FLIGHT.pop(session_id, {})
+        handles = list(registry.values())
+        for handle in handles:
+            handle.cancel.set()
+            # F1: wake any coroutine blocked on this wait immediately — the wake is
+            # a loop-thread-safe event set, never a join, and never a pool thread.
+            _signal_loop_waiters(handle)
+        _WAIT_TOMBSTONES.pop(session_id, None)
+        return handles
+
+
+def _join_wait_threads(
+    handles: list[_WaitHandle], timeout: float = WAIT_JOIN_TIMEOUT_SECONDS
+) -> None:
+    """Join retired wait workers.  MUST be called OUTSIDE the module ``_lock``.
+
+    The guard below is the mechanical form of the K-5 invariant: a future refactor
+    that moves the join back inside the locked teardown fails loudly here instead
+    of deadlocking the product.
+    """
+    if getattr(_lock, "_is_owned", lambda: False)():
+        raise RuntimeError(
+            "wait join attempted while holding the module lock (K-5 deadlock: the "
+            "worker's own finally needs that lock)"
+        )
+    for handle in handles:
+        thread = handle.thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+
+
+def _signal_loop_waiters(handle: _WaitHandle) -> None:
+    """Wake every coroutine blocked on this wait — from ANY thread, no executor.
+
+    F1 (VAL-WP6-01): the wake is delivered through ``loop.call_soon_threadsafe`` on
+    the asyncio.Event each blocked call registered, so blocking NEVER occupies an
+    executor thread and no number of concurrently blocked wait calls can starve
+    the loop's default pool. Called by the worker AFTER the terminal state is
+    retired (F2 ordering) and by the cancel/stop paths directly.
+    """
+    loop = handle.loop
+    if loop is None:
+        return
+    with handle.waiters_lock:
+        waiters = list(handle.waiters)
+    for event in waiters:
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            pass  # the creating loop is already closed; its waiters are gone with it
+
+
+def _fire_wait_event(loop: Any, event: Any) -> None:
+    """Fire one loop-registered wait event from a foreign thread (best effort)."""
+    try:
+        loop.call_soon_threadsafe(event.set)
+    except RuntimeError:
+        pass  # the creating loop is already closed; its waiters are gone with it
+
+
+async def _await_wait_wake(handle: _WaitHandle, timeout: float) -> bool:
+    """Await one blocking segment (or the bounded cancel join) ON the event loop.
+
+    The coroutine waits on an ``asyncio.Event`` that the worker — and, directly,
+    the cancel/stop paths — signal via :func:`_signal_loop_waiters`. NO executor
+    thread is ever involved (F1): the number of concurrently blocked wait calls
+    costs the loop zero pooled threads.
+
+    The timeout is enforced in REAL time by a one-shot daemon ``threading.Timer``
+    that fires the SAME loop event at the deadline — deliberately not an asyncio
+    timer: the segment cap (≤ 55 s) is a REAL-time contract and must hold even if
+    the loop's clock is patched or stalled, and a one-shot timer thread that only
+    ``set()``s an event cannot starve anything (it is never a pooled worker and
+    exits immediately after firing).
+    """
+    event = asyncio.Event()
+    with handle.waiters_lock:
+        handle.waiters.add(event)
+    timer: threading.Timer | None = None
+    try:
+        if not handle.done.is_set():
+            timer = threading.Timer(timeout, _fire_wait_event, args=(handle.loop, event))
+            timer.daemon = True
+            timer.start()
+            await event.wait()
+        # A wake that raced a completion signal still lands terminal-safe: the
+        # worker retires (F2) BEFORE signalling, so a set ``done`` implies the
+        # tombstone is already readable.
+        return handle.done.is_set()
+    finally:
+        if timer is not None:
+            timer.cancel()
+        with handle.waiters_lock:
+            handle.waiters.discard(event)
+
+
+def _live_wait_snapshot(handle: _WaitHandle) -> tuple[float, float]:
+    """(elapsed, remaining) straight from the handle's monotonic anchors."""
+    now = _wait_now()
+    return (
+        max(0.0, now - handle.started_monotonic),
+        max(0.0, handle.deadline_monotonic - now),
+    )
+
+
+def _tombstone_reply(
+    session_id: str,
+    wait_id: str,
+    tombstone: _WaitTombstone,
+    *,
+    already_cancelled: bool = False,
+) -> dict[str, object]:
+    """The reply for a wait that is already terminal (read from the tombstone ring)."""
+    if tombstone.outcome == "wait_failed":
+        return _wait_failed_reply(
+            session_id,
+            wait_id,
+            tombstone.elapsed_seconds,
+            tombstone.remaining_seconds,
+            tombstone.message,
+        )
+    message = (
+        f"Wait already finished ({tombstone.outcome}) at {tombstone.at}: elapsed "
+        f"{round(tombstone.elapsed_seconds, 3)} s, remaining "
+        f"{round(tombstone.remaining_seconds, 3)} s."
+    )
+    return _wait_marker_reply(
+        session_id=session_id,
+        wait_id=wait_id,
+        status=tombstone.outcome,
+        message=message,
+        elapsed=tombstone.elapsed_seconds,
+        remaining=tombstone.remaining_seconds,
+        extra={
+            "finished_at": tombstone.at,
+            **({"already_cancelled": True} if already_cancelled else {}),
+        },
+    )
+
+
+@mcp.tool()
+@_session_scoped
+async def computer_wait(
+    session_id: str,
+    duration_seconds: float,
+    label: NullableStr = None,
+) -> dict[str, object]:
+    """Wait for a chosen duration and be TOLD when the wait is over.
+
+    THE WAIT LOOP: call ``computer_wait(duration_seconds)`` — the call BLOCKS for up
+    to one segment (``CORTEX_WAIT_SEGMENT_SECONDS``, default 45 s, band 1..55 —
+    always far under the MCP client's 60 s tool timeout). When the call returns:
+
+    * ``status`` is ``completed`` (with ``elapsed_seconds``) — the wait is over;
+      ACT now.
+    * ``status`` is ``running`` — the reply carries your ``wait_id`` plus
+      ``elapsed_seconds`` and ``remaining_seconds``; call
+      ``computer_wait_status(session_id, wait_id)`` to block for the NEXT segment.
+      Repeat until it returns ``completed``, then act.
+
+    ``duration_seconds`` is required, in SECONDS, and must be > 0 and finite. The
+    hard ceiling is 10 800 s (3 h). A request above the EFFECTIVE cap
+    ``min(limits.max_wait_seconds, 10800.0)`` is REFUSED with a rejection naming
+    that cap and your requested value — it is never silently shortened, and nothing
+    starts. Splitting one long wait into several waits is NOT a workaround: each
+    call is bounded, each gets its own ``wait_id``, and the split is visible to you.
+
+    WHAT A WAIT COSTS: **zero** ``max_actions`` slots. ``max_actions`` bounds INPUT
+    volume and a wait dispatches no input, so ``computer_wait`` does not enter the
+    action pipeline at all. The wait is bounded instead by ``max_wait_seconds`` per
+    request and by the concurrent-wait caps (4 per session, 16 process-wide).
+
+    WHAT ACTUALLY ENDS A SESSION (there is no hidden task clock): ``stop_session``,
+    an internal safety kill, exhausting the ``max_actions`` budget, the host's
+    ``max_steps``, or the process exiting. The advertised ``max_task_seconds`` (900)
+    is a LIMIT YOU MAY SET, not a wall-clock ceiling that ends a session.
+
+    SESSION LIFETIME: the waiting time is TOOL-RUNNING time, never idle time — a
+    session with a running wait is never stopped for inactivity, and the idle count
+    starts only when the wait completes, is cancelled, or the session is stopped.
+
+    CANCELLATION: call ``computer_cancel_wait(wait_id)`` to end a wait early. If
+    YOUR CLIENT cancels this blocking MCP call, only the call's blocking stops —
+    the wait itself KEEPS RUNNING and stays queryable with ``computer_wait_status``;
+    nothing is lost.
+
+    This is a different product from the flat ``{"action": "wait", "delta": N}``
+    queue item, which stays capped at 10 seconds for short in-queue pauses.
+    """
+    try:
+        bundle = _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    # WP7-SEAM(wait-lease): when the waypoint-plan lease lands (WP7), a plan-lease
+    # refusal for computer_wait/computer_cancel_wait goes HERE (status stays allowed
+    # during a lease — it is read-only). Recorded in wp6-notes.md for WP7.
+    if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, (int, float)):
+        return _wait_rejection(
+            "invalid_wait_duration",
+            f"duration_seconds must be a number of seconds; got {duration_seconds!r} "
+            f"({type(duration_seconds).__name__}).",
+        )
+    requested = float(duration_seconds)
+    cap = _effective_wait_cap(bundle)
+    if not math.isfinite(requested) or requested <= 0.0:
+        return _wait_rejection(
+            "invalid_wait_duration",
+            "duration_seconds must be a finite number greater than 0 seconds "
+            f"(the cap for this session is {cap} s); got {duration_seconds!r}.",
+        )
+    if requested > cap:
+        return _wait_rejection(
+            "wait_duration_exceeds_max",
+            f"requested {requested} s exceeds the maximum wait of {cap} s "
+            f"({cap * 1000:,.0f} ms) for this session; nothing was started. "
+            "A wait is never silently shortened — request less, or split the work "
+            "across sessions.",
+        )
+    wait_id = f"wt_{uuid.uuid4().hex[:16]}"
+    started_at = datetime.now(timezone.utc)
+    started_monotonic = _wait_now()
+    handle = _WaitHandle(
+        wait_id=wait_id,
+        session_id=session_id,
+        requested_seconds=requested,
+        label=None if label is None else str(label),
+        started_at=started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        started_monotonic=started_monotonic,
+        deadline_monotonic=started_monotonic + requested,
+        context_ref=weakref.ref(bundle.context),
+        loop=asyncio.get_running_loop(),
+    )
+    thread = threading.Thread(
+        target=_wait_worker,
+        args=(handle,),
+        name=f"cortex-wait-{wait_id}",
+        daemon=True,
+    )
+    handle.thread = thread
+    with _lock:
+        # S-15 fix: the caps are checked BEFORE any setdefault, so a refused wait
+        # leaves no empty per-session dict behind.
+        registry = _WAITS_IN_FLIGHT.get(session_id, {})
+        live = sum(len(entries) for entries in _WAITS_IN_FLIGHT.values())
+        if len(registry) >= MAX_WAITS_PER_SESSION:
+            return _wait_rejection(
+                "too_many_waits",
+                f"this session already has {len(registry)} waits in flight "
+                f"(MAX_WAITS_PER_SESSION = {MAX_WAITS_PER_SESSION}); cancel one first.",
+            )
+        if live >= MAX_WAITS_GLOBAL:
+            return _wait_rejection(
+                "too_many_waits",
+                f"{live} waits are in flight across all sessions "
+                f"(MAX_WAITS_GLOBAL = {MAX_WAITS_GLOBAL}); cancel one first.",
+            )
+        # F7 (VAL-WP6-01 delta): re-check liveness AT registration, under the same
+        # lock as the insert — a session stopped while this call was starting is
+        # refused here instead of registering an orphaned wait.
+        if session_id not in _bundles:
+            return _error_response(_StoppedSession(session_id))
+        # The entry is inserted BEFORE start() so a cancel can never race ahead of
+        # the registry, and it is removed in exactly one place: the worker's finally.
+        _WAITS_IN_FLIGHT.setdefault(session_id, {})[wait_id] = handle
+    try:
+        thread.start()
+    except Exception as exc:  # noqa: BLE001 - F6 (VAL-WP6-01): no phantom registration
+        with _lock:
+            registry = _WAITS_IN_FLIGHT.get(session_id)
+            if registry is not None:
+                registry.pop(wait_id, None)
+                if not registry:
+                    _WAITS_IN_FLIGHT.pop(session_id, None)
+        return {
+            "ok": False,
+            "result": "failed",
+            "error": "wait_failed",
+            "session_id": session_id,
+            "wait_id": wait_id,
+            "status": "failed",
+            "message": (
+                "The wait could not be started "
+                f"({type(exc).__name__}: {exc}); nothing is registered, no wait "
+                "slot is consumed, and no worker exists."
+            ),
+        }
+    segment = _wait_segment_seconds()
+    # THE BLOCKING SEGMENT: awaited ON the event loop via the loop-signal design —
+    # the executor is never involved, so any number of concurrently blocked calls
+    # stays safe, and cancel/stop wake this call through call_soon_threadsafe < 1 s.
+    await _await_wait_wake(handle, segment)
+    return _wait_segment_result_reply(session_id, wait_id, handle, segment, source="wait")
+
+
+def _wait_segment_result_reply(
+    session_id: str,
+    wait_id: str,
+    handle: _WaitHandle,
+    segment: float,
+    *,
+    source: str,
+) -> dict[str, object]:
+    """Resolve the reply after a blocking segment (computer_wait / computer_wait_status).
+
+    A client-side cancellation of the CALL never stops the WAIT: this resolver only
+    ever READS state. Resolution order: session liveness (``session_stopped``), the
+    tombstone (F2: a woken caller ALWAYS finds the terminal state here), the
+    cancel-flag fallback (woken by cancel/stop before the worker reported
+    retirement — answered from the handle rather than a lie), otherwise ``running``.
+    """
+    try:
+        _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    with _lock:
+        tombstone = _WAIT_TOMBSTONES.get(session_id, {}).get(wait_id)
+    if tombstone is not None:
+        return _tombstone_reply(session_id, wait_id, tombstone)
+    elapsed, remaining = _live_wait_snapshot(handle)
+    if handle.cancel.is_set():
+        return _wait_marker_reply(
+            session_id=session_id,
+            wait_id=wait_id,
+            status="cancelled",
+            message=(
+                "Cancellation was requested; the wait was signalled to end and the "
+                "worker had not yet reported retirement. The wait is retired either "
+                "way — call computer_wait_status to confirm."
+            ),
+            handle=handle,
+            elapsed=elapsed,
+            remaining=remaining,
+            extra={"cancelled_at": _wait_iso_utc()},
+        )
+    if source == "wait":
+        message = (
+            "The wait did not finish inside this segment. It is still running "
+            f"({round(elapsed, 3)} s elapsed, {round(remaining, 3)} s remaining of "
+            f"{handle.requested_seconds} s). To be told when the wait is over, call "
+            "computer_wait_status(session_id="
+            f"\"{session_id}\", wait_id=\"{wait_id}\") — it blocks for the next "
+            f"{round(segment, 3)} s segment and returns completed when the wait "
+            "ends. Call computer_cancel_wait(wait_id) to end it early."
+        )
+    else:
+        message = (
+            "The wait is still running "
+            f"({round(elapsed, 3)} s elapsed, {round(remaining, 3)} s remaining of "
+            f"{handle.requested_seconds} s). Call computer_wait_status(session_id, "
+            f"wait_id) again to wait the next {round(segment, 3)} s segment, or "
+            "computer_cancel_wait(wait_id) to end it early."
+        )
+    return _wait_marker_reply(
+        session_id=session_id,
+        wait_id=wait_id,
+        status="running",
+        message=message,
+        handle=handle,
+        elapsed=elapsed,
+        remaining=remaining,
+        extra={"segment_seconds": round(segment, 3), "max_wait_seconds": _effective_wait_cap_for(session_id)},
+    )
+
+
+def _effective_wait_cap_for(session_id: str) -> float:
+    """The effective cap echoed in replies (the session's configured limit)."""
+    with _lock:
+        bundle = _bundles.get(session_id)
+    if bundle is None:
+        return WAIT_HARD_MAX_SECONDS
+    return _effective_wait_cap(bundle)
+
+
+@mcp.tool()
+@_session_scoped
+async def computer_wait_status(
+    session_id: str,
+    wait_id: str,
+    block: bool = True,
+) -> dict[str, object]:
+    """Wait for (or peek at) a running wait and report its outcome.
+
+    The consumer half of the wait loop: call this with the ``wait_id`` from
+    ``computer_wait`` whenever that call returned ``status`` ``running``. With the
+    default ``block=true`` the call blocks for up to one more segment (the same
+    ``CORTEX_WAIT_SEGMENT_SECONDS`` bound — always under the MCP client's 60 s tool
+    timeout) and then answers with the wait's state:
+
+    * ``status`` ``completed`` — the wait ran its full course; ACT now.
+    * ``status`` ``running`` — still going; call this again to wait the next segment.
+    * ``status`` ``cancelled`` — the wait was ended early (this carries
+      ``elapsed_seconds``/``remaining_seconds`` so you know how far it got).
+
+    Pass ``block=false`` for a non-blocking PEEK: the current state and timers with
+    no waiting. A wait_id that finished earlier is answered from the bounded
+    tombstone ring; an unknown or foreign-session wait_id is ``unknown_wait``
+    (session-scoped ids: a wrong id can never probe another session's waits).
+
+    If the worker behind the wait raised, the reply is ``failed`` with
+    ``error`` ``wait_failed``. On a stopped session this is refused with
+    ``session_stopped``. If YOUR CLIENT cancels this blocking call, the underlying
+    wait is NOT affected — call again to re-attach.
+    """
+    try:
+        _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    if not isinstance(wait_id, str) or not wait_id:
+        return _wait_rejection(
+            "unknown_wait",
+            "wait_id must be a non-empty string as returned by computer_wait.",
+        )
+    with _lock:
+        handle = _WAITS_IN_FLIGHT.get(session_id, {}).get(wait_id)
+        tombstone = _WAIT_TOMBSTONES.get(session_id, {}).get(wait_id)
+    if handle is None:
+        if tombstone is None:
+            # Byte-identical for a never-existed id AND for another session's id:
+            # the message deliberately does NOT echo the value (R2 / A-6).
+            return _wait_rejection(
+                "unknown_wait",
+                "No wait with this wait_id exists on this session: wait ids are "
+                "session-scoped, are not persisted across a server restart, and a "
+                "finished wait is remembered only briefly.",
+            )
+        return _tombstone_reply(session_id, wait_id, tombstone)
+    segment = _wait_segment_seconds()
+    if block:
+        await _await_wait_wake(handle, segment)
+        return _wait_segment_result_reply(session_id, wait_id, handle, segment, source="status")
+    elapsed, remaining = _live_wait_snapshot(handle)
+    return _wait_marker_reply(
+        session_id=session_id,
+        wait_id=wait_id,
+        status="running",
+        message=(
+            f"The wait is still running ({round(elapsed, 3)} s elapsed, "
+            f"{round(remaining, 3)} s remaining of {handle.requested_seconds} s). "
+            "Call computer_wait_status(session_id, wait_id) again to wait the next "
+            f"{round(segment, 3)} s segment, or computer_cancel_wait(wait_id) to "
+            "end it early."
+        ),
+        handle=handle,
+        elapsed=elapsed,
+        remaining=remaining,
+        extra={"segment_seconds": round(segment, 3), "block": bool(block)},
+    )
+
+
+@mcp.tool()
+@_session_scoped
+async def computer_cancel_wait(session_id: str, wait_id: str) -> dict[str, object]:
+    """End a wait EARLY and report how much of it actually elapsed.
+
+    ``status`` is always one of the defined answers, never a guess:
+
+    * ``cancelled`` — this call ended the wait. Carries ``elapsed_seconds`` and
+      ``remaining_seconds`` so you know exactly how much time passed. A second
+      cancel of the same id is idempotent: the same numbers plus
+      ``already_cancelled: true``.
+    * ``completed`` — the wait had already run its full course. That is an honest
+      answer, not a failure; ``remaining_seconds`` is 0.
+
+    An ``unknown`` ``wait_id`` is ``unknown_wait``. A ``wait_id`` belonging to a
+    DIFFERENT session gets the byte-identical answer, so a wrong id can never probe
+    another session's handles or stop someone else's wait.
+
+    A wait whose worker raised answers ``failed`` with ``error`` ``wait_failed``
+    and a short message (never a traceback). On a stopped session this is refused
+    with ``session_stopped`` — a stopped session performs no further work of any
+    kind.
+
+    This call never blocks longer than one cancellation slice (~0.1 s): the wake is
+    the worker's own done event, so a ``computer_wait``/``computer_wait_status``
+    call blocked on this wait returns ``cancelled`` in under a second.
+    """
+    try:
+        _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    if not isinstance(wait_id, str) or not wait_id:
+        return _wait_rejection(
+            "unknown_wait",
+            "wait_id must be a non-empty string as returned by computer_wait.",
+        )
+    # Session-scoped lookup ONLY: a foreign id is indistinguishable from one that
+    # never existed, and can never cancel another session's wait (R2 / A-6).
+    with _lock:
+        handle = _WAITS_IN_FLIGHT.get(session_id, {}).get(wait_id)
+        tombstone = _WAIT_TOMBSTONES.get(session_id, {}).get(wait_id)
+        if handle is not None:
+            handle.cancel.set()
+            # F1 (VAL-WP6-01 delta): wake any coroutine blocked on this wait
+            # immediately — a loop-thread-safe event set, never an executor thread.
+            _signal_loop_waiters(handle)
+    if handle is None:
+        if tombstone is None:
+            return _wait_rejection(
+                "unknown_wait",
+                "No wait with this wait_id exists on this session: wait ids are "
+                "session-scoped, are not persisted across a server restart, and a "
+                "finished wait is remembered only briefly.",
+            )
+        return _tombstone_reply(
+            session_id, wait_id, tombstone, already_cancelled=tombstone.outcome == "cancelled"
+        )
+    # No lock is held here and NO executor thread is occupied: this call waits on
+    # the same loop-signal event the worker (and the direct signal above) set, so
+    # the worker's retire — and every other blocked caller's wake — happens within
+    # the 0.1 s cancellation slice, far under the 1 s contract. Bounded at the
+    # S-16 join budget so a wedged worker degrades to the handle-based answer
+    # below instead of hanging the call.
+    await _await_wait_wake(handle, WAIT_JOIN_TIMEOUT_SECONDS)
+    try:
+        _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    with _lock:
+        settled = _WAIT_TOMBSTONES.get(session_id, {}).get(wait_id)
+    if settled is None:
+        # The worker is wedged; answer from the handle rather than lie.
+        elapsed, remaining = _live_wait_snapshot(handle)
+        return _wait_marker_reply(
+            session_id=session_id,
+            wait_id=wait_id,
+            status="cancelled",
+            message=(
+                "Cancellation requested; the wait was signalled to end and the "
+                "worker had not yet reported retirement. The wait is retired "
+                "either way — call computer_wait_status to confirm."
+            ),
+            handle=handle,
+            elapsed=elapsed,
+            remaining=remaining,
+            extra={"cancelled_at": _wait_iso_utc()},
+        )
+    # Dev-identical semantics: THIS call ended the wait, so no already_cancelled
+    # flag — that flag is reserved for a cancel that found the wait already over.
+    return _tombstone_reply(session_id, wait_id, settled)
 
 
 @mcp.tool()

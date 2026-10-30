@@ -905,7 +905,7 @@ async def test_rt7_old_client_shapes_accepted_on_the_tool_surface(
     assert payload["ok"] is True
     assert "screenshot_after_base64" not in payload
     assert backend.executed  # the legacy calls really executed
-    stopped = server.stop_session(session_id)  # legacy shape, no new params
+    stopped = await server.stop_session(session_id)  # legacy shape, no new params
     assert stopped.get("ok") is False or stopped.get("stopped") is True or "session_id" in stopped
 
 

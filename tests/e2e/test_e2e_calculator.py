@@ -192,7 +192,7 @@ def test_calculator_clicks_and_display_verification(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            server.stop_session(session_id)
+            asyncio.run(server.stop_session(session_id))
 
 
 def test_calculator_division_precision(
@@ -245,4 +245,4 @@ def test_calculator_division_precision(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            server.stop_session(session_id)
+            asyncio.run(server.stop_session(session_id))

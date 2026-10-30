@@ -218,7 +218,7 @@ def test_session_stopped_call_still_fails_closed(
 ) -> None:
     """A call on an already-stopped id changes nothing (fail-closed discipline intact)."""
     session_id, _bundle, _backend = _text_session(monkeypatch)
-    server.stop_session(session_id)
+    asyncio.run(server.stop_session(session_id))
     clock.advance(500)
     assert server._sweep_idle_sessions() == []  # nothing left to reap
     rejection = _run_execute(session_id, action="click", x=1, y=1)
@@ -357,7 +357,7 @@ def test_call_on_reaped_id_reports_inactivity_reason(
     assert "inactivity" in rejection["message"]
     validate_reply(rejection, "flat_execute")
 
-    stopped_error = server.stop_session(session_id)  # idempotent re-stop: shape preserved
+    stopped_error = asyncio.run(server.stop_session(session_id))  # idempotent re-stop: shape preserved
     assert stopped_error["ok"] is True
     assert stopped_error["message"] == "Session already stopped."
 

@@ -611,7 +611,7 @@ async def test_computer_execute_expected_effect_and_failure_shapes(
     assert invalid["result"] == "rejected"
     assert "invalid_action" in invalid["reasons"]
 
-    server.stop_session(session_id)
+    await server.stop_session(session_id)
     stopped = await server.computer_execute(session_id, "wait", delta=1)
     assert stopped["ok"] is False
     assert "stopped" in stopped["message"].lower()
@@ -661,7 +661,7 @@ async def test_stop_session_removes_bundle_and_blocks_tools(
     session_id, _bundle, _backend, _provider = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    stop_response = server.stop_session(session_id)
+    stop_response = await server.stop_session(session_id)
     assert stop_response["ok"] is True
     assert session_id not in server._bundles  # memory freed
     assert server._registry.get(session_id) is None  # registry consistent
@@ -681,7 +681,7 @@ async def test_stop_session_removes_bundle_and_blocks_tools(
     # AMENDED (loop removal): the removed loop tool's stopped-session shape check
     # died with the loop; every surviving tool fails closed with session_stopped.
 
-    again = server.stop_session(session_id)  # idempotent, shape preserved
+    again = await server.stop_session(session_id)  # idempotent, shape preserved
     assert again["ok"] is True
     assert "already" in again["message"]
 

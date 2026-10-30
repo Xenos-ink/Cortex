@@ -120,7 +120,7 @@ async def _drive(
         )
     finally:
         try:
-            server.stop_session(session_id=session_id)
+            await server.stop_session(session_id=session_id)
         except Exception as exc:  # noqa: BLE001 - teardown must not mask a verdict
             assert "not a live session" not in str(exc)
 
@@ -299,7 +299,7 @@ async def test_the_field_is_null_on_a_non_ensure_app_action(fresh_server: Any) -
             )
         )
     finally:
-        server.stop_session(session_id=session_id)
+        await server.stop_session(session_id=session_id)
 
     assert payload["ensure_app_outcome"] is None
 

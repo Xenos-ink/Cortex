@@ -113,7 +113,7 @@ async def _drive_audit_scenarios(
     sid, bundle, _, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    server.stop_session(sid)
+    await server.stop_session(sid)
     stopped = await server.computer_execute(sid, "wait", delta=1)
     # §1.4 delta (ORVEX-2026-108): execute-surface stopped refusal = rejection
     # envelope; the stop itself is what this scenario's audit assertions read below.

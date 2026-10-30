@@ -248,7 +248,7 @@ def test_right_click_opens_real_context_menu(
                 evidence.assert_that("menu closed after ESC", True)
         finally:
             with suppress(Exception):  # teardown never masks the test result
-                server.stop_session(session_id)
+                asyncio.run(server.stop_session(session_id))
 
 
 def _payload(response: Any) -> dict[str, Any]:

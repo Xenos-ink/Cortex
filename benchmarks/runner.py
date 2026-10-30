@@ -759,7 +759,7 @@ class BenchmarkRunner:
             metrics_snapshot = bundle.metrics.snapshot()
             run_response["metrics"] = metrics_snapshot
             result.update(self._collect(task, run_response, bundle, session_id, world, scratch_dir))
-            server.stop_session(session_id)
+            asyncio.run(server.stop_session(session_id))
             return result
         except Exception as exc:  # noqa: BLE001 - harness failures are recorded, never raised
             result["error"] = f"{type(exc).__name__}: {exc}"

@@ -81,7 +81,12 @@ SURFACE_RESULT_TOKENS: dict[str, frozenset[str]] = {
     "follow_up_item": frozenset({"verified", "uncertain", "failed", "rejected", "dry_run", "marker", "stopped"}),
     "plan_step": frozenset({"verified", "uncertain", "failed", "rejected", "not_executed"}),
     "terminal_plan": frozenset({"verified", "unknown", "failed", "stopped"}),
-    "wait": frozenset({"marker"}),
+    # WP6 amendment (ORVEX-2026-108, recorded): a gate refusal ON the wait tool
+    # (invalid_wait_duration / wait_duration_exceeds_max / too_many_waits) is a
+    # rejected reply like every other gate — and DELTA 1/F5 adds "failed": the
+    # wait tool itself can answer wait_failed (worker raised / worker could not
+    # start) through the same §1.3 surface.
+    "wait": frozenset({"marker", "rejected", "failed"}),
     "cancel_wait": frozenset({"marker", "failed", "rejected"}),
     "wait_status": frozenset({"marker", "failed", "rejected"}),
     "fetch_image": frozenset({"verified", "rejected"}),

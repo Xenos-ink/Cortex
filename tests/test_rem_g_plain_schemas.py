@@ -47,6 +47,8 @@ from computer_use_mcp.state import SessionRegistry
 # AMENDED (loop removal): the internal-loop tool family is deleted from the surface.
 # AMENDED (AL-002 Amendment A1, owner addendum 2026-09-18): ``computer_zoom`` joins
 # as the sixth, observation-only tool; the no-anyOf walk covers it identically.
+# RESTATED (ORVEX-2026-108 WP6, decision D-1): the wait family — ``computer_wait``,
+# ``computer_cancel_wait``, ``computer_wait_status`` — joins as tools 7-9.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
@@ -54,6 +56,9 @@ ALL_TOOLS = (
     "computer_screenshot",
     "computer_execute",
     "computer_zoom",
+    "computer_wait",
+    "computer_cancel_wait",
+    "computer_wait_status",
 )
 
 
@@ -153,7 +158,7 @@ def test_pin_a_no_anyof_in_any_tool_input_schema(fresh_server: Any) -> None:
     live client-side validator rejected. This pin walks the FULL inputSchema of
     each tool (nested, including $defs) through the REAL FastMCP tool metadata.
     """
-    assert len(ALL_TOOLS) == 6  # the fixed surface: five deterministic tools + the A1 observation-only zoom
+    assert len(ALL_TOOLS) == 9  # six deterministic/observation tools + the WP6 wait family (D-1)
     total_hits: list[str] = []
     for name in ALL_TOOLS:
         schema = _meta(name).arg_model.model_json_schema()

@@ -786,6 +786,10 @@ async def test_r2_d11_fault_injection_window_and_focus_change_must_not_verify_ty
 
 #: AMENDED (AL-002 Amendment A1, owner addendum 2026-09-18): ``computer_zoom`` joins
 #: as the sixth, observation-only tool; the wire-compat walk covers it identically.
+#: RESTATED (ORVEX-2026-108 WP6, decision D-1): the cancellable-wait family —
+#: ``computer_wait``, ``computer_cancel_wait`` and the NEW consumer
+#: ``computer_wait_status`` — joins as tools 7-9. ``computer_fetch_image`` (WP5)
+#: will restate this tuple to 10.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
@@ -793,14 +797,16 @@ ALL_TOOLS = (
     "computer_screenshot",
     "computer_execute",
     "computer_zoom",
+    "computer_wait",
+    "computer_cancel_wait",
+    "computer_wait_status",
 )
 
 
-async def test_r2_surface_is_exactly_six_plain_tools() -> None:
-    """Exactly 6 registered tools (AMENDED by AL-002 Amendment A1, owner addendum
-    2026-09-18: the observation-only ``computer_zoom`` joins the five deterministic
-    tools); every advertised inputSchema contains ZERO anyOf and ZERO $ref/$defs
-    (the wire-compat contract, re-walked independently)."""
+async def test_r2_surface_is_exactly_nine_plain_tools() -> None:
+    """Exactly 9 registered tools (AL-002 zoom was the sixth; ORVEX-2026-108 WP6
+    decision D-1 added the wait family as 7-9); every advertised inputSchema contains
+    ZERO anyOf and ZERO $ref/$defs (the wire-compat contract, re-walked independently)."""
     tools = await server.mcp.list_tools()
     assert sorted(tool.name for tool in tools) == sorted(ALL_TOOLS)
     for name in ALL_TOOLS:

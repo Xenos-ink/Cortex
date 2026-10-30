@@ -166,6 +166,11 @@ class SessionContext:
     created_monotonic: float = field(default_factory=lambda: time.monotonic())
     last_activity_monotonic: float = field(default_factory=lambda: time.monotonic())
     _in_flight: int = 0
+    # WP-S carry-over (3): set by ``claim_for_reap`` while the reaper holds a claim on
+    # this session (selected as expired, not yet closed). A tool call arriving on a
+    # claimed session refuses instead of marking busy, so the close outside the server
+    # lock can never reap a session that just became busy (no reap-vs-busy race).
+    _reap_claimed: bool = False
     _activity_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
@@ -193,6 +198,47 @@ class SessionContext:
         """Seconds since the last activity anchor (negative never reported)."""
         current = time.monotonic() if now is None else now
         return max(0.0, current - self.last_activity_monotonic)
+
+    def reap_eligible(self, *, now: float, timeout: float) -> bool:
+        """Atomic 'reap-eligible at ``now``/``timeout``' check (WP-S carry-over 3).
+
+        In-flight count and last activity are read TOGETHER under the activity lock,
+        so a concurrent ``mark_busy`` can never fall between the two reads. A wait
+        thread holds an in-flight mark for the whole wait, so a running wait makes
+        this ``False`` for the wait's entire lifetime.
+        """
+        with self._activity_lock:
+            return self._in_flight == 0 and (now - self.last_activity_monotonic) >= timeout
+
+    def claim_for_reap(self, *, now: float, timeout: float) -> float | None:
+        """Atomically check :meth:`reap_eligible` AND claim the session for reaping.
+
+        Returns the measured idle seconds when the session was claimed (the sweep
+        audits exactly this number), or ``None`` when it is not eligible. The claim
+        is what fences tool entry against the close that happens OUTSIDE the server
+        lock (WP-S carry-over 2): after a non-``None`` return, every later
+        ``_session_enter`` on this session refuses (the session timed out), so the
+        reaper can run the audited close without holding the server lock and still
+        never reap a session that has become busy again. The claim is released only
+        by the claiming sweep when its close raised (see ``server._sweep_idle_sessions``);
+        a successful close discards the whole context.
+        """
+        with self._activity_lock:
+            if self._in_flight == 0 and (now - self.last_activity_monotonic) >= timeout:
+                self._reap_claimed = True
+                return max(0.0, now - self.last_activity_monotonic)
+            return None
+
+    @property
+    def reap_claimed(self) -> bool:
+        """Whether a reaper currently holds a claim (read under the activity lock)."""
+        with self._activity_lock:
+            return self._reap_claimed
+
+    def release_reap_claim(self) -> None:
+        """Give up a claim (close failed; a later sweep must be able to re-claim)."""
+        with self._activity_lock:
+            self._reap_claimed = False
 
     @contextmanager
     def in_flight_call(self) -> Iterator[SessionContext]:

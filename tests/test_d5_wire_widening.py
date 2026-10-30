@@ -240,7 +240,7 @@ async def test_d5_boundary_allowlist_string_forms(
     assert comma["allowed_processes"] == ["mspaint.exe", "notepad.exe"]
     bundle = server._get_bundle(str(comma["session_id"]))
     assert bundle.extra["allowed_processes"] == ["mspaint.exe", "notepad.exe"]
-    server.stop_session(str(comma["session_id"]))
+    await server.stop_session(str(comma["session_id"]))
 
     json_form = await boundary_start(allowed_processes='["mspaint.exe"]')
     assert json_form["allowed_processes"] == ["mspaint.exe"]  # pre_parse_json normalizes

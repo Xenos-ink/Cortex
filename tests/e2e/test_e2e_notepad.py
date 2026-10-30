@@ -163,7 +163,7 @@ def test_notepad_window_identity_observation(
                 evidence.add_extra("monitor", monitor)
                 evidence.save_audit(bundle, session_id)
         finally:
-            server.stop_session(session_id)
+            asyncio.run(server.stop_session(session_id))
 
 
 def test_notepad_type_semantic_verification(
@@ -227,7 +227,7 @@ def test_notepad_type_semantic_verification(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            server.stop_session(session_id)
+            asyncio.run(server.stop_session(session_id))
 
 
 def test_notepad_moved_window_verification_failure_returns_to_host(
@@ -317,7 +317,7 @@ def test_notepad_moved_window_verification_failure_returns_to_host(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            server.stop_session(session_id)
+            asyncio.run(server.stop_session(session_id))
 
 
 def test_notepad_window_switch_stale_observation(
@@ -404,4 +404,4 @@ def test_notepad_window_switch_stale_observation(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            server.stop_session(session_id)
+            asyncio.run(server.stop_session(session_id))

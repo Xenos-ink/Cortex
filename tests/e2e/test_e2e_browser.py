@@ -176,4 +176,4 @@ def test_browser_local_page_window_state_verification(
                     "after", w32.observe_tool_metadata(server.computer_observe(session_id))["observation"]
                 )
         finally:
-            server.stop_session(session_id)
+            asyncio.run(server.stop_session(session_id))

@@ -26,6 +26,7 @@ in both modes (outbound-only doctrine). Invalid param values fail CLOSED with
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from typing import Any
@@ -265,7 +266,7 @@ async def test_env_layer(
         monkeypatch.setenv(server.IMAGE_DELIVERY_ENV, raw)
         session_id = _start()
         assert server._get_bundle(session_id).extra["image_delivery"] == expected, raw
-        server.stop_session(session_id)
+        await server.stop_session(session_id)
     monkeypatch.delenv(server.IMAGE_DELIVERY_ENV, raising=False)
     assert server._resolve_image_delivery(None) == "image"  # unset -> default
 
@@ -397,7 +398,7 @@ async def test_param_tolerance(
         response = await boundary_start(image_delivery=raw)
         assert response.get("session_id"), (raw, response)
         assert response["image_delivery"] == "text", raw
-        server.stop_session(str(response["session_id"]))
+        await server.stop_session(str(response["session_id"]))
 
 
 # --- pin 14: resume is governed by the fresh param ----------------------------------------------
@@ -436,7 +437,7 @@ async def test_resume_governed_by_fresh_param(
         bundle, goal=str(bundle.context.task.goal or "")
     )
     await server.computer_execute(session_id, "click", x=15, y=15)
-    server.stop_session(session_id)
+    await server.stop_session(session_id)
     path = checkpoint_manager.checkpoint_path(session_id)
     assert path.exists(), "no checkpoint was written on stop"
 

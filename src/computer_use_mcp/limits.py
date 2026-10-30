@@ -57,6 +57,14 @@ class Limits:
     ``approval_epoch_seconds`` 60..86400 (default 1800 = 30 minutes), ``approval_epoch_actions``
     1..1000 (default 50 interactive actions) — whichever is reached first ends the approval
     epoch — and ``health_check_interval`` 60..3600 (default 600 = 10 minutes).
+
+    WP6 (ORVEX-2026-108) adds ``max_wait_seconds`` 0..10800 (default 10800 = 3 hours):
+    the per-session bound a ``computer_wait`` request is measured against. The EFFECTIVE
+    cap is ``min(max_wait_seconds, 10800.0)`` (server ``WAIT_HARD_MAX_SECONDS``); a request
+    above it is REFUSED with a typed rejection naming the cap and the requested value —
+    never silently shortened. It is the ONLY enforced wall-clock bound on a wait:
+    ``max_task_seconds`` is advertised but has no production call site, and
+    ``max_session_seconds`` exists only on the resume / long-running path.
     """
 
     max_task_seconds: float = 900.0
@@ -77,6 +85,12 @@ class Limits:
     approval_epoch_seconds: float = 1800.0
     approval_epoch_actions: int = 50
     health_check_interval: float = 600.0
+    # WP6 (ORVEX-2026-108): the ONLY enforced bound on a ``computer_wait`` request.
+    # 3 h = 10 800 s is also the hard ceiling one request may name; a request above
+    # the EFFECTIVE cap ``min(max_wait_seconds, 10800.0)`` is refused with a typed
+    # rejection that names the cap (the REQUEST is never silently shortened; the
+    # silent clamp of the LIMIT itself stays, like every other field in ``validate``).
+    max_wait_seconds: float = 10800.0
 
     def validate(self) -> Limits:
         """Return a clamped copy of these limits; the original is left untouched."""
@@ -100,6 +114,7 @@ class Limits:
             approval_epoch_seconds=_clamp(self.approval_epoch_seconds, 60.0, 86400.0),
             approval_epoch_actions=int(_clamp(self.approval_epoch_actions, 1, 1000)),
             health_check_interval=_clamp(self.health_check_interval, 60.0, 3600.0),
+            max_wait_seconds=_clamp(self.max_wait_seconds, 0.0, 10800.0),
         )
 
 

@@ -150,7 +150,7 @@ async def test_stop_session_a_does_not_stop_session_b(
         monkeypatch, backend=backend_two,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    stop_response = server.stop_session(sid_one)
+    stop_response = await server.stop_session(sid_one)
     assert stop_response["ok"] is True
     assert bundle_two.context.stop.stopped is False
     assert bundle_two.state.stopped is False
@@ -206,7 +206,7 @@ async def test_removed_session_frees_slot_and_unknown_sessions_fail_closed(
     assert observe["ok"] is False
     assert observe["error"] == "unknown_session"
     assert observe["session_id"] == "does-not-exist"
-    stopped_tool = server.stop_session("does-not-exist")
+    stopped_tool = await server.stop_session("does-not-exist")
     assert stopped_tool["ok"] is False and stopped_tool["error"] == "unknown_session"
     executed = await server.computer_execute("does-not-exist", "wait", delta=1)
     # §1.4 delta (ORVEX-2026-108): execute-surface unknown-session refusal = rejection.
@@ -226,7 +226,7 @@ async def test_tools_on_a_stopped_session_fail_safe(
     sid, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    server.stop_session(sid)
+    await server.stop_session(sid)
 
     # D1 (fixed): stopping closes and removes the bundle — memory freed, registry consistent.
     assert sid not in server._bundles
@@ -286,7 +286,7 @@ async def test_stop_session_then_every_tool_says_session_stopped_not_unknown(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, provider=provider, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
-    stopped = server.stop_session(session_id)
+    stopped = await server.stop_session(session_id)
     assert stopped["ok"] is True
     for _ in range(10):
         observe = server.computer_observe(session_id)
@@ -311,7 +311,7 @@ async def test_teardown_snapshot_failure_still_remembers_session_as_stopped(
         raise RuntimeError("metrics sink exploded during teardown")
 
     monkeypatch.setattr(bundle.metrics, "snapshot", _exploding_snapshot)
-    stopped = server.stop_session(session_id)
+    stopped = await server.stop_session(session_id)
     assert stopped["ok"] is True  # teardown survived the injected failure
     # The session is REMEMBERED as stopped: structured session_stopped, never unknown.
     response = server.computer_observe(session_id)
@@ -329,7 +329,7 @@ def test_registry_and_bundle_store_stay_consistent_across_start_stop_cycles(
             monkeypatch, provider=provider, dry_run=True, require_approval=False, limits=FAST_LIMITS
         )
         assert server._registry.get(session_id) is not None
-        assert server.stop_session(session_id)["ok"] is True
+        assert (asyncio.run(server.stop_session(session_id)))["ok"] is True
         assert server._registry.get(session_id) is None
         assert session_id not in server._bundles
         assert session_id in server._stopped_sessions

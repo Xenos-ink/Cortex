@@ -187,3 +187,70 @@ def test_a_not_determined_predicate_after_uncertain_steps_is_not_completed(
     assert item["verification_outcomes"]["verified"] == 0, item
     assert item["uncertain_steps"] == 1, item
     assert payload["summary"]["uncertain_steps_total"] == 1, payload["summary"]
+
+
+# --- WP6 DELTA 2: the runner must actually STOP the session it started -----------------------
+
+
+def test_direct_call_driver_end_to_end_stops_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELTA 2 (WP6) regression guard: ``stop_session`` is an ASYNC coroutine since
+    WP6 DELTA 1/F4. The runner used to call it synchronously, so the coroutine was
+    never awaited and every benchmark task leaked a live session (the 2
+    RuntimeWarnings the Commander caught). This test drives the DirectCallDriver
+    end to end on the fake backend through the real server tool surface and asserts
+    the session is GONE from the registry and the bundle store after the stop —
+    and that a later call fails closed with ``session_stopped``. Combined with the
+    suite-wide ``error:coroutine.*was never awaited`` filter (tests/conftest.py),
+    any future sync caller of an async tool fails the suite here."""
+    import asyncio
+
+    from benchmarks.runner import DirectCallDriver, FakeWorld, StepResolver, load_tasks
+
+    from computer_use_mcp import server
+    from computer_use_mcp.state import SessionRegistry
+
+    tasks = {t.id: t for t in load_tasks(TASKS_DIR)}
+    task = tasks["t01-notepad-type-verify"]
+    assert task.fake_runnable, task.id
+
+    monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
+    world = FakeWorld()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    world.setup(task, scratch)
+
+    saved = (server._registry, server._bundles, server._backend_factory, server._provider_factory)
+    server._registry = SessionRegistry(max_sessions=8)
+    server._bundles = {}
+    server._backend_factory = lambda: world.backend  # type: ignore[method-assign]
+    try:
+        response = server.start_session(
+            dry_run=False, require_approval=False, max_steps=task.max_actions + 4
+        )
+        assert response.get("session_id"), response
+        session_id = str(response["session_id"])
+
+        driver = DirectCallDriver(task, StepResolver("fake", world))
+        run_response = asyncio.run(driver.run(session_id))
+        assert run_response.get("results"), run_response
+        assert session_id in server._bundles  # live while driving
+
+        # The sync→async bridge the runner uses for computer_execute, applied to
+        # stop_session (DELTA 2 fix in benchmarks/runner.py).
+        asyncio.run(server.stop_session(session_id))
+
+        assert server._registry.get(session_id) is None, "session leaked in the registry"
+        assert session_id not in server._bundles, "session leaked in the bundle store"
+        observe = server.computer_observe(session_id)
+        payload = observe if isinstance(observe, dict) else json.loads(observe[0].text)
+        assert payload["ok"] is False
+        assert payload["error"] == "session_stopped"
+    finally:
+        (
+            server._registry,
+            server._bundles,
+            server._backend_factory,
+            server._provider_factory,
+        ) = saved

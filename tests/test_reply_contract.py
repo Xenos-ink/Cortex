@@ -402,7 +402,7 @@ async def test_stopped_session_execute_reply_is_a_rejection(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    server.stop_session(session_id)
+    await server.stop_session(session_id)
     payload = await server.computer_execute(session_id, "wait", delta=0)
     validate_reply(payload, "flat_execute")
     assert_rejection(payload)
@@ -479,7 +479,7 @@ async def test_no_execute_rejection_reply_ever_carries_an_error_key(
     session_id2, _bundle2, _backend2, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    server.stop_session(session_id2)
+    await server.stop_session(session_id2)
     rejected_replies.append(await server.computer_execute(session_id2, "wait", delta=0))
     for payload in rejected_replies:
         assert payload["result"] == "rejected", payload
@@ -793,7 +793,7 @@ async def test_ensure_app_failure_outcomes_are_failed_or_uncertain(
                 await server.computer_execute(session_id, "ensure_app", target=target)
             )
         finally:
-            server.stop_session(session_id=session_id)
+            await server.stop_session(session_id=session_id)
 
     async def _drive_with_allowlist(world: Any, target: str, allowlist: list[str]) -> dict[str, Any]:
         return await _drive(world, target, allowlist=allowlist)

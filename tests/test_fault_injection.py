@@ -707,7 +707,7 @@ async def test_stop_from_another_thread_mid_execute_halts_with_zero_inputs(
     # an independent OS thread that fires as soon as the physical input phase is entered.
     def _stop_when_entered() -> None:
         blocking.entered_execute.wait(timeout=10)
-        server.stop_session(session_id)
+        asyncio.run(server.stop_session(session_id))
 
     stopper = threading.Thread(target=_stop_when_entered, daemon=True)
     stopper.start()
