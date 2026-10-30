@@ -6,18 +6,17 @@ the v0.7.5 surface:
 - the closed ``ensure_app_outcome`` Literal enum rides every executed ensure_app
   reply (``None`` on every other action) — a driver switches on a field instead of
   parsing a string;
-- a REAL server-side spawn in THIS tree is still prefixed ``NO_INSTANCE`` (the
-  ``LAUNCHED`` leading-token change is WP4b scope), but the payload carries
-  ``launched=<process>``, which is the only proof a process was REALLY spawned —
-  the classifier maps it to ``"launched"`` WITHOUT changing the message prefix
-  (the mission's mapping rule);
-- the typed refusal of an out-of-allowlist target (reject-before-dispatch) is WP4b
-  scope: in this tree the allowlist refusal happens at the launch gate, so the probe
-  still runs with ``allow_launch=False`` and honestly reports ``not_found`` with
-  nothing spawned — this port pins THAT (v0.7.5-true) behavior;
+- a REAL server-side spawn is prefixed ``LAUNCHED`` (WP4b / dev F3 fix 5.1: the
+  ``NO_INSTANCE`` token was chosen before the spawn attempt and never revised, so
+  the first word of a successful spawn said the opposite of what happened); the
+  payload still carries ``launched=<process>``, and the classifier maps it to
+  ``"launched"``;
+- the typed refusal of an out-of-allowlist target (reject-before-dispatch) stays at
+  the launch gate in this tree: the probe runs with ``allow_launch=False`` and
+  honestly reports ``not_found`` with nothing spawned — this port pins THAT
+  behavior;
 - the C·N2 ambiguous-candidate rendering (list EVERY candidate with its ``unsaved``
-  flag in the mixed case) depends on a backend payload change that belongs to WP4b
-  and is NOT ported here.
+  flag in the mixed case) landed with WP4b and is pinned below.
 
 ``ok`` semantics are the §1.1 ok-rule and are NOT changed here.
 """
@@ -224,9 +223,37 @@ async def test_an_ambiguous_match_reports_ambiguous(fresh_server: Any) -> None:
     assert world.launched_processes == []
 
 
+async def test_the_mixed_saved_unsaved_case_lists_every_candidate(
+    fresh_server: Any,
+) -> None:
+    """WP4b (C·N2 / dev F3 fix 5.1): the repro's C8-2b — two instances, ONE unsaved,
+    ONE reported. The payload used to be built from the UNSAVED SUBSET alone, so the
+    saved candidate (the one the driver most needed to see) vanished from the
+    message. Every candidate is listed now, each with its own ``unsaved=`` flag."""
+    a = window(11, "Book1 - Excel")
+    b = window(12, "Budget - Excel")
+    world = LaunchingWorld(
+        windows=[a, b], app_windows=candidates(a, b, unsaved={"Book1 - Excel"})
+    )
+
+    payload = await _drive(world, "excel|nomatch")
+
+    validate_reply(payload, "flat_execute")
+    assert payload["ensure_app_outcome"] == "ambiguous"
+    message = str(payload["message"])
+    assert message.startswith("AMBIGUOUS_INSTANCE")
+    assert "Book1 - Excel" in message
+    assert "Budget - Excel" in message  # the non-unsaved candidate is no longer dropped
+    assert message.count("unsaved=") == 2
+    assert "do_not_launch=true" in message
+    assert world.launched_processes == []  # the branch never launches
+
+
 async def test_a_real_launch_reports_launched(fresh_server: Any) -> None:
-    """A real spawn is typed ``launched`` — by the ``launched=`` payload proof, with
-    THIS tree's unchanged ``NO_INSTANCE`` message prefix (WP4b owns the prefix)."""
+    """A real spawn is typed ``launched`` — and, since WP4b (C8 / dev F3 fix 5.1),
+    the message's leading token is ``LAUNCHED``: the first word now says what
+    happened (the old ``NO_INSTANCE`` token was chosen before the spawn attempt and
+    never revised)."""
     world = LaunchingWorld(windows=[], app_windows=[])
 
     payload = await _drive(world, "mspaint")
@@ -234,7 +261,10 @@ async def test_a_real_launch_reports_launched(fresh_server: Any) -> None:
     assert world.launched_processes == ["mspaint"]
     assert payload["ensure_app_outcome"] == "launched"
     assert payload["result"] == "verified"  # the spawn is proven
+    assert payload["message"].startswith("LAUNCHED")
     assert "launched=" in payload["message"]
+    assert "launch_rejected=" not in payload["message"]
+    assert "launch_unresolved=" not in payload["message"]
 
 
 async def test_a_no_match_with_no_launch_authority_reports_not_found(fresh_server: Any) -> None:

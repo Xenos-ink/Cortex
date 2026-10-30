@@ -148,6 +148,48 @@ UIA_MAX_ELEMENTS = 30  # bounded element list (visible buttons/fields)
 UIA_MAX_DEPTH = 2  # focused element + its direct children
 UIA_READ_BUDGET_SECONDS = 0.05  # hard wall for one semantic read; past it: partial
 
+# --- D15 (ORVEX-2026-108 WP4b): the semantic read REPORTS what it dropped --------------------
+#: Snapshot key carrying the per-read drop breakdown. A reader that finds N elements and
+#: hands over fewer must say so: ``omitted_count`` in the ``spatial_text`` block is
+#: computed at the CONSUMER boundary, which structurally cannot see the producer's own
+#: caps — that is how 33 of 45 known regions shipped as ``region_count=12,
+#: omitted_count=0`` (a healthy-looking block for a partial read).
+SNAPSHOT_DROPPED_KEY = "dropped"
+
+#: The drop reasons a reader may report. Every one of them is a KNOWN loss, never a
+#: guess: ``cap_exceeded`` (the element budget stopped the walk), ``budget_exceeded``
+#: (the wall-clock budget did), ``offscreen`` (deliberately not a visible region),
+#: ``unavailable`` (an element the walk could not summarize).
+SNAPSHOT_DROP_REASONS: tuple[str, ...] = (
+    "cap_exceeded",
+    "budget_exceeded",
+    "offscreen",
+    "unavailable",
+)
+
+
+def _empty_drops() -> dict[str, int]:
+    return {reason: 0 for reason in SNAPSHOT_DROP_REASONS}
+
+
+def snapshot_dropped_total(dropped: object) -> int:
+    """Total known-but-unserved elements in a snapshot's drop breakdown (0 when absent).
+
+    Defensive by construction: an untrusted / hand-built snapshot's breakdown is
+    coerced to ints, unknown keys are ignored, and anything unusable contributes
+    nothing — an unreadable report must never inflate ``omitted_count`` with a guess.
+    """
+    if not isinstance(dropped, dict):
+        return 0
+    total = 0
+    for reason in SNAPSHOT_DROP_REASONS:
+        value = dropped.get(reason)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if value > 0:
+            total += int(value)
+    return total
+
 # --- interference-probe constants (T8; A12 mechanisms i-v) ----------------------------------
 _GW_OWNER = 4  # GetWindow(): retrieves the window's owner (owned-dialog chains)
 _DIALOG_WINDOW_CLASS = "#32770"  # system dialog class (Save As, Confirm Save As, ...)
@@ -1586,6 +1628,77 @@ def _clipboard_open() -> bool:
     return False
 
 
+#: D13 / repair 3.3 restore-discipline annotation values (additive action-message
+#: suffixes; the ``Executed type.`` prefix and the ``integrity=`` suffix stay stable).
+#: The first is a restore that was ATTEMPTED and failed. The second is a payload that
+#: was DESTROYED because it could not be saved in the first place (the clipboard held
+#: a non-text payload — a copied image, a file drop, RTF — which the transport's
+#: ``EmptyClipboard`` destroyed). The second is a data-loss disclosure, so it must
+#: never be reported under the first value.
+CLIPBOARD_RESTORE_FAILED = "clipboard_restore=failed"
+CLIPBOARD_RESTORE_DESTROYED = "clipboard_restore=non_text_destroyed"
+
+#: The three ways a clipboard save can end (:func:`_clipboard_read_verdict`).
+#: ``restorable`` — text is known and will be restored. ``non_text`` — the clipboard
+#: OPENED and held no ``CF_UNICODETEXT``, so the next ``EmptyClipboard`` destroys a
+#: non-text payload (a copied image, a file drop, RTF): a KNOWN loss, disclosed.
+#: ``unknown`` — the open was refused or the read failed: an ABSENCE of knowledge, and
+#: an absence of knowledge is never reported as a known loss.
+CLIPBOARD_RESTORABLE = "restorable"
+CLIPBOARD_NON_TEXT = "non_text"
+CLIPBOARD_UNKNOWN = "unknown"
+
+
+def _clipboard_read_verdict() -> tuple[str | None, str]:
+    """Read the current clipboard AND say which of the three cases it is.
+
+    D13 / repair 3.3 (ORVEX-2026-108 WP4b). The pre-fix reader answered ``None`` for
+    BOTH "there is no text format here" and "the open/read failed", and the
+    transport's write path calls ``EmptyClipboard()`` either way — so a user's copied
+    image was destroyed silently. Splitting the answer is what lets the action
+    DISCLOSE the loss instead of hiding it behind a success-sounding message.
+
+    Returns ``(text, reason)``:
+
+    * ``(str, "restorable")`` — text read (possibly ``""``; an empty string is a REAL
+      restorable payload, not an absent one);
+    * ``(None, "non_text")`` — the clipboard opened and has no ``CF_UNICODETEXT``;
+    * ``(None, "unknown")`` — the open was refused, the handle was missing, or the
+      read raised. Never claims a loss it cannot prove.
+    """
+    if not _clipboard_open():
+        return (None, CLIPBOARD_UNKNOWN)
+    try:
+        try:
+            if not _user32.IsClipboardFormatAvailable(_CF_UNICODETEXT):
+                # DELTA 1 (VAL-WP4b MINOR): distinguish a truly EMPTY clipboard (no
+                # formats AT ALL — nothing was on it, so ``EmptyClipboard`` destroys
+                # nothing) from a NON-TEXT payload (a copied image, a file drop, RTF
+                # — a KNOWN loss, disclosed). An empty clipboard is an absence of
+                # payload, not a destroyed one: reporting ``non_text`` there would
+                # claim a loss the code cannot prove.
+                if not _user32.CountClipboardFormats():
+                    return (None, CLIPBOARD_UNKNOWN)
+                return (None, CLIPBOARD_NON_TEXT)
+            handle = _user32.GetClipboardData(_CF_UNICODETEXT)
+            if not handle:
+                return (None, CLIPBOARD_UNKNOWN)
+            pointer = _kernel32.GlobalLock(ctypes.c_void_p(handle))
+            if not pointer:
+                return (None, CLIPBOARD_UNKNOWN)
+            try:
+                return (ctypes.wstring_at(pointer), CLIPBOARD_RESTORABLE)
+            finally:
+                _kernel32.GlobalUnlock(ctypes.c_void_p(handle))
+        except (OSError, AttributeError, ValueError):
+            return (None, CLIPBOARD_UNKNOWN)
+    finally:
+        try:
+            _user32.CloseClipboard()
+        except (OSError, AttributeError, ValueError):
+            pass
+
+
 def _clipboard_read_text() -> str | None:
     """Best-effort CF_UNICODETEXT read of the CURRENT clipboard; ``None`` on ANY failure.
 
@@ -1593,30 +1706,12 @@ def _clipboard_read_text() -> str | None:
     ``None`` here means "nothing restorable is known" (non-text content, open refused,
     read failed) and the restore step is skipped silently — a failed SAVE must never
     fail or even annotate the action.
+
+    D13 / repair 3.3: the transport now calls :func:`_clipboard_read_verdict` instead,
+    which splits the two ``None``s. This function keeps its EXACT contract (and is
+    what every non-transport caller uses) — it is a thin projection of the verdict.
     """
-    if not _clipboard_open():
-        return None
-    try:
-        try:
-            if not _user32.IsClipboardFormatAvailable(_CF_UNICODETEXT):
-                return None
-            handle = _user32.GetClipboardData(_CF_UNICODETEXT)
-            if not handle:
-                return None
-            pointer = _kernel32.GlobalLock(ctypes.c_void_p(handle))
-            if not pointer:
-                return None
-            try:
-                return ctypes.wstring_at(pointer)
-            finally:
-                _kernel32.GlobalUnlock(ctypes.c_void_p(handle))
-        except (OSError, AttributeError, ValueError):
-            return None
-    finally:
-        try:
-            _user32.CloseClipboard()
-        except (OSError, AttributeError, ValueError):
-            pass
+    return _clipboard_read_verdict()[0]
 
 
 def _clipboard_write_text(text: str) -> bool:
@@ -2472,8 +2567,56 @@ class UiaSemanticReader:
             "focused": focused,
         }
 
+    @staticmethod
+    def _dropped_for_total(total: int, *, visited: int | None = None) -> dict[str, int]:
+        """Breakdown of the elements a bounded walk of ``total`` did not hand over.
+
+        ``total`` is what the container PROMISED (``IUIAutomationElementArray::get_Length``).
+        ``visited`` is how many the walk actually reached; ``None`` means the walk
+        stopped at the element cap, so the remainder is a ``cap_exceeded`` loss, and an
+        explicit value splits the remainder into a budget loss (what the cap did not
+        explain) and nothing else.
+        """
+        total = max(0, int(total))
+        if visited is None:
+            return {**_empty_drops(), "cap_exceeded": max(0, total - UIA_MAX_ELEMENTS)}
+        reached = max(0, min(int(visited), total))
+        return {**_empty_drops(), "budget_exceeded": max(0, total - reached)}
+
+    @classmethod
+    def _account_cap_and_budget(
+        cls, drops: dict[str, int], total: int, *, visited: int
+    ) -> None:
+        """ACCUMULATE the cap/budget split into the walk's own drop counts (E-15).
+
+        E-15 (ORVEX-2026-106, fixed during the WP4b port): the dev copy merged this
+        split with ``drops.update(...)``, which REPLACES the values for
+        ``cap_exceeded``/``budget_exceeded`` — and because the split dict carries all
+        four reasons (via ``_empty_drops``), the update also ZEROED the
+        ``offscreen``/``unavailable`` counts the loop had already accumulated. A read
+        that dropped 3 offscreen elements and hit the cap reported
+        ``offscreen: 0``. Accumulation is the fix: add the split's counts onto the
+        loop's own, never overwrite them.
+        """
+        if visited >= UIA_MAX_ELEMENTS:
+            extra = cls._dropped_for_total(total)
+        elif visited < total:
+            extra = cls._dropped_for_total(total, visited=visited)
+        else:
+            return
+        for reason, count in extra.items():
+            drops[reason] += count
+
     def read(self) -> dict[str, object] | None:
-        """One bounded semantic snapshot; ``None`` on any failure (silent degradation)."""
+        """One bounded semantic snapshot; ``None`` on any failure (silent degradation).
+
+        D15 (ORVEX-2026-108 WP4b): the snapshot now carries a ``dropped`` breakdown
+        under :data:`SNAPSHOT_DROPPED_KEY` for every element the walk SAW but did not
+        hand over — the ``UIA_MAX_ELEMENTS`` cap, the wall-clock budget break, offscreen
+        elements, and elements whose summary could not be read. Nothing is silently
+        dropped any more: the breakdown rides the existing additive ``omitted_count``
+        channel of the ``spatial_text`` block.
+        """
         if not IS_WINDOWS or _ole32 is None or _oleaut32 is None:
             return None
         deadline = time.perf_counter() + UIA_READ_BUDGET_SECONDS
@@ -2486,6 +2629,7 @@ class UiaSemanticReader:
                 return None
             if not focused_ptr.value:
                 return None
+            drops = _empty_drops()
             snapshot: dict[str, object] = {
                 "focused": self._element_summary(int(focused_ptr.value), deadline, focused=True),
                 "elements": [],
@@ -2505,16 +2649,29 @@ class UiaSemanticReader:
                     elements: list[dict[str, object]] = []
                     length = ctypes.c_long(0)
                     if _com_call(int(array_ptr.value), _UIA_ARRAY_GET_LENGTH, (ctypes.POINTER(ctypes.c_long),), ctypes.byref(length)) == 0:
-                        for index in range(min(int(length.value), UIA_MAX_ELEMENTS)):
+                        total = int(length.value)
+                        visited = 0
+                        for index in range(min(total, UIA_MAX_ELEMENTS)):
                             if time.perf_counter() > deadline:
                                 break
+                            visited += 1
                             child_ptr = ctypes.c_void_p()
                             if _com_call(int(array_ptr.value), _UIA_ARRAY_GET_ELEMENT, (ctypes.c_long, ctypes.POINTER(ctypes.c_void_p)), index, ctypes.byref(child_ptr)) == 0 and child_ptr.value:
                                 summary = self._element_summary(int(child_ptr.value), deadline)
                                 if summary.get("offscreen") is not True:
                                     elements.append(summary)
+                                else:
+                                    drops["offscreen"] += 1
                                 _com_release(int(child_ptr.value))
+                            else:
+                                # the container PROMISED this element and the walk could
+                                # not read it — a known loss, reported not swallowed
+                                drops["unavailable"] += 1
+                        # E-15: ACCUMULATE the cap/budget split — see
+                        # :meth:`_account_cap_and_budget` for the overwrite this fixes.
+                        self._account_cap_and_budget(drops, total, visited=visited)
                     snapshot["elements"] = elements
+                    snapshot[SNAPSHOT_DROPPED_KEY] = drops
                     _com_release(int(array_ptr.value))
                 _com_release(int(condition_ptr.value))
             _com_release(int(focused_ptr.value))
@@ -2585,7 +2742,14 @@ class Win32TextReader:
         return self._available
 
     def read(self) -> dict[str, object] | None:
-        """One bounded snapshot of the foreground window's focused control + children."""
+        """One bounded snapshot of the foreground window's focused control + children.
+
+        D15 (ORVEX-2026-108 WP4b): as with the UIA reader, the snapshot carries a
+        ``dropped`` breakdown for every child the bounded walk saw but did not
+        summarize (built directly by :meth:`_bounded_children` — the dev copy's
+        separate ``_dropped_for_total`` helper was DEAD code there, never called by
+        this walk, and is deliberately not ported).
+        """
         if not IS_WINDOWS or _user32 is None:
             return None
         deadline = time.perf_counter() + UIA_READ_BUDGET_SECONDS
@@ -2594,10 +2758,12 @@ class Win32TextReader:
             if not root:
                 return None
             focused_summary = self._focused_control_summary(root)
+            elements, drops = self._bounded_children(root, deadline)
             return {
                 "focused": focused_summary,
-                "elements": self._bounded_children(root, deadline),
+                "elements": elements,
                 "source": "win32",
+                SNAPSHOT_DROPPED_KEY: drops,
             }
         except Exception:  # noqa: BLE001 - observation must never fail because of UIA
             return None
@@ -2617,28 +2783,50 @@ class Win32TextReader:
         except (OSError, AttributeError, ValueError):
             return None
 
-    def _bounded_children(self, root: int, deadline: float) -> list[dict[str, object]]:
-        """Two-level, count- and budget-bounded walk of the foreground window's children."""
+    def _bounded_children(
+        self, root: int, deadline: float
+    ) -> tuple[list[dict[str, object]], dict[str, int]]:
+        """Two-level, count- and budget-bounded walk of the foreground window's children.
+
+        Returns the elements it summarized AND the :data:`SNAPSHOT_DROP_REASONS`
+        breakdown of the children the walk reached but could not hand over (D15).
+        """
         elements: list[dict[str, object]] = []
+        drops = _empty_drops()
         try:
             level1 = _window_child_chain(root, limit=UIA_MAX_ELEMENTS)
             for index, child in enumerate(level1):
                 if len(elements) >= UIA_MAX_ELEMENTS or time.perf_counter() > deadline:
+                    # DELTA 1 (VAL-WP4b MINOR): EVERY sibling the chain still holds is
+                    # a child the walk reached but did not hand over — not just one.
+                    drops["budget_exceeded"] += len(level1) - index
                     break
                 summary = self._control_summary(child)
                 if summary is not None:
                     elements.append(summary)
+                else:
+                    drops["unavailable"] += 1
                 if index < 3:  # budget guard: only the first few hosts get a second level
                     level2 = _window_child_chain(child, limit=UIA_MAX_ELEMENTS - len(elements))
-                    for grandchild in level2:
+                    for grandchild_index, grandchild in enumerate(level2):
                         if len(elements) >= UIA_MAX_ELEMENTS or time.perf_counter() > deadline:
+                            drops["budget_exceeded"] += len(level2) - grandchild_index
                             break
                         summary = self._control_summary(grandchild)
                         if summary is not None:
                             elements.append(summary)
+                        else:
+                            drops["unavailable"] += 1
+                    if drops["budget_exceeded"] or len(elements) >= UIA_MAX_ELEMENTS:
+                        # The early exit after a filled second level must ALSO count the
+                        # level-1 siblings it is about to abandon (the same
+                        # "healthy-looking partial read" failure D15 targets: a break
+                        # that counts +1 while several siblings remain).
+                        drops["budget_exceeded"] += len(level1) - (index + 1)
+                        break
         except (OSError, AttributeError, ValueError):
-            return elements
-        return elements
+            return elements, drops
+        return elements, drops
 
     def _control_summary(self, hwnd: int, *, focused: bool = False) -> dict[str, object] | None:
         """One control's summary dict; None when the window is gone or inaccessible."""
@@ -2769,13 +2957,32 @@ def _uia_snapshot_to_ui_elements(snapshot: dict[str, object]) -> list[dict[str, 
     return elements[: UIA_MAX_ELEMENTS + 1]
 
 
+#: Per-region label clip applied by the semantic read (unchanged bound; D15 only MARKS
+#: the clip, it does not lift it).
+UIA_MAX_LABEL_CHARS = 200
+
+
 def _uia_snapshot_to_text_regions(
     snapshot: dict[str, object],
     origin: tuple[int, int],
     scale: tuple[float, float],
-) -> list[TextRegion]:
-    """Snapshot -> ``Observation.ocr_text`` regions (screenshot-local, bounded)."""
+) -> tuple[list[TextRegion], int]:
+    """Snapshot -> ``(Observation.ocr_text regions, known-but-dropped count)``.
+
+    D15 (ORVEX-2026-108 WP4b). Two things changed, both additive:
+
+    1. The function now RETURNS the number of elements it saw but could not turn into a
+       region — the ``UIA_MAX_ELEMENTS`` cap here, rect-less/degenerate elements, and
+       text-less elements — PLUS whatever the reader itself reported under
+       :data:`SNAPSHOT_DROPPED_KEY`. Those are added, never double-counted: a reader
+       that dropped an element did not put it in the list this function iterates, so
+       the two channels are disjoint by construction.
+    2. A label longer than :data:`UIA_MAX_LABEL_CHARS` is served clipped **and** marked
+       ``text_truncated`` on the region, so a silent content loss cannot pass as a
+       complete read.
+    """
     regions: list[TextRegion] = []
+    dropped = snapshot_dropped_total(snapshot.get(SNAPSHOT_DROPPED_KEY))
     candidates: list[object] = []
     focused = snapshot.get("focused")
     if isinstance(focused, dict):
@@ -2785,21 +2992,34 @@ def _uia_snapshot_to_text_regions(
         candidates.extend(item for item in children if isinstance(item, dict))
     for element in candidates:
         if len(regions) >= UIA_MAX_ELEMENTS:
-            break
+            dropped += 1
+            continue
         rect = element.get("rect")
         if not isinstance(rect, tuple) or len(rect) != 4:
+            dropped += 1
             continue
         converted = _uia_rect_to_screenshot(
             (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])), origin, scale
         )
         if converted is None:
+            dropped += 1
             continue
         text = element.get("name") or element.get("control_type") or ""
         if not text:
+            dropped += 1
             continue
         x, y, width, height = converted
-        regions.append(TextRegion(text=text[:200], x=x, y=y, width=width, height=height))
-    return regions
+        regions.append(
+            TextRegion(
+                text=text[:UIA_MAX_LABEL_CHARS],
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+                text_truncated=len(text) > UIA_MAX_LABEL_CHARS,
+            )
+        )
+    return regions, dropped
 
 
 def _set_process_dpi_awareness() -> str:
@@ -4301,7 +4521,7 @@ class LocalComputerBackend(ComputerBackend):
                 origin_x=left, origin_y=top, scale_x=verdict.scale_x, scale_y=verdict.scale_y
             ).to_screenshot(*cursor_physical)
         self._active_context = _CaptureContext(monitor=monitor, verdict=verdict)
-        ocr_text, ui_elements = self._uia_semantic_fields(monitor, verdict)
+        ocr_text, ui_elements, ocr_dropped = self._uia_semantic_fields(monitor, verdict)
         observation = Observation(
             image_base64=encoded,
             width=image_width,
@@ -4318,6 +4538,7 @@ class LocalComputerBackend(ComputerBackend):
             active_window_info=window_info,
             ocr_text=ocr_text,
             ui_elements=ui_elements,
+            ocr_dropped=ocr_dropped,
             redactions_applied=False,
         )
         if self._internal_frame_reuse:
@@ -4393,30 +4614,33 @@ class LocalComputerBackend(ComputerBackend):
 
     def _uia_semantic_fields(
         self, monitor: MonitorInfo, verdict: CoordinateVerdict
-    ) -> tuple[list[TextRegion] | None, list[dict[str, object]] | None]:
+    ) -> tuple[list[TextRegion] | None, list[dict[str, object]] | None, int]:
         """Semantic snapshot -> the optional ``ocr_text``/``ui_elements`` fields.
 
         Silent degradation everywhere: an unavailable reader, a failed COM call, or an
         exceeded read budget leaves both fields ``None`` (or returns the partial data
-        already gathered) and never raises into the observation loop.
+        already gathered) and never raises into the observation loop. D15: the third
+        element is the read's own known-but-dropped count (0 when nothing was dropped),
+        riding ``Observation.ocr_dropped`` into the ``spatial_text`` block's additive
+        ``omitted_count`` channel, so a partial read is fully accounted for.
         """
         reader = self._semantic_reader
         if reader is None or not reader.available:
-            return (None, None)
+            return (None, None, 0)
         try:
             snapshot = reader.read()
         except Exception:  # noqa: BLE001 - a broken reader must never break an observation
-            return (None, None)
+            return (None, None, 0)
         if snapshot is None:
-            return (None, None)
+            return (None, None, 0)
         origin = (monitor.bounds[0], monitor.bounds[1])
         scale = (verdict.scale_x, verdict.scale_y)
         try:
             ui_elements = _uia_snapshot_to_ui_elements(snapshot)
-            ocr_text = _uia_snapshot_to_text_regions(snapshot, origin, scale)
+            ocr_text, dropped = _uia_snapshot_to_text_regions(snapshot, origin, scale)
         except Exception:  # noqa: BLE001 - conversion must never break an observation
-            return (None, None)
-        return (ocr_text or None, ui_elements or None)
+            return (None, None, 0)
+        return (ocr_text or None, ui_elements or None, dropped)
 
     def read_focused_control_value(self) -> str | None:
         """R-04 integrity read-back: the focused control's value, or ``None``.
@@ -5241,8 +5465,12 @@ class LocalComputerBackend(ComputerBackend):
         so the text rides the chord path instead. Sequence:
 
         1. B8 focus settle + B3 gap policy, exactly like keypress/hotkey (no new knobs).
-        2. Best-effort SAVE of the current clipboard text (``None`` = nothing restorable
-           — non-text content or the open/read failed; skipping the restore is silent).
+        2. Best-effort SAVE of the current clipboard (:func:`_clipboard_read_verdict`).
+           ``None`` text + ``restorable`` is impossible; ``None`` text is either a
+           non-text payload or an unreadable clipboard, and the reason distinguishes
+           them (repair 3.3): ``non_text`` is a KNOWN loss and is DISCLOSED as
+           ``clipboard_restore=non_text_destroyed``; ``unknown`` is an absence of
+           knowledge and is never claimed.
         3. Set the action text as ``CF_UNICODETEXT``. A failure here raises
            :class:`InputBlockedError` (the established dispatch-could-not-proceed type;
            the payload names the clipboard cause) with ZERO keystrokes dispatched and the
@@ -5250,10 +5478,24 @@ class LocalComputerBackend(ComputerBackend):
         4. ONE ctrl+v chord through the EXISTING ``engine.chord`` path — failsafe,
            stop-token, and :class:`InputBlockedError` semantics ride it unchanged. The
            T8 focus hook runs once, pre-dispatch, like the single-chunk legacy path.
-        5. ``finally``: best-effort restore of the saved clipboard. A restore failure is
-           typed-annotated (``clipboard_restore=failed``) and NEVER raised, and the
-           restore dispatches no keystrokes. An abort anywhere after step 3 still
-           restores.
+        5. **D13 / repair 3.2 (WP4b) — the settle, THEN the restore.**
+           ``engine.chord`` only QUEUES keystrokes (SendInput returns before the
+           target's wndproc runs), so the pre-fix ordering restored the clipboard ~5 µs
+           after the chord returned while the transport's own
+           ``TYPE_VERIFY_SETTLE_SECONDS`` (50 ms) was slept *afterwards*: a target that
+           read the clipboard even slightly late pasted the user's OLD text. The window
+           was zero-width BY CONSTRUCTION, so it lost every time. The rollback now
+           happens after the settle.
+        6. ``finally`` kept for the ABORT paths only: an exception between step 3 and
+           step 4 (failsafe, stop token, :class:`InputBlockedError`) still restores,
+           because on that path the chord was never dispatched and there is nothing to
+           wait for. A restore failure is typed-annotated
+           (``clipboard_restore=failed``) and NEVER raised; the restore dispatches no
+           keystrokes.
+
+        The save -> set -> paste ORDERING ITSELF IS UNCHANGED and must stay so: only
+        the rollback's position moved. Privacy note: the user's clipboard now holds the
+        agent's text for ~``TYPE_VERIFY_SETTLE_SECONDS`` longer than before.
 
         Verification is the honest single-read-back form (the per-char fast/escalation
         ladder does not apply to a single paste): confirmed endswith →
@@ -5273,8 +5515,9 @@ class LocalComputerBackend(ComputerBackend):
         # B3 gap-policy parity (a ctrl+v chord carries no terminal key: policy no-op,
         # kept so the clipboard transport can never be faster-paced than keypress).
         self._apply_key_dispatch_gap(["ctrl", "v"])
-        prior = _clipboard_read_text()
+        prior, prior_reason = _clipboard_read_verdict()
         restore_note = ""
+        aborted = True
         try:
             if not _clipboard_write_text(text):
                 raise InputBlockedError(
@@ -5295,12 +5538,29 @@ class LocalComputerBackend(ComputerBackend):
                 focus_hook()
             self._engine.chord(["ctrl", "v"])
             self._last_key_dispatch = time.monotonic()
+            aborted = False
         finally:
-            # Restore discipline: best-effort, silent-failure, ZERO extra keystrokes.
-            if prior is not None and not _clipboard_write_text(prior):
-                restore_note = " clipboard_restore=failed"
+            # ABORT PATH ONLY: the chord was never dispatched, so there is no paste to
+            # wait for and the clipboard must go back immediately.
+            if aborted and prior is not None and not _clipboard_write_text(prior):
+                restore_note = f" {CLIPBOARD_RESTORE_FAILED}"
+        # D13 / repair 3.2: the settle comes BEFORE the rollback — the target needs
+        # the typed text still on the clipboard while it processes the queued chord.
         if TYPE_VERIFY_SETTLE_SECONDS > 0:
             time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
+        # Restore discipline: best-effort, silent-failure, ZERO extra keystrokes.
+        if prior is not None and not _clipboard_write_text(prior):
+            restore_note = f" {CLIPBOARD_RESTORE_FAILED}"
+        elif prior is None and prior_reason == CLIPBOARD_NON_TEXT:
+            # D13 / repair 3.3: the ``EmptyClipboard`` in step 3 DESTROYED a non-text
+            # payload (a copied image, a file drop, RTF). Nothing can bring it back,
+            # so the only honest thing left is to say so — same annotation shape,
+            # distinct value.
+            restore_note = (
+                f" {CLIPBOARD_RESTORE_DESTROYED} (the clipboard held a non-text payload "
+                "— a copied image/file — which EmptyClipboard destroyed; it could not "
+                "be saved or restored)"
+            )
         if stop is not None:
             stop.ensure_live()
         landed = self._read_landed_normalized()
@@ -5420,12 +5680,19 @@ class LocalComputerBackend(ComputerBackend):
            when no matched instance can name a focus target.
         2. No identity match but unsaved-candidate windows exist -> the structured
            ``AMBIGUOUS_INSTANCE`` payload (unsaved-work risk; the driver decides) —
-           never launches, never closes anything.
+           never launches, never closes anything. C·N2 (dev F3 fix 5.1): EVERY
+           candidate is reported, each with its own ``unsaved=`` flag — the payload
+           used to be built from the UNSAVED SUBSET alone, so a surface with one
+           unsaved and one saved instance reported exactly one candidate (the saved
+           one, the one the driver most needed to see, vanished from the payload).
         3. Nothing matches -> ``NO_INSTANCE target=... launch=...``. Only when the host
            explicitly authorized server-side launches (``allow_launch=True`` AND the
            session policy ``attach_or_launch.launch == "server"`` — enforced by the
-           caller) AND the process is resolvable is ``Popen`` used; the DEFAULT
-           path never spawns a process.
+           caller) AND the process is resolvable is ``Popen`` used.  The enforced
+           DEFAULT policy is ``launch="server"``
+           (``interference._default_launch_policy``), so with no process allowlist
+           configured a ``NO_INSTANCE`` DOES spawn; ``CORTEX_ATTACH_OR_LAUNCH=driver``
+           restores never-launch.
 
         v0.7.1 (Defect B) honest-payload contract for the AUTHORIZED (``launch=server``)
         launch outcome — the payload carries EXACTLY ONE of:
@@ -5444,7 +5711,12 @@ class LocalComputerBackend(ComputerBackend):
         ``CORTEX_LAUNCH_PATHS`` (``needle=path;...``, see README "Environment
         variables") — the mapping is consulted FIRST.
         """
-        from .interference import format_ambiguous_instance, format_no_instance, format_reattached
+        from .interference import (
+            LAUNCHED,
+            format_ambiguous_instance,
+            format_no_instance,
+            format_reattached,
+        )
 
         process_needle, _, doc_needle = target.partition("|")
         process_needle = process_needle.strip()
@@ -5460,7 +5732,21 @@ class LocalComputerBackend(ComputerBackend):
                 except LaunchTargetError:
                     return f"{payload} launch_rejected=LaunchTargetError"
                 if launched:
-                    payload = f"{payload} launched={launched}"
+                    # WP4b (C8 / dev F3 fix 5.1): a REAL launch used to keep the
+                    # ``NO_INSTANCE`` leading token, because the payload was built
+                    # BEFORE the spawn attempt and the token was never revised. The
+                    # leading token is now ``LAUNCHED`` — the first word of the
+                    # message is what a driver (or a human reading a transcript)
+                    # looks at, and it was saying the opposite of what happened.
+                    # Every status suffix below is unchanged, so a consumer that
+                    # reads ``launched=``/``launch_unresolved=`` still works.
+                    # ``launch=server`` is kept: it is the policy that authorised
+                    # the spawn, and a consumer reading the policy must not have to
+                    # infer it.
+                    payload = (
+                        f"{LAUNCHED} target={target!r} launch=server launched={launched} "
+                        f"(no existing window matched; the process was started server-side)"
+                    )
                 else:
                     # v0.7.1 (Defect B): an authorized launch that produced no process
                     # is NEVER silent — _launch_process leaves the typed reason on
@@ -5496,9 +5782,13 @@ class LocalComputerBackend(ComputerBackend):
             window = titled[0].window
             self.focus_window_title(window.title)
             return format_reattached(window.title, window.hwnd)
-        unsaved = [item for item in candidates if item.unsaved_candidate]
-        if unsaved:
-            return format_ambiguous_instance(unsaved)
+        # WP4b (C·N2 / dev F3 fix 5.1): EVERY candidate is reported, each with its own
+        # ``unsaved=`` flag.  This used to build the payload from the UNSAVED SUBSET
+        # alone, so a surface with one unsaved and one saved instance reported exactly
+        # one candidate — the saved one, the one the driver most needed to see,
+        # vanished from the payload.  The disambiguation information (which title to
+        # pick) is precisely what a driver reads this to get.  The branch NEVER
+        # launches and NEVER closes anything, before or after.
         return format_ambiguous_instance(candidates)
 
     def _launch_process(self, process_needle: str) -> str | None:
@@ -5766,6 +6056,8 @@ class FakeComputerBackend(ComputerBackend):
         windows: list[WindowInfo] | None = None,
         cursor: tuple[int, int] | None = None,
         input_blocked: bool = False,
+        initial_clipboard: str | None = None,
+        clipboard_app_latency_s: float = 0.0,
     ) -> None:
         self.width = width
         self.height = height
@@ -5835,8 +6127,16 @@ class FakeComputerBackend(ComputerBackend):
         # the OS clipboard (save/set/restore discipline, parity with the real ctypes
         # path); ``clipboard_pastes`` records every simulated ctrl+v paste payload so
         # tests can assert the transport actually dispatched the chord.
-        self.clipboard_value: str | None = None
+        #
+        # D13 / repair 3.2 (WP4b): ``clipboard_app_latency_s`` models a target
+        # application that needs wall time to PROCESS a queued chord before it reads
+        # the clipboard — the real shape (``SendInputEngine.chord`` only queues). With
+        # it non-zero the recorded paste payload is read from the clipboard AT DELIVERY
+        # TIME, so a restore ordered before the paste becomes visible to the fake (it
+        # was not, while the double recorded the local ``text`` variable).
+        self.clipboard_value: str | None = initial_clipboard
         self.clipboard_pastes: list[str] = []
+        self.clipboard_app_latency_s = max(0.0, float(clipboard_app_latency_s))
 
     def set_windows(self, windows: list[WindowInfo]) -> None:
         """Replace the fake top-level window list (first entry = top of Z-order)."""
@@ -5938,7 +6238,12 @@ class FakeComputerBackend(ComputerBackend):
 
     def ensure_app(self, target: str, allow_launch: bool = False) -> str:
         """Simulated attach-or-launch over the injected ``app_windows`` population."""
-        from .interference import format_ambiguous_instance, format_no_instance, format_reattached
+        from .interference import (
+            LAUNCHED,
+            format_ambiguous_instance,
+            format_no_instance,
+            format_reattached,
+        )
 
         self.ensure_app_calls.append(target)
         process_needle, _, doc_needle = target.partition("|")
@@ -5969,7 +6274,13 @@ class FakeComputerBackend(ComputerBackend):
                     payload = f"{payload} {format_launch_unresolved_path_miss()}"
                     return payload
                 self.launched_processes.append(resolved)
-                payload = f"{payload} launched={resolved}"
+                # WP4b (C8 / dev F3 fix 5.1): real-vs-fake payload PARITY on the
+                # revised leading token — a real spawn reads ``LAUNCHED ...``, not
+                # ``NO_INSTANCE ...``.
+                payload = (
+                    f"{LAUNCHED} target={target!r} launch=server launched={resolved} "
+                    f"(no existing window matched; the process was started server-side)"
+                )
             return payload
 
         def _doc_matches(candidate: AppWindowCandidate) -> bool:
@@ -5994,9 +6305,8 @@ class FakeComputerBackend(ComputerBackend):
             window = titled[0].window
             self.focus_window_title(window.title)
             return format_reattached(window.title, window.hwnd)
-        unsaved = [item for item in candidates if item.unsaved_candidate]
-        if unsaved:
-            return format_ambiguous_instance(unsaved)
+        # WP4b (C·N2): EVERY candidate is reported, each with its own ``unsaved=``
+        # flag — identical to LocalComputerBackend.ensure_app (see that comment).
         return format_ambiguous_instance(candidates)
 
     def _resolve_fake_launch_target(self, process_needle: str) -> str | None:
@@ -6316,30 +6626,52 @@ class FakeComputerBackend(ComputerBackend):
 
         Mirrors the real transport's discipline in memory: ``clipboard_value`` is saved,
         set to the action text, the paste payload is recorded in ``clipboard_pastes``,
-        and the prior value is restored in ``finally`` — including on a MID-TRANSPORT
-        abort (a pre-stopped token raises AFTER the set, before the paste; the restore
-        still runs). With a readable ``focused_control_value`` the paste APPENDS the
-        text at the cursor and the single read-back confirms ``integrity=verified``;
-        with ``None`` (the simulated Blender shape) the outcome is the honest
+        and the prior value is restored — including on a MID-TRANSPORT abort (a
+        pre-stopped token raises AFTER the set, before the paste; the restore still
+        runs). With a readable ``focused_control_value`` the paste APPENDS the text at
+        the cursor and the single read-back confirms ``integrity=verified``; with
+        ``None`` (the simulated Blender shape) the outcome is the honest
         ``integrity=unverified`` + ``TYPE_UNCONFIRMED no-readable-target`` diagnostic.
+
+        D13 / repair 3.2 (WP4b) — THE DOUBLE'S BLIND SPOT IS CLOSED. This used to
+        record the LOCAL ``text`` variable, which made it structurally incapable of
+        detecting a restore ordered before the paste: the real transport's zero-width
+        window shipped unchanged against 141 green typing tests. The recorded payload
+        is now read off ``clipboard_value`` **at delivery time**, after the optional
+        ``app_latency_s`` sleep that models a target which defers the clipboard read
+        (exactly what ``SendInputEngine.chord`` does — it only QUEUES). The restore is
+        skipped on the abort path, matching the real transport's abort-vs-dispatched
+        split, and the dispatched path restores after the settle (nothing to wait for
+        on an abort).
         """
         text = action.text or ""
         total = len(text)
         if not text:
             return "Simulated type."
         prior = self.clipboard_value
+        aborted = True
         try:
             self.clipboard_value = text  # the set
             if stop is not None:
                 stop.ensure_live()  # mid-transport abort point (mirrors the real pre-chord check)
-            self.clipboard_pastes.append(text)  # the ctrl+v chord
+            if self.clipboard_app_latency_s > 0:
+                time.sleep(self.clipboard_app_latency_s)  # the target is still waking up
+            # the ctrl+v chord: read the CLIPBOARD, not the local variable
+            self.clipboard_pastes.append(self.clipboard_value or "")
+            aborted = False
             if self.focused_control_value is not None:
                 # A paste lands at the cursor: append, then the single read-back below.
                 self.focused_control_value = self.focused_control_value + text
         finally:
-            # Restore discipline (in-memory; never raises, never dispatches).
-            if prior is not None:
-                self.clipboard_value = prior
+            # Restore discipline (in-memory; never raises, never dispatches). As in
+            # the real transport the abort path restores immediately and the
+            # dispatched path restores after the settle — there is nothing to wait
+            # for on an abort.
+            if aborted or prior is not None:
+                if self.clipboard_app_latency_s > 0 and not aborted:
+                    time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
+                if prior is not None:
+                    self.clipboard_value = prior
         if self.focused_control_value is None:
             return (
                 "Simulated type. via=clipboard "

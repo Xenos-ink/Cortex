@@ -644,13 +644,24 @@ def spatial_text_of(
         # decode) unless the A3 side substrate already fetched it (memoized above).
         evidence_on = bool(pixel_evidence)
         frame = _frame_once() if (evidence_on and capped) else None
+        # D15 (ORVEX-2026-108 WP4b): ``omitted_count`` used to be ``len(merged) - cap``
+        # ONLY — the count a block BUILDER can compute, which structurally cannot see
+        # the semantic reader's own 30-element cap, its wall-clock budget break, or its
+        # per-element drops. A partial read therefore shipped as a healthy block (12 of
+        # 45 regions, ``omitted_count=0``). ``observation.ocr_dropped`` is the
+        # producer's own report of what it knew it dropped; the two channels are
+        # DISJOINT (an element the reader dropped is not in ``merged``, it was never
+        # handed over), so they are added, not reconciled. After this,
+        # ``region_count + omitted_count`` accounts for every region the read knew
+        # about.
+        reader_omitted = max(0, int(getattr(observation, "ocr_dropped", 0) or 0))
         block = {
             "observation_id": observation.observation_id,
             "coordinate_space": observation.coordinate_space.value,
             "coordinate_scale": [observation.coordinate_scale_x, observation.coordinate_scale_y],
             "crop_origin": list(observation.monitor.bounds[0:2]) if observation.monitor else [0, 0],
             "region_count": len(capped),
-            "omitted_count": max(0, len(merged) - cap),
+            "omitted_count": max(0, len(merged) - cap) + reader_omitted,
             **substrate_keys,
             "pixel_evidence_mode": "on" if evidence_on else "off",
             "pixel_evidence_sigma": [PIXEL_EVIDENCE_SIGMA_LO, PIXEL_EVIDENCE_SIGMA_HI],

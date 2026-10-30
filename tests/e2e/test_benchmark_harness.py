@@ -195,62 +195,129 @@ def test_a_not_determined_predicate_after_uncertain_steps_is_not_completed(
 def test_direct_call_driver_end_to_end_stops_the_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DELTA 2 (WP6) regression guard: ``stop_session`` is an ASYNC coroutine since
-    WP6 DELTA 1/F4. The runner used to call it synchronously, so the coroutine was
-    never awaited and every benchmark task leaked a live session (the 2
-    RuntimeWarnings the Commander caught). This test drives the DirectCallDriver
-    end to end on the fake backend through the real server tool surface and asserts
-    the session is GONE from the registry and the bundle store after the stop —
-    and that a later call fails closed with ``session_stopped``. Combined with the
-    suite-wide ``error:coroutine.*was never awaited`` filter (tests/conftest.py),
-    any future sync caller of an async tool fails the suite here."""
-    import asyncio
+    """DELTA 2 (WP6) regression guard, strengthened (VAL-WP6-02 N2 carry-over, WP4b):
+    ``stop_session`` is an ASYNC coroutine since WP6 DELTA 1/F4, and the RUNNER is the
+    caller that must await it (``benchmarks/runner.py``: the sync→async bridge at the
+    task teardown). This test drives the runner's OWN task path end to end on the fake
+    backend and asserts the runner actually stopped the session it started — the test
+    itself makes NO ``stop_session`` call of any kind. Reverting the runner's fix (a
+    sync ``server.stop_session(...)`` call) fails this test twice over: the spy records
+    no awaited stop, and the abandoned coroutine raises the never-awaited
+    RuntimeWarning the suite-wide filter (tests/conftest.py) escalates to an error."""
+    import shutil
 
-    from benchmarks.runner import DirectCallDriver, FakeWorld, StepResolver, load_tasks
+    from benchmarks.runner import BenchmarkRunner
 
     from computer_use_mcp import server
-    from computer_use_mcp.state import SessionRegistry
 
-    tasks = {t.id: t for t in load_tasks(TASKS_DIR)}
-    task = tasks["t01-notepad-type-verify"]
-    assert task.fake_runnable, task.id
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    shutil.copyfile(TASKS_DIR / "t01-notepad-type-verify.yaml", tasks / "t01-notepad-type-verify.yaml")
 
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    world = FakeWorld()
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
-    world.setup(task, scratch)
 
-    saved = (server._registry, server._bundles, server._backend_factory, server._provider_factory)
-    server._registry = SessionRegistry(max_sessions=8)
-    server._bundles = {}
-    server._backend_factory = lambda: world.backend  # type: ignore[method-assign]
-    try:
-        response = server.start_session(
-            dry_run=False, require_approval=False, max_steps=task.max_actions + 4
-        )
-        assert response.get("session_id"), response
-        session_id = str(response["session_id"])
+    installed: dict[str, Any] = {}
+    original_isolate = BenchmarkRunner.__dict__["_isolate_server"].__func__
 
-        driver = DirectCallDriver(task, StepResolver("fake", world))
-        run_response = asyncio.run(driver.run(session_id))
-        assert run_response.get("results"), run_response
-        assert session_id in server._bundles  # live while driving
+    def _spy_isolate(*args: Any, **kwargs: Any) -> Any:
+        snapshot = original_isolate(*args, **kwargs)
+        installed["registry"] = server._registry
+        installed["bundles"] = server._bundles
+        return snapshot
 
-        # The sync→async bridge the runner uses for computer_execute, applied to
-        # stop_session (DELTA 2 fix in benchmarks/runner.py).
-        asyncio.run(server.stop_session(session_id))
+    monkeypatch.setattr(BenchmarkRunner, "_isolate_server", staticmethod(_spy_isolate))
 
-        assert server._registry.get(session_id) is None, "session leaked in the registry"
-        assert session_id not in server._bundles, "session leaked in the bundle store"
-        observe = server.computer_observe(session_id)
-        payload = observe if isinstance(observe, dict) else json.loads(observe[0].text)
-        assert payload["ok"] is False
-        assert payload["error"] == "session_stopped"
-    finally:
-        (
-            server._registry,
-            server._bundles,
-            server._backend_factory,
-            server._provider_factory,
-        ) = saved
+    stop_calls: list[str] = []
+    real_stop = server.stop_session
+
+    async def _spy_stop(session_id: str, *args: Any, **kwargs: Any) -> Any:
+        stop_calls.append(str(session_id))
+        return await real_stop(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(server, "stop_session", _spy_stop)
+
+    runner = BenchmarkRunner("fake", tasks, tmp_path / "out", "harness-stop")
+    payload = runner.run()
+    item = payload["tasks"][0]
+    assert item["status"] == "completed", item  # the task itself ran to completion
+    # The RUNNER stopped the session: exactly one awaited stop, for the session the
+    # runner's own isolated wiring created.
+    assert len(stop_calls) == 1, stop_calls
+    session_id = stop_calls[0]
+    assert installed["registry"].get(session_id) is None, "session leaked in the registry"
+    observe = server.computer_observe(session_id)
+    observe_payload = observe if isinstance(observe, dict) else json.loads(observe[0].text)
+    assert observe_payload["ok"] is False
+    assert observe_payload["error"] == "session_stopped"
+
+
+def test_a_live_mode_run_halts_on_an_uncertain_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N2 (VAL-WP4a-02 carry-over, WP4b): the continue-past-uncertain rule is FAKE-MODE
+    ONLY (``benchmarks/runner.py``, the ``resolver.mode == "fake"`` gate). A LIVE-mode
+    (``env``) run must HALT on an unproven step — it must never keep dispatching real
+    input after a step whose effect nothing could corroborate.
+
+    Offline by construction: the "live" run is driven against a STUBBED world and a
+    stubbed backend factory — the env-mode branches (``RealWorld``, the real backend
+    constructor) are monkeypatched to the fake world, so no real application is
+    touched and no real input is dispatched. The task is the t90 shape: one click with
+    an effect no deterministic tier can see (honestly ``uncertain``), then a ``done``
+    marker. Fake mode continues and reads ``completed`` (pinned above); live mode must
+    halt instead."""
+    import json as _json
+
+    from benchmarks import runner as runner_module
+    from benchmarks.runner import BenchmarkRunner, FakeWorld
+
+    class _EnvWorld(FakeWorld):
+        """The fake world standing in for ``RealWorld`` — env mode calls ``teardown``."""
+
+        def teardown(self) -> None:
+            pass
+
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    (tasks / "t91-live-uncertain-halt.yaml").write_text(
+        _json.dumps(
+            {
+                "id": "t91-live-uncertain-halt",
+                "category": "verification",
+                "goal": "probe: a live run halts on an unproven step",
+                "fake_runnable": True,
+                "setup": {"app": "notepad"},
+                "provider": {
+                    "steps": [
+                        {
+                            "type": "click_window_center",
+                            "window": "target",
+                            "expected_effect": "a change no deterministic tier can see",
+                        },
+                        {"type": "done", "summary": "probe done"},
+                    ]
+                },
+                "verification": {"kind": "window_text_contains", "value": "typed marker"},
+                "max_actions": 5,
+                "safety_notes": "offline stub probe; no real input is ever dispatched.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    world = _EnvWorld()
+    monkeypatch.setattr(runner_module, "RealWorld", _EnvWorld)
+    monkeypatch.setattr(runner_module, "LocalComputerBackend", lambda: world.backend)
+
+    runner = BenchmarkRunner("env", tasks, tmp_path / "out", "harness-n2")
+    payload = runner.run()
+    item = payload["tasks"][0]
+    # THE HALT: the first step's honest ``uncertain`` ends a live run — the
+    # fake-mode-only continue never fires here.
+    assert item["termination_reason"] == "verification_uncertain", item
+    assert item["status"] == "failed", item
+    assert item["completed"] is False, item
+    assert item["uncertain_steps"] == 1, item
+    assert item["verification_outcomes"]["uncertain"] == 1, item
+    assert item["verification_outcomes"]["verified"] == 0, item
+    assert item["executed_actions"] == 1, item  # the marker never executed

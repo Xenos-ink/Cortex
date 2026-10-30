@@ -2235,8 +2235,10 @@ class _WaitHandle:
     started_monotonic: float
     deadline_monotonic: float
     context_ref: "weakref.ref[Any] | None" = None
-    # F1 (VAL-WP6-01): the event loop the blocking call ran on, plus the per-call
-    # asyncio.Events the worker signals through ``call_soon_threadsafe``. Blocking
+    # F1 (VAL-WP6-01): the event loop the ``computer_wait`` that created this handle
+    # ran on (diagnostics only since N1 — wakes no longer route through it), plus the
+    # per-call ``(own loop, asyncio.Event)`` pairs the worker signals through
+    # ``call_soon_threadsafe`` on EACH waiter's own loop (N1, VAL-WP6-02). Blocking
     # NEVER occupies an executor thread — any number of concurrently blocked wait
     # calls costs the loop zero threads, so the default pool can never be starved.
     loop: Any | None = None
@@ -2501,17 +2503,22 @@ def _signal_loop_waiters(handle: _WaitHandle) -> None:
     executor thread and no number of concurrently blocked wait calls can starve
     the loop's default pool. Called by the worker AFTER the terminal state is
     retired (F2 ordering) and by the cancel/stop paths directly.
+
+    N1 (VAL-WP6-02, fixed in WP4b): each waiter carries its OWN loop — captured at
+    registration with ``asyncio.get_running_loop()`` — and its event is fired on
+    THAT loop. The pre-fix code fired every waiter's event on the loop that CREATED
+    the wait, so a ``computer_wait_status``/``computer_cancel_wait`` call running on
+    a different loop than the originating ``computer_wait`` had its wake delivered
+    to the wrong loop (a closed original loop swallowed it; the call then fell back
+    to the full segment or the join budget).
     """
-    loop = handle.loop
-    if loop is None:
-        return
     with handle.waiters_lock:
         waiters = list(handle.waiters)
-    for event in waiters:
+    for loop, event in waiters:
         try:
             loop.call_soon_threadsafe(event.set)
         except RuntimeError:
-            pass  # the creating loop is already closed; its waiters are gone with it
+            pass  # that waiter's loop is already closed; its waiter is gone with it
 
 
 def _fire_wait_event(loop: Any, event: Any) -> None:
@@ -2530,6 +2537,11 @@ async def _await_wait_wake(handle: _WaitHandle, timeout: float) -> bool:
     thread is ever involved (F1): the number of concurrently blocked wait calls
     costs the loop zero pooled threads.
 
+    N1 (VAL-WP6-02, fixed in WP4b): the waiter registers ``(OWN loop, event)`` — the
+    loop THIS call is running on, not the loop that created the wait — and the
+    real-time segment Timer fires THAT pair. A status/cancel call on a different
+    loop than the originating ``computer_wait`` is woken on its own loop.
+
     The timeout is enforced in REAL time by a one-shot daemon ``threading.Timer``
     that fires the SAME loop event at the deadline — deliberately not an asyncio
     timer: the segment cap (≤ 55 s) is a REAL-time contract and must hold even if
@@ -2538,12 +2550,13 @@ async def _await_wait_wake(handle: _WaitHandle, timeout: float) -> bool:
     exits immediately after firing).
     """
     event = asyncio.Event()
+    own_loop = asyncio.get_running_loop()
     with handle.waiters_lock:
-        handle.waiters.add(event)
+        handle.waiters.add((own_loop, event))
     timer: threading.Timer | None = None
     try:
         if not handle.done.is_set():
-            timer = threading.Timer(timeout, _fire_wait_event, args=(handle.loop, event))
+            timer = threading.Timer(timeout, _fire_wait_event, args=(own_loop, event))
             timer.daemon = True
             timer.start()
             await event.wait()
@@ -2555,7 +2568,7 @@ async def _await_wait_wake(handle: _WaitHandle, timeout: float) -> bool:
         if timer is not None:
             timer.cancel()
         with handle.waiters_lock:
-            handle.waiters.discard(event)
+            handle.waiters.discard((own_loop, event))
 
 
 def _live_wait_snapshot(handle: _WaitHandle) -> tuple[float, float]:

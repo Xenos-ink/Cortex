@@ -31,6 +31,7 @@ from computer_use_mcp.backend import (
 )
 from computer_use_mcp.interference import (
     AMBIGUOUS_INSTANCE,
+    LAUNCHED,
     NO_INSTANCE,
     REATTACHED,
     parse_interference,
@@ -226,16 +227,31 @@ def test_ensure_app_reattached_verifies_via_process_identity() -> None:
 
 
 def test_ensure_app_probe_outcome_is_evidence_not_a_screen_claim() -> None:
+    """A probe that RAN keeps ``ok: true`` — the payload makes no screen claim and the
+    payload IS the answer.
+
+    WP4b (C8 / dev F3 fix 5.1): the fake world here CAN launch, so the payload is a
+    successful launch and its leading token is now ``LAUNCHED`` (fix 5.1 revised the
+    token that was chosen pre-launch; before this it read ``NO_INSTANCE ...
+    launched=excel``, the first word saying the opposite of what happened). A launch
+    is exactly as screen-claim-free as ``NO_INSTANCE``, so it joins the probe
+    shortcut's vocabulary and ``ok`` is UNCHANGED at ``True`` — 5.1 does not touch
+    ``ok`` semantics. The failure half of the probe vocabulary is pinned in
+    tests/test_c8_launch_failure_not_verified.py."""
     backend = _backend_with()
     outcome = _run(
         backend, GroundedAction(action="ensure_app", target="excel", confidence=1.0)
     )
     assert outcome.kind == "executed" and outcome.result is not None
     assert outcome.result.ok is True
-    assert outcome.result.message.startswith(NO_INSTANCE)
+    assert outcome.result.message.startswith(LAUNCHED)
+    assert outcome.result.ensure_app_outcome == "launched"
+    assert "launch_rejected=" not in outcome.result.message
+    assert "launch_unresolved=" not in outcome.result.message
     assert outcome.result.verification is not None
     assert outcome.result.verification.verification_method == "ensure_app_probe"
-    assert "NO_INSTANCE" in outcome.result.verification.note
+    # The note echoes the payload, so it carries the revised leading token.
+    assert "LAUNCHED" in outcome.result.verification.note
 
 
 def test_ensure_app_without_target_is_rejected_fail_closed() -> None:

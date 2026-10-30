@@ -43,7 +43,7 @@ from computer_use_mcp.backend import (
     LocalComputerBackend,
     parse_launch_paths,
 )
-from computer_use_mcp.interference import NO_INSTANCE, format_no_instance
+from computer_use_mcp.interference import LAUNCHED, NO_INSTANCE, format_no_instance
 
 LAUNCH_PATHS_ENV = "CORTEX_LAUNCH_PATHS"
 
@@ -353,7 +353,11 @@ def test_fake_mapping_launches_and_records_basename(
     exe = _mapping(monkeypatch, tmp_path)
     backend = FakeComputerBackend()
     payload = backend.ensure_app("blender", allow_launch=True)
-    assert payload.startswith(NO_INSTANCE)
+    # WP4b (C8 / dev F3 fix 5.1): a REAL spawn now leads with ``LAUNCHED``. The old
+    # ``NO_INSTANCE`` token was chosen BEFORE the launch attempt and never revised,
+    # so the first word of a successful spawn said the opposite of what happened.
+    # ``launch=server``, ``launched=<exe>`` and the recorded process are UNCHANGED.
+    assert payload.startswith(LAUNCHED)
     assert "launch=server" in payload
     assert "launched=blender.exe" in payload
     assert backend.launched_processes == ["blender.exe"]

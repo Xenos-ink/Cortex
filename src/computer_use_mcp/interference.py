@@ -83,6 +83,14 @@ MODAL_DIALOG = "MODAL_DIALOG"
 REATTACHED = "REATTACHED"
 AMBIGUOUS_INSTANCE = "AMBIGUOUS_INSTANCE"
 NO_INSTANCE = "NO_INSTANCE"
+#: ORVEX-2026-108 WP4b (C8 / dev F3 fix 5.1): the leading token for a payload where a
+#: process was REALLY spawned server-side. Before this the token was chosen BEFORE the
+#: launch attempt and never revised, so a successful spawn still read
+#: ``NO_INSTANCE ... launched=mspaint.exe`` — the first word of the message said the
+#: opposite of what happened. The status suffixes (``launched=``,
+#: ``launch_unresolved=``, ``launch_rejected=``) are unchanged, so a consumer that
+#: reads those still works; only the leading token moved.
+LAUNCHED = "LAUNCHED"
 STUCK_MODIFIER = "STUCK_MODIFIER"
 FOCUS_IDENTITY_UNKNOWN = "FOCUS_IDENTITY_UNKNOWN"
 TARGET_GONE = "TARGET_GONE"

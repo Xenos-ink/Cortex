@@ -120,6 +120,10 @@ STOCK_OBSERVATION_KEYS = [
     "active_window_info",
     "ocr_text",
     "ui_elements",
+    # D15 (ORVEX-2026-108 WP4b) amendment: ``ocr_dropped`` is the ONE additive key —
+    # the producer's own known-but-dropped count, riding the existing additive
+    # ``omitted_count`` channel of the ``spatial_text`` block.
+    "ocr_dropped",
 ]
 
 

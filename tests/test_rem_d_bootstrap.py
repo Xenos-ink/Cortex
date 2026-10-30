@@ -37,7 +37,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.interference import NO_INSTANCE, REATTACHED
+from computer_use_mcp.interference import LAUNCHED, NO_INSTANCE, REATTACHED
 from computer_use_mcp.models import GroundedAction, Observation, WindowInfo
 from computer_use_mcp.agent import ComputerUseAgent
 from computer_use_mcp.limits import Limits
@@ -239,5 +239,9 @@ def test_pin5_no_allowlist_ensure_app_unchanged() -> None:
     )
     assert outcome.kind == "executed" and outcome.result is not None
     assert outcome.result.ok is True
-    assert outcome.result.message.startswith(NO_INSTANCE)
+    # WP4b (C8 / dev F3 fix 5.1): a REAL spawn now leads with ``LAUNCHED`` (the old
+    # ``NO_INSTANCE`` token was chosen before the launch attempt and never revised).
+    # The launch itself — ``launched=<exe>``, ok True, the probe verification method —
+    # is UNCHANGED.
+    assert outcome.result.message.startswith(LAUNCHED)
     assert "launched=mspaint.exe" in outcome.result.message

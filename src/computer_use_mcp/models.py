@@ -160,6 +160,10 @@ class TextRegion(BaseModel):
     width: int = Field(gt=0)
     height: int = Field(gt=0)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    #: D15 (ORVEX-2026-108 WP4b) is ADDITIVE and defaults to ``False``: the region's
+    #: label was longer than the semantic read's 200-char clip and is served CLIPPED,
+    #: so a silent content loss cannot pass as a complete read.
+    text_truncated: bool = False
 
 
 class GroundingResult(BaseModel):
@@ -467,6 +471,14 @@ class Observation(BaseModel):
     active_window_info: WindowInfo | None = None
     ocr_text: list[TextRegion] | None = None
     ui_elements: list[Any] | None = None
+    #: D15 (ORVEX-2026-108 WP4b, additive): how many text elements THIS READ knew
+    #: about but did not serve — the reader's own element/wall-clock caps and
+    #: offscreen/unreadable elements, plus the rect-less/text-less drops in the
+    #: conversion. The ``spatial_text`` block's ``omitted_count`` adds this to its own
+    #: cap-drop count, so ``region_count + omitted_count`` accounts for the whole
+    #: read. ``0`` means "nothing was dropped" (and a degraded read, where ``ocr_text``
+    #: is ``None``, ships ``spatial_text_available: false`` instead of a block).
+    ocr_dropped: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _sync_coordinate_space(self) -> Observation:

@@ -831,9 +831,18 @@ class ComputerUseAgent:
 
     @staticmethod
     def _ensure_app_probe_outcome(message: str) -> bool:
-        """True when an ensure_app execution returned a PROBE outcome (no screen claim)."""
+        """True when an ensure_app execution returned a PROBE outcome (no screen claim).
+
+        WP4b (C8 / dev F3 fix 5.1): ``LAUNCHED`` joins the probe vocabulary. A
+        successful server-side launch is exactly as screen-claim-free as
+        ``NO_INSTANCE`` — the payload IS the answer, and its window may not even
+        exist yet when the post-action capture lands. Recognising it here keeps the
+        probe shortcut's ``ok`` semantics UNCHANGED by the leading-token fix (that is
+        §1.3, not 5.1); the two FAILURE-valued launches still start with
+        ``NO_INSTANCE`` and are demoted by the probe branch below.
+        """
         text = str(message or "")
-        return text.startswith(("NO_INSTANCE", "AMBIGUOUS_INSTANCE"))
+        return text.startswith(("NO_INSTANCE", "AMBIGUOUS_INSTANCE", "LAUNCHED"))
 
     def _post_action_guard_events(
         self,
@@ -1413,20 +1422,20 @@ class ComputerUseAgent:
         after: Observation,
         action: GroundedAction | None = None,
         *,
-        record: bool = True,
         return_tier: bool = False,
     ) -> Any:
         """VERIFY phase: strategy chain or provider judge; uncertain never becomes success.
 
-        ``record=False`` runs the ladder WITHOUT emitting the metrics/audit event, so a
-        caller that may run it MORE THAN ONCE for one action (F2-3's single
-        late-repaint re-capture, the expected-text fallback) can record the FINAL
-        verdict exactly once via :meth:`_record_verification` instead of one event per
-        attempt. ``return_tier=True`` returns ``(result, ladder_tier)`` so that single
-        record names the tier that actually decided. Both default off, so every
-        existing caller is byte-identical.
+        DELTA 1 (VAL-WP4b MAJOR): the ``record`` parameter is REMOVED — this method
+        NEVER emits the metrics/audit event. Every production caller (all three
+        ``run_single`` branches) runs the ladder unrecorded and the ONE
+        ``_record_verification`` after the demotions is the only verification audit
+        record (E-05), so a hard-coded tier at the record site is pinned by the
+        production-path test
+        (``test_reply_contract.py::test_verification_audit_names_the_real_ladder_tier``).
+        ``return_tier=True`` returns ``(result, ladder_tier)`` so that single record
+        names the tier that actually decided.
         """
-        started = time.perf_counter()
         ladder_tier = "engine"
         try:
             if intent.kind == VerificationKind.MODEL_JUDGE.value:
@@ -1455,19 +1464,9 @@ class ComputerUseAgent:
                 observation_id=after.observation_id,
             )
         # v0.7.1 Defect A: honest capture-source diagnostics (marker rides ALONGSIDE
-        # the verdict; the verdict itself is never altered).
-        result, capture_marker = self._capture_source_guard(action, result)
-        duration_ms = (time.perf_counter() - started) * 1000.0
-        if record:
-            self._record_verification(
-                result,
-                intent,
-                after,
-                action,
-                ladder_tier=ladder_tier,
-                duration_ms=duration_ms,
-                capture_marker=capture_marker,
-            )
+        # the verdict; the verdict itself is never altered). The single record
+        # downstream re-runs this guard and carries ``capture_source_suspected``.
+        result, _capture_marker = self._capture_source_guard(action, result)
         return (result, ladder_tier) if return_tier else result
 
     def _record_verification(
@@ -1487,11 +1486,11 @@ class ComputerUseAgent:
         than once for a single action — the one late-repaint re-capture, the
         expected-text fallback — still produces exactly one audit event carrying the
         FINAL verdict, and exactly one latency sample for the whole verification. The
-        audit ``result`` and the reply verdict are produced from the same object at
-        record time, so they agree HERE. The ONE known exception is pre-existing
-        (v0.7.5) ordering, owned by WP4b / E-05: the post-action FOCUS_DRIFTED
-        demotion (verified -> failed) runs AFTER this record, so on that path the
-        audit row says ``verified`` while the reply says ``failed`` (F2, VAL-WP4a).
+        audit ``result`` and the reply verdict are produced from the same object, and
+        since E-05 (WP4b) the caller emits this record AFTER every demotion — the
+        type-integrity mismatch veto, the launch-outcome demotion, and the post-action
+        FOCUS_DRIFTED demotion — so the audit verdict ALWAYS equals the reply verdict
+        on every executed-action path.
         """
         self.metrics.record_latency("verification_ms", duration_ms)
         if result.outcome == "verified":
@@ -2357,6 +2356,9 @@ class ComputerUseAgent:
             post_events, post_annotations, post_stops = self._post_action_guard_events(action, after)
             outcome_message = str(message)
             intent = self._build_intent(action, None, expected_effect)
+            verify_started = time.perf_counter()
+            ladder_tier = "engine"
+            capture_marker: str | None = None
             if marker:
                 # §1.2 (ORVEX-2026-108; dev F2-4): a MARKER is verified by
                 # construction, and that is honest: it claimed no screen transition,
@@ -2367,6 +2369,7 @@ class ComputerUseAgent:
                 # lie this contract exists to remove. The confidence is about the
                 # MARKER being handled, not about the task; the reply's top-level
                 # ``result`` token is ``"marker"`` (assigned by the reply builder).
+                ladder_tier = "no_op_marker"
                 verification = VerificationResult(
                     outcome="verified",
                     changed=False,
@@ -2381,22 +2384,6 @@ class ComputerUseAgent:
                     verification_method="no_op_marker",
                     observation_id=after.observation_id,
                 )
-                # the audit event ``_verify`` would have emitted (same shape) — the
-                # marker branch skips the ladder, not the audit trail.
-                self.metrics.incr("verification_verified")
-                self._audit(
-                    "verification",
-                    observation=after,
-                    action=action,
-                    result="verified",
-                    metadata={
-                        "method": "no_op_marker",
-                        "verification_confidence": _NO_OP_MARKER_CONFIDENCE,
-                        "note": verification.note[:200],
-                        "intent_kind": intent.kind,
-                        "ladder_tier": "no_op_marker",
-                    },
-                )
             elif action.action is ActionType.ENSURE_APP and self._ensure_app_probe_outcome(outcome_message):
                 # §1.3 (ORVEX-2026-108, MAJOR-4): the probe outcome is the answer the
                 # driver acts on — and its VALUE decides the verdict, never a blanket
@@ -2405,6 +2392,7 @@ class ComputerUseAgent:
                 # ok False — uncertain is never success); not_found / launch_rejected /
                 # launch_unresolved are launch FAILURES (failed, ok False) — shipping
                 # them with ok:true was a label lie even before WP4b.
+                ladder_tier = "ensure_app_probe"
                 probe_outcome = ensure_app_outcome(outcome_message)
                 if probe_outcome in ("not_found", "launch_rejected", "launch_unresolved"):
                     verification = VerificationResult(
@@ -2450,14 +2438,13 @@ class ComputerUseAgent:
                 # F2-3: the ladder may run more than once for ONE action (the single
                 # late-repaint re-capture below, the expected-text fallback), so the
                 # ladder runs unrecorded and the FINAL verdict is audited exactly once
-                # by ``_record_verification`` after the block.
-                verify_started = time.perf_counter()
+                # by ``_record_verification`` after the demotions below (E-05).
                 ladder_tier = "engine"
                 # F1 (VAL-WP4a): the primary ladder run returns its REAL tier so the
                 # single audit record names it (v0.7.5 behaviour), exactly like the
                 # recapture and fallback branches below.
                 verification, ladder_tier = await self._verify(
-                    intent, observation, after, action=action, record=False, return_tier=True
+                    intent, observation, after, action=action, return_tier=True
                 )
                 # F2-3 + E-02: an ``uncertain`` that is SPECIFICALLY "the two frames
                 # were byte-identical" earns ONE late-repaint re-capture — but only
@@ -2486,7 +2473,7 @@ class ComputerUseAgent:
                     after = self._observe("post_action")
                     self.metrics.incr("verification_recapture")
                     verification, ladder_tier = await self._verify(
-                        intent, observation, after, action=action, record=False, return_tier=True
+                        intent, observation, after, action=action, return_tier=True
                     )
                 # T8 B2: an uncertain expected-text verdict (typed text invisible to
                 # window/UI-control evidence) routes to the reliable pixel-diff tier.
@@ -2499,30 +2486,16 @@ class ComputerUseAgent:
                     # from evidence; uncertain is never upgraded.
                     fallback_intent = self._build_intent(action, "visual_change", expected_effect)
                     verification, ladder_tier = await self._verify(
-                        fallback_intent, observation, after, action=action, record=False, return_tier=True
+                        fallback_intent, observation, after, action=action, return_tier=True
                     )
                 if action.action is ActionType.TYPE:
                     # F2-1: the focused control's R-04 read-back outranks a title/control
                     # substring match — an ``integrity=mismatch`` vetoed verified to the
-                    # honest §1 token (uncertain, ok False), never ok:true. Applied
-                    # BEFORE the single audit record so the audit 'verification' event
-                    # and the reply verdict agree here (contract item d; the ONE
-                    # remaining audit/reply disagreement — the post-action drift
-                    # demotion after the record — is pre-existing ordering owned by
-                    # WP4b / E-05, F2 VAL-WP4a).
+                    # honest §1 token (uncertain, ok False), never ok:true.
                     verification = _apply_type_integrity_status(
                         verification, outcome_message, changed=verification.changed
                     )
                 _, capture_marker = self._capture_source_guard(action, verification)
-                self._record_verification(
-                    verification,
-                    intent,
-                    after,
-                    action,
-                    ladder_tier=ladder_tier,
-                    duration_ms=(time.perf_counter() - verify_started) * 1000.0,
-                    capture_marker=capture_marker,
-                )
             if pre_annotation:
                 post_annotations.insert(0, pre_annotation)
             if post_annotations:
@@ -2542,6 +2515,27 @@ class ComputerUseAgent:
                     verification_method="interference_post_action",
                     observation_id=after.observation_id,
                 )
+            # E-05 (ORVEX-2026-106, fixed during the WP4b port): the ONE verification
+            # audit event is emitted AFTER every demotion — the type-integrity veto
+            # above, the launch-outcome demotion in the probe branch, and THIS drift
+            # demotion (verified -> failed; the last audit/reply disagreement left by
+            # VAL-WP4a F2) — so the audit verdict always equals the reply verdict. All
+            # three branches (marker, probe, ladder) funnel through the same single
+            # record: done/wait markers and ensure_app probes now emit the event too
+            # (the probe branch previously emitted NO verification audit event at all).
+            self._record_verification(
+                verification,
+                intent,
+                after,
+                action,
+                ladder_tier=ladder_tier,
+                duration_ms=(
+                    (time.perf_counter() - verify_started) * 1000.0
+                    if ladder_tier not in ("no_op_marker", "ensure_app_probe")
+                    else 0.0
+                ),
+                capture_marker=capture_marker,
+            )
             ok = verification.outcome == "verified"
             if ok:
                 self._verified_reanchor(self.guard, verification.outcome, after)

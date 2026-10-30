@@ -521,7 +521,12 @@ async def test_d8_bare_name_resolves_through_store_alias_and_launches(
     payload = await _run(session_id, {"action": "ensure_app", "target": "mspaint"})
     assert payload["ok"] is True, payload
     message = str(payload["message"])
-    assert message.startswith("NO_INSTANCE"), message
+    # WP4b (C8 / dev F3 fix 5.1): the leading token of a REAL launch is now
+    # ``LAUNCHED`` (the old ``NO_INSTANCE`` was chosen before the spawn attempt and
+    # never revised, so the first word said the opposite of what happened). ``ok`` is
+    # UNCHANGED: a launch is a screen-claim-free probe outcome, so it still verifies.
+    # The payload still records the REAL executable name, which is this test's subject.
+    assert message.startswith("LAUNCHED"), message
     assert "launch=server" in message, message
     assert "launched=mspaint.exe" in message, message  # the ALIAS's real name
     assert backend.ensure_app_calls == ["mspaint"]

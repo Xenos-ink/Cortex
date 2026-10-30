@@ -1458,3 +1458,57 @@ async def test_verification_audit_names_the_real_ladder_tier_on_the_plain_path(
     assert events[0]["result"] == "verified", events[0]
     assert events[0]["metadata"]["ladder_tier"] == "engine", events[0]
     assert bundle.metrics.snapshot()["latencies"]["verification_ms"]["count"] == 1
+
+
+async def test_verification_audit_names_the_real_ladder_tier_off_the_plain_path(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N1 (VAL-WP4a-02 carry-over, WP4b; ROUTED THROUGH THE PRODUCTION PATH in
+    DELTA 1): the plain-path pin above asserts the literal ``"engine"`` — the old
+    hard-coded value — so it passes with or without the F1 fix. THIS pin drives
+    ``computer_execute`` end-to-end with a scenario whose REAL tier is NOT
+    ``"engine"``: a frozen capture source (every ``observe()`` hands back the SAME
+    observation) makes the post-action capture IS the grounding capture — the B1
+    starved-ladder route — so the tier is ``engine_no_diff`` and the verification
+    audit event's ``ladder_tier`` metadata must say exactly that. Hard-coding
+    ``"engine"`` at the production record site (``agent._record_verification``) fails
+    this test.
+
+    (The ``model_judge`` tier is unreachable from the execute surface — no production
+    caller builds a model-judge intent on ``run_single`` — so its tier naming stays
+    covered at the ladder seam, tests/test_perf004_loop_economics.py, which asserts
+    ``tier == "model_judge"`` from ``_verify_judge_ladder`` itself.)
+    """
+
+    class _FrozenCaptureBackend(ScriptedBackend):
+        """A degenerate capture source: every observe() returns the SAME observation —
+        the starved-ladder shape the B1 route exists for."""
+
+        def __init__(self) -> None:
+            super().__init__(flip=False)
+            self._frozen: Any = None
+
+        def observe(self) -> Any:
+            if self._frozen is None:
+                self._frozen = super().observe()
+            return self._frozen
+
+    backend = _FrozenCaptureBackend()
+    session_id, bundle, _backend, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = execute_payload(
+        await server.computer_execute(session_id, "click", x=10, y=10)
+    )
+    validate_reply(payload, "flat_execute")
+    # The frozen capture can prove no transition: dispatched, unproven — honest.
+    assert payload["result"] == "uncertain", payload
+    assert payload["ok"] is False
+    events = [
+        e for e in audit_events(bundle, session_id) if e["event_type"] == "verification"
+    ]
+    assert len(events) == 1, events
+    # THE PIN: the audit metadata names the REAL tier of the run — a hard-coded
+    # ``"engine"`` at the production record site fails here.
+    assert events[0]["metadata"]["ladder_tier"] == "engine_no_diff", events[0]
+    assert events[0]["result"] == "uncertain"

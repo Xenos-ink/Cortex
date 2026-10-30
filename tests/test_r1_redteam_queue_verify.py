@@ -562,7 +562,12 @@ async def test_attack6_default_policy_dispatches_server_side_launch(
     payload = await _run(session_id, {"action": "ensure_app", "target": "mspaint"})
     assert payload["ok"] is True, payload
     message = str(payload["message"])
-    assert message.startswith("NO_INSTANCE"), message
+    # WP4b (C8 / dev F3 fix 5.1): a REAL spawn now leads with ``LAUNCHED``. The old
+    # ``NO_INSTANCE`` token was chosen BEFORE the launch attempt and never revised,
+    # so the first word of a successful spawn said the opposite of what happened.
+    # Every assertion below about the launch itself (``launch=server``,
+    # ``launched=<exe>``, the recorded process) is UNCHANGED.
+    assert message.startswith("LAUNCHED"), message
     assert "launch=server" in message, message
     assert "launched=mspaint" in message, message
     assert backend.ensure_app_calls == ["mspaint"]

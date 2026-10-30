@@ -254,16 +254,17 @@ def test_snapshot_to_text_regions_screenshot_local(monkeypatch: pytest.MonkeyPat
     reader.warm()
     snapshot = reader.read()
     assert snapshot is not None
-    regions = _uia_snapshot_to_text_regions(snapshot, origin=(0, 0), scale=(1.0, 1.0))
+    regions, dropped = _uia_snapshot_to_text_regions(snapshot, origin=(0, 0), scale=(1.0, 1.0))
     assert all(isinstance(region, TextRegion) for region in regions)
+    assert dropped == 0
     assert (regions[0].x, regions[0].y) == (100, 50)
     assert (regions[0].width, regions[0].height) == (400, 30)
     # Scaled space: the physical rect through the 1.25 scale becomes screenshot-local.
-    scaled = _uia_snapshot_to_text_regions(snapshot, origin=(0, 0), scale=(1.25, 1.25))
+    scaled, _ = _uia_snapshot_to_text_regions(snapshot, origin=(0, 0), scale=(1.25, 1.25))
     assert (scaled[0].x, scaled[0].y) == (80, 40)
     assert (scaled[0].width, scaled[0].height) == (320, 24)
     # Negative-origin secondary monitor: localized onto the captured monitor.
-    shifted = _uia_snapshot_to_text_regions(snapshot, origin=(-1920, 0), scale=(1.0, 1.0))
+    shifted, _ = _uia_snapshot_to_text_regions(snapshot, origin=(-1920, 0), scale=(1.0, 1.0))
     assert shifted[0].x == 100 + 1920
 
 
@@ -285,8 +286,10 @@ def test_snapshot_to_text_regions_skips_rectless_and_empty() -> None:
             {"name": "valid", "rect": (1.0, 2.0, 5.0, 6.0)},
         ],
     }
-    regions = _uia_snapshot_to_text_regions(snapshot, origin=(0, 0), scale=(1.0, 1.0))
+    regions, dropped = _uia_snapshot_to_text_regions(snapshot, origin=(0, 0), scale=(1.0, 1.0))
     assert [(region.text, region.x, region.y) for region in regions] == [("valid", 1, 2)]
+    # D15 (WP4b): the three skipped elements are now REPORTED, not swallowed.
+    assert dropped == 3
 
 
 # --- silent degradation ---------------------------------------------------------------------------
@@ -447,7 +450,7 @@ def test_win32_reader_text_regions_conversion(fake_text_user32: _FakeTextUser32)
     reader = Win32TextReader()
     snapshot = reader.read()
     assert snapshot is not None
-    regions = _uia_snapshot_to_text_regions(snapshot, origin=(0, 0), scale=(1.0, 1.0))
+    regions, _dropped = _uia_snapshot_to_text_regions(snapshot, origin=(0, 0), scale=(1.0, 1.0))
     assert any(region.text == "hello" for region in regions)
     assert any(region.text == "OK" for region in regions)
 
