@@ -1027,6 +1027,15 @@ def test_d4_both_concrete_engines_implement_the_key_primitives(
 
     if engine_cls is SendInputEngine:
         engine = engine_cls()
+        # HERMETICITY (WP7b carry-over, VAL-WP7a full-suite flake): the press path
+        # routes through ``_send``, whose failsafe pre-check reads the LIVE cursor
+        # (``get_cursor_position``) — a full-suite run with the desktop cursor
+        # parked in a screen corner raised InputBlockedError before any event
+        # reached the stub, failing a purely structural node. The corner check is
+        # stubbed FALSE on the instance (the same seam ``_dispatch`` already
+        # stubs); the dispatch-event assertions below are UNCHANGED and no real
+        # input is ever sent.
+        monkeypatch.setattr(engine, "_cursor_in_failsafe_corner", lambda: False)
         # DELTA 1 (F1): releases route through ``_send_release``, whose corner check
         # is skipped — record the COMMON dispatch tail (``_dispatch``) so the
         # behaviour proof covers both the press and the release path.

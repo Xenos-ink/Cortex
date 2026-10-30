@@ -36,6 +36,28 @@ def _plan(points: list[dict[str, Any]], **plan_kwargs: Any) -> WaypointPlan:
     return WaypointPlan(points=points, **plan_kwargs)
 
 
+def test_a_whitespace_only_arrival_condition_is_never_copied_into_expected_effect() -> None:
+    """VAL-WP7a-02 #14 (executed in WP7b): a blank ``arrival_condition`` is an ABSENCE
+    of a statement — direct construction is untouched (the wire gate rejects it), but
+    the normalizer must not inject blank text as an action's ``expected_effect``."""
+    for blank in ("", "   "):
+        specs, _ctx = normalize_plan(
+            _plan(
+                [
+                    {
+                        "id": "a",
+                        "x": 1,
+                        "y": 2,
+                        "arrival_condition": blank,
+                        "actions": [{"action": "click"}],
+                    }
+                ]
+            )
+        )
+        click = next(spec for spec in specs if spec.action.value == "click")
+        assert click.expected_effect is None
+
+
 # --- VAL-WP7a-01 #6: the defense runs at the TOP of normalize_plan -----------------------------
 
 

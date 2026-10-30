@@ -130,6 +130,8 @@ from .models import (
     ok_from_result,
 )
 from .observation import observation_text_summary
+from . import plan as plan_layer
+from .plan import PLAN_EVIDENCE_KEY, PlanLease, PlanLeaseGuard
 from .provider import OpenAICompatibleVisionProvider
 from .redaction import redact_text
 from .resume_manager import ResumeBundle, ResumeManager, ResumeRefusalError
@@ -355,6 +357,12 @@ def _close_stopped_bundle(
         # WP6: cancel-and-detach the session's waits while the teardown is atomic
         # (cancel flags set + registries cleaned under ``_lock``, before the pop).
         cancelled_wait_handles = _cancel_all_waits(session_id)
+        # WP7b: release the plan lease HERE — inside the locked teardown, before
+        # the bundle is popped. This is the ONE session-end funnel (stop_session,
+        # the WP-S idle reaper and the internal kill path all call this), so an
+        # active lease can never outlive its session; the guard's release is
+        # idempotent (exactly once, no double-release error).
+        _plan_guard.release(session_id, bundle)
         # WP5: dispose the evidence store HERE, inside the locked teardown and BEFORE
         # the bundle is popped — this is the ONE session-end path (stop_session, the
         # WP-S idle reaper and the internal kill path all funnel through
@@ -663,21 +671,13 @@ def _redact_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _redact_queue_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """F2 defense-in-depth for PERF-004 C7 queue entries: redact text at the sink.
 
-    WP7b-SEAM(redact-delegate): the plan layer's ``computer_use_mcp.plan.redact_queue_entry``
-    is the SAME behavior (same three text keys, same ``redact_text`` sink); WP7b
-    delegates this function to it so the two sinks cannot drift, and WP8's dead-code
-    sweep owns any leftover duplicate.
+    WP7b-SEAM(redact-delegate) — WIRED: this IS the plan layer's
+    ``computer_use_mcp.plan.redact_queue_entry`` (same three text keys, same
+    ``redact_text`` sink); delegating means the flat-queue and plan sinks cannot
+    drift. WP8's dead-code sweep owns the leftover duplicate in plan.py's docstring
+    history only.
     """
-    redacted = dict(entry)
-    if redacted.get("message"):
-        redacted["message"] = redact_text(str(redacted["message"]))[0]
-    reasons = redacted.get("reasons")
-    if isinstance(reasons, list):
-        redacted["reasons"] = [redact_text(str(reason))[0] for reason in reasons]
-    verification_note = redacted.get("verification_note")
-    if verification_note:
-        redacted["verification_note"] = redact_text(str(verification_note))[0]
-    return redacted
+    return plan_layer.redact_queue_entry(entry)
 
 
 # --- REM-A outbound image budget + content-block parity (master-mission Phase 2) ---------------
@@ -1541,11 +1541,43 @@ NullableBool = Annotated[bool | None, _PLAIN_NULLABLE_BOOLEAN]
 NullableCoordinate = Annotated[TolerantInt | None, _PLAIN_WIDENED_NULLABLE_COORDINATE]
 NullableStrList = Annotated[TolerantStrList | None, _PLAIN_WIDENED_NULLABLE_STRING_ARRAY]
 NullableFollowUps = Annotated[TolerantFollowUps | None, _PLAIN_WIDENED_NULLABLE_OBJECT_ARRAY]
-# WP7b-SEAM(plan-param): attach the S-10 typed advertised schema from plan.py here —
-# `NullablePlan = Annotated[dict[str, Any] | None, _PlainJsonSchema(plan.PLAN_PARAM_PLAIN_SCHEMA)]`
-# (object-only, no anyOf/$ref/string arm; the JSON-string tolerance stays runtime-only
-# via plan.coerce_tolerant_plan) — plus the `plan`/`plan_action` trailing-optional
-# parameters on computer_execute (the rt7 trailing-pin).
+# WP7b-SEAM(plan-param) — WIRED: the S-10 typed advertised schema from plan.py is
+# attached here. The ADVERTISED shape is the object-only PLAN_PARAM_PLAIN_SCHEMA (no
+# anyOf/$ref, no "string" arm — the REM-G plain rule and S-10 hold verbatim); the
+# JSON-string tolerance is RUNTIME-only, behind the boundary, via the same
+# parse-only coercion the follow_ups queue uses (the strict fail-closed validation
+# itself stays in computer_execute's handler so a malformed plan is the teaching
+# ``invalid_action`` reply, never an argument error).
+def _coerce_plan_param(value: Any) -> Any:
+    """Boundary tolerance for the ``plan`` parameter (the follow_ups pattern).
+
+    Accepts the plan object as-is and a JSON-encoded STRING containing it; anything
+    else raises a typed error before the tool runs. This helper PARSES only — the
+    strict :func:`computer_use_mcp.plan.coerce_tolerant_plan` pipeline (raw
+    boundary -> strict model -> model defense -> SPEC 5.2 explicitness) applies in
+    the handler regardless of the wire shape, so tolerance is never a bypass.
+    """
+    if value is None or isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"plan string is not valid JSON: {exc}") from None
+        if not isinstance(parsed, dict):
+            raise ValueError("plan string must encode a JSON object")
+        return parsed
+    raise ValueError(
+        f"plan must be an object: {{\"points\": [{{\"x\", \"y\", \"actions\"}}]}}; "
+        f"got {type(value).__name__}."
+    ) from None
+
+
+NullablePlan = Annotated[
+    dict[str, Any] | None,
+    BeforeValidator(_coerce_plan_param),
+    _PlainJsonSchema(plan_layer.PLAN_PARAM_PLAIN_SCHEMA),
+]
 NullableStrMap = Annotated[dict[str, Any] | None, _PLAIN_NULLABLE_STRING_MAP]
 NullableNumberMap = Annotated[dict[str, float] | None, _PLAIN_NULLABLE_NUMBER_MAP]
 NullableKeys = Annotated[TolerantKeys | None, _PLAIN_WIDENED_NULLABLE_STRING_ARRAY]
@@ -2062,6 +2094,10 @@ def start_session(
                 # failed resume start is a session END — dispose the store exactly
                 # once before the bundle is dropped, like every other end path.
                 dispose_store(bundle.extra)
+                # WP7b (defensive): a fresh session cannot carry a plan lease (no
+                # plan call has run yet), but the release is idempotent and keeps
+                # the lease lifecycle total across every bundle-drop path.
+                _plan_guard.release(session_id, bundle)
                 _bundles.pop(session_id, None)
             _registry.remove(session_id)
             return _resume_error_response(exc, resume_from_checkpoint)
@@ -2717,9 +2753,15 @@ async def computer_wait(
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
-    # WP7b-SEAM(wait-lease): when the waypoint-plan lease lands (WP7), a plan-lease
-    # refusal for computer_wait/computer_cancel_wait goes HERE (status stays allowed
-    # during a lease — it is read-only). Recorded in wp6-notes.md for WP7.
+    # WP7b-SEAM(wait-lease) — WIRED: while a waypoint-plan lease is active a wait
+    # would interleave with the lease's step-by-step sequence and make the
+    # handshake's own timing unaccounted for, so the call is refused with the typed
+    # ``plan_lease`` rejection BEFORE anything starts (zero effect). The read-only
+    # ``computer_wait_status`` stays allowed during a lease (master-mission WP6
+    # decision).
+    lease_rejection = _active_plan_tool_rejection(bundle)
+    if lease_rejection is not None:
+        return lease_rejection
     if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, (int, float)):
         return _wait_rejection(
             "invalid_wait_duration",
@@ -3001,9 +3043,15 @@ async def computer_cancel_wait(session_id: str, wait_id: str) -> dict[str, objec
     call blocked on this wait returns ``cancelled`` in under a second.
     """
     try:
-        _get_live_bundle(session_id)
+        bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
+    # WP7b: a cancel interleaved with a plan lease would kill a wait the lease's
+    # sequence may be pacing around — refused with the typed ``plan_lease``
+    # rejection while a lease is active (the wait itself is left running).
+    lease_rejection = _active_plan_tool_rejection(bundle)
+    if lease_rejection is not None:
+        return lease_rejection
     if not isinstance(wait_id, str) or not wait_id:
         return _wait_rejection(
             "unknown_wait",
@@ -3123,6 +3171,14 @@ def computer_observe(
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
+    # WP7b (observe/zoom-during-lease decision, dev parity): an INDEPENDENT
+    # observation while a plan lease is waiting would desynchronize the lease's
+    # grounding premise — refused with the typed ``plan_lease`` rejection before
+    # any capture. computer_fetch_image stays allowed (S-04: it serves evidence
+    # the session already holds and captures nothing).
+    lease_rejection = _active_plan_tool_rejection(bundle)
+    if lease_rejection is not None:
+        return lease_rejection
     # D1: text mode suppresses the OUTBOUND image block only — a non-vision model
     # receiving one ImageContent anywhere in its history gets the whole provider
     # request rejected with a 400 and the session dies permanently.
@@ -3368,6 +3424,11 @@ def computer_zoom(
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
+    # WP7b: zoom is refused during a plan lease exactly like observe (dev parity;
+    # same rationale — an independent capture would desynchronize the lease).
+    lease_rejection = _active_plan_tool_rejection(bundle)
+    if lease_rejection is not None:
+        return lease_rejection
     image_mode = _session_image_delivery(bundle)
     # Fail-closed view/density resolution BEFORE any capture (a bad name wastes no
     # capture; the observe-path precedent). Raw/absent views ignore density silently.
@@ -3529,6 +3590,1232 @@ def computer_zoom(
     ]
 
 
+# --- WP7b: the waypoint plan surface (ORVEX-2026-101 Batch 2 / master-mission §1.2-§1.3) ------
+# ONE normalization path, NO second executor: a plan normalizes to plain action-queue
+# items (``[move, actions...]`` per point) and each STEP runs through the EXISTING
+# queue via ``agent.run_single(..., plan_policies=..., plan_context=...)``, so every
+# item inherits the full independent pipeline (ground -> validate -> safety ->
+# approval -> execute -> verify) — "wait and re-observe" per point is inherited,
+# never bypassed (RFC §4.1, decision D1). The data layer lives in plan.py; this
+# section is ONLY the wire: the lease gate, one-step-per-call execution, the §1.3
+# step/terminal replies, and the lease lifecycle.
+#
+# S-01: the dev copy's LEGACY single-call plan path (a whole plan executed in one
+# call through the queue) is deliberately NOT ported — a plan is always stepwise
+# here; a host that wants one-shot behavior passes a one-point plan.
+
+#: The module-level lease guard (replaces the dev ``_PLANS_IN_FLIGHT`` set + the
+#: ``bundle.extra`` bookkeeping helpers): atomic install, idempotent release — the
+#: ONE exit for every terminal/session-end path.
+_plan_guard = PlanLeaseGuard()
+
+#: Bounded retention for the lease's cross-call interference-event carry (D-3): the
+#: guard produces at most a handful of events per step, but an unbounded lease is a
+#: leak, so the retained list is deduped (order-preserving) and capped.
+_PLAN_INTERFERENCE_EVENTS_MAX = 64
+
+#: Bounded capture metadata per plan reply (the dev ``_plan_evidence`` bound).
+_PLAN_EVIDENCE_CAPTURES_MAX = 32
+
+
+def _plan_evidence(bundle: Any, lease: PlanLease) -> dict[str, Any]:
+    """Return bounded backend/capture evidence WITHOUT fabricating observations.
+
+    evidence-by-backend seam — WIRED (S-03 / decision D-2): the value is built
+    from ``EvidenceStore.captures()`` (filled by the reply hooks, so it is real on
+    BOTH backends) plus the lease's retained repositions — never from the fake
+    backend's ``executed``/``observed`` attributes the dev copy read (those do not
+    exist on ``LocalComputerBackend``; the dev block was fake-only). Served under
+    :data:`PLAN_EVIDENCE_KEY` (``evidence_by_backend``) so ``evidence`` keeps meaning
+    exactly one thing everywhere: a LIST of evidence lines.
+    """
+    store = evidence_store(bundle.extra)
+    captures = store.captures() if store is not None else []
+    return {
+        "captures": captures[-_PLAN_EVIDENCE_CAPTURES_MAX:],
+        "repositions": list(lease.repositions),
+    }
+
+
+def _active_plan_tool_rejection(bundle: Any) -> dict[str, Any] | None:
+    """Reject an independent tool while a plan lease is waiting (typed ``plan_lease``).
+
+    Read-only surfaces that CONSUME the lease's own state stay allowed:
+    ``computer_wait_status`` (read-only, master-mission WP6 decision) and
+    ``computer_fetch_image`` (S-04: a fetch is a READ-ONLY retrieval of evidence the
+    session already holds). Refused: flat computer_execute (its own gate inside
+    computer_execute), computer_wait, computer_cancel_wait, and the independent
+    observation tools computer_observe / computer_zoom / computer_screenshot (dev
+    parity: a mid-plan independent observation would desynchronize the lease's
+    grounding premise; recorded as the WP7b observe/zoom decision).
+    """
+    lease = _plan_guard.active_lease(bundle)
+    if lease is None:
+        return None
+    return {
+        "ok": False,
+        "error": "plan_lease",
+        "blocked": True,
+        "message": "A stepwise plan lease is active; finish or stop the plan (continue/stop/replace) first.",
+        "executed_prefix": [_redact_queue_entry(entry) for entry in lease.prefix],
+        "remaining": plan_layer.plan_remaining(lease, "plan_lease_active"),
+        PLAN_EVIDENCE_KEY: _plan_evidence(bundle, lease),
+        "next_step": plan_layer.plan_next_step(lease),
+    }
+
+
+def _plan_lease_refusal(bundle: Any, lease: PlanLease, message: str) -> dict[str, Any]:
+    """The typed zero-effect ``plan_lease`` refusal for a misdirected execute call.
+
+    DELTA 1 #6 (§1.1): an execute-surface refusal is a REJECTED reply — it carries
+    the closed ``result:"rejected"`` token and a ``reasons`` list naming the typed
+    code, beside the kept ``error``/``blocked``/handshake keys (the validate_reply
+    ``plan_refusal`` surface)."""
+    return {
+        "ok": False,
+        "result": "rejected",
+        "reasons": ["plan_lease"],
+        "error": "plan_lease",
+        "blocked": True,
+        "message": message,
+        "executed_prefix": [_redact_queue_entry(entry) for entry in lease.prefix],
+        "remaining": plan_layer.plan_remaining(lease, "plan_lease_active"),
+        PLAN_EVIDENCE_KEY: _plan_evidence(bundle, lease),
+        "next_step": plan_layer.plan_next_step(lease),
+    }
+
+
+def _cutoff_budget_fields(
+    bundle: Any,
+    plan_context: dict[str, Any],
+    *,
+    limit_name: str | None,
+    executed_count: int,
+) -> dict[str, Any]:
+    """Build the four truthful budget fields required at every cut."""
+    required = int(plan_context.get("normalized_item_count") or 0)
+    available = 0
+    if limit_name == "max_actions":
+        available = max(
+            0,
+            int(getattr(bundle.enforcer.limits, "max_actions", 0))
+            - int(getattr(bundle.enforcer, "_actions", 0)),
+        )
+    elif limit_name == "max_steps":
+        available = max(0, int(bundle.state.max_steps) - int(bundle.state.step_count))
+    else:
+        # Non-action gates still expose a bounded statement; zero is truthful when
+        # the available budget is not a simple session counter.
+        available = 0
+    return {
+        "limit_name": limit_name,
+        "required": required,
+        "available": available,
+        "executed_count": int(executed_count),
+    }
+
+
+def _plan_limit_cutoff_from_outcome(
+    outcome: Any,
+    bundle: Any | None = None,
+    plan_context: dict[str, Any] | None = None,
+    prefix_entries: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Identify the established max_steps cut without introducing preflight policy."""
+    if outcome.follow_ups_stopped_reason != "safety_denied":
+        return None
+    entries = list(prefix_entries if prefix_entries is not None else (outcome.follow_up_results or []))
+    if not entries:
+        return None
+    final = list(outcome.follow_up_results or [entries[-1]])[-1]
+    if (
+        final.get("kind") == "safety_denied"
+        and final.get("message") == "Maximum session steps reached."
+    ):
+        executed_count = sum(
+            entry.get("kind") in {"executed", "dispatched_unverified"}
+            for entry in entries
+        )
+        if bundle is not None and plan_context is not None:
+            return {
+                **_cutoff_budget_fields(
+                    bundle, plan_context, limit_name="max_steps", executed_count=executed_count
+                ),
+                "resolved_count": len(entries),
+            }
+        return {
+            "limit_name": "max_steps",
+            "required": 0,
+            "available": 0,
+            "executed_count": executed_count,
+            "resolved_count": len(entries),
+        }
+    return None
+
+
+def _build_plan_aggregate(
+    plan_context: dict[str, Any],
+    outcome: Any | None = None,
+    *,
+    follow_up_results: list[dict[str, Any]] | None = None,
+    stopped_reason: str | None = None,
+    interference_events: list[str] | None = None,
+    cutoff: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the per-point aggregate from the known queue prefix (§4.4/B4-8).
+
+    Normal calls pass the first ``SingleActionOutcome`` unchanged.  Limit/cancel
+    paths pass the mutable prefix retained by the plan context, never a fabricated
+    remainder.  An entry's ``ok`` stays the queue's own verdict; a point is
+    ``completed`` only when EVERY item is present and ok, while a known but
+    incomplete prefix is explicitly ``partial``.  Redaction remains at this sink.
+    The per-action rows echo ``hold_ms`` (E2) exactly as the queue entries carry it.
+    """
+    if outcome is not None:
+        raw_entries = list(outcome.follow_up_results or [])
+        stopped_reason = outcome.follow_ups_stopped_reason
+        interference_events = outcome.interference_events
+    else:
+        raw_entries = list(follow_up_results or [])
+    entries = [
+        _redact_queue_entry(entry) if entry is not None else None
+        for entry in raw_entries
+    ]
+    points_out: list[dict[str, Any]] = []
+    last_entry_index = max(
+        (index for index, entry in enumerate(entries) if entry is not None),
+        default=-1,
+    )
+    for point in plan_context["points"]:
+        point_entries = [
+            entry
+            for entry in entries[point["first_item"] : point["last_item"] + 1]
+            if entry is not None
+        ]
+        if not point_entries:
+            status = "skipped"
+        else:
+            all_ok = all(bool(entry.get("ok")) for entry in point_entries)
+            complete_count = point["last_item"] - point["first_item"] + 1
+            point_complete = len(point_entries) == complete_count
+            has_failed = any(
+                entry.get("verification_outcome") == "failed" or entry.get("kind") != "executed"
+                for entry in point_entries
+            )
+            has_uncertain = any(
+                entry.get("verification_outcome") == "uncertain" for entry in point_entries
+            )
+            has_dispatched_unknown = any(
+                entry.get("kind") == "dispatched_unverified" for entry in point_entries
+            )
+            stop_landed_here = (
+                stopped_reason is not None
+                and point["first_item"] <= last_entry_index <= point["last_item"]
+            )
+            if all_ok and point_complete:
+                status = "completed"
+            elif all_ok and not point_complete:
+                status = "partial"
+            elif has_dispatched_unknown:
+                status = "uncertain_stopped"
+            elif has_failed:
+                status = "failed"
+            elif has_uncertain:
+                status = "uncertain_stopped" if stop_landed_here else "uncertain"
+            else:
+                status = "failed"
+        transition_entry = point_entries[0] if point_entries else None
+        actions_out = [
+            {
+                "action": entry.get("action_type"),
+                "hold_ms": entry.get("hold_ms"),
+                "outcome": entry.get("kind"),
+                "verification": entry.get("verification_outcome"),
+                "ok": bool(entry.get("ok")),
+            }
+            for entry in point_entries[1:]
+        ]
+        points_out.append(
+            {
+                "id": point["id"],
+                "index": point["index"],
+                "status": status,
+                "timeout_ms": point["timeout_ms"],
+                "transition": (
+                    {
+                        "action": transition_entry.get("action_type"),
+                        "duration_ms": transition_entry.get("duration_ms"),
+                        "outcome": transition_entry.get("kind"),
+                        "verification": transition_entry.get("verification_outcome"),
+                        "ok": bool(transition_entry.get("ok")),
+                    }
+                    if transition_entry is not None
+                    else None
+                ),
+                "actions": actions_out,
+            }
+        )
+    final_wait_outcome: dict[str, Any] | None = None
+    final_wait_item = plan_context["final_wait_item"]
+    if final_wait_item is not None and len(entries) > final_wait_item:
+        entry = entries[final_wait_item]
+        # Sparse prefix (F1 fix 2.1): every item the plan did not reach is padded
+        # with ``None`` (``_plan_aggregate_for_state``), and the trailing wait is
+        # ALWAYS the last item — so it is ``None`` in exactly the case this
+        # aggregate exists for: a response issued before the wait ran (any halted
+        # step, ``plan_action="stop"``, ``plan_action="continue"``, the terminal
+        # reply).  Apply the same ``is not None`` guard the point loop above
+        # already uses and NAME the wait instead of raising out of the tool.
+        final_wait_outcome = (
+            {"outcome": "not_executed", "ok": False}
+            if entry is None
+            else {"outcome": entry.get("kind"), "ok": bool(entry.get("ok"))}
+        )
+    aggregate = {
+        "plan_id": plan_context["plan_id"],
+        "status": (
+            "completed"
+            if stopped_reason is None
+            else "cancelled"
+            if stopped_reason == "stopped"
+            else "failed"
+        ),
+        "stopped_reason": stopped_reason,
+        "points": points_out,
+        "interference_events": list(interference_events or []),
+        "final_wait_ms": plan_context["final_wait_ms"],
+        **({"final_wait_outcome": final_wait_outcome} if final_wait_outcome is not None else {}),
+    }
+    if cutoff is not None:
+        aggregate["cutoff"] = dict(cutoff)
+    return aggregate
+
+
+def _plan_aggregate_for_state(
+    lease: PlanLease,
+    *,
+    status: str,
+    stopped_reason: str | None,
+    current_events: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build the additive aggregate from the exact retained prefix.
+
+    ``current_events`` is the step being built RIGHT NOW.  The lease is appended to
+    further down in ``_plan_response`` (the only place the outcome and the lease are
+    both in scope), i.e. AFTER this aggregate is built, so without this the reply for
+    the very step that observed a guard event would under-report its own — a
+    pre-dispatch rejection has no later call to wait for, because the point does not
+    advance.
+    """
+    aligned: list[dict[str, Any] | None] = [None] * len(lease.specs)
+    for entry, source_index in zip(lease.prefix, lease.source_indices, strict=False):
+        if 0 <= source_index < len(aligned):
+            aligned[source_index] = entry
+    aggregate = _build_plan_aggregate(
+        lease.context,
+        follow_up_results=aligned,  # type: ignore[arg-type]
+        stopped_reason=stopped_reason,
+        # ORVEX-2026-105 D-3: the retained lease list is the only thing that can
+        # carry a previous step's guard events — the aggregate is rebuilt from the
+        # lease on every reply.
+        interference_events=[*lease.interference_events, *(current_events or [])],
+    )
+    aggregate["status"] = status
+    return aggregate
+
+
+def _step_interference_events(outcome: Any) -> list[str]:
+    """The step's merged interference events (DELTA 1 #3): EVERY queue item's events,
+    collected by the queue into ``follow_up_interference_events``; falls back to the
+    first outcome's own list for non-queue outcomes."""
+    merged = getattr(outcome, "follow_up_interference_events", None)
+    if merged is None:
+        return list(outcome.interference_events or [])
+    return list(merged)
+
+
+def _plan_retain_events(lease: PlanLease, events: list[str] | None) -> None:
+    """Dedupe + bound the lease's cross-call interference-event carry (D-3/WP3).
+
+    Appended at the one site where the step outcome and the lease are simultaneously
+    in scope; a later call (continue/stop/terminal) runs in a fresh frame and would
+    otherwise report ``interference_events: []`` for a guard event the host was
+    already told about in an earlier reply. Dedup preserves first-seen order; the
+    oldest entries beyond the cap are dropped (bounded lease).
+    """
+    if not events:
+        return
+    seen = set(lease.interference_events)
+    for event in events:
+        if event not in seen:
+            lease.interference_events.append(event)
+            seen.add(event)
+    del lease.interference_events[:-_PLAN_INTERFERENCE_EVENTS_MAX]
+
+
+def _plan_carry_events(response: dict[str, Any], lease: PlanLease) -> None:
+    """Mirror the lease's retained events onto a reply that owns no outcome of its own.
+
+    ORVEX-2026-105 D-3: ``_plan_response`` publishes the STEP's events on its own
+    top-level key, but the terminal / exception / walk-completed replies are built in
+    a LATER call whose frame never saw a ``SingleActionOutcome`` — without this the
+    events would survive only inside the nested aggregate.  Conditional on a
+    non-empty lease so a plan that observed nothing keeps its exact pre-existing key
+    set.
+    """
+    if lease.interference_events:
+        response["interference_events"] = list(lease.interference_events)
+
+
+def _plan_step_result(step_entries: list[dict[str, Any]]) -> str:
+    """The STEP reply's ``result`` token (§1.3 plan-step surface).
+
+    The terminal aggregate vocabulary names an all-uncertain step ``unknown``; the
+    §1.3 step surface names that same state ``uncertain`` — one classifier
+    (:func:`plan.plan_result_from_entries`), one mapping at the surface. Step
+    replies never say ``unknown``; only a terminal plan reply can.
+    """
+    aggregate = plan_layer.plan_result_from_entries(step_entries)
+    return "uncertain" if aggregate == "unknown" else aggregate
+
+
+# WP8-SEAM(failure-classification): the MINIMAL failure-reason plumbing a §1.3 step
+# reply needs. The dev copy's full B6/B7/B8 classification tables
+# (``_PLAN_ERROR_TO_FAILURE_REASON`` / the kind / specific-stop / stop-reason tables
+# and the closed ``PLAN_FAILURE_REASONS`` vocabulary with the ``unclassified``
+# escalation fallback) are WP8 scope and are NOT ported here; WP8 replaces this
+# helper with the table-driven classifier and ports
+# test_batch6/test_batch7/test_batch8. The step reply keeps carrying the typed
+# ``failure_reason`` key ALWAYS (None on a verified step) — only the CLASS set is
+# minimal until WP8.
+_PLAN_STEP_FAILURE_REASONS = frozenset(
+    {
+        "verification_failed",
+        "verification_uncertain",
+        "execution_error",
+        "limit_exceeded",
+        "cancelled",
+        "safety_denied",
+        "approval_required",
+        "rejected",
+        "invalid_action",
+        "awaiting_plan_action",
+    }
+)
+
+
+def _plan_step_failure_reason(
+    outcome: Any,
+    step_entries: list[dict[str, Any]],
+    *,
+    result: str,
+    error: str | None = None,
+) -> str | None:
+    """Classify a non-verified step into ONE minimal token (WP8 owns the tables).
+
+    ``None`` is the honest answer for a verified step (no failure happened). The
+    classification is a pure read of signals the reply already carries.
+    """
+    if result == "verified":
+        return None
+    if any(entry.get("requires_approval") for entry in step_entries):
+        return "approval_required"
+    if error is not None:
+        return {
+            "limit_exceeded": "limit_exceeded",
+            "action_error": "execution_error",
+            "invalid_action": "invalid_action",
+            "cancelled": "cancelled",
+        }.get(str(error), "execution_error")
+    kind = getattr(outcome, "kind", None)
+    if kind == "approval_required":
+        return "approval_required"
+    if kind in {"rejected", "safety_denied", "digest_surprise"}:
+        return "rejected" if kind == "rejected" else "safety_denied"
+    if kind == "error":
+        return "execution_error"
+    stopped = getattr(outcome, "follow_ups_stopped_reason", None)
+    if stopped == "limit_exceeded":
+        return "limit_exceeded"
+    if stopped == "cancelled" or stopped == "stopped":
+        return "cancelled"
+    if any(
+        entry.get("verification_outcome") == "failed"
+        or entry.get("result") == "failed"
+        for entry in step_entries
+    ):
+        return "verification_failed"
+    if result == "uncertain":
+        return "verification_uncertain"
+    if any(
+        entry.get("verification_outcome") == "uncertain"
+        or entry.get("kind") == "dispatched_unverified"
+        for entry in step_entries
+    ):
+        return "verification_uncertain"
+    if stopped == "policy_stop":
+        return "verification_failed"
+    return "rejected"
+
+
+def _plan_not_executed(lease: PlanLease, reason: str) -> list[dict[str, Any]]:
+    """Decision 3: the explicit, bounded list of plan work that never executed.
+
+    Same shape and same boundedness as ``remaining`` (decision 6 additive).  The
+    only difference is the per-step ``reason``, which carries the typed failure
+    classification on EVERY entry — including the partially attempted current step,
+    whose stored remainder still carries the generic historical phrase.  A verified
+    step is not a failure, so it reports ``awaiting_plan_action``.
+    """
+    return plan_layer.plan_not_executed(lease, reason)
+
+
+def _plan_terminal_response(
+    bundle: Any,
+    lease: PlanLease,
+    *,
+    result: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Return a terminal stop/replace handoff with no backend or capture effect."""
+    aggregate = _plan_aggregate_for_state(
+        lease, status="stopped" if reason == "stop" else "failed", stopped_reason=reason
+    )
+    executed_count = sum(
+        entry.get("kind") in {"executed", "dispatched_unverified"} for entry in lease.prefix
+    )
+    cutoff = {
+        **_cutoff_budget_fields(
+            bundle, lease.context, limit_name="stop", executed_count=executed_count
+        )
+    }
+    # The host closed this plan on purpose: ``stopped`` never verifies (V/4244 ok
+    # rule), so ``ok`` is False regardless of how good the prefix looked.
+    outcome = plan_layer.plan_terminal_outcome(
+        lease.prefix, stopped=True, expected_items=int(lease.context["normalized_item_count"])
+    )
+    assert outcome.result == "stopped" and outcome.ok is False
+    response: dict[str, Any] = {
+        "ok": False,
+        "result": result,
+        "message": (
+            "Plan stopped by the host; the executed prefix is preserved."
+            if reason == "stop"
+            else reason
+        ),
+        "blocked": False,
+        "plan_id": lease.context["plan_id"],
+        "executed_prefix": [_redact_queue_entry(entry) for entry in lease.prefix],
+        "follow_up_results": [_redact_queue_entry(entry) for entry in lease.prefix],
+        "remaining": plan_layer.plan_remaining(lease, reason),
+        PLAN_EVIDENCE_KEY: _plan_evidence(bundle, lease),
+        "cutoff": cutoff,
+        "plan": aggregate,
+        "step_index": max(lease.cursor - 1, 0),
+        "next_step": None,
+        # Batch 6 (decision 3, additive): the host closed this plan on purpose, so
+        # nothing FAILED; the work it chose not to run is named by ``not_executed``.
+        "failure_reason": None,
+        "not_executed": _plan_not_executed(lease, reason),
+    }
+    response["plan"]["cutoff"] = dict(response["cutoff"])
+    _plan_carry_events(response, lease)
+    return response
+
+
+def _plan_exception_response(
+    bundle: Any,
+    lease: PlanLease,
+    *,
+    step_index: int,
+    result: str,
+    reason: str,
+    blocked: bool,
+    stopped: bool = False,
+    failure_reason: str | None = None,
+) -> dict[str, Any]:
+    """Return a truthful failed/unknown step without claiming unobserved work."""
+    limit_name: str | None = None
+    if reason.startswith(("max_actions:", "max_steps:")):
+        limit_name = reason.split(":", 1)[0]
+    if failure_reason is None:
+        failure_reason = (
+            "cancelled"
+            if stopped
+            else ("limit_exceeded" if limit_name is not None else "execution_error")
+        )
+    executed_count = sum(
+        entry.get("kind") in {"executed", "dispatched_unverified"} for entry in lease.prefix
+    )
+    response: dict[str, Any] = {
+        "ok": False,
+        "result": result,
+        "message": reason,
+        "blocked": blocked,
+        "plan_id": lease.context["plan_id"],
+        "step_index": step_index,
+        "step_number": step_index + 1,
+        "executed_prefix": [_redact_queue_entry(entry) for entry in lease.prefix],
+        "follow_up_results": [_redact_queue_entry(entry) for entry in lease.prefix],
+        "remaining": plan_layer.plan_remaining(lease, reason),
+        PLAN_EVIDENCE_KEY: _plan_evidence(bundle, lease),
+        "next_step": plan_layer.plan_next_step(lease) if blocked else None,
+        "plan": _plan_aggregate_for_state(
+            lease,
+            status="blocked" if blocked else ("cancelled" if stopped else "failed"),
+            stopped_reason=reason,
+        ),
+        "failure_reason": failure_reason,
+        "not_executed": _plan_not_executed(lease, failure_reason),
+    }
+    if limit_name is not None:
+        response["error"] = "limit_exceeded"
+        response["limit"] = limit_name
+    else:
+        # Same literals the sibling reply builders already use for the very same
+        # conditions; ``action_error`` matches ``outcome.kind == "error"`` exactly.
+        response["error"] = {
+            "execution_error": "action_error",
+            "invalid_action": "invalid_action",
+            "cancelled": "cancelled",
+        }.get(failure_reason, "action_error")
+    if limit_name is not None or stopped:
+        cutoff_name = limit_name or "cancel"
+        response["cutoff"] = {
+            **_cutoff_budget_fields(
+                bundle,
+                lease.context,
+                limit_name=cutoff_name,
+                executed_count=executed_count,
+            ),
+            "resolved_count": len(lease.prefix),
+        }
+        response["plan"]["cutoff"] = dict(response["cutoff"])
+    if stopped:
+        response["stopped"] = True
+    _plan_carry_events(response, lease)
+    return response
+
+
+def _plan_response(
+    bundle: Any,
+    lease: PlanLease,
+    outcome: Any,
+    *,
+    step_index: int,
+    step_entries: list[dict[str, Any]],
+    include_screenshot_after: bool | None,
+    image_mode: str,
+    view_provider: Any | None,
+    complete_walk: bool = False,
+) -> Any:
+    """Assemble the §1.3 plan-step reply around the per-item pipeline payload.
+
+    One call == one waypoint step == one full pipeline pass (WP1 contract): the
+    reply carries the step's ``result`` (the §1.3 plan-step token set), the typed
+    ``failure_reason`` (ALWAYS, ``None`` on a verified step), ``not_executed``, the
+    ``evidence_by_backend`` block (store captures + lease repositions, both
+    backends), the executed prefix, the per-point aggregate (E2 ``hold_ms`` echo),
+    and the step's interference events (D-3, retained on the lease).
+    """
+    if outcome.kind == "rejected":
+        # §1.1: a gate refusal is a REJECTED reply — reasons, never an error key.
+        response: dict[str, Any] = {
+            "ok": False,
+            "result": "rejected",
+            "message": outcome.message or "Action rejected (no gate detail available).",
+            "reasons": list(outcome.reasons),
+        }
+        if outcome.partial_delivery is not None:
+            response["partial_delivery"] = dict(outcome.partial_delivery)
+    elif outcome.kind == "safety_denied":
+        response = {
+            "ok": False,
+            "result": "rejected",
+            "message": outcome.message,
+            "reasons": rejection_reasons(outcome),
+        }
+    elif outcome.kind == "approval_required":
+        # §1.1 approval rule (O-03): ok=False, result="not_executed",
+        # requires_approval=True — the SAME envelope as the flat approval gate.
+        response = {
+            "ok": False,
+            "result": "not_executed",
+            "requires_approval": True,
+            "message": outcome.message,
+        }
+    elif outcome.kind == "digest_surprise":
+        response = {
+            "ok": False,
+            "result": "rejected",
+            "message": outcome.message,
+            "reasons": rejection_reasons(outcome),
+        }
+    elif outcome.kind == "error":
+        # §1.2: an operation error is ``failed``; the typed code stays.
+        response = {"ok": False, "result": "failed", "error": "action_error", "message": outcome.message}
+    else:
+        result = outcome.result
+        if result is None:
+            response = {
+                "ok": False,
+                "result": "failed",
+                "error": "action_error",
+                "message": "Execution produced no result.",
+            }
+        else:
+            response = _redact_result_payload(result.model_dump())
+            response.update(
+                {
+                    "model_confidence": outcome.model_confidence,
+                    "grounding_confidence": outcome.grounding_confidence,
+                    "verification_confidence": outcome.verification_confidence,
+                }
+            )
+    # The STEP verdict comes from the step's own entries through the ONE classifier
+    # (never from the first item's token): rejected/approval outcomes name their own
+    # §1.3 token directly.
+    # DELTA 1 #5: a session killed mid-step (stop_session / idle reap / the internal
+    # kill path) is a KILLED plan, not a finished one — the reply says ``stopped``
+    # (ok false) even though the lease is already gone and the queue may have run.
+    session_killed = bool(getattr(bundle.state, "stopped", False)) or bool(
+        getattr(getattr(bundle.context, "stop", None), "stopped", False)
+    )
+    if outcome.kind == "approval_required":
+        step_result = "not_executed"
+    elif outcome.kind in {"rejected", "safety_denied", "digest_surprise"}:
+        step_result = "rejected"
+    elif outcome.kind == "error":
+        step_result = "failed"
+    elif session_killed:
+        step_result = "stopped"
+    else:
+        step_result = _plan_step_result(step_entries)
+        # §1.1 approval rule: when the step's queue was halted by an approval hold on
+        # a LATER item (the first outcome is the executed transition move), the step
+        # verdict is the approval token, not a failure — the point's action never
+        # dispatched and approval is pending.
+        if step_result == "failed" and any(
+            entry.get("requires_approval") for entry in step_entries
+        ):
+            step_result = "not_executed"
+    response["result"] = step_result
+    response["ok"] = ok_from_result(step_result)
+    if step_result == "not_executed":
+        response["requires_approval"] = True
+    response["follow_up_results"] = [_redact_queue_entry(entry) for entry in lease.prefix]
+    response["follow_ups_stopped_reason"] = outcome.follow_ups_stopped_reason
+    cutoff = _plan_limit_cutoff_from_outcome(
+        outcome, bundle, lease.context, prefix_entries=lease.prefix
+    )
+    if cutoff is not None:
+        lease.last_failure_reason = "limit_exceeded"
+        response["cutoff"] = dict(cutoff)
+        response["error"] = "limit_exceeded"
+        response["limit"] = cutoff["limit_name"]
+    response["executed_prefix"] = [_redact_queue_entry(entry) for entry in lease.prefix]
+    response["step_index"] = step_index
+    response["step_number"] = step_index + 1
+    response[PLAN_EVIDENCE_KEY] = _plan_evidence(bundle, lease)
+    response["next_step"] = plan_layer.plan_next_step(lease)
+    response["remaining"] = plan_layer.plan_remaining(
+        lease,
+        "awaiting_plan_action" if response["result"] != "failed" else "previous_step_failed",
+    )
+    step_failure_reason = _plan_step_failure_reason(
+        outcome, step_entries, result=response["result"], error=response.get("error")
+    )
+    response["failure_reason"] = step_failure_reason
+    response["not_executed"] = _plan_not_executed(
+        lease, step_failure_reason or "awaiting_plan_action"
+    )
+    lease_active = _plan_guard.active_lease(bundle) is lease
+    response["blocked"] = lease_active and not session_killed
+    response["plan_id"] = lease.context["plan_id"]
+    response["message"] = response.get("message") or (
+        f"Plan step {step_index + 1} executed; the lease awaits continue/stop/replace."
+        if lease_active
+        else f"Plan step {step_index + 1} executed."
+    )
+    if session_killed:
+        # DELTA 1 #5: the session ended mid-step — the aggregate must not read as a
+        # finished plan either.
+        response["message"] = (
+            "The session was stopped while the plan step was in flight; the plan "
+            "did not finish."
+        )
+        response["stopped"] = True
+        if response.get("failure_reason") in (None, "awaiting_plan_action"):
+            response["failure_reason"] = "cancelled"
+    response["plan"] = _plan_aggregate_for_state(
+        lease,
+        status=(
+            "cancelled"
+            if session_killed
+            else "blocked"
+            if lease_active
+            else "completed"
+        ),
+        stopped_reason=(
+            "stopped"
+            if session_killed
+            else "awaiting_plan_action"
+            if lease_active
+            else None
+        ),
+        # DELTA 1 #3: the step's events are the MERGED per-item list (every queue
+        # item), not only the first outcome's.
+        current_events=_step_interference_events(outcome),
+    )
+    if cutoff is not None:
+        response["plan"]["cutoff"] = dict(cutoff)
+        response["plan"]["stopped_reason"] = "limit_exceeded"
+    # ORVEX-2026-105 D-3: publish the STEP's events on their own top-level key AND
+    # retain them on the lease (deduped, bounded) — the only place the per-step
+    # outcome and the lease are both in scope.
+    _plan_retain_events(lease, _step_interference_events(outcome))
+    if lease.interference_events:
+        response["interference_events"] = list(lease.interference_events)
+    if complete_walk:
+        # DELTA 2 N1/N3: this step verified itself and completed the walk — the
+        # verdict fields become the whole-plan aggregate's (released here, once);
+        # everything else the step disclosed stays in the payload (the image tail
+        # below still runs, so the walk-ending reply carries the frame + image_id).
+        _apply_terminal_verdict_fields(bundle, lease, response)
+    # v07-007 R-21: non-executed shapes embed model-proposed text in ``message`` —
+    # the SAME redaction the flat path applies.
+    if outcome.kind in {"rejected", "safety_denied", "approval_required", "digest_surprise", "error"}:
+        response = _redact_result_payload(response)
+    if include_screenshot_after is False:
+        # PERF-004 C4 opt-out: no image, honest None scale.
+        if response.pop("screenshot_after_base64", None) is not None:
+            response[IMAGE_OUTBOUND_SCALE_KEY] = None
+    if outcome.kind != "executed" or "screenshot_after_base64" not in response:
+        return response
+    if image_mode == "text":
+        # D1: text mode dominates — the attachment and bytes are removed, never the
+        # retained frame or its id (WP5 retention rule).
+        response.pop("screenshot_after_base64", None)
+        response["image_delivery"] = "text"
+        response[IMAGE_OUTBOUND_SCALE_KEY] = None
+        response["image_delivery_note"] = IMAGE_DELIVERY_TEXT_NOTE
+        return response
+    frame = getattr(outcome.result, "_frame", None)
+    full_resolution = include_screenshot_after is True or _action_image_full()
+    view_id: str | None = None
+    view_payload: tuple[str, Any] | None = None
+    if view_provider is not None:
+        view_id = view_provider.id
+        if not view_provider.passthrough:
+            try:
+                derived = view_provider.derive(
+                    observation_for_payload(str(response["screenshot_after_base64"]), frame)
+                )
+                started = time.perf_counter()
+                encoded_b64 = encode_png_b64(derived.image)
+                bundle.metrics.record_latency(
+                    "view_derive_ms", (time.perf_counter() - started) * 1000.0
+                )
+                view_payload = (encoded_b64, derived.image)
+            except VisualViewError as exc:  # fail-closed: no image, no raw fallback
+                response.pop("screenshot_after_base64", None)
+                response["visual_view"] = view_id
+                response["visual_view_error"] = f"view_derive_failed: {exc}"
+                return response
+            except Exception as exc:  # noqa: BLE001 - fail-closed, no traceback
+                response.pop("screenshot_after_base64", None)
+                response["visual_view"] = view_id
+                response["visual_view_error"] = (
+                    f"view_derive_failed: {type(exc).__name__}: {exc}"
+                )
+                return response
+    # WP5 retention rule: THIS reply carries the post-action image, so the frame is
+    # retained HERE — the bytes kept are EXACTLY the bytes the reply carries (the
+    # derived view when one was served, otherwise the raw capture), both pre-ladder.
+    carried_b64 = (
+        str(view_payload[0]) if view_payload is not None else str(response["screenshot_after_base64"])
+    )
+    response.update(
+        register_frame(
+            bundle.extra,
+            payload=carried_b64,
+            source="computer_execute(plan_step)",
+            attached=True,
+            visual_view=view_id,
+        )
+    )
+    # S-03: the evidence block is (re)built AFTER this reply's own frame was
+    # retained, so ``captures`` includes the capture THIS reply carries — the same
+    # truth the dev block reported from the backend's observation list.
+    response[PLAN_EVIDENCE_KEY] = _plan_evidence(bundle, lease)
+    return _execute_response_blocks(
+        response,
+        frame=frame,
+        full_resolution=full_resolution,
+        view_id=view_id,
+        view_payload=view_payload,
+    )
+
+
+def _apply_terminal_verdict_fields(
+    bundle: Any, lease: PlanLease, response: dict[str, Any]
+) -> None:
+    """Override a walk-ending STEP reply payload with the whole-plan aggregate
+    verdict (in place, BEFORE the content blocks are built).
+
+    DELTA 2 N1/N3: the reply keeps everything the completing step disclosed (image
+    block + image_id, interference events, per-item fields like requires_approval /
+    reasons / partial_delivery — ``_plan_response`` already retained the step's
+    events on the lease and in the aggregate); ONLY the verdict fields are decided
+    by ``plan_terminal_outcome`` over the whole retained prefix, so an earlier
+    uncertain/failed point caps the reply at ``unknown``/``failed`` with
+    ``ok:false`` even though the last step itself verified (the V/4244 fix). The
+    lease is released exactly once here."""
+    outcome = plan_layer.plan_terminal_outcome(
+        lease.prefix,
+        expected_items=int(lease.context["normalized_item_count"]),
+    )
+    result = outcome.result
+    failure_reason = (
+        None if result == "verified"
+        else _plan_step_failure_reason(None, lease.prefix, result=result)
+    )
+    _plan_guard.release(str(bundle.context.session_id), bundle)
+    response["result"] = result
+    response["ok"] = outcome.ok
+    response["failure_reason"] = failure_reason
+    response["message"] = (
+        "Plan complete; every item verified."
+        if result == "verified"
+        else f"Plan walk finished; terminal verdict: {result}."
+    )
+    response["blocked"] = False
+    response["next_step"] = None
+    response["remaining"] = []
+    response["not_executed"] = [] if result == "verified" else _plan_not_executed(lease, failure_reason)
+    response["plan"]["status"] = (
+        "completed" if result == "verified" else "failed" if result == "failed" else "blocked"
+    )
+    response["plan"]["stopped_reason"] = None if result == "verified" else failure_reason
+
+
+def _plan_terminal_walk_reply(bundle: Any, lease: PlanLease) -> dict[str, Any]:
+    """THE terminal reply of a finished plan walk (V/4244, VAL-WP7b-01 #1).
+
+    Serves the ``continue`` path whose cursor is already past the last step (the
+    parked-at-the-end shape of DELTA 2 N3: the last step did not verify itself, so
+    it parked, and this is the host's explicit walk-end request). The final step's
+    events and frame are already on the lease (retained by ``_plan_response`` when
+    that step replied), so the aggregate over the retained prefix carries them.
+    Releases the lease exactly once (the guard's release is idempotent)."""
+    _plan_guard.release(str(bundle.context.session_id), bundle)
+    # V/4244 (F2-0 honesty): the walk is over, but "the cursor passed the last
+    # step" is not a success claim. The terminal verdict is read off the retained
+    # prefix through plan.py's aggregate — ``ok`` is True ONLY for a fully-verified
+    # plan (``ok = (result == "verified")`` by construction); unknown and stopped
+    # are never success, and a partial prefix is capped at ``unknown`` by
+    # ``expected_items``.
+    outcome = plan_layer.plan_terminal_outcome(
+        lease.prefix,
+        expected_items=int(lease.context["normalized_item_count"]),
+    )
+    result = outcome.result
+    # The typed classification rides the entries themselves (DELTA 1 #1 audit): an
+    # approval-held prefix classifies ``approval_required``, a failed one
+    # ``verification_failed``, an uncertain one ``verification_uncertain`` — never
+    # a blanket "verification_failed" for every non-verified walk.
+    failure_reason = (
+        None if result == "verified"
+        else _plan_step_failure_reason(None, lease.prefix, result=result)
+    )
+    aggregate_status = (
+        "completed" if result == "verified" else "failed" if result == "failed" else "blocked"
+    )
+    aggregate_reason = None if result == "verified" else failure_reason
+    completed: dict[str, Any] = {
+        "ok": outcome.ok,
+        "result": result,
+        "message": (
+            "Plan complete; every item verified."
+            if result == "verified"
+            else f"Plan walk finished; terminal verdict: {result}."
+        ),
+        "blocked": False,
+        "plan_id": lease.context["plan_id"],
+        "step_index": max(lease.cursor - 1, 0),
+        "executed_prefix": [_redact_queue_entry(entry) for entry in lease.prefix],
+        "follow_up_results": [_redact_queue_entry(entry) for entry in lease.prefix],
+        "remaining": [],
+        PLAN_EVIDENCE_KEY: _plan_evidence(bundle, lease),
+        "next_step": None,
+        "plan": _plan_aggregate_for_state(
+            lease, status=aggregate_status, stopped_reason=aggregate_reason
+        ),
+        # A verified plan ran every declared item; a non-verified one names the work
+        # that never produced evidence (a final step cut short by its own policy
+        # stop, the final wait, ...).
+        "failure_reason": failure_reason,
+        "not_executed": [] if result == "verified" else _plan_not_executed(lease, failure_reason),
+    }
+    _plan_carry_events(completed, lease)
+    return completed
+
+
+async def _execute_plan_step(
+    bundle: Any,
+    lease: PlanLease,
+    *,
+    include_screenshot_after: bool | None,
+    image_mode: str,
+    view_provider: Any | None,
+) -> Any:
+    """Execute exactly one waypoint step and retain the lease unless terminal."""
+    session_id = str(bundle.context.session_id)
+    if lease.cursor >= len(lease.steps):
+        return _plan_terminal_walk_reply(bundle, lease)
+    step_index = lease.cursor
+    step_specs = lease.steps[step_index]
+    lease.remainder = []
+    step_context, policies = plan_layer.plan_step_context(lease, step_index, step_specs)
+    try:
+        grounded = step_specs[0].to_grounded(reason_prefix="MCP plan action")
+        for spec in step_specs:
+            spec.to_grounded(reason_prefix="MCP plan action")
+    except Exception as exc:  # noqa: BLE001 - structural rejection is typed
+        _plan_guard.release(session_id, bundle)
+        return _plan_exception_response(
+            bundle,
+            lease,
+            step_index=step_index,
+            result="failed",
+            reason=f"Plan step could not be converted: {exc}",
+            blocked=False,
+            failure_reason="invalid_action",
+        )
+    try:
+        # O-03: approval was evaluated ONCE on the FIRST plan call and is inherited
+        # by every step and by replace — ``continue`` never re-asks.
+        outcome = await bundle.agent.run_single(
+            bundle.state,
+            grounded,
+            approved=lease.approved,
+            expected_effect=step_specs[0].expected_effect,
+            follow_ups=step_specs[1:],
+            follow_ups_cap=len(step_specs) - 1,
+            plan_policies=policies,
+            plan_context=step_context,
+        )
+    except TaskStopped as exc:
+        step_entries = list(step_context.get("partial_results") or [])
+        plan_layer.merge_plan_step_prefix(
+            lease,
+            step_entries,
+            source_offset=int(lease.context["points"][step_index]["first_item"]),
+        )
+        plan_layer.set_plan_step_remainder(lease, step_index, step_specs, step_entries)
+        # TaskStopped is the cancellation contract, including synthetic seams.
+        if plan_layer.plan_step_attempted(step_entries):
+            lease.cursor = plan_layer.plan_cursor_after(lease.cursor, step_index, step_entries)
+        _plan_guard.release(session_id, bundle)
+        return _plan_exception_response(
+            bundle,
+            lease,
+            step_index=step_index,
+            # DELTA 1 #5: the session/stop-token was killed mid-step — the plan was
+            # NOT finished, so the reply says ``stopped`` (ok false by the terminal
+            # rule), never a step verdict that could read as an honest completion.
+            result="stopped",
+            reason=str(exc),
+            blocked=False,
+            stopped=True,
+            failure_reason="cancelled",
+        )
+    except LimitExceeded as exc:
+        lease.last_failure_reason = exc.limit_name
+        step_entries = list(step_context.get("partial_results") or [])
+        plan_layer.merge_plan_step_prefix(
+            lease,
+            step_entries,
+            source_offset=int(lease.context["points"][step_index]["first_item"]),
+        )
+        plan_layer.set_plan_step_remainder(lease, step_index, step_specs, step_entries)
+        if plan_layer.plan_step_attempted(step_entries):
+            lease.cursor = plan_layer.plan_cursor_after(lease.cursor, step_index, step_entries)
+        return _plan_exception_response(
+            bundle,
+            lease,
+            step_index=step_index,
+            result="failed",
+            reason=f"{exc.limit_name}: {exc}",
+            blocked=True,
+            failure_reason="limit_exceeded",
+        )
+    except BaseException:
+        # Structural/unexpected failures release the lease in this path; the outer
+        # server teardown cannot accidentally leave a caller stuck behind a dead plan.
+        plan_layer.merge_plan_step_prefix(
+            lease,
+            list(step_context.get("partial_results") or []),
+            source_offset=int(lease.context["points"][step_index]["first_item"]),
+        )
+        lease.cursor = step_index + 1
+        _plan_guard.release(session_id, bundle)
+        raise
+    step_entries = list(outcome.follow_up_results or step_context.get("partial_results") or [])
+    plan_layer.merge_plan_step_prefix(
+        lease,
+        step_entries,
+        source_offset=int(lease.context["points"][step_index]["first_item"]),
+    )
+    plan_layer.set_plan_step_remainder(lease, step_index, step_specs, step_entries)
+    # K-53: the cursor advances iff >= 1 item of the step dispatched input; a
+    # pre-dispatch refusal (rejected/approval/safety) keeps the cursor so
+    # ``continue`` re-executes the same step.
+    lease.cursor = plan_layer.plan_cursor_after(lease.cursor, step_index, step_entries)
+    if outcome.kind == "error":
+        # A backend/agent error is a structural failure, not a repairable step
+        # verdict: release the lease in the guaranteed path so no caller is
+        # stranded behind it.
+        _plan_guard.release(session_id, bundle)
+        return _plan_exception_response(
+            bundle,
+            lease,
+            step_index=step_index,
+            result="failed",
+            reason=outcome.message or "action_error",
+            blocked=False,
+            failure_reason="execution_error",
+        )
+    # DELTA 1 #1 + DELTA 2 N3 (§1.3 "retry = replace"): the walk ends in THIS call
+    # only when the LAST STEP ITSELF verified — and then the reply is the terminal
+    # reply whose verdict comes from the whole-plan aggregate over the retained
+    # prefix (an earlier uncertain/failed point still caps the verdict at
+    # ``unknown``/``failed`` with ``ok:false`` — the #1 fix stays). A last step
+    # that did NOT itself verify (uncertain / failed / rejected / partial) PARKS
+    # the lease: the host may ``replace`` to retry or ``continue`` to receive the
+    # terminal reply (built by the same aggregate over the whole prefix).
+    session_killed = bool(getattr(bundle.state, "stopped", False)) or bool(
+        getattr(getattr(bundle.context, "stop", None), "stopped", False)
+    )
+    if (
+        lease.cursor >= len(lease.steps)
+        and not session_killed
+        and outcome.kind == "executed"
+        and _plan_step_result(step_entries) == "verified"
+    ):
+        # N1 (VAL-WP7b-02): the terminal reply is the STEP reply (image registered
+        # and attached, per-item disclosure kept, the step's events retained on the
+        # lease and in the aggregate) with the verdict overridden by the whole-plan
+        # aggregate — the completing step loses nothing.
+        return _plan_response(
+            bundle,
+            lease,
+            outcome,
+            step_index=step_index,
+            step_entries=step_entries,
+            include_screenshot_after=include_screenshot_after,
+            image_mode=image_mode,
+            view_provider=view_provider,
+            complete_walk=True,
+        )
+    return _plan_response(
+        bundle,
+        lease,
+        outcome,
+        step_index=step_index,
+        step_entries=step_entries,
+        include_screenshot_after=include_screenshot_after,
+        image_mode=image_mode,
+        view_provider=view_provider,
+    )
+
+
+async def _handle_plan_action(
+    bundle: Any,
+    lease: PlanLease,
+    *,
+    plan_action: str | None,
+    plan: Any,
+    include_screenshot_after: bool | None,
+    image_mode: str,
+    view_provider: Any | None,
+) -> Any:
+    """Validate and service the additive continue/stop/replace handshake."""
+    session_id = str(bundle.context.session_id)
+    if not isinstance(plan_action, str) or plan_action not in {"continue", "stop", "replace"}:
+        return {
+            "ok": False,
+            "result": "rejected",
+            "reasons": ["invalid_plan_action"],
+            "error": "invalid_plan_action",
+            "blocked": True,
+            "plan_id": lease.context["plan_id"],
+            "message": "plan_action must be continue, stop, or replace while a plan lease is active.",
+            "executed_prefix": [_redact_queue_entry(entry) for entry in lease.prefix],
+            "remaining": plan_layer.plan_remaining(lease, "awaiting_plan_action"),
+            PLAN_EVIDENCE_KEY: _plan_evidence(bundle, lease),
+            "next_step": plan_layer.plan_next_step(lease),
+        }
+    if plan_action == "stop":
+        _plan_guard.release(session_id, bundle)
+        return _plan_terminal_response(bundle, lease, result="stopped", reason="stop")
+    if plan_action == "replace":
+        if plan is None:
+            return {
+                "ok": False,
+                "result": "rejected",
+                "reasons": ["invalid_plan_action"],
+                "error": "invalid_plan_action",
+                "blocked": True,
+                "plan_id": lease.context["plan_id"],
+                "message": "plan_action='replace' requires a complete replacement plan.",
+                "executed_prefix": [_redact_queue_entry(entry) for entry in lease.prefix],
+                "remaining": plan_layer.plan_remaining(lease, "awaiting_plan_action"),
+                PLAN_EVIDENCE_KEY: _plan_evidence(bundle, lease),
+                "next_step": plan_layer.plan_next_step(lease),
+            }
+        try:
+            replacement = plan_layer.coerce_tolerant_plan(plan)
+            replacement_specs, replacement_context = plan_layer.normalize_plan(replacement)
+            for spec in replacement_specs:
+                spec.to_grounded(reason_prefix="MCP plan action")
+        except Exception as exc:  # noqa: BLE001 - malformed replacement has no effect
+            return _teaching_invalid_action(exc, "done")
+        old_id = lease.context["plan_id"]
+        old_prefix = [_redact_queue_entry(entry) for entry in lease.prefix]
+        _plan_guard.release(session_id, bundle)
+        # O-03: approval was decided on the FIRST plan call; a replace INHERITS it.
+        # The replace call's own ``approved`` parameter is deliberately NOT read —
+        # an unapproved plan cannot be escalated into an approved one by replacing.
+        new_lease = PlanLease(
+            model=replacement,
+            specs=replacement_specs,
+            context=replacement_context,
+            steps=plan_layer.plan_step_slices(replacement_specs, replacement_context),
+            approved=lease.approved,
+            replaced_plan_id=old_id,
+        )
+        _plan_guard.install(bundle, new_lease)
+        response = await _execute_plan_step(
+            bundle,
+            new_lease,
+            include_screenshot_after=include_screenshot_after,
+            image_mode=image_mode,
+            view_provider=view_provider,
+        )
+        if isinstance(response, dict):
+            response["replaced_plan_id"] = old_id
+            response["replaced_prefix"] = old_prefix
+        return response
+    return await _execute_plan_step(
+        bundle,
+        lease,
+        include_screenshot_after=include_screenshot_after,
+        image_mode=image_mode,
+        view_provider=view_provider,
+    )
+
+
 @mcp.tool()
 @_session_scoped
 async def computer_execute(
@@ -3548,6 +4835,8 @@ async def computer_execute(
     include_screenshot_after: NullableBool = None,
     follow_ups: NullableFollowUps = None,
     visual_view: NullableStr = None,
+    plan: NullablePlan = None,
+    plan_action: NullableStr = None,
 ) -> Any:
     """Validate and execute one grounded action; approval applies only to this action call.
 
@@ -3683,6 +4972,81 @@ async def computer_execute(
     outcome is never hidden) but with NO image block and an additive
     ``visual_view_error: "view_derive_failed: ..."`` marker — never a silent raw
     substitution. In text mode (no image is served either way) the keys do not apply.
+
+    Waypoint plan (ORVEX-2026-101 Batch 2, trailing optional ``plan``): a plan
+    declares a sequence of POINTS + ACTIONS and Cortex executes it STEPWISE — you
+    declare LOCATIONS AND ACTIONS ONLY; the mouse motion BETWEEN points is an
+    internal detail (deterministic defaults; optionally overridable per point with
+    ``duration_ms``; there are NO path/bend/easing parameters). Shape:
+    {"points": [{"id": "open-menu", "x": 420, "y": 180, "actions": [{"action": "click"}],
+                 "arrival_condition": "menu is open"},
+                {"id": "save", "x": 850, "y": 720, "actions": [{"action": "click"}]}]}.
+    Every point normalizes internally to a ``move`` transition + its actions, and
+    EVERY item rides the FULL independent pipeline (ground -> validate -> safety ->
+    approval -> execute -> verify) exactly like a single action — the "wait and
+    re-observe" discipline is inherited per item, never bypassed. Point actions
+    carry NO x/y (the point IS the location); x2/y2 belong to a queued ``drag``
+    only. ``arrival_condition`` rides as ``expected_effect`` for the point's
+    actions that lack an explicit one. A plan and the flat action/follow_ups
+    surface are mutually exclusive (pass EITHER; a plan call leaves every flat
+    action parameter at its default). An invalid or INCOMPLETE plan is a typed
+    ``invalid_action`` rejection BEFORE any capture or motion. At most 10 points
+    and 5 actions per point.
+
+    MOTION AND TIMING — a plan is the EXPLICIT-TIMING mode (ORVEX-2026-102 §5.2).
+    A bare action is the INSTANT mode: outside a plan the move duration and the
+    settle are both 0 ms, so a single action is dispatched as fast as the machine
+    allows and NOTHING is hidden. A SUBMITTED plan must therefore STATE all of the
+    following, or it is rejected BEFORE any capture or motion, naming what is
+    missing: ``points`` in order and ``actions`` at each point (an explicit empty
+    ``"actions": []`` declares a crossing point); the movement timing
+    (``transition_duration_ms`` on the plan, or ``duration_ms`` on every point);
+    an explicit ``delta`` on every ``wait`` action inside a point (0..10 s;
+    ``final_wait_ms`` never covers it); the settle wanted (``settle_ms``, 0 = no
+    settle, 1..200); what is verified after each step (``arrival_condition``, or an
+    action-level ``expected_effect``); the per-step cooperative timeout
+    (``point_timeout_ms``, or ``timeout_ms`` per point); and BOTH ``on_failure``
+    and ``on_uncertain`` ("stop"/"continue"). Optional plan-level keys:
+    ``final_wait_ms`` (one trailing wait, capped 5000 ms) and inherited
+    ``settle_ms``/policies/timeout/duration.
+
+    Stepwise handshake (ORVEX-2026-101 decision 1, trailing optional
+    ``plan_action``): the FIRST plan call executes ONE waypoint step, then returns
+    ``blocked=true`` with an explicit JSON result/evidence/prefix/next_step/
+    remaining block, and a plan LEASE stays active on the session. While the lease
+    is active, flat actions, follow_ups, observation tools
+    (computer_observe/zoom/screenshot), computer_wait and computer_cancel_wait are
+    refused with the typed ``plan_lease`` error before any capture or input —
+    computer_wait_status and computer_fetch_image stay allowed (read-only). A
+    misdirected call costs nothing. ``plan_action="continue"`` runs the NEXT step
+    under the SAME approval verdict (approval is decided once, on the FIRST plan
+    call, and inherited by every step and by ``replace`` — ``continue`` never
+    re-asks); ``plan_action="stop"`` releases the lease and returns the executed
+    prefix with ``result:"stopped"``; ``plan_action="replace"`` validates a
+    complete replacement plan (required), closes the old lease, and opens a new
+    one inheriting the FIRST call's approval. A plan whose steps abstain reports
+    ``result:"uncertain"`` per step and TERMINATES with ``result:"unknown"`` —
+    ``ok`` is true ONLY when EVERY step verified (``ok = (result ==
+    "verified")``); ``unknown`` and ``stopped`` terminal verdicts are never
+    success.
+
+    Plan replies (unified contract §1.3): every step and terminal reply carries
+    ``result`` (step: verified/uncertain/failed/rejected/not_executed; terminal:
+    verified/unknown/failed/stopped), ``failure_reason`` (ALWAYS; ``null`` when
+    nothing failed; ONE token of the typed vocabulary — the full B6-B8
+    classification tables land with the WP8 decomposition), ``not_executed`` (the
+    bounded, explicit list of plan work that never ran, each entry carrying the
+    reason), and ``evidence_by_backend`` (a DICT: ``captures`` from the session's
+    evidence store — real on BOTH backends — plus ``repositions`` the plan's moves
+    recorded). The bare ``evidence`` key stays a LIST of evidence lines everywhere
+    else; the two are never mixed. The aggregate ``plan`` block reports per-point
+    status and per-action rows (including each action's ``hold_ms``).
+
+    The lease is released exactly once — on the terminal reply, a host
+    ``stop``/``replace``, a structural step error or exception, or the session
+    ending (stop_session, the idle timeout, an internal kill). An idle lease with
+    no call in flight does NOT keep the session alive: after the idle timeout the
+    session is reaped and the lease released with it.
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -3708,6 +5072,66 @@ async def computer_execute(
     # can only REMOVE bytes, never re-enable an image (a non-vision model passing
     # True must not be able to kill its own session).
     image_mode = _session_image_delivery(bundle)
+    # ORVEX-2026-101 decision 1 (WP7b): the lease gate is the FIRST operation after
+    # session lookup. A flat/follow-up call, a second plan, or a plan payload
+    # without an explicit continuation decision is refused before visual-view
+    # resolution, validation, capture, or backend dispatch: zero-effect handshake
+    # rejection. A plan lease is released only by continue/stop/replace, the
+    # terminal paths inside the step machinery, or session teardown — never leaked.
+    active_lease = _plan_guard.active_lease(bundle)
+    if active_lease is not None:
+        if not (
+            action == "done"
+            and x is None
+            and y is None
+            and text is None
+            and not keys
+            and delta == 0
+            and expected_effect is None
+            and x2 is None
+            and y2 is None
+            and target is None
+            and via is None
+            and follow_ups is None
+        ):
+            return _plan_lease_refusal(
+                bundle,
+                active_lease,
+                "A stepwise plan lease is active on this session; flat actions and follow-ups are refused with zero effect.",
+            )
+        if plan is not None and plan_action != "replace":
+            return _plan_lease_refusal(
+                bundle,
+                active_lease,
+                "A replacement plan requires plan_action='replace'; the active lease was not touched.",
+            )
+        if plan is None and plan_action is None:
+            # DELTA 1 #13: a bare call (defaults, no plan_action) mid-lease is a
+            # plan_lease refusal naming the handshake verb it must send — NOT the
+            # invalid_plan_action reply, which is reserved for a GIVEN-but-invalid
+            # plan_action.
+            return _plan_lease_refusal(
+                bundle,
+                active_lease,
+                "A stepwise plan lease is active on this session; send plan_action='continue', 'stop' or 'replace' (with a replacement plan only for 'replace').",
+            )
+        return await _handle_plan_action(
+            bundle,
+            active_lease,
+            plan_action=plan_action,
+            plan=plan,
+            include_screenshot_after=include_screenshot_after,
+            image_mode=image_mode,
+            view_provider=None,
+        )
+    if plan_action is not None:
+        return {
+            "ok": False,
+            "result": "rejected",
+            "reasons": ["invalid_plan_action"],
+            "error": "invalid_plan_action",
+            "message": "plan_action is only valid while a stepwise plan lease is active.",
+        }
     # AL-002: resolve an explicit view request BEFORE anything runs (fail-closed — a
     # bad view name never dispatches input); the absent request adds only this
     # None-check (H19).
@@ -3724,6 +5148,64 @@ async def computer_execute(
             "message": str(exc),
             "reasons": [f"invalid_visual_view: {exc}"],
         }
+    # ORVEX-2026-101 decision 1 (WP7b): a new plan is fully validated, normalized,
+    # and pre-converted BEFORE the lease is installed — a malformed or incomplete
+    # plan is a typed teaching rejection with ZERO effect (no capture, no motion,
+    # no lease). Only then does the first point step execute. There is NO legacy
+    # single-call plan path (S-01): a plan is always stepwise.
+    if plan is not None:
+        if (
+            action != "done"
+            or x is not None
+            or y is not None
+            or text is not None
+            or keys
+            or delta != 0
+            or expected_effect is not None
+            or x2 is not None
+            or y2 is not None
+            or target is not None
+            or via is not None
+            or follow_ups is not None
+        ):
+            return _teaching_invalid_action(
+                ValueError(
+                    "pass EITHER a plan (waypoints+actions) OR a flat action/follow_ups "
+                    "call — not both; a plan call leaves every flat action parameter at "
+                    "its default (action=\"done\", no x/y/text/keys/...)."
+                ),
+                action,
+            )
+        try:
+            plan_model = plan_layer.coerce_tolerant_plan(plan)
+            plan_specs, plan_context = plan_layer.normalize_plan(plan_model)
+            for plan_spec in plan_specs:
+                # R-18: every plan item must CONVERT to a GroundedAction before the
+                # first motion — the plan never starts on an unconvertible item.
+                plan_spec.to_grounded(reason_prefix="MCP plan action")
+        except Exception as exc:  # noqa: BLE001 - malformed plan: fail closed, teach
+            return _teaching_invalid_action(exc, action)
+        lease = PlanLease(
+            model=plan_model,
+            specs=plan_specs,
+            context=plan_context,
+            steps=plan_layer.plan_step_slices(plan_specs, plan_context),
+            # O-03: require_approval is evaluated ONCE, on this FIRST plan call,
+            # for the whole plan — every step inherits this verdict and ``replace``
+            # inherits it too; ``continue`` never re-asks.
+            approved=bool(approved),
+        )
+        try:
+            _plan_guard.install(bundle, lease)
+        except ValueError as exc:
+            return {"ok": False, "error": "plan_lease", "blocked": True, "message": str(exc)}
+        return await _execute_plan_step(
+            bundle,
+            lease,
+            include_screenshot_after=include_screenshot_after,
+            image_mode=image_mode,
+            view_provider=view_provider,
+        )
     if follow_ups is not None:
         # REM-F: normalize the tolerant shapes for DIRECT callers too (the boundary
         # coercion already produced list[dict] for MCP callers — idempotent here:
@@ -4046,14 +5528,12 @@ def _record_observation_evidence(
     )
 
 
-# WP7b-SEAM(evidence-by-backend): the store read API WP7 consumes already exists —
-# ``EvidenceStore.captures()`` (evidence.py) returns bounded per-frame metadata for
-# every retained capture, on BOTH backends (it is filled by the reply hooks above,
-# never by backend-specific attributes — no fake-only ``executed``/``observed``
-# reads, S-03).  WP7 builds the plan-step/terminal ``evidence_by_backend`` block from
-# ``evidence_store(bundle.extra).captures()`` (captures) + the plan lease (repositions)
-# and publishes it on every plan step and terminal plan reply; this marker is the ONE
-# place that work hooks into the server.  Nothing else about plans exists yet (WP7).
+# evidence-by-backend seam — WIRED: ``_plan_evidence`` (in the plan surface
+# section above) builds the plan-step/terminal ``evidence_by_backend`` block from
+# ``EvidenceStore.captures()`` (the store read API, filled by the reply hooks — real
+# on BOTH backends, no fake-only ``executed``/``observed`` reads, S-03) plus the
+# lease's retained repositions, and publishes it on every plan step and terminal
+# plan reply. The dev copy's fake-only block is gone by design (decision D-2).
 
 
 #: Rejection wording for ``computer_fetch_image`` (unified contract §1.3: a fetch
@@ -4241,11 +5721,11 @@ async def computer_fetch_image(session_id: str, image_id: str) -> Any:
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
-    # WP7b-SEAM(fetch-lease): a fetch is a READ-ONLY retrieval of evidence this
-    # session already holds — it is ALLOWED while a plan lease is active (S-04) and
-    # must stay allowed.  WP7 must NOT add a lease refusal here (the observe/zoom
-    # lease-refusal placement deliberately does NOT extend to this tool); if WP7's
-    # plan machinery needs to gate anything on this surface, gate only writes.
+    # S-04 (WP7b, wired): a fetch is a READ-ONLY retrieval of evidence this session
+    # already holds — it stays ALLOWED while a plan lease is active. There is
+    # deliberately NO lease refusal on this surface (the observe/zoom refusal does
+    # not extend here); the mid-lease fetch behavior is pinned by
+    # tests/test_wp7b_plan_surface.py::test_a_fetch_succeeds_mid_lease.
     store = evidence_store(bundle.extra)
     if store is None:
         # Fail-closed: a live session always has a store (written at bundle

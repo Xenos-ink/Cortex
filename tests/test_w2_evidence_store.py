@@ -867,13 +867,26 @@ def test_a_late_spatial_text_failure_stores_nothing(
 
 
 def test_the_two_wp7_seam_markers_exist_exactly_once() -> None:
-    """Exactly one ``WP7b-SEAM(fetch-lease)`` (where WP7 keeps the fetch ALLOWED
-    during a plan lease, S-04) and one ``WP7b-SEAM(evidence-by-backend)`` (where WP7
-    builds the plan evidence block from the store + lease, S-03).  The plans
-    themselves do not exist yet — WP7 owns them; this pins the seams, not the plans."""
+    """CHANGED PIN (WP7b, §-reason: both seams are now WIRED, so the forward-looking
+    seam markers are replaced by the implemented behavior they promised):
+
+    - ``WP7-SEAM(fetch-lease)`` is GONE by contract item (f): the fetch-allowed-
+      during-a-lease behavior (S-04) is implemented (no refusal on the fetch
+      surface) and pinned behaviorally by
+      ``tests/test_wp7b_plan_surface.py::test_a_fetch_succeeds_mid_lease`` — the
+      comment at the fetch entry still names the decision without carrying the
+      marker token.
+    - ``WP7b-SEAM(evidence-by-backend)`` is WIRED: ``server._plan_evidence`` builds
+      the block from the store + lease; the marker comment above the evidence
+      section records the site (kept marker-free, so this pin now asserts the
+      absence of BOTH stale seam tokens and the presence of the wired helpers).
+    The pinned PROPERTY — exactly one implemented evidence/fetch site, no
+    duplicated seam — is unchanged and unchanged in strength."""
     source = SERVER_PATH.read_text(encoding="utf-8")
-    assert source.count("WP7b-SEAM(fetch-lease)") == 1
-    assert source.count("WP7b-SEAM(evidence-by-backend)") == 1
+    assert source.count("WP7b-SEAM(fetch-lease)") == 0
+    assert source.count("WP7b-SEAM(evidence-by-backend)") == 0
+    assert "def _plan_evidence(" in source
+    assert "S-04 (WP7b, wired)" in source
 
 
 def test_the_store_read_api_for_evidence_by_backend_exists_and_is_backend_agnostic() -> None:

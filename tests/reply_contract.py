@@ -329,6 +329,29 @@ def assert_terminal_plan_reply(reply: dict[str, Any]) -> None:
     assert "evidence_by_backend" in reply, "terminal reply carries evidence_by_backend"
 
 
+def assert_plan_refusal(reply: dict[str, Any]) -> None:
+    """§1.1 execute-surface plan refusal (WP7b DELTA 1 #6): the misdirected
+    computer_execute call's reply is a REJECTED reply — the closed ``result``
+    token, ok False, a non-empty ``reasons`` list naming the typed code — while
+    ALSO keeping the typed ``error`` key and the handshake echo keys (blocked,
+    executed_prefix, ...). ``error`` is deliberately allowed here, unlike
+    :func:`assert_rejection`: the typed code rides both keys on this surface."""
+
+    assert reply.get("result") == "rejected", (
+        f"plan refusal must carry result='rejected', got {reply.get('result')!r}"
+    )
+    assert reply.get("ok") is False, "plan refusals are ok=False (§1.1 ok-rule)"
+    reasons = reply.get("reasons")
+    assert isinstance(reasons, list) and reasons, "plan refusal carries a non-empty reasons list"
+    assert reasons[0] in {"plan_lease", "invalid_plan_action"}, (
+        f"plan refusal names its typed code first, got {reasons!r}"
+    )
+    assert reply.get("error") in {"plan_lease", "invalid_plan_action"}, (
+        "plan refusal keeps the typed error key beside the rejected envelope"
+    )
+    assert_envelope(reply, result_required=False)
+
+
 def validate_reply(reply: dict[str, Any], surface: str) -> dict[str, Any]:
     """Compose the §1 assertions for one reply of a named surface.
 
@@ -342,6 +365,10 @@ def validate_reply(reply: dict[str, Any], surface: str) -> dict[str, Any]:
         assert_plan_step_reply(reply)
     elif surface == "terminal_plan":
         assert_terminal_plan_reply(reply)
+    elif surface == "plan_refusal":
+        # WP7b DELTA 1 #6: the execute-surface plan_lease / invalid_plan_action
+        # refusals — a rejected envelope plus the typed error key and handshake echo
+        assert_plan_refusal(reply)
     elif surface in ("flat_execute", "follow_up_item"):
         assert_envelope(reply)
         assert_ok_rule(reply)

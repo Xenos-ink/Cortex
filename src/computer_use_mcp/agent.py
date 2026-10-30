@@ -657,6 +657,12 @@ class SingleActionOutcome:
     follow_up_results: list[dict[str, Any]] | None = None
     follow_ups_stopped_reason: str | None = None
     interference_events: list[str] | None = None
+    #: WP7b DELTA 1 (VAL-WP7b-01 #3): the queue collects the Interference Guard's
+    # events from EVERY item (not only the first outcome, which is the benign
+    # transition move on the plan path) into this merged list; the flat reply keeps
+    # publishing ``interference_events`` (item 0's) unchanged, while the plan-step
+    # machinery publishes the merged list. ``None`` = the queue path did not run.
+    follow_up_interference_events: list[str] | None = None
 
 
 class ComputerUseAgent:
@@ -1535,6 +1541,9 @@ class ComputerUseAgent:
         approved: bool = False,
         expected_effect: str | None = None,
         follow_ups: list[ActionSpec] | None = None,
+        follow_ups_cap: int = MAX_FOLLOW_UPS,
+        plan_policies: list[dict[str, Any] | None] | None = None,
+        plan_context: dict[str, Any] | None = None,
     ) -> SingleActionOutcome:
         """Run one client-supplied action through the full pipeline (``computer_execute``).
 
@@ -1557,24 +1566,42 @@ class ComputerUseAgent:
         ``CORTEX_QUEUE_STRICT_VERIFY=1`` restores stop-on-failed). Every executed
         action emits its own audit events. ``approved`` applies to every item (the
         safety policy evaluates each independently).
+
+        ORVEX-2026-101 Batch 2 (P2.1, additive; the ONLY queue changes the waypoint
+        plan requires — WP7b wiring): ``follow_ups_cap`` lets the plan surface pass
+        its own already-validated item count (a plan point step normalizes to up to 7
+        items — move + 5 actions + the final wait — more than the speculative queue's
+        ``MAX_FOLLOW_UPS``; the default keeps the legacy silent-truncation behavior
+        byte-identical), and ``plan_policies`` carries the plan's point-end stop
+        policies (RFC §2.3 T7/T8: a plan point resolved failed/uncertain honors the
+        point's ``on_failure``/``on_uncertain`` — stop by default, a deliberate
+        deviation from the exploratory queue's continue). When ``plan_policies`` is
+        not None the queue path runs even for a single item so plan responses carry
+        the uniform per-item aggregate.
         """
-        if follow_ups:
-            specs = list(follow_ups)[:MAX_FOLLOW_UPS]
+        if follow_ups or plan_policies is not None:
+            specs = list(follow_ups or [])[:follow_ups_cap]
             return await self._run_action_queue(
-                state, action, specs, approved=approved, expected_effect=expected_effect
+                state,
+                action,
+                specs,
+                approved=approved,
+                expected_effect=expected_effect,
+                plan_policies=plan_policies,
+                plan_context=plan_context,
             )
         outcome, _post = await self._run_single_pipeline(
             state, action, approved=approved, expected_effect=expected_effect
         )
         return outcome
 
-    # WP7b-SEAM(plan-queue): the plan path enters HERE — WP7b adds the additive
-    # ``plan_policies`` / ``plan_context`` parameters (dev agent.py shape), stamps the
-    # INTERNAL settle markers from computer_use_mcp.plan (``stamped_plan_actions`` or
-    # the per-policy stamp: ``item.plan_point_settle = policies[i] is not None`` and
-    # ``item.plan_point_settle_ms = policies[i]["settle_ms"]``), and retains the step's
-    # ``interference_events`` on the lease at this boundary. plan.py supplies
-    # plan_step_context / plan_cursor_after (K-53) / merge_plan_step_prefix.
+    # WP7b-SEAM(plan-queue) — WIRED: the plan path enters through the additive
+    # ``plan_policies`` / ``plan_context`` parameters below. Per-policy settle
+    # stamping (``item.plan_point_settle`` bool + ``plan_point_settle_ms`` value),
+    # the TaskStopped partial-truth entry (``dispatched_unverified``), and the
+    # point-end policy stop all live in ``_run_action_queue``; the LEASE-side
+    # retention (interference events, K-53 cursor, prefix merge) stays in
+    # server.py's step machinery, which is the only place the lease is in scope.
     async def _run_action_queue(
         self,
         state: Any,
@@ -1583,6 +1610,8 @@ class ComputerUseAgent:
         *,
         approved: bool,
         expected_effect: str | None,
+        plan_policies: list[dict[str, Any] | None] | None = None,
+        plan_context: dict[str, Any] | None = None,
     ) -> SingleActionOutcome:
         """Speculative host queue (PERF-004 C7): primary action + bounded follow_ups.
 
@@ -1678,11 +1707,90 @@ class ComputerUseAgent:
                 )
                 return rejection
             queue_items.append((grounded_spec, spec.expected_effect))
+        # ORVEX-2026-101 Batch 3 (P3.2/D15) + E-01 (WP7b): the plan's settle policy
+        # rides the queue items as INTERNAL GroundedAction markers (never
+        # host-visible: ActionSpec deliberately does not mirror them — P3.2 item 9).
+        # The plan point's LAST item carries True plus the DECLARED ms — the backend
+        # settles ONCE there, for exactly the stated duration, after that dispatch
+        # and before its post-action observation; transition moves of points WITH
+        # actions carry False (they settle not after the move). follow_ups queues
+        # and single actions never reach this loop: their items keep the markers
+        # unset (the exact legacy settle policy, byte-identical).
+        if plan_policies is not None:
+            for marker_index, (item, _item_effect) in enumerate(queue_items):
+                if marker_index >= len(plan_policies):
+                    break  # misaligned context: leave the legacy settle policy untouched
+                policy = plan_policies[marker_index]
+                item.plan_point_settle = policy is not None
+                item.plan_point_settle_ms = policy["settle_ms"] if policy is not None else None
+
+        async def _run_item_with_partial_truth(
+            item_index: int,
+            item: GroundedAction,
+            item_effect: str | None,
+            premise: Observation | None,
+            *,
+            strict_digest: bool,
+        ) -> tuple[SingleActionOutcome, Observation | None]:
+            try:
+                return await self._run_single_pipeline(
+                    state,
+                    item,
+                    approved=approved,
+                    expected_effect=item_effect,
+                    source_observation=premise,
+                    strict_digest=strict_digest,
+                )
+            except TaskStopped as exc:
+                if plan_context is not None and item._dispatch_started:
+                    follow_up_results.append(
+                        {
+                            "index": item_index,
+                            "action_id": item.action_id,
+                            "action_type": item.action.value,
+                            "kind": "dispatched_unverified",
+                            # §1 envelope parity: the token comes from the same §1.2
+                            # set — "dispatched, unproven" IS ``uncertain`` — and ok
+                            # follows the shared ok-rule (never True here).
+                            "result": "uncertain",
+                            "ok": False,
+                            "message": str(exc),
+                            "reasons": ["stopped_after_dispatch"],
+                            "requires_approval": False,
+                            "ensure_app_outcome": None,
+                            "model_confidence": item.confidence,
+                            "grounding_confidence": None,
+                            "verification_confidence": None,
+                            "verification": {
+                                "outcome": "uncertain",
+                                "confidence": 0.0,
+                                "evidence": [],
+                                "verification_method": "none",
+                            },
+                            "verification_outcome": "uncertain",
+                            "verification_note": (
+                                "Input dispatched before cancellation; resulting state "
+                                "was not independently verified."
+                            ),
+                        }
+                    )
+                raise
         follow_up_results: list[dict[str, Any]] = []
         stopped_reason: str | None = None
         source_observation: Observation | None = None
         executed_count = 0
         first_outcome: SingleActionOutcome | None = None
+        # WP7b DELTA 1 (#3): the step's interference events are collected from EVERY
+        # queue item — item 0 (the plan path's transition move) is only one
+        # contributor; a guard event observed on the point's ACTION item must reach
+        # the step reply and the lease like any other.
+        step_events: list[str] = []
+        if plan_context is not None:
+            # The mutable prefix is internal orchestration state, never a
+            # host-visible marker.  Limit/cancel exceptions can therefore be
+            # answered from exactly the queue entries that were already resolved,
+            # without re-running anything.
+            plan_context["partial_results"] = follow_up_results
         for index, (item, item_effect) in enumerate(queue_items):
             self.stop_token.ensure_live()  # P0-C: kill path checked between queue items
             strict_digest = index > 0  # follow-ups stop on attached-window identity change
@@ -1696,12 +1804,11 @@ class ComputerUseAgent:
             # rejection entry below and stops the batch with the named reason.
             limit_trip: LimitExceeded | None = None
             try:
-                outcome, post = await self._run_single_pipeline(
-                    state,
+                outcome, post = await _run_item_with_partial_truth(
+                    index,
                     item,
-                    approved=approved,
-                    expected_effect=item_effect,
-                    source_observation=source_observation,
+                    item_effect,
+                    source_observation,
                     strict_digest=strict_digest,
                 )
             except LimitExceeded as exc:
@@ -1710,12 +1817,16 @@ class ComputerUseAgent:
                 limit_trip = exc
                 outcome = SingleActionOutcome(
                     kind="rejected",
+                    interference_events=[],
                     reasons=[f"limit_exceeded: {exc.limit_name}"],
                     message=str(exc),
                 )
                 post = None
             if first_outcome is None:
                 first_outcome = outcome  # the legacy response payload stays item 0's
+            # WP7b DELTA 1 (#3): merge THIS item's guard events into the step's list
+            # (every item, not only the first outcome's).
+            step_events.extend(list(outcome.interference_events or []))
             # MINOR-N6 (VAL-WP1-02): the tripped item dispatched NOTHING, so it is not
             # counted as executed.
             if limit_trip is None:
@@ -1794,6 +1905,36 @@ class ComputerUseAgent:
                     or (outcome.kind if outcome.kind != "executed" else "verification_failed")
                 )
                 break
+            # ORVEX-2026-101 Batch 2 (RFC §2.3 T7/T8, WP7b): a PLAN point's last item
+            # resolves the point. The point is failed when any of its items carried a
+            # failed verification, uncertain when any carried uncertain (and none
+            # failed); the point's own on_failure/on_uncertain policy then decides —
+            # "stop" halts the sequence here with the named ``policy_stop`` reason,
+            # "continue" proceeds with the honest verdict riding the entries.
+            # Structural rejections never reach this point (they already stopped
+            # above, regardless of any policy). The policy slice is STEP-LOCAL: the
+            # plan step's context rewrote ``first_item_index`` to 0, so the slice
+            # indexes this step's ``follow_up_results``.
+            policy = (
+                plan_policies[index]
+                if plan_policies is not None and index < len(plan_policies)
+                else None
+            )
+            if policy is not None and outcome.result is not None:
+                point_entries = follow_up_results[policy["first_item_index"] : index + 1]
+                point_failed = any(
+                    entry.get("verification_outcome") == "failed" for entry in point_entries
+                )
+                point_uncertain = any(
+                    entry.get("verification_outcome") == "uncertain" for entry in point_entries
+                )
+                if (point_failed and policy["on_failure"] == "stop") or (
+                    point_uncertain
+                    and not point_failed
+                    and policy["on_uncertain"] == "stop"
+                ):
+                    stopped_reason = "policy_stop"
+                    break
             if post is None:
                 # Dry-run (or a degenerate executed outcome without a fresh capture):
                 # nothing further can be verified — stop before speculating.
@@ -1815,6 +1956,10 @@ class ComputerUseAgent:
         # follow_ups see byte-identical shapes; queue callers get the extra fields.
         first_outcome.follow_up_results = follow_up_results
         first_outcome.follow_ups_stopped_reason = stopped_reason
+        # WP7b DELTA 1 (#3): the merged per-item event list rides the first outcome
+        # for the plan-step machinery; the flat reply's ``interference_events`` key
+        # keeps publishing item 0's list (byte-identical flat contract).
+        first_outcome.follow_up_interference_events = step_events
         return first_outcome
 
     @staticmethod

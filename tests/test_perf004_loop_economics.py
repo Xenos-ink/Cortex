@@ -399,15 +399,18 @@ def test_computer_execute_signature_additions_are_trailing_optional() -> None:
     # optional (None == byte-identical legacy behavior; documented existing-test
     # change — the tested property is unchanged and re-pinned in
     # tests/test_avr_visual_views.py). The pre-AL-002 pins below are otherwise intact.
+    # CHANGED PIN (WP7b, §-reason: contract item (a) — `plan`/`plan_action` join as
+    # trailing optionals AFTER visual_view; the pinned property "the perf-004
+    # additions stay trailing optionals with None defaults" is unchanged)
     parameters = list(inspect.signature(server.computer_execute).parameters.values())
-    assert [p.name for p in parameters][-3:] == [
+    assert [p.name for p in parameters][-5:] == [
         "include_screenshot_after",
         "follow_ups",
         "visual_view",
+        "plan",
+        "plan_action",
     ]
-    assert parameters[-3].default is None
-    assert parameters[-2].default is None
-    assert parameters[-1].default is None
+    assert all(p.default is None for p in parameters[-5:])
 
 
 # --- C5: dry-run default flip + unmistakable banner ------------------------------------------------

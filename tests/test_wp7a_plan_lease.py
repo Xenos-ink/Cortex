@@ -438,7 +438,7 @@ def test_the_terminal_token_set_is_closed() -> None:
 
 
 def test_all_verified_prefix_is_verified_and_ok() -> None:
-    outcome = plan_terminal_outcome([_entry("verified"), _entry("verified")])
+    outcome = plan_terminal_outcome([_entry("verified"), _entry("verified")], expected_items=2)
     assert outcome.result == "verified"
     assert outcome.ok is True
 
@@ -446,7 +446,7 @@ def test_all_verified_prefix_is_verified_and_ok() -> None:
 def test_a_marker_only_prefix_is_verified_and_ok() -> None:
     """A plan of done/wait points: markers are the §1.1 non-screen ok tokens, so a
     marker prefix's terminal verdict is verified (nothing to disprove it)."""
-    outcome = plan_terminal_outcome([_entry("marker")])
+    outcome = plan_terminal_outcome([_entry("marker")], expected_items=1)
     assert outcome.result == "verified"
     assert outcome.ok is True
 
@@ -455,7 +455,7 @@ def test_an_uncertain_prefix_is_unknown_and_ok_false() -> None:
     """The V/4244 fix: an all-uncertain plan is ``unknown`` with ok FALSE — never the
     dev ``ok = result != 'failed'`` honesty hole that reported unknown as success."""
     outcome = plan_terminal_outcome(
-        [_entry("uncertain", verification_outcome="uncertain")]
+        [_entry("uncertain", verification_outcome="uncertain")], expected_items=1
     )
     assert outcome.result == "unknown"
     assert outcome.ok is False
@@ -464,7 +464,8 @@ def test_an_uncertain_prefix_is_unknown_and_ok_false() -> None:
 def test_a_dispatched_unverified_item_is_unknown_and_ok_false() -> None:
     outcome = plan_terminal_outcome(
         [_entry("verified"), _entry(None, kind="dispatched_unverified",
-                                    verification_outcome="uncertain")]
+                                    verification_outcome="uncertain")],
+        expected_items=2,
     )
     assert outcome.result == "unknown"
     assert outcome.ok is False
@@ -477,28 +478,29 @@ def test_every_real_entry_shape_classifies_fail_closed(entry: dict[str, Any], ex
     dry_run and not_executed and rejected are never verified; only
     verified/marker count."""
     assert plan_result_from_entries([entry]) == expected
-    outcome = plan_terminal_outcome([entry])
+    outcome = plan_terminal_outcome([entry], expected_items=1)
     assert outcome.ok == (expected == "verified")
 
 
 def test_an_executed_entry_with_no_verification_outcome_is_never_verified() -> None:
     """The fail-open hole the validator found: ``[{"kind": "executed", "index": 0}]``
     (no result, no verification_outcome) is uncertain/ok:false — never verified."""
-    outcome = plan_terminal_outcome([{"kind": "executed", "index": 0}])
+    outcome = plan_terminal_outcome([{"kind": "executed", "index": 0}], expected_items=1)
     assert outcome.result == "unknown"
     assert outcome.ok is False
 
 
 def test_a_failed_item_is_failed_and_ok_false() -> None:
     outcome = plan_terminal_outcome(
-        [_entry("verified"), _entry("failed", verification_outcome="failed")]
+        [_entry("verified"), _entry("failed", verification_outcome="failed")],
+        expected_items=2,
     )
     assert outcome.result == "failed"
     assert outcome.ok is False
 
 
 def test_an_empty_prefix_fails_closed() -> None:
-    outcome = plan_terminal_outcome([])
+    outcome = plan_terminal_outcome([], expected_items=0)
     assert outcome.result == "failed"
     assert outcome.ok is False
 
@@ -506,18 +508,18 @@ def test_an_empty_prefix_fails_closed() -> None:
 def test_a_host_requested_stop_is_stopped_and_ok_false() -> None:
     """§1.2/§1.3: a stopped plan verified NOTHING, whatever its prefix looked like —
     even an all-verified prefix reports ``stopped`` with ok false."""
-    outcome = plan_terminal_outcome([_entry("verified")], stopped=True)
+    outcome = plan_terminal_outcome([_entry("verified")], stopped=True, expected_items=1)
     assert outcome.result == "stopped"
     assert outcome.ok is False
-    assert plan_terminal_outcome([], stopped=True).result == "stopped"
+    assert plan_terminal_outcome([], stopped=True, expected_items=0).result == "stopped"
 
 
 def test_ok_is_verified_by_construction_over_the_whole_token_set() -> None:
     outcomes = {
-        "verified": plan_terminal_outcome([_entry("verified")]),
-        "unknown": plan_terminal_outcome([_entry("uncertain")]),
-        "failed": plan_terminal_outcome([]),
-        "stopped": plan_terminal_outcome([], stopped=True),
+        "verified": plan_terminal_outcome([_entry("verified")], expected_items=1),
+        "unknown": plan_terminal_outcome([_entry("uncertain")], expected_items=1),
+        "failed": plan_terminal_outcome([], expected_items=0),
+        "stopped": plan_terminal_outcome([], stopped=True, expected_items=0),
     }
     assert set(outcomes) == set(TERMINAL_PLAN_RESULTS)
     for token, outcome in outcomes.items():
@@ -573,11 +575,18 @@ def test_a_stopped_plan_is_stopped_regardless_of_completeness() -> None:
     assert outcome.ok is False
 
 
-def test_the_expected_count_is_optional_for_direct_construction() -> None:
-    """Without ``expected_items`` (dev-shaped callers, unit contexts) the aggregate
-    keeps its prefix-only semantics — completeness is an ADDITIONAL input, not a
-    new requirement."""
-    assert plan_terminal_outcome([_entry("verified")]).result == "verified"
+def test_the_expected_count_is_a_required_argument() -> None:
+    """CHANGED PIN (WP7b, §-reason: VAL-WP7a-02 #15 carry-over): ``expected_items`` is
+    now a REQUIRED keyword of ``plan_terminal_outcome`` (no ``None`` default), so
+    every caller passes the plan's declared item count and no caller can silently
+    drop the completeness check. The old node pinned the parameter as OPTIONAL —
+    that pin is superseded by the explicit carry-over instruction; the property it
+    guarded (prefix-only semantics for unit contexts) is preserved by passing the
+    ``len(entries)`` the context actually declares. No safety assertion weakened:
+    the completeness cap now fires on every real call path."""
+    assert plan_terminal_outcome([_entry("verified")], expected_items=1).result == "verified"
+    with pytest.raises(TypeError):
+        plan_terminal_outcome([_entry("verified")])  # type: ignore[call-arg]
 
 
 def test_plan_result_from_entries_matches_the_step_vocabulary() -> None:

@@ -95,7 +95,8 @@ def complete_plan(plan: dict[str, Any], **overrides: Any) -> dict[str, Any]:
         # helper would blanket every action with the point's condition and change the
         # verdicts the restated tests exist to observe.
         declares = any(
-            isinstance(spec, dict) and spec.get("expected_effect")
+            isinstance(spec, dict) and isinstance(spec.get("expected_effect"), str)
+            and spec.get("expected_effect").strip() != ""
             for spec in point.get("actions") or []
         )
         if point.get("actions") and not declares and not point.get("arrival_condition"):

@@ -79,9 +79,21 @@ def _frame(*, changed: bool, tick: int = 0) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _backend_class(delay: float, *, never_changes: bool = False) -> type[FakeComputerBackend]:
+def _backend_class(
+    delay: float, *, never_changes: bool = False, paint_after_observes: int | None = None
+) -> type[FakeComputerBackend]:
     class DelayedRepaintBackend(FakeComputerBackend):
-        """World state changes at dispatch; the PIXELS follow ``delay`` seconds later."""
+        """World state changes at dispatch; the PIXELS follow ``delay`` seconds later.
+
+        HERMETICITY (WP7b carry-over): ``paint_after_observes`` INJECTS the capture
+        timing instead of the wall clock — the paint lands deterministically on the
+        ``paint_after_observes``-th ``observe()`` after dispatch (0 = the first
+        post-action capture already sees it; 1 = exactly the ONE bounded re-capture
+        sees it; a large value = beyond the settle). Under a loaded full-suite run
+        the real 1 ms delays could elapse BEFORE the first capture, flipping the
+        capture-count assertions; the injected clock removes the race. The
+        wall-clock ``delay`` arm is unchanged for every other node.
+        """
 
         def __init__(self) -> None:
             super().__init__(width=WIDTH, height=HEIGHT, active_window=WindowInfo(**BOARD.model_dump()))
@@ -89,22 +101,24 @@ def _backend_class(delay: float, *, never_changes: bool = False) -> type[FakeCom
             self._frozen = never_changes
             self._painted = False
             self._pending_since: float | None = None
+            self._observes_since_dispatch = 0
             self.dispatch_ts: float | None = None
             self.capture_phases: list[str] = []
 
         def observe(self, monitor_index: int | None = None) -> Observation:
-            if (
-                self._pending_since is not None
-                and not self._painted
-                and not self._frozen
-                and time.monotonic() - self._pending_since >= delay
-            ):
-                self._painted = True
+            if self._pending_since is not None and not self._painted and not self._frozen:
+                if paint_after_observes is not None:
+                    if self._observes_since_dispatch >= paint_after_observes:
+                        self._painted = True
+                elif time.monotonic() - self._pending_since >= delay:
+                    self._painted = True
             observation = super().observe(monitor_index)
             observation.image_base64 = _frame(
                 changed=self._painted, tick=len(self.capture_phases)
             )
             self.capture_phases.append("capture")
+            if self._pending_since is not None:
+                self._observes_since_dispatch += 1
             return observation
 
         def execute(self, action, stop=None, focus_hook=None, allow_launch=False):  # type: ignore[no-untyped-def]
@@ -186,12 +200,23 @@ def test_late_repaints_up_to_the_settle_no_longer_survive_the_cliff() -> None:
     Before the fix, 0 ms verified and 1 ms did not — a cliff one millisecond wide.
     Now a repaint that lands inside the settle is caught by the one extra capture, so
     every delay in the sweep verifies (the recovered pixels ARE the bare-change
-    claim on the T8 B2 pixel fallback)."""
+    claim on the T8 B2 pixel fallback).
+
+    HERMETICITY (WP7b carry-over): the paint timing is INJECTED
+    (``paint_after_observes``) instead of racing the real 1 ms delays against the
+    dispatch→capture gap — under a loaded full-suite run the real clock let the
+    repaint land inside the FIRST capture, flipping the capture-count assertions.
+    The assertions are UNCHANGED (verdicts + the exact per-delay capture counts):
+    delay 0 lands inside the FIRST capture (nothing to recover); every later delay
+    needs exactly the ONE re-capture and no more."""
     settle_ms = _IDENTICAL_FRAME_RECHECK_SETTLE_SECONDS * 1000.0
     for delay_ms in (0, 1, 3, 10, 50):
         if delay_ms >= settle_ms:
             continue
-        backend = _backend_class(delay_ms / 1000.0)()
+        # 0 ms paints before the first capture; every nonzero in-settle delay paints
+        # exactly on the ONE bounded re-capture (capture timing injected)
+        paint_at = 0 if delay_ms == 0 else 1
+        backend = _backend_class(delay_ms / 1000.0, paint_after_observes=paint_at)()
         result, phases = _run(backend, _type())
         assert backend.ground_truth is True
         assert result.verification is not None
@@ -199,8 +224,6 @@ def test_late_repaints_up_to_the_settle_no_longer_survive_the_cliff() -> None:
             f"delay {delay_ms} ms -> {result.verification.outcome}: {result.verification.note}"
         )
         assert result.ok is True
-        # delay 0 lands inside the FIRST capture, so there is nothing to recover; every
-        # later delay needs exactly the ONE re-capture and no more.
         expected_captures = 1 if delay_ms == 0 else 2
         assert phases.count("post_action") == expected_captures, (delay_ms, phases)
 

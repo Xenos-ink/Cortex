@@ -428,6 +428,16 @@ PLAN_EXPLICIT_POINT_KEYS: tuple[str, ...] = (
 )
 
 
+def _stated_text(value: Any) -> bool:
+    """A text statement counts only when it is a string with non-whitespace content.
+
+    VAL-WP7a-02 #14: an empty or whitespace-only ``arrival_condition`` is an ABSENCE
+    of a statement, never one — it is treated exactly like a missing key (the
+    explicitness gate demands the verification statement, and the normalizer never
+    copies it into ``expected_effect``)."""
+    return isinstance(value, str) and value.strip() != ""
+
+
 def plan_explicitness_message(missing: list[str]) -> str:
     """Teach-in text for a plan rejected at the wire boundary (SPEC 5.2)."""
     return (
@@ -530,8 +540,9 @@ def validate_plan_explicitness(value: dict[str, Any]) -> None:
         if not plan_states_settle and not _stated(point, "settle_ms"):
             missing.append(f"{path}.settle_ms (0 = no settle, 1..200 = that many ms)")
         actions = point.get("actions") or []
-        if actions and point.get("arrival_condition") is None and not any(
-            isinstance(spec, dict) and spec.get("expected_effect") for spec in actions
+        if actions and not _stated_text(point.get("arrival_condition")) and not any(
+            isinstance(spec, dict) and _stated_text(spec.get("expected_effect"))
+            for spec in actions
         ):
             missing.append(
                 f"{path}.arrival_condition (what to verify after this step — an "
@@ -667,7 +678,7 @@ def normalize_plan(plan: WaypointPlan) -> tuple[list[ActionSpec], dict[str, Any]
         policies.append(None)
         for spec in waypoint.actions:
             updates: dict[str, Any] = {"x": waypoint.x, "y": waypoint.y}
-            if spec.expected_effect is None and waypoint.arrival_condition is not None:
+            if spec.expected_effect is None and _stated_text(waypoint.arrival_condition):
                 updates["expected_effect"] = waypoint.arrival_condition
             specs.append(spec.model_copy(update=updates))
             policies.append(None)
@@ -801,7 +812,15 @@ def plan_step_slices(
 def plan_step_context(
     lease: PlanLease, step_index: int, step_specs: list[ActionSpec]
 ) -> tuple[dict[str, Any], list[dict[str, Any] | None]]:
-    """Build the one-point context/policy slice consumed by the existing queue."""
+    """Build the one-point context/policy slice consumed by the existing queue.
+
+    The point's policy dict rides the step's LAST item with a STEP-LOCAL
+    ``first_item_index`` of 0 (the queue consumes step-local ``follow_up_results``,
+    so its point-resolution slice ``[first_item_index : index + 1]`` must index the
+    step, never the full plan — the dev copy kept the full-plan index, which only
+    worked on the removed single-call path; the stepwise handshake needs this
+    rewritten or ``on_failure``/``on_uncertain`` could never halt a step).
+    """
     point = lease.context["points"][step_index]
     first_item = point["first_item"]
     last_item = point["last_item"]
@@ -809,6 +828,8 @@ def plan_step_context(
     policies = list(source_policies[first_item : last_item + 1])
     if lease.context.get("final_wait_item") is not None and step_index == len(lease.steps) - 1:
         policies.append(None)
+    if policies and policies[-1] is not None:
+        policies[-1] = {**policies[-1], "first_item_index": 0}
     step_point = {
         "id": point["id"],
         "index": point["index"],
@@ -1134,7 +1155,7 @@ def plan_terminal_outcome(
     entries: list[dict[str, Any]],
     *,
     stopped: bool = False,
-    expected_items: int | None = None,
+    expected_items: int,
 ) -> PlanTerminalOutcome:
     """The pure terminal aggregate (master-mission §1.2/§1.3).
 
@@ -1144,14 +1165,15 @@ def plan_terminal_outcome(
     item verified or marker), ``unknown`` (at least one step uncertain or
     dispatched-unverified, none failed), or ``failed``.
 
-    ``expected_items`` (VAL-WP7a-01 #4) is the plan's declared item count
-    (``context["normalized_item_count"]``). When it is given and the prefix holds
-    FEWER entries than expected, a verified-so-far prefix is capped at
-    ``unknown``: work the plan declared never produced evidence, so the plan's
-    end state is an ABSENCE of evidence — ``unknown`` per §1.2 ("dispatched,
-    unproven" covers the unexecuted remainder's silence), never ``stopped`` (the
-    host did not request a stop) and never ``failed`` (nothing was proven not
-    achieved).
+    ``expected_items`` (VAL-WP7a-01 #4; REQUIRED — VAL-WP7a-02 #15) is the plan's
+    declared item count (``context["normalized_item_count"]``). Every caller passes
+    the plan's expected item count, so no caller can silently drop the completeness
+    check: when the prefix holds FEWER entries than expected, a verified-so-far
+    prefix is capped at ``unknown``: work the plan declared never produced evidence,
+    so the plan's end state is an ABSENCE of evidence — ``unknown`` per §1.2
+    ("dispatched, unproven" covers the unexecuted remainder's silence), never
+    ``stopped`` (the host did not request a stop) and never ``failed`` (nothing was
+    proven not achieved).
 
     ``ok = (result == "verified")`` BY CONSTRUCTION — the V/4244 fix: the terminal
     reply of a plan whose steps abstained is ``unknown`` with ``ok:false``, never the
@@ -1159,11 +1181,7 @@ def plan_terminal_outcome(
     as success.
     """
     result = "stopped" if stopped else plan_result_from_entries(entries)
-    if (
-        result == "verified"
-        and expected_items is not None
-        and len(entries) < int(expected_items)
-    ):
+    if result == "verified" and len(entries) < int(expected_items):
         result = "unknown"
     return PlanTerminalOutcome(result=result, ok=result == "verified")
 

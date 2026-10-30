@@ -367,6 +367,32 @@ def test_an_action_level_expected_effect_covers_the_verification_declaration() -
     assert plan.points[0].actions[0].expected_effect == "the menu opened"
 
 
+def test_an_empty_arrival_condition_is_not_a_statement() -> None:
+    """VAL-WP7a-02 #14 (executed in WP7b): ``""`` / whitespace-only is an ABSENCE,
+    never a statement — the wire gate demands the verification statement exactly as
+    if the key were missing, naming the field."""
+    for blank in ("", "   ", "\n\t "):
+        payload = {
+            "transition_duration_ms": 0,
+            "point_timeout_ms": 5_000,
+            "settle_ms": 0,
+            "on_failure": "stop",
+            "on_uncertain": "continue",
+            "points": [
+                {
+                    "id": "a",
+                    "x": 1,
+                    "y": 2,
+                    "arrival_condition": blank,
+                    "actions": [{"action": "click"}],
+                }
+            ],
+        }
+        with pytest.raises(ValueError) as excinfo:
+            coerce_tolerant_plan(payload)
+        assert "arrival_condition" in str(excinfo.value), blank
+
+
 def test_an_explicit_delta_on_every_in_plan_wait_is_required() -> None:
     """Rule 4: a ``wait`` action inside a point states its 0..10 s delta; the trailing
     ``final_wait_ms`` is a separate declaration and never a substitute."""
