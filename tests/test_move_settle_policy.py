@@ -99,27 +99,14 @@ def explicit_settle(monkeypatch: pytest.MonkeyPatch) -> float:
 
 
 def _probe_settle(env_value: str | None) -> dict[str, float]:
-    """Read the shipped settle values in a subprocess with a controlled env so ambient
-    CORTEX_* variables on the dev desktop cannot mask the behavior under test."""
-    source_root = str(backend_module.__file__).rsplit(os.sep + "computer_use_mcp", 1)[0]
-    probe = (
-        "import json; from computer_use_mcp import backend as b; "
-        "print(json.dumps({'ms': b.MOVE_SETTLE_MS, 'seconds': b._MOVE_SETTLE_SECONDS}))"
-    )
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CORTEX_")}
-    env["PYTHONPATH"] = source_root
-    if env_value is not None:
-        env["CORTEX_MOVE_SETTLE_MS"] = env_value
-    completed = subprocess.run(
-        [sys.executable, "-c", probe],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=120,
-        check=False,  # the return code is asserted below (report stderr on failure)
-    )
-    assert completed.returncode == 0, completed.stderr
-    return json.loads(completed.stdout)
+    """Read the shipped settle values from a FRESH in-process import with a controlled
+    env so ambient CORTEX_* variables on the dev desktop cannot mask the behavior
+    under test. WP-H DELTA 1 (m2): the former ``sys.executable -c`` child probe is
+    replaced by the in-process fresh import (no subprocess at all)."""
+    from fresh_backend_import import fresh_backend
+
+    module = fresh_backend({} if env_value is None else {"CORTEX_MOVE_SETTLE_MS": env_value})
+    return {"ms": module.MOVE_SETTLE_MS, "seconds": module._MOVE_SETTLE_SECONDS}
 
 
 def test_shipped_settle_default_is_the_legacy_50ms() -> None:

@@ -296,24 +296,10 @@ def test_timed_move_to_current_position_issues_one_move(
 
 
 def _probe_env(env_name: str, value: str, expression: str) -> str:
-    import os
-    import subprocess
-    import sys
+    from fresh_backend_import import fresh_backend
 
-    source_root = str(backend_module.__file__).rsplit(os.sep + "computer_use_mcp", 1)[0]
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CORTEX_")}
-    env["PYTHONPATH"] = source_root
-    env[env_name] = value
-    completed = subprocess.run(
-        [sys.executable, "-c", f"import computer_use_mcp.backend as b; print({expression})"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=120,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    return completed.stdout.strip()
+    module = fresh_backend({env_name: value})
+    return str(eval(expression, {"b": module}))  # noqa: S307 - test-authored expression
 
 
 @pytest.mark.parametrize(

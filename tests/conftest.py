@@ -7,12 +7,46 @@ name ``conftest`` is ambiguous between ``tests/`` and ``tests/e2e/``.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pytest
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp.backend import LocalComputerBackend
+
+
+@pytest.fixture(autouse=True)
+def hermetic_desktop_tripwire(request: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """WP-H: the offline suite must never touch the user's desktop.
+
+    Whenever ``CUMCP_RUN_E2E != "1"`` (i.e. in EVERY offline gate run), every real
+    desktop EFFECT entry point — the backend's ``_user32`` effect functions,
+    GUI-app ``subprocess.Popen``/``os.startfile`` launches, and every importable
+    ``pyautogui`` effect function — raises
+    :class:`desktop_tripwire.RealDesktopEffectInOfflineSuite` naming the call and
+    this test node, instead of acting. Read-only Win32 calls stay allowed.
+
+    Installed by an autouse fixture, so it is armed BEFORE the test's own
+    fixtures run: a test that installs its own stub at or above these points
+    (``monkeypatch.setattr(backend_module, "_user32", fake)``, a patched
+    ``engine._dispatch``) overrides the tripwire by ordinary monkeypatch ordering
+    and keeps working unchanged. Live desktop tests opt out with the shared
+    ``LIVE_DESKTOP`` marker (tests/desktop_tripwire.py) — they are skipped in
+    offline runs and run only under CUMCP_RUN_E2E=1 (the WP12 live gate).
+    """
+    if os.environ.get("CUMCP_RUN_E2E") == "1":
+        yield
+        return
+    from desktop_tripwire import assert_no_unexpected_trips, install_tripwire
+
+    install_tripwire(monkeypatch, request.node.nodeid)
+    yield
+    # DELTA 1 (M1): a trip whose exception was swallowed (backend._launch's
+    # degraded outcome, agent.run_single error kinds, focus_guard refocus errors,
+    # worker threads) still fails THIS test here — the trip was recorded even
+    # though the error never surfaced.
+    assert_no_unexpected_trips(request.node.nodeid)
 
 
 def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:

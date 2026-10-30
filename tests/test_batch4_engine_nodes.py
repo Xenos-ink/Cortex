@@ -109,19 +109,22 @@ def test_b4_5_every_numeric_env_helper_falls_back_on_nonfinite(
 def _run_env_probe(
     value: str, expression: str, *, key: str = "CORTEX_MOVE_BEND_PX"
 ) -> subprocess.CompletedProcess[str]:
-    source_root = str(Path(backend_module.__file__).resolve().parents[1])
-    env = {key_name: item for key_name, item in os.environ.items() if not key_name.startswith("CORTEX_")}
-    env["PYTHONPATH"] = source_root
-    env[key] = value
-    return subprocess.run(
-        [sys.executable, "-c", f"import computer_use_mcp.backend as b; print({expression})"],
-        cwd=str(Path(source_root).parent),
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=120,
-        check=False,
-    )
+    from types import SimpleNamespace
+
+    from fresh_backend_import import fresh_backend
+
+    try:
+        import traceback
+
+        module = fresh_backend({key: value})
+        stdout = str(eval(expression, {"b": module}))  # noqa: S307 - test-authored expression
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    except Exception as exc:  # surfaced exactly like the former child's non-zero exit
+        return SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+        )
 
 
 @pytest.mark.parametrize("value", ["1e400", "9" * 400, "NaN", "Infinity", "-Infinity", "abc"])

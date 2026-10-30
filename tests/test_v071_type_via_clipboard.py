@@ -22,9 +22,10 @@ that preserves the user's clipboard content.
 from __future__ import annotations
 
 import ctypes
-import os
 
 import pytest
+from desktop_tripwire import LIVE_DESKTOP
+
 from recording_engine import RecordingEngine
 
 import computer_use_mcp.backend as backend_module
@@ -54,13 +55,10 @@ WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="require
 # Everything they pin that is testable WITHOUT the OS is pinned offline by the stubbed
 # equivalents below (the F-01 code-unit sizing on the recording kernel32 fake, the
 # stubbed-OS astral roundtrip, and the refused-write-never-opens ordering).
-LIVE_CLIPBOARD = pytest.mark.skipif(
-    os.environ.get("CUMCP_RUN_E2E") != "1",
-    reason=(
-        "touches the REAL system clipboard; live opt-in only "
-        "(CUMCP_RUN_E2E=1, the tests/e2e / WP12 live gate)"
-    ),
-)
+# WP-H: LIVE_CLIPBOARD is now the SHARED LIVE_DESKTOP marker
+# (tests/desktop_tripwire.py) — one gate and one reason for every real-desktop test
+# (real input, real system clipboard, real app launches).
+LIVE_CLIPBOARD = LIVE_DESKTOP
 
 
 # --- helpers ----------------------------------------------------------------------------------------

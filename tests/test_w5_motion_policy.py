@@ -68,22 +68,17 @@ def _click(point: tuple[int, int], **kw: Any) -> GroundedAction:
 
 
 def _env_probe(env: dict[str, str], expression: str) -> str:
-    """Evaluate ``expression`` in a FRESH interpreter with a controlled env.
+    """Evaluate ``expression`` against a FRESH in-process import with a controlled env.
 
-    The bands are evaluated once at import, so a subprocess is the only way to prove
-    a band's edge (the established pattern in tests/test_move_settle_policy.py).
+    The bands are evaluated once at import, so a fresh module execution is the way to
+    prove a band's edge. WP-H DELTA 1 (m2): the former ``sys.executable -c`` child
+    probe is replaced by the in-process fresh import (no subprocess at all).
     """
-    source_root = str(backend_module.__file__).rsplit(os.sep + "computer_use_mcp", 1)[0]
-    completed = subprocess.run(
-        [sys.executable, "-c", f"import computer_use_mcp.backend as b; print({expression})"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=120,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    return completed.stdout.strip()
+    from fresh_backend_import import fresh_backend
+
+    overrides = {k: v for k, v in env.items() if k != "PYTHONPATH"}
+    module = fresh_backend(overrides)
+    return str(eval(expression, {"b": module}))  # noqa: S307 - test-authored expression
 
 
 def _clean_env(**overrides: str) -> dict[str, str]:

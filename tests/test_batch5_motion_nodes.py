@@ -32,21 +32,10 @@ WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="require
 
 
 def _env_probe(key: str, value: str, expression: str) -> str:
-    source_root = str(Path(backend_module.__file__).resolve().parents[1])
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CORTEX_")}
-    env["PYTHONPATH"] = source_root
-    env[key] = value
-    completed = subprocess.run(
-        [sys.executable, "-c", f"import computer_use_mcp.backend as b; print({expression})"],
-        cwd=str(Path(source_root).parent),
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=120,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    return completed.stdout.strip()
+    from fresh_backend_import import fresh_backend
+
+    module = fresh_backend({key: value})
+    return str(eval(expression, {"b": module}))  # noqa: S307 - test-authored expression
 
 
 @pytest.mark.parametrize(

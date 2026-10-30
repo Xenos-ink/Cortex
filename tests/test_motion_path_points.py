@@ -428,31 +428,17 @@ def test_shipped_env_defaults_match_the_rfc() -> None:
     so the internal constant is a fail-safe (0 = an instant jump) rather than a
     300 ms behaviour; ``move_duration`` was already 0 and stays 0.
     """
-    import json
-    import os
-    import subprocess
-    import sys
+    from fresh_backend_import import fresh_backend
 
-    source_root = str(backend_module.__file__).rsplit(os.sep + "computer_use_mcp", 1)[0]
-    probe = (
-        "import json; from computer_use_mcp import backend as b; "
-        "print(json.dumps({"
-        "'move_duration': b.MOVE_DURATION_MS, 'plan_move_duration': b.PLAN_MOVE_DURATION_MS, "
-        "'shape': b.MOVE_SHAPE, 'bend': b.MOVE_BEND_PX, 'easing': b.MOVE_EASING, "
-        "'interval': b.PLAN_SAMPLE_INTERVAL_MS}))"
-    )
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CORTEX_")}
-    env["PYTHONPATH"] = source_root
-    completed = subprocess.run(
-        [sys.executable, "-c", probe],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=120,
-        check=False,  # the return code is asserted below (report stderr on failure)
-    )
-    assert completed.returncode == 0, completed.stderr
-    shipped = json.loads(completed.stdout)
+    module = fresh_backend({})
+    shipped = {
+        "move_duration": module.MOVE_DURATION_MS,
+        "plan_move_duration": module.PLAN_MOVE_DURATION_MS,
+        "shape": module.MOVE_SHAPE,
+        "bend": module.MOVE_BEND_PX,
+        "easing": module.MOVE_EASING,
+        "interval": module.PLAN_SAMPLE_INTERVAL_MS,
+    }
     assert shipped == {
         "move_duration": 0,
         "plan_move_duration": 0,  # SPEC 5.2: the model must state it (WP7 consumes)

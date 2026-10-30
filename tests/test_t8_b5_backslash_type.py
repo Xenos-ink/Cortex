@@ -21,13 +21,17 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from typing import Any
 
 import pytest
+from desktop_tripwire import LIVE_DESKTOP
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp.backend import (
     FakeComputerBackend,
     LocalComputerBackend,
+    _INPUT,
+    _key_event,
     _text_to_key_units,
     find_window_by_title,
 )
@@ -102,6 +106,7 @@ def test_follow_ups_chain_with_backslash_path_type_runs_to_completion() -> None:
 
 
 @pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="Real Win32 dispatch requires Windows.")
+@LIVE_DESKTOP
 def test_real_dispatch_of_backslash_path_completes_under_a_second(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -151,3 +156,71 @@ def test_real_dispatch_of_backslash_path_completes_under_a_second(
     assert result["error"] is None, f"B5 real-dispatch worker failed: {result['error']}"
     assert result["done"] is True, "B5 STALL REPRODUCED: the path type did not finish in 30 s"
     assert result["elapsed"] < 1.0, f"path typing took {result['elapsed']:.2f}s (must be <1s)"
+
+
+# --- WP-H offline twin of the gated live dispatch ----------------------------------------------------
+#
+# The live test above (LIVE_DESKTOP-gated) launches a real Notepad and types through
+# the real SendInput engine; the offline suite must never do that. What it pins that
+# IS offline-provable — the exact incident payload driven through the REAL
+# SendInputEngine.type_text batching path completes promptly and delivers the full
+# down+up VK_PACKET INPUT array — is pinned here with the OS call stubbed at the
+# LOWEST seam (backend_module._user32.SendInput; array construction, chunking,
+# failsafe check and pacing all stay real).
+
+
+class _RecordingSendInputUser32:
+    """user32 stand-in: records SendInput batches AND serves the failsafe pre-check.
+
+    ``GetCursorPos``/``GetSystemMetrics`` feed ``get_cursor_position`` /
+    ``_primary_screen_size`` — so the engine's REAL failsafe corner check runs
+    against a controlled cursor (screen 1920x1080, cursor at 960, 540 = no corner).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, bytes]] = []
+
+    def SendInput(self, count: int, array: Any, size: int) -> int:
+        self.calls.append((count, bytes(array)))
+        return count
+
+    def GetCursorPos(self, lp_point: Any) -> int:
+        point = lp_point._obj
+        point.x, point.y = 960, 540  # center: NOT a failsafe corner
+        return 1
+
+    def GetSystemMetrics(self, index: int) -> int:
+        return (1920, 1080)[index]
+
+
+def test_offline_twin_backslash_path_through_real_sendinput_batching_completes_under_a_second(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What this OFFLINE twin proves: the exact incident payload, driven through the
+    REAL ``SendInputEngine.type_text`` production path (chunking, failsafe pre-check
+    served by this fake's cursor/screen, per-chunk pacing), completes promptly
+    (<1 s) and delivers the complete INPUT array in ONE batched SendInput call —
+    one down+up VK_PACKET pair per code unit, byte-identical to ``_key_event`` over
+    ``_text_to_key_units``, backslashes included.
+
+    What ONLY the LIVE_DESKTOP-gated real-dispatch node proves: the B5 activation
+    race against a REAL window (win+r/activation topology) — a real OS stall can
+    never be reproduced with the OS call stubbed, by construction.
+    """
+    fake_user32 = _RecordingSendInputUser32()
+    monkeypatch.setattr(backend_module, "_user32", fake_user32)
+    engine = backend_module.SendInputEngine()
+
+    started = time.perf_counter()
+    engine.type_text(INCIDENT_TEXT)
+    elapsed = time.perf_counter() - started
+
+    units = _text_to_key_units(INCIDENT_TEXT)
+    expected_array = (_INPUT * len(units))(*[_key_event(vk, scan, flags) for vk, scan, flags in units])
+    assert len(fake_user32.calls) == 1, (
+        f"expected ONE batched SendInput call, got {len(fake_user32.calls)}"
+    )
+    count, raw = fake_user32.calls[0]
+    assert count == 2 * len(INCIDENT_TEXT)  # down+up per code unit, nothing dropped
+    assert raw == bytes(expected_array)  # the exact INPUT array, backslashes included
+    assert elapsed < 1.0, f"offline batching took {elapsed:.3f}s (must be <1s)"
