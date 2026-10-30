@@ -104,6 +104,20 @@ from .checkpoint_manager import (
     CheckpointValidationError,
 )
 from .context_manager import ContextManager
+from .evidence import (
+    EVIDENCE_REFUSE_DISPOSED,
+    EVIDENCE_STORE_KEY,
+    FETCH_FRESHNESS_NOTE,
+    RETIRE_AGE_CAP,
+    RETIRE_BYTE_CAP,
+    RETIRE_COUNT_CAP,
+    EvidenceLookup,
+    EvidenceStore,
+    dispose_store,
+    evidence_store,
+    new_store,
+    register_frame,
+)
 from .interference import parse_interference
 from .limits import LimitEnforcer, LimitExceeded, Limits
 from .long_running import LongRunningRuntime
@@ -341,6 +355,14 @@ def _close_stopped_bundle(
         # WP6: cancel-and-detach the session's waits while the teardown is atomic
         # (cancel flags set + registries cleaned under ``_lock``, before the pop).
         cancelled_wait_handles = _cancel_all_waits(session_id)
+        # WP5: dispose the evidence store HERE, inside the locked teardown and BEFORE
+        # the bundle is popped — this is the ONE session-end path (stop_session, the
+        # WP-S idle reaper and the internal kill path all funnel through
+        # ``_close_stopped_bundle``), so disposal happens exactly once.  Disposal both
+        # empties the store object and REMOVES the key from ``extra``, so a suspended
+        # tool call resuming after the pop cannot find a store — the resurrection race
+        # dies here.  A second call finds no key and releases nothing (exactly-once).
+        released_frames = dispose_store(bundle.extra)
         snapshot: dict[str, Any] = {}
         try:
             snapshot = {
@@ -356,6 +378,10 @@ def _close_stopped_bundle(
         _remember_stopped(session_id, snapshot)
         _bundles.pop(session_id, None)
         _registry.remove(session_id)
+    if released_frames:
+        logger.debug(
+            "evidence store disposed on stop; released %d frame(s)", released_frames
+        )
     return cancelled_wait_handles
 
 
@@ -1979,6 +2005,14 @@ def start_session(
                 "max_retries_per_action": max_retries_per_action,
                 "interference_policy": interference_policy,
                 "image_delivery": image_mode,
+                # WP5: the evidence store is created HERE, once, next to the
+                # image_delivery key — never lazily on first use.  ``extra`` is an
+                # unsynchronised dict that is never copied, so a lazily-created key
+                # could be re-created by a tool call resuming after a teardown already
+                # popped the bundle from ``_bundles``.  A missing key therefore means
+                # "this session is gone", and every evidence hook treats it as exactly
+                # that: it writes nothing and creates nothing.
+                EVIDENCE_STORE_KEY: new_store(session_id, image_delivery=image_mode),
             },
         )
     try:
@@ -2013,6 +2047,10 @@ def start_session(
             runtime = _build_runtime(bundle, goal="", resume_bundle=resume_bundle)
         except Exception as exc:  # noqa: BLE001 - typed refusal, never a partial restore
             with _lock:
+                # WP5: the bundle was already created (with its evidence store), so a
+                # failed resume start is a session END — dispose the store exactly
+                # once before the bundle is dropped, like every other end path.
+                dispose_store(bundle.extra)
                 _bundles.pop(session_id, None)
             _registry.remove(session_id)
             return _resume_error_response(exc, resume_from_checkpoint)
@@ -3173,6 +3211,9 @@ def computer_observe(
     # UNCHANGED stock ladder.
     view_scale: float | None = None
     if view_provider is None or view_provider.passthrough:
+        # WP5 (VAL-WP5 F1): the RAW capture is what this reply carries — exactly the
+        # bytes the evidence store keeps (pre-ladder, so a fetch re-runs the ladder).
+        carried_b64 = observation.image_base64
         outbound_b64, outbound_mime, image_scale = _bound_outbound_image(
             # R-5 (W4): the capture-time frame (backend stash) skips the PNG re-decode on
             # the JPEG ladder; absent (fakes/legacy) the path decodes exactly as before.
@@ -3193,6 +3234,9 @@ def computer_observe(
             return _view_derive_failed(str(exc))
         except Exception as exc:  # noqa: BLE001 - fail-closed: typed error, no traceback
             return _view_derive_failed(f"{type(exc).__name__}: {exc}")
+        # WP5 (VAL-WP5 F1): the DERIVED view (grid labels and all) is what this reply
+        # carries — the store keeps exactly these bytes, never the raw capture.
+        carried_b64 = encoded_b64
     metadata = {
         # §1.1 (ORVEX-2026-108): ok + message on EVERY reply — here ok means "served
         # as requested" (a read-only surface carries no result token, §1.3).
@@ -3225,6 +3269,21 @@ def computer_observe(
         metadata["spatial_text"] = spatial_block
         if spatial_block is None:
             metadata["spatial_text_available"] = False  # degraded UIA read (honest)
+    # WP5: THIS reply is committed to carrying the image — the hook runs HERE, after
+    # every late failure return above (a ``_view_derive_failed`` from the spatial-text
+    # block stores nothing — VAL-WP5 F2), so the frame retained is EXACTLY the bytes
+    # the reply carried (raw capture or derived view, pre-ladder — VAL-WP5 F1), and
+    # the reply gains the additive image_id keys naming it.
+    metadata.update(
+        _record_observation_evidence(
+            bundle,
+            observation,
+            source="computer_observe",
+            digest=digest,
+            payload=carried_b64,
+            visual_view=view_provider.id if view_provider is not None else None,
+        )
+    )
     return [
         TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
         ImageContent(type="image", data=outbound_b64, mimeType=outbound_mime),
@@ -3436,6 +3495,21 @@ def computer_zoom(
         "visual_view_scale": view_scale,
         "spatial_text": zoom_block,
     }
+    # WP5: the CROP this reply carries is what is retained (pre-ladder, so a later
+    # fetch re-runs the outbound ladder honestly), and the crop region rides along so
+    # the frame's own coordinates are never mistaken for full-screen coordinates.
+    # The text-mode branch above stores nothing — that reply carries no image.
+    metadata.update(
+        _record_observation_evidence(
+            bundle,
+            observation,
+            source="computer_zoom",
+            digest=digest,
+            payload=encoded_b64,
+            crop_region=(left, top, width, height),
+            visual_view=view_id,
+        )
+    )
     if zoom_block is None:
         metadata["spatial_text_available"] = False  # degraded UIA read (honest)
     return [
@@ -3881,6 +3955,27 @@ async def computer_execute(
                         f"view_derive_failed: {type(exc).__name__}: {exc}"
                     )
                     return response
+        # WP5: THIS reply is about to carry the post-action image, so the frame is
+        # retained HERE — after every early return that ends in a reply WITHOUT the
+        # image (rejection, approval, opt-out pop, text mode, view-derive failure) —
+        # and the reply gains the additive image_id keys.  The bytes retained are
+        # EXACTLY the bytes the reply carries (VAL-WP5 F1): the DERIVED view payload
+        # when an explicit non-raw view was served, otherwise the raw post-action
+        # capture — both pre-ladder, so a later fetch re-runs the ladder honestly.
+        # ``register_frame`` reads the store key and never creates it, so a teardown
+        # that already ran writes nothing instead of resurrecting a store.
+        carried_b64 = (
+            str(view_payload[0]) if view_payload is not None else str(response["screenshot_after_base64"])
+        )
+        response.update(
+            register_frame(
+                bundle.extra,
+                payload=carried_b64,
+                source="computer_execute",
+                attached=True,
+                visual_view=view_id,
+            )
+        )
         return _execute_response_blocks(
             response,
             frame=frame,
@@ -3889,6 +3984,263 @@ async def computer_execute(
             view_payload=view_payload,
         )
     return response
+
+
+# --- WP5: the evidence store's server seam ---------------------------------------------------
+# Capture hooks + ``computer_fetch_image``.  The retention rule for the stable tree
+# is ONE sentence: **a frame is retained iff THIS reply carries it.**  A reply that
+# carries no image (text mode, an opt-out, a rejection, a failure return) stores
+# nothing and carries no evidence keys — "no image in this reply" IS "nothing kept".
+# Every hook runs at the point where the reply is already committed to carrying the
+# image, after every early return that ends in an image-less reply.
+
+
+def _record_observation_evidence(
+    bundle: "_SessionBundle",
+    observation: Any,
+    *,
+    source: str,
+    digest: str,
+    payload: str | None = None,
+    crop_region: Any = None,
+    visual_view: str | None = None,
+) -> dict[str, Any]:
+    """Retain the freshly captured frame an observe-family reply carries.
+
+    ``payload`` overrides what is stored — and MUST be exactly the bytes the reply
+    carries (VAL-WP5 F1): the zoom path stores the CROP it served, the observe path
+    stores the carried derived view (grid) or the raw capture (raw/absent request).
+    Both are the PRE-ladder bytes, never the post-ladder copy, so a later fetch can
+    re-run the budget ladder and report an honest ``image_outbound_scale``.  The
+    frame's width/height come from the Observation; the zoom's crop carries the
+    crop region so its coordinates are never mistaken for full-screen ones, and
+    ``visual_view`` records the derived view the frame shows (a fetched image is
+    self-describing).
+    """
+    return register_frame(
+        bundle.extra,
+        payload=payload if payload is not None else observation.image_base64,
+        source=source,
+        attached=True,
+        width=observation.width,
+        height=observation.height,
+        digest=digest,
+        observation_id=observation.observation_id,
+        coordinate_scale_x=observation.coordinate_scale_x,
+        coordinate_scale_y=observation.coordinate_scale_y,
+        coordinate_space=getattr(observation.coordinate_space, "value", None),
+        crop_region=crop_region,
+        visual_view=visual_view,
+        redactions_applied=observation.redactions_applied,
+    )
+
+
+# WP7-SEAM(evidence-by-backend): the store read API WP7 consumes already exists —
+# ``EvidenceStore.captures()`` (evidence.py) returns bounded per-frame metadata for
+# every retained capture, on BOTH backends (it is filled by the reply hooks above,
+# never by backend-specific attributes — no fake-only ``executed``/``observed``
+# reads, S-03).  WP7 builds the plan-step/terminal ``evidence_by_backend`` block from
+# ``evidence_store(bundle.extra).captures()`` (captures) + the plan lease (repositions)
+# and publishes it on every plan step and terminal plan reply; this marker is the ONE
+# place that work hooks into the server.  Nothing else about plans exists yet (WP7).
+
+
+#: Rejection wording for ``computer_fetch_image`` (unified contract §1.3: a fetch
+#: refusal is a ``rejected`` reply whose ``reasons`` name the typed error).
+_EVIDENCE_NOT_FOUND_MESSAGE = (
+    "No stored image with this image_id exists on this session. Image ids are "
+    "session-scoped, live in memory only, and a frame is dropped when it falls "
+    "outside the session's retention bounds — so a wrong id, another session's id, "
+    "and an id whose frame was already retired are indistinguishable by design."
+)
+
+_EVIDENCE_STORE_DISPOSED_MESSAGE = (
+    "This session's evidence store is no longer available: the session is being "
+    "torn down or was already stopped, so no stored frame can be served. Start a "
+    "new session and capture again if you need the screen."
+)
+
+_EVIDENCE_FRAME_TOO_LARGE_MESSAGE = (
+    "The stored frame exceeds this session's evidence byte ceiling, so it cannot "
+    "be served. This is a fail-closed guard; capture a fresh observation instead."
+)
+
+#: Which retention policy retired a frame, in the words the model reads.
+_EVIDENCE_RETIRE_POLICIES = {
+    RETIRE_COUNT_CAP: "the frame count cap",
+    RETIRE_BYTE_CAP: "the byte cap",
+    RETIRE_AGE_CAP: "the age cap",
+}
+
+
+def _evidence_rejection(error: str, message: str, **extra: Any) -> dict[str, Any]:
+    """The fetch rejection envelope (§1.1): ok:false, result:"rejected", a non-empty
+    ``reasons`` list naming the typed error, and NO ``error`` key."""
+    payload: dict[str, Any] = {
+        "ok": False,
+        "result": "rejected",
+        "message": message,
+        "reasons": [error],
+    }
+    payload.update(extra)
+    return payload
+
+
+async def _fetch_image_response(store: EvidenceStore, image_id: str) -> Any:
+    """Resolve one id against THIS session's store and shape the reply.
+
+    The outcomes are distinguishable answers: a frame that is still here is served
+    (``verified`` + the image + ``image_outbound_scale``); a frame a retention policy
+    retired answers ``image_expired`` naming WHICH policy; a store disposed under the
+    lookup answers ``store_disposed`` ATOMICALLY (VAL-WP5 F3 — the disposal check
+    shares the store lock, so a fetch racing the teardown can never answer
+    ``image_not_found`` for a frame that existed a moment ago); and an id that never
+    existed — a malformed id, and another session's id alike — answers
+    ``image_not_found``, byte-identical in those forms, so a wrong id can never probe
+    which ids exist in another session.
+    """
+    lookup: EvidenceLookup = store.lookup(image_id)
+    if lookup.outcome == "not_found":
+        # Byte-identical for a malformed id, an id that never existed, and another
+        # session's id.  The message deliberately does NOT echo the value and does
+        # NOT distinguish the three cases.
+        return _evidence_rejection("image_not_found", _EVIDENCE_NOT_FOUND_MESSAGE)
+    if lookup.outcome == "disposed":
+        # Atomic with the frame read under the store lock (VAL-WP5 F3).
+        return _evidence_rejection(
+            EVIDENCE_REFUSE_DISPOSED, _EVIDENCE_STORE_DISPOSED_MESSAGE
+        )
+    if lookup.outcome == "expired":
+        # Name WHICH policy retired it and the session's bounds, so the model can
+        # tell "ask sooner" from "ask less".
+        policy = _EVIDENCE_RETIRE_POLICIES.get(lookup.reason or "", "a retention policy")
+        retention = store.retention()
+        return _evidence_rejection(
+            "image_expired",
+            f"This frame is no longer available: it was retired by {policy}. This "
+            f"session's retention bounds are {retention['max_frames']} frames, "
+            f"{retention['max_bytes']} bytes, {retention['max_age_seconds']} s. "
+            "Capture a new observation if you need to see the screen again.",
+            retired_by=lookup.reason,
+            evidence_retention=retention,
+        )
+    frame = lookup.frame
+    assert frame is not None  # lookup() only returns "found" with a frame
+    if frame.byte_size > store.max_bytes:
+        # Fail-closed guard: a frame larger than the session's byte ceiling can never
+        # have been stored through ``store()``; refuse rather than serve oversize.
+        return _evidence_rejection(
+            "frame_too_large",
+            _EVIDENCE_FRAME_TOO_LARGE_MESSAGE,
+            evidence_retention=store.retention(),
+        )
+    # The PRE-ladder original is re-bounded NOW, so the scale reported is the scale
+    # of the bytes actually being returned and a frame stored under the budget is
+    # served at its original resolution.  VAL-WP5 F5: the PIL re-encode ladder runs
+    # OFF the event-loop thread via asyncio.to_thread — the loop stays responsive
+    # while a large frame is encoded (pinned by a blocked-encode test).
+    bounded_b64, mime_type, applied_scale = await asyncio.to_thread(
+        _bound_outbound_image, frame.image_base64
+    )
+    metadata: dict[str, Any] = {
+        "ok": True,
+        "result": "verified",
+        "message": "Stored frame served (a stored capture is not necessarily current).",
+        "session_id": frame.session_id,
+        "image_id": frame.image_id,
+        "image_format": mime_type,
+        IMAGE_OUTBOUND_SCALE_KEY: applied_scale,
+        "captured_at": frame.captured_at,
+        "age_seconds": store.age_seconds(frame.image_id),
+        "width": frame.width,
+        "height": frame.height,
+        "bytes": frame.byte_size,
+        "source": frame.source,
+        "observation_id": frame.observation_id,
+        "digest": frame.digest,
+        "coordinate_scale_x": frame.coordinate_scale_x,
+        "coordinate_scale_y": frame.coordinate_scale_y,
+        "coordinate_space": frame.coordinate_space,
+        "crop_region": list(frame.crop_region) if frame.crop_region else None,
+        # VAL-WP5 F1: the derived view this frame shows (grid etc.) — a fetched
+        # image is self-describing; None for a raw capture.
+        "visual_view": frame.visual_view,
+        "redactions_applied": frame.redactions_applied,
+        "evidence_retention": store.retention(),
+        "freshness_note": FETCH_FRESHNESS_NOTE,
+    }
+    return [
+        TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
+        ImageContent(type="image", data=bounded_b64, mimeType=mime_type),
+    ]
+
+
+@mcp.tool()
+@_session_scoped
+async def computer_fetch_image(session_id: str, image_id: str) -> Any:
+    """Re-serve a frame this session captured earlier, by id.
+
+    Every capture THIS SESSION'S REPLIES actually carry (computer_observe,
+    computer_screenshot, computer_zoom, computer_execute) is retained under a unique
+    ``image_id`` published on that same reply — EXACTLY the bytes the reply carried
+    (for a derived visual view, the derived image with its labels, not the raw
+    capture).  This tool hands that exact frame back to you as a real image block,
+    with its metadata.  It never auto-sends: nothing is fetched until you ask, by id.
+
+    THE MANDATORY SCENARIO: capture -> read the ``image_id`` off the reply -> decide
+    you must look at that frame again -> call this tool.  This is how you re-examine
+    something you skimmed past, or re-check a step's evidence after doing something
+    else.
+
+    A FETCHED IMAGE IS NOT NECESSARILY CURRENT.  Read ``captured_at`` and
+    ``age_seconds`` before you treat it as present truth — it is a picture of the
+    screen at the moment it was captured, and anything you have done since then is
+    not in it.  When you need to know what is on screen NOW, call
+    ``computer_observe``; use this tool to look back, never to look forward.
+
+    The verified reply carries ``image_id``, ``captured_at``, ``age_seconds``, the
+    stored ``width``/``height``, ``image_format``, the ``image_outbound_scale`` of
+    the copy you are being returned NOW, the source ``observation_id``/``digest``,
+    the ``visual_view`` when the frame is a derived view, the ``crop_region`` when
+    the frame came from ``computer_zoom``, and the session's retention bounds.
+
+    RETENTION: 16 frames / 24 MB / 3600 s per session, in memory only.  The oldest
+    frame is dropped when a cap is exceeded and every frame is dropped when the
+    session ends (stop_session, the idle timeout, or the server restarting).
+
+    REJECTED REPLIES (ok:false, result:"rejected", ``reasons`` names the error):
+    ``image_not_found`` — the id does not exist on THIS session.  An id belonging to
+    a different session and a malformed id return the BYTE-IDENTICAL reply, so a
+    wrong id can never probe another session's images.  ``image_expired`` — the
+    frame was retired by the count, byte or age cap; ``retired_by`` names which.
+    ``store_disposed`` — the session's store is already gone (teardown).  A stopped
+    session returns ``session_stopped`` and an unknown one ``unknown_session``.
+
+    This tool can never return a ``RAW:`` placeholder: a text-delivery session
+    (``start_session(image_delivery="text")``) has no image bytes at all, so no id
+    is ever issued on one.
+    """
+    try:
+        bundle = _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    # WP7-SEAM(fetch-lease): a fetch is a READ-ONLY retrieval of evidence this
+    # session already holds — it is ALLOWED while a plan lease is active (S-04) and
+    # must stay allowed.  WP7 must NOT add a lease refusal here (the observe/zoom
+    # lease-refusal placement deliberately does NOT extend to this tool); if WP7's
+    # plan machinery needs to gate anything on this surface, gate only writes.
+    store = evidence_store(bundle.extra)
+    if store is None:
+        # Fail-closed: a live session always has a store (written at bundle
+        # construction), so reaching here means the bundle is mid-teardown — the
+        # exactly-once disposal already popped the key.  The answer is the typed
+        # disposed refusal, never a partial image and never a resurrection; a store
+        # disposed BETWEEN this check and the lookup is caught atomically by the
+        # lookup itself (VAL-WP5 F3 — same lock as the frame read).
+        return _evidence_rejection(
+            EVIDENCE_REFUSE_DISPOSED, _EVIDENCE_STORE_DISPOSED_MESSAGE
+        )
+    return await _fetch_image_response(store, image_id)
 
 
 def main() -> None:

@@ -49,6 +49,7 @@ from computer_use_mcp.state import SessionRegistry
 # as the sixth, observation-only tool; the no-anyOf walk covers it identically.
 # RESTATED (ORVEX-2026-108 WP6, decision D-1): the wait family — ``computer_wait``,
 # ``computer_cancel_wait``, ``computer_wait_status`` — joins as tools 7-9.
+# RESTATED (ORVEX-2026-108 WP5): ``computer_fetch_image`` joins as the tenth.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
@@ -59,6 +60,7 @@ ALL_TOOLS = (
     "computer_wait",
     "computer_cancel_wait",
     "computer_wait_status",
+    "computer_fetch_image",
 )
 
 
@@ -158,7 +160,7 @@ def test_pin_a_no_anyof_in_any_tool_input_schema(fresh_server: Any) -> None:
     live client-side validator rejected. This pin walks the FULL inputSchema of
     each tool (nested, including $defs) through the REAL FastMCP tool metadata.
     """
-    assert len(ALL_TOOLS) == 9  # six deterministic/observation tools + the WP6 wait family (D-1)
+    assert len(ALL_TOOLS) == 10  # six deterministic/observation + wait family (D-1) + fetch (WP5)
     total_hits: list[str] = []
     for name in ALL_TOOLS:
         schema = _meta(name).arg_model.model_json_schema()

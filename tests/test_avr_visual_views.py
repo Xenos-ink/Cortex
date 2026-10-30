@@ -87,6 +87,26 @@ STOCK_IMAGE_KEYS = [
     "image_outbound_scale",
     "text_summary",
 ]
+#: RESTATED (ORVEX-2026-108 WP5): every image-BEARING observe/zoom reply now also
+#: carries the evidence block — the capture the reply actually carries is retained
+#: and the reply names its id.  Additive keys only, appended in this order after the
+#: stock keys (the text-mode shapes carry NONE of these: a reply with no image stores
+#: nothing).  Nothing was removed or reordered — the AL-002 stock-key pin holds
+#: exactly for the stock prefix; these keys come from the evidence store, not from
+#: the visual-view layer.
+EVIDENCE_IMAGE_KEYS = [
+    "image_stored",
+    "image_attached",
+    "image_id",
+    "image_captured_at",
+    "image_age_seconds",
+    "image_bytes",
+    "image_width",
+    "image_height",
+    "evidence_retention",
+    "evidence_source",
+    "evidence_fetch",
+]
 STOCK_TEXT_KEYS = [
     "ok",
     "message",
@@ -244,15 +264,18 @@ def observe_metadata(blocks: Any) -> dict[str, Any]:
 # --- item 1: raw representation compatibility (H19) ---------------------------------------------
 
 
-def test_item1_absent_request_observe_image_mode_byte_identical_shape(
+def test_item1_absent_request_observe_image_mode_stock_shape_with_additive_evidence_keys(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Absent visual_view: stock keys ONLY, stock image bytes, no spatial-text work."""
+    """Absent visual_view: stock keys ONLY + the WP5 additive evidence keys (the
+    carried capture is retained), stock image bytes, no spatial-text work."""
     session_id, bundle, backend = make_session(monkeypatch)
     blocks = server.computer_observe(session_id)
     assert len(blocks) == 2
     metadata = observe_metadata(blocks)
-    assert list(metadata.keys()) == STOCK_IMAGE_KEYS
+    assert list(metadata.keys()) == STOCK_IMAGE_KEYS + EVIDENCE_IMAGE_KEYS
+    assert metadata["image_stored"] is True
+    assert metadata["image_id"].startswith("img_")
     assert list(metadata["observation"].keys()) == STOCK_OBSERVATION_KEYS
     observation = backend.observed[-1]
     expected_b64, expected_mime, _expected_scale = server._bound_outbound_image(
@@ -311,12 +334,14 @@ def test_item1_explicit_raw_serves_stock_bytes_plus_additive_keys(
     assert explicit[1].data == absent[1].data
     assert explicit[1].mimeType == absent[1].mimeType
     # additive keys ONLY: stock keys unchanged and in order, then the additions
+    # (WP5 DELTA 1: the evidence block sits AFTER the view keys — the hook runs at
+    # the final return, so a late view failure can never leave an orphan frame)
     assert list(raw_meta.keys()) == STOCK_IMAGE_KEYS + [
         "visual_view",
         "visual_view_scale",
         "spatial_text",
         "spatial_text_available",  # degraded UIA read (ScriptedBackend carries no regions)
-    ]
+    ] + EVIDENCE_IMAGE_KEYS
     assert raw_meta["visual_view"] == "raw"
     assert raw_meta["visual_view_scale"] is None  # raw adds no view transform
     assert raw_meta["spatial_text"] is None
@@ -1272,7 +1297,7 @@ def test_a1_density_unknown_is_typed_error_raw_ignores_silently(
     absent_meta = observe_metadata(
         server.computer_observe(session_id, visual_view=None, visual_view_density="ultra")
     )
-    assert list(absent_meta.keys()) == STOCK_IMAGE_KEYS  # byte-identical default shape
+    assert list(absent_meta.keys()) == STOCK_IMAGE_KEYS + EVIDENCE_IMAGE_KEYS  # stock + WP5 evidence
     with pytest.raises(InvalidVisualViewError):
         resolve_density("ultra")
 
@@ -1291,6 +1316,8 @@ def test_a1_zoom_metadata_shape(fresh_server: Any, monkeypatch: pytest.MonkeyPat
         "ok", "message", "observation", "digest", "observation_id", "active_app", "image_format",
         "image_outbound_scale",
         "text_summary", "crop_region", "visual_view", "visual_view_scale", "spatial_text",
+        # WP5: the carried crop is retained, so the evidence block rides too.
+        *EVIDENCE_IMAGE_KEYS,
     ]
     assert meta["visual_view"] == "raw"  # the zoom default view
     assert meta["visual_view_scale"] == 1.0  # under the outbound budget: no ladder scale

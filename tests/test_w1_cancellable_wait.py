@@ -1112,12 +1112,13 @@ async def test_a_session_with_max_wait_seconds_zero_refuses_every_wait(
 
 async def test_expected_tools_matches_the_registered_surface(fresh_server: Any) -> None:
     """R17 / K-8 / B-2b: the drift guard.  6 -> 9 with the WP6 wait family
-    (decision D-1); ``computer_fetch_image`` is WP5's tenth and is NOT here yet."""
+    (decision D-1), 9 -> 10 with WP5's ``computer_fetch_image`` (the evidence
+    store's retrieval tool)."""
     registered = {tool.name for tool in await server.mcp.list_tools()}
     assert cli_module.EXPECTED_TOOLS == registered
     assert {"computer_wait", "computer_cancel_wait", "computer_wait_status"} <= registered
-    assert len(registered) == 9
-    assert "computer_fetch_image" not in registered
+    assert len(registered) == 10
+    assert "computer_fetch_image" in registered
 
 
 async def test_the_new_tools_advertise_no_anyof_and_no_ref() -> None:
