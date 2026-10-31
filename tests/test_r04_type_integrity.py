@@ -23,9 +23,9 @@ from __future__ import annotations
 import pytest
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import (
-    FakeComputerBackend,
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.input_engine as input_engine_module
+from computer_use_mcp.desktop.backend import (
     LocalComputerBackend,
     TextIntegrityError,
     _format_integrity_status,
@@ -34,6 +34,8 @@ from computer_use_mcp.backend import (
     _split_type_chunks,
     _typed_index_for_norm_len,
 )
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.input_engine import _text_to_key_units
 from computer_use_mcp.core.models import GroundedAction
 from computer_use_mcp.core.state import StopToken, TaskStopped
 
@@ -129,7 +131,7 @@ def test_split_type_chunks_keeps_astral_characters_whole() -> None:
     chunks = _split_type_chunks(text, 8)
     assert "".join(chunks) == text
     for chunk in chunks:
-        units = backend_module._text_to_key_units(chunk)
+        units = _text_to_key_units(chunk)
         scans = [scan for _vk, scan, _flags in units[::2]]
         pending_high = 0
         for scan in scans:
@@ -533,7 +535,10 @@ def test_fake_backend_type_integrity_contract() -> None:
 
 
 def test_fake_backend_type_integrity_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(backend_module, "TYPE_INTEGRITY_ENABLED", False)
+    # C-4: the driven reader is FakeComputerBackend — patch ITS binding.
+    from computer_use_mcp.desktop import fake_backend as fake_backend_module
+
+    monkeypatch.setattr(fake_backend_module, "TYPE_INTEGRITY_ENABLED", False)
     backend = FakeComputerBackend()
     assert backend.execute(_type_action("abc")) == "Simulated type."
     assert [item.action.value for item in backend.executed] == ["type"]
@@ -549,7 +554,7 @@ def test_chunks_reach_the_sendinput_engine_as_separate_batches(
     from test_io_parity import _ParityFakeUser32
 
     fake_user32 = _ParityFakeUser32()
-    monkeypatch.setattr(backend_module, "_user32", fake_user32)
+    monkeypatch.setattr(input_engine_module, "_user32", fake_user32)
     monkeypatch.setattr(backend_module, "TYPE_VERIFY_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(backend_module, "TYPE_CHUNK_CHARS", 3)
     monkeypatch.setattr(real_backend, "_engine", backend_module.SendInputEngine())

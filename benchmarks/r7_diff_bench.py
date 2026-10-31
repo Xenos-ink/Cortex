@@ -64,7 +64,7 @@ def _observe_frames(capture_env: str | None) -> tuple[Any, Any, dict[str, Any]]:
         os.environ["CORTEX_CAPTURE"] = capture_env
     else:
         os.environ.pop("CORTEX_CAPTURE", None)
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
     from computer_use_mcp.pipeline.verification import ScreenshotDiffStrategy
 
     backend = LocalComputerBackend()

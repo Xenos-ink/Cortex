@@ -65,7 +65,7 @@ def main() -> int:
     iters = max(3, args.iterations)
 
     # import server for _bound_outbound_image (importable; no server start)
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
     from computer_use_mcp.core.limits import LimitEnforcer, Limits
     from computer_use_mcp.vision.observation import observation_digest
     from computer_use_mcp.pipeline.verification import (

@@ -1,4 +1,4 @@
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import GroundedAction, SessionState
 from computer_use_mcp.security.safety import SafetyPolicy
 

@@ -23,7 +23,7 @@ from typing import Any
 
 from PIL import Image
 
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.focus_guard import InterferenceGuard
 from computer_use_mcp.desktop.interference import MODAL_DIALOG, parse_interference
 from computer_use_mcp.core.models import FailureClass, GroundedAction, Observation, WindowInfo

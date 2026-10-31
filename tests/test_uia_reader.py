@@ -18,14 +18,23 @@ from typing import Any
 
 import pytest
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import (
-    TextRegion,
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.text_readers as text_readers_module
+import computer_use_mcp.desktop.windows as windows_module
+from computer_use_mcp.desktop.text_readers import (
     UiaSemanticReader,
     Win32TextReader,
     _uia_snapshot_to_text_regions,
     _uia_snapshot_to_ui_elements,
 )
+from computer_use_mcp.desktop.win32 import (
+    _GW_CHILD,
+    _GW_HWNDNEXT,
+    _VARIANT,
+    _WM_GETTEXT,
+    _WM_GETTEXTLENGTH,
+)
+from computer_use_mcp.core.models import TextRegion
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 
@@ -36,26 +45,26 @@ _VT_ARRAY_R8 = 0x2000 | 5
 
 # 64-bit safety: these oleaut functions return POINTERS and must not be truncated to
 # c_int (the default restype) — the exact class of bug the real reader must avoid too.
-backend_module._oleaut32.SysAllocStringLen.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
-backend_module._oleaut32.SysAllocStringLen.restype = ctypes.c_void_p
-backend_module._oleaut32.SafeArrayCreateVector.argtypes = [ctypes.c_ushort, ctypes.c_long, ctypes.c_long]
-backend_module._oleaut32.SafeArrayCreateVector.restype = ctypes.c_void_p
+text_readers_module._oleaut32.SysAllocStringLen.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+text_readers_module._oleaut32.SysAllocStringLen.restype = ctypes.c_void_p
+text_readers_module._oleaut32.SafeArrayCreateVector.argtypes = [ctypes.c_ushort, ctypes.c_long, ctypes.c_long]
+text_readers_module._oleaut32.SafeArrayCreateVector.restype = ctypes.c_void_p
 
 
 def _bstr(text: str) -> int:
     """Real BSTR allocation (VariantClear frees it through the real oleaut)."""
-    return int(backend_module._oleaut32.SysAllocStringLen(text, len(text)) or 0)
+    return int(text_readers_module._oleaut32.SysAllocStringLen(text, len(text)) or 0)
 
 
 def _rect_safearray(values: tuple[float, float, float, float]) -> int:
     """Real SAFEARRAY of 4 doubles (the UIA BoundingRectangle representation)."""
-    psa = int(backend_module._oleaut32.SafeArrayCreateVector(5, 0, 4) or 0)  # VT_R8, 4 elems
+    psa = int(text_readers_module._oleaut32.SafeArrayCreateVector(5, 0, 4) or 0)  # VT_R8, 4 elems
     access = ctypes.c_void_p()
-    assert backend_module._oleaut32.SafeArrayAccessData(ctypes.c_void_p(psa), ctypes.byref(access)) == 0
+    assert text_readers_module._oleaut32.SafeArrayAccessData(ctypes.c_void_p(psa), ctypes.byref(access)) == 0
     target = ctypes.cast(access, ctypes.POINTER(ctypes.c_double))
     for index, value in enumerate(values):
         target[index] = value
-    assert backend_module._oleaut32.SafeArrayUnaccessData(ctypes.c_void_p(psa)) == 0
+    assert text_readers_module._oleaut32.SafeArrayUnaccessData(ctypes.c_void_p(psa)) == 0
     return psa
 
 
@@ -174,7 +183,7 @@ class _FakeUiaWorld:
         return self.factory.make_object(
             {
                 6: ((ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)), find_all),
-                10: ((ctypes.c_long, ctypes.POINTER(backend_module._VARIANT)), get_property_value),
+                10: ((ctypes.c_long, ctypes.POINTER(_VARIANT)), get_property_value),
             }
         )
 
@@ -201,7 +210,7 @@ def _install_fake_com(monkeypatch: pytest.MonkeyPatch, automation_ptr: int) -> N
         return 0
 
     monkeypatch.setattr(
-        backend_module,
+        text_readers_module,
         "_ole32",
         SimpleNamespace(
             CoInitializeEx=lambda _pv, _mode: 0,
@@ -296,7 +305,7 @@ def test_snapshot_to_text_regions_skips_rectless_and_empty() -> None:
 
 
 def test_uia_reader_degrades_when_ole32_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(backend_module, "_ole32", None)
+    monkeypatch.setattr(text_readers_module, "_ole32", None)
     reader = UiaSemanticReader()
     assert reader.warm() is False
     assert reader.read() is None
@@ -308,7 +317,7 @@ def test_uia_reader_degrades_on_activation_failure(monkeypatch: pytest.MonkeyPat
         return -2147467262  # E_NOINTERFACE (observed on hardened boxes)
 
     monkeypatch.setattr(
-        backend_module,
+        text_readers_module,
         "_ole32",
         SimpleNamespace(CoInitializeEx=lambda _pv, _mode: 0, CoCreateInstance=failing_create),
     )
@@ -330,8 +339,8 @@ def test_uia_reader_degrades_on_com_exception(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_win32_reader_not_available_without_windows(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(backend_module, "IS_WINDOWS", False)
-    monkeypatch.setattr(backend_module, "_user32", None)
+    monkeypatch.setattr(text_readers_module, "IS_WINDOWS", False)
+    monkeypatch.setattr(text_readers_module, "_user32", None)
     reader = Win32TextReader()
     assert reader.warm() is False
     assert reader.read() is None
@@ -386,10 +395,10 @@ class _FakeTextUser32:
 
     def GetWindow(self, hwnd: Any, flag: int) -> int:
         key = _hwnd_id(hwnd)
-        if flag == backend_module._GW_CHILD:
+        if flag == _GW_CHILD:
             chain = self.children.get(key, [])
             return chain[0] if chain else 0
-        if flag == backend_module._GW_HWNDNEXT:
+        if flag == _GW_HWNDNEXT:
             for siblings in self.children.values():
                 if key in siblings:
                     index = siblings.index(key)
@@ -404,9 +413,9 @@ class _FakeTextUser32:
         self, hwnd: Any, msg: int, _wparam: Any, lparam: Any, _flags: Any, _timeout: Any, result: Any
     ) -> int:
         text = self.texts.get(_hwnd_id(hwnd), "")
-        if msg == backend_module._WM_GETTEXTLENGTH:
+        if msg == _WM_GETTEXTLENGTH:
             return len(text)
-        if msg == backend_module._WM_GETTEXT:
+        if msg == _WM_GETTEXT:
             if lparam is not None:
                 lparam.value = text
             if result is not None:
@@ -424,7 +433,10 @@ class _FakeTextUser32:
 @pytest.fixture
 def fake_text_user32(monkeypatch: pytest.MonkeyPatch) -> _FakeTextUser32:
     fake = _FakeTextUser32()
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    # D3 dual patch: the driven reader chain reads the binding in BOTH modules —
+    # Win32TextReader (text_readers) and _window_class_name/_window_rect (windows).
+    monkeypatch.setattr(text_readers_module, "_user32", fake)
+    monkeypatch.setattr(windows_module, "_user32", fake)
     return fake
 
 
@@ -458,7 +470,7 @@ def test_win32_reader_text_regions_conversion(fake_text_user32: _FakeTextUser32)
 def test_win32_reader_degrades_when_no_foreground(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeTextUser32()
     fake.GetForegroundWindow = lambda: 0
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    monkeypatch.setattr(text_readers_module, "_user32", fake)
     assert Win32TextReader().read() is None
 
 

@@ -35,12 +35,13 @@ from __future__ import annotations
 
 from typing import Any
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp import backend as B
-from computer_use_mcp.backend import (
+import computer_use_mcp.desktop.backend as backend_module
+from computer_use_mcp.desktop import backend as B
+import computer_use_mcp.desktop.text_readers as text_readers_module
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.text_readers import (
     SNAPSHOT_DROPPED_KEY,
     UIA_MAX_ELEMENTS,
-    FakeComputerBackend,
     _empty_drops,
     _uia_snapshot_to_text_regions,
 )
@@ -350,14 +351,14 @@ def test_pixel_evidence_off_still_omits_its_field_but_keeps_the_truncation_marke
 def test_uia_reader_reports_the_elements_the_cap_dropped() -> None:
     """``UiaSemanticReader._dropped_for_total`` counts what ``get_Length`` promised but
     never visited."""
-    drops = backend_module.UiaSemanticReader._dropped_for_total(45)
+    drops = text_readers_module.UiaSemanticReader._dropped_for_total(45)
     assert drops["cap_exceeded"] == 45 - UIA_MAX_ELEMENTS
     assert drops["cap_exceeded"] == 15
     assert sum(drops.values()) == 15
 
 
 def test_uia_reader_reports_nothing_dropped_for_a_small_surface() -> None:
-    assert backend_module.UiaSemanticReader._dropped_for_total(3) == {
+    assert text_readers_module.UiaSemanticReader._dropped_for_total(3) == {
         "cap_exceeded": 0,
         "budget_exceeded": 0,
         "offscreen": 0,
@@ -371,7 +372,7 @@ def test_the_win32_walk_reports_its_drops_in_the_snapshot_shape() -> None:
     ported): the snapshot carries the breakdown under ``SNAPSHOT_DROPPED_KEY`` with the
     four-reason vocabulary, all-zero for an unpopulated walk."""
     drops = _empty_drops()
-    assert set(backend_module.SNAPSHOT_DROP_REASONS) == set(drops)
+    assert set(text_readers_module.SNAPSHOT_DROP_REASONS) == set(drops)
     assert sum(drops.values()) == 0
 
 
@@ -386,7 +387,7 @@ def test_win32_walk_counts_every_remaining_sibling_on_the_cap_break(
     targets: ``region_count + omitted_count`` must still account for them)."""
     import time as _time
 
-    reader = object.__new__(backend_module.Win32TextReader)
+    reader = object.__new__(text_readers_module.Win32TextReader)
     level1 = [10, 11, 12, 13]
 
     def _fake_chain(parent: int, *, limit: int) -> list[int]:
@@ -395,7 +396,7 @@ def test_win32_walk_counts_every_remaining_sibling_on_the_cap_break(
         assert parent == 10  # only the first host gets a second level
         return [100 + i for i in range(29)]  # exactly fills the cap with the host itself
 
-    monkeypatch.setattr(backend_module, "_window_child_chain", _fake_chain)
+    monkeypatch.setattr(text_readers_module, "_window_child_chain", _fake_chain)
     monkeypatch.setattr(
         reader,
         "_control_summary",
@@ -442,9 +443,9 @@ def test_a_snapshot_with_no_drop_key_is_never_invented() -> None:
 
 def test_the_reader_drop_total_is_the_sum_of_its_breakdown() -> None:
     breakdown = {"cap_exceeded": 3, "budget_exceeded": 1, "offscreen": 2, "unavailable": 4}
-    assert backend_module.snapshot_dropped_total(breakdown) == 10
-    assert backend_module.snapshot_dropped_total(None) == 0
-    assert backend_module.snapshot_dropped_total({"cap_exceeded": "x"}) == 0
+    assert text_readers_module.snapshot_dropped_total(breakdown) == 10
+    assert text_readers_module.snapshot_dropped_total(None) == 0
+    assert text_readers_module.snapshot_dropped_total({"cap_exceeded": "x"}) == 0
 
 
 # --- E-15: the cap/budget split ACCUMULATES over the walk's own counts -----------------------
@@ -460,7 +461,7 @@ def test_e15_cap_split_accumulates_over_the_walks_own_counts() -> None:
     drops["offscreen"] = 2
     drops["unavailable"] = 1
 
-    backend_module.UiaSemanticReader._account_cap_and_budget(drops, 45, visited=30)
+    text_readers_module.UiaSemanticReader._account_cap_and_budget(drops, 45, visited=30)
 
     assert drops["offscreen"] == 2  # NOT overwritten to 0
     assert drops["unavailable"] == 1  # NOT overwritten to 0
@@ -473,7 +474,7 @@ def test_e15_budget_split_accumulates_the_same_way() -> None:
     drops = _empty_drops()
     drops["offscreen"] = 3
 
-    backend_module.UiaSemanticReader._account_cap_and_budget(drops, 40, visited=12)
+    text_readers_module.UiaSemanticReader._account_cap_and_budget(drops, 40, visited=12)
 
     assert drops["offscreen"] == 3
     assert drops["budget_exceeded"] == 28
@@ -484,6 +485,6 @@ def test_e15_no_split_when_the_walk_served_everything() -> None:
     drops = _empty_drops()
     drops["offscreen"] = 1
 
-    backend_module.UiaSemanticReader._account_cap_and_budget(drops, 10, visited=10)
+    text_readers_module.UiaSemanticReader._account_cap_and_budget(drops, 10, visited=10)
 
     assert drops == {**_empty_drops(), "offscreen": 1}

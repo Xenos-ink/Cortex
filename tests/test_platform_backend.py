@@ -19,20 +19,19 @@ from typing import Any
 
 import pytest
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import (
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.windows as windows_module
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.coordinates import (
     CoordinateSpace,
-    CoordinateSpaceError,
     CoordinateTransform,
     CoordinateVerdict,
-    FakeComputerBackend,
-    InputBlockedError,
-    LocalComputerBackend,
     classify_coordinate_space,
-    enumerate_monitors,
-    interruptible_wait,
-    query_foreground_window,
 )
+from computer_use_mcp.desktop.errors import CoordinateSpaceError, InputBlockedError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.motion import interruptible_wait
+from computer_use_mcp.desktop.windows import enumerate_monitors, query_foreground_window
 from computer_use_mcp.core.models import GroundedAction, MonitorInfo, Observation, WindowInfo
 from computer_use_mcp.core.state import StopToken, TaskStopped
 
@@ -343,8 +342,8 @@ def _fake_kernel32(
 def test_window_info_extraction_via_mocked_win32(monkeypatch: pytest.MonkeyPatch) -> None:
     user32 = _fake_user32(foreground=111, ancestor=222)
     kernel32, closed = _fake_kernel32()
-    monkeypatch.setattr(backend_module, "_user32", user32)
-    monkeypatch.setattr(backend_module, "_kernel32", kernel32)
+    monkeypatch.setattr(windows_module, "_user32", user32)
+    monkeypatch.setattr(windows_module, "_kernel32", kernel32)
     window = query_foreground_window()
     assert window is not None
     assert window.hwnd == 222  # root owner, not the child foreground handle
@@ -361,8 +360,8 @@ def test_window_info_extraction_via_mocked_win32(monkeypatch: pytest.MonkeyPatch
 def test_window_info_graceful_when_open_process_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     user32 = _fake_user32(foreground=111)
     kernel32, _closed = _fake_kernel32(open_result=0)
-    monkeypatch.setattr(backend_module, "_user32", user32)
-    monkeypatch.setattr(backend_module, "_kernel32", kernel32)
+    monkeypatch.setattr(windows_module, "_user32", user32)
+    monkeypatch.setattr(windows_module, "_kernel32", kernel32)
     window = query_foreground_window()
     assert window is not None
     assert window.pid == 4321
@@ -373,7 +372,7 @@ def test_window_info_graceful_when_open_process_fails(monkeypatch: pytest.Monkey
 
 @WINDOWS_ONLY
 def test_window_info_returns_none_when_no_foreground(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(backend_module, "_user32", _fake_user32(foreground=0))
+    monkeypatch.setattr(windows_module, "_user32", _fake_user32(foreground=0))
     assert query_foreground_window() is None
 
 
@@ -390,7 +389,7 @@ def test_enumerate_monitors_with_per_monitor_dpi(monkeypatch: pytest.MonkeyPatch
 
     def fake_monitor_info(hmonitor: int, info_ref) -> int:
         info = info_ref._obj
-        info.dwFlags = backend_module.MONITORINFOF_PRIMARY
+        info.dwFlags = windows_module.MONITORINFOF_PRIMARY
         info.szDevice = "\\\\.\\DISPLAY1"
         return 1
 
@@ -400,7 +399,7 @@ def test_enumerate_monitors_with_per_monitor_dpi(monkeypatch: pytest.MonkeyPatch
         return 0  # S_OK
 
     monkeypatch.setattr(
-        backend_module,
+        windows_module,
         "_user32",
         SimpleNamespace(
             EnumDisplayMonitors=fake_enum,
@@ -409,7 +408,7 @@ def test_enumerate_monitors_with_per_monitor_dpi(monkeypatch: pytest.MonkeyPatch
         ),
     )
     monkeypatch.setattr(
-        backend_module, "_shcore", SimpleNamespace(GetDpiForMonitor=fake_dpi_for_monitor)
+        windows_module, "_shcore", SimpleNamespace(GetDpiForMonitor=fake_dpi_for_monitor)
     )
     monitors, estimated = enumerate_monitors(None)
     assert estimated is False
@@ -433,7 +432,7 @@ def test_enumerate_monitors_dpi_falls_back_to_system_when_getdpiformonitor_fails
         return 1
 
     monkeypatch.setattr(
-        backend_module,
+        windows_module,
         "_user32",
         SimpleNamespace(
             EnumDisplayMonitors=fake_enum,
@@ -442,7 +441,7 @@ def test_enumerate_monitors_dpi_falls_back_to_system_when_getdpiformonitor_fails
         ),
     )
     monkeypatch.setattr(
-        backend_module,
+        windows_module,
         "_shcore",
         SimpleNamespace(GetDpiForMonitor=lambda hmonitor, dpi_type, x_ref, y_ref: 1),
     )
@@ -457,7 +456,7 @@ def test_enumerate_monitors_falls_back_to_mss_list_and_system_dpi(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        backend_module,
+        windows_module,
         "_user32",
         SimpleNamespace(
             EnumDisplayMonitors=lambda hdc, clip, callback, data: 1,  # no monitors reported
@@ -478,10 +477,10 @@ def test_enumerate_monitors_falls_back_to_mss_list_and_system_dpi(
 
 @WINDOWS_ONLY
 def test_enumerate_monitors_raises_when_nothing_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    from computer_use_mcp.backend import DisplayUnavailableError
+    from computer_use_mcp.desktop.backend import DisplayUnavailableError
 
     monkeypatch.setattr(
-        backend_module,
+        windows_module,
         "_user32",
         SimpleNamespace(EnumDisplayMonitors=lambda hdc, clip, callback, data: 1),
     )
@@ -495,17 +494,17 @@ def test_enumerate_monitors_raises_when_nothing_available(monkeypatch: pytest.Mo
 @WINDOWS_ONLY
 def test_dpi_awareness_fallback_chain(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        backend_module,
+        windows_module,
         "_user32",
         SimpleNamespace(SetProcessDpiAwarenessContext=lambda ctx: 0, SetProcessDPIAware=lambda: 1),
     )
     monkeypatch.setattr(
-        backend_module, "_shcore", SimpleNamespace(SetProcessDpiAwareness=lambda mode: 0)
+        windows_module, "_shcore", SimpleNamespace(SetProcessDpiAwareness=lambda mode: 0)
     )
-    assert backend_module._set_process_dpi_awareness() == "per_monitor"
+    assert windows_module._set_process_dpi_awareness() == "per_monitor"
 
     monkeypatch.setattr(
-        backend_module,
+        windows_module,
         "_user32",
         SimpleNamespace(
             SetProcessDpiAwarenessContext=lambda ctx: 0,
@@ -515,19 +514,19 @@ def test_dpi_awareness_fallback_chain(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
     )
     monkeypatch.setattr(
-        backend_module, "_shcore", SimpleNamespace(SetProcessDpiAwareness=lambda mode: 1)
+        windows_module, "_shcore", SimpleNamespace(SetProcessDpiAwareness=lambda mode: 1)
     )
-    assert backend_module._set_process_dpi_awareness() == "per_monitor"
+    assert windows_module._set_process_dpi_awareness() == "per_monitor"
 
     monkeypatch.setattr(
-        backend_module,
+        windows_module,
         "_user32",
         SimpleNamespace(SetProcessDpiAwarenessContext=lambda ctx: 0, SetProcessDPIAware=lambda: 0),
     )
     monkeypatch.setattr(
-        backend_module, "_shcore", SimpleNamespace(SetProcessDpiAwareness=lambda mode: 1)
+        windows_module, "_shcore", SimpleNamespace(SetProcessDpiAwareness=lambda mode: 1)
     )
-    assert backend_module._set_process_dpi_awareness() == "unavailable"
+    assert windows_module._set_process_dpi_awareness() == "unavailable"
 
 
 @WINDOWS_ONLY
@@ -607,7 +606,7 @@ def test_real_backend_find_window_by_title_populates_identity(
         ) and 1,
         GetDpiForSystem=lambda: 96,
     )
-    monkeypatch.setattr(backend_module, "_user32", user32)
+    monkeypatch.setattr(windows_module, "_user32", user32)
     window = real_backend.find_window_by_title("calculator")  # case-insensitive
     assert window is not None  # the regression: the ABC stub returned None ALWAYS
     assert window.hwnd == 2

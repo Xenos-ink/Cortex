@@ -21,14 +21,24 @@ from typing import Any
 
 import pytest
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import (
-    CoordinateVerdict,
-    InputBlockedError,
-    LocalComputerBackend,
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.input_engine as input_engine_module
+import computer_use_mcp.desktop.windows as windows_module
+from computer_use_mcp.desktop.win32 import (
+    _KEYEVENTF_UNICODE,
+    _MOUSEEVENTF_LEFTDOWN,
+    _MOUSEEVENTF_LEFTUP,
+    _MOUSEEVENTF_MOVE,
+    _MOUSEEVENTF_WHEEL,
+)
+import computer_use_mcp.desktop.input_engine as input_engine_module
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.capture import _CaptureContext
+from computer_use_mcp.desktop.coordinates import CoordinateVerdict
+from computer_use_mcp.desktop.errors import InputBlockedError
+from computer_use_mcp.desktop.input_engine import (
     PyAutoGuiInputEngine,
     SendInputEngine,
-    _CaptureContext,
     _from_absolute_65535,
 )
 from computer_use_mcp.core.models import CoordinateSpace, GroundedAction, MonitorInfo
@@ -142,7 +152,8 @@ def _run_both(
     pyautogui_message = real_backend.execute(action)
 
     fake_user32 = _ParityFakeUser32()
-    monkeypatch.setattr(backend_module, "_user32", fake_user32)
+    # Driven reader: SendInputEngine._dispatch reads the input_engine binding.
+    monkeypatch.setattr(input_engine_module, "_user32", fake_user32)
     monkeypatch.setattr(real_backend, "_engine", SendInputEngine())
     sendinput_message = real_backend.execute(action)
     return pa_module.calls, fake_user32, pyautogui_message, sendinput_message
@@ -157,7 +168,7 @@ def _sendinput_move_points(fake_user32: _ParityFakeUser32) -> list[tuple[int, in
     points: list[tuple[int, int]] = []
     for batch in fake_user32.batches:
         for event in batch:
-            if event["kind"] == 0 and event["flags"] & backend_module._MOUSEEVENTF_MOVE:
+            if event["kind"] == 0 and event["flags"] & _MOUSEEVENTF_MOVE:
                 points.append(
                     (
                         _from_absolute_65535(event["dx"], 0, 1920),
@@ -183,7 +194,7 @@ def test_parity_click(real_backend: LocalComputerBackend, monkeypatch: pytest.Mo
     assert pa_calls == [("click", 30, 45)]
     assert _sendinput_move_points(fake_user32) == [(30, 45)]
     flags = [event["flags"] for event in fake_user32.batches[0]]
-    assert flags[1:] == [backend_module._MOUSEEVENTF_LEFTDOWN, backend_module._MOUSEEVENTF_LEFTUP]
+    assert flags[1:] == [_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP]
 
 
 @WINDOWS_ONLY
@@ -194,7 +205,7 @@ def test_parity_double_click(
     pa_calls, fake_user32, pa_msg, si_msg = _run_both(real_backend, monkeypatch, action)
     assert pa_msg == si_msg == "Executed double_click."
     assert pa_calls == [("click", 30, 45)]
-    downs = [e for e in fake_user32.batches[0] if e["flags"] == backend_module._MOUSEEVENTF_LEFTDOWN]
+    downs = [e for e in fake_user32.batches[0] if e["flags"] == input_engine_module._MOUSEEVENTF_LEFTDOWN]
     assert len(downs) == 2
     assert _sendinput_move_points(fake_user32) == [(30, 45)]
 
@@ -234,7 +245,7 @@ def test_parity_type(real_backend: LocalComputerBackend, monkeypatch: pytest.Mon
         event["scan"]
         for batch in fake_user32.batches
         for event in batch
-        if event["kind"] == 1 and event["flags"] == backend_module._KEYEVENTF_UNICODE
+        if event["kind"] == 1 and event["flags"] == _KEYEVENTF_UNICODE
     ]
     assert keys == [ord("h"), ord("i")]
 
@@ -265,7 +276,7 @@ def test_parity_scroll(real_backend: LocalComputerBackend, monkeypatch: pytest.M
     pa_calls, fake_user32, pa_msg, si_msg = _run_both(real_backend, monkeypatch, action)
     assert pa_msg == si_msg == "Executed scroll."
     assert pa_calls == [("scroll", 5)]
-    wheel = [e for e in fake_user32.batches[0] if e["flags"] == backend_module._MOUSEEVENTF_WHEEL]
+    wheel = [e for e in fake_user32.batches[0] if e["flags"] == _MOUSEEVENTF_WHEEL]
     assert wheel[0]["data"] == 5 * 120
 
 
@@ -306,7 +317,10 @@ def test_parity_failsafe_corner_same_error_semantics(
         real_backend.execute(action)
 
     fake_user32 = _ParityFakeUser32(cursor=(0, 0))  # the REAL replicated corner check
-    monkeypatch.setattr(backend_module, "_user32", fake_user32)
+    # D3 dual patch: the dispatch reads the input_engine binding, the corner check's
+    # get_cursor_position reads the windows binding — both must see the fake.
+    monkeypatch.setattr(input_engine_module, "_user32", fake_user32)
+    monkeypatch.setattr(windows_module, "_user32", fake_user32)
     monkeypatch.setattr(real_backend, "_engine", SendInputEngine())
     with pytest.raises(InputBlockedError, match="failsafe"):
         real_backend.execute(action)
@@ -321,7 +335,7 @@ def test_parity_sendinput_blocked_input_fails_closed(
     (it silently swallows PermissionError/OSError) — the new path is strictly stronger."""
     action = GroundedAction(confidence=1.0, action="click", point={"x": 30, "y": 45})
     monkeypatch.setattr(real_backend, "_active_context", None)
-    monkeypatch.setattr(backend_module, "_user32", _ParityFakeUser32(send_results=[0]))
+    monkeypatch.setattr(input_engine_module, "_user32", _ParityFakeUser32(send_results=[0]))
     monkeypatch.setattr(real_backend, "_engine", SendInputEngine())
     with pytest.raises(InputBlockedError, match="blocked"):
         real_backend.execute(action)
@@ -345,7 +359,8 @@ def test_parity_scaled_space_coordinates_through_the_one_transform(
     monkeypatch.setattr(real_backend, "_engine", PyAutoGuiInputEngine(pa_module))
     real_backend.execute(action)
     fake_user32 = _ParityFakeUser32()
-    monkeypatch.setattr(backend_module, "_user32", fake_user32)
+    # Driven reader: SendInputEngine._dispatch reads the input_engine binding.
+    monkeypatch.setattr(input_engine_module, "_user32", fake_user32)
     monkeypatch.setattr(real_backend, "_engine", SendInputEngine())
     real_backend.execute(action)
 

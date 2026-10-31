@@ -24,9 +24,11 @@ from typing import Any
 
 import pytest
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp import backend as B
-from computer_use_mcp.backend import (
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.clipboard as clipboard_module
+from computer_use_mcp.desktop import backend as B
+import computer_use_mcp.desktop.clipboard as clipboard_module
+from computer_use_mcp.desktop.clipboard import (
     CLIPBOARD_RESTORE_DESTROYED,
     CLIPBOARD_RESTORE_FAILED,
     _clipboard_read_text,
@@ -117,11 +119,13 @@ def _run(
     instance._apply_focus_settle = lambda: None  # type: ignore[method-assign]
     instance._apply_key_dispatch_gap = lambda keys: None  # type: ignore[method-assign]
     saved = (
-        B._clipboard_read_text,
+        clipboard_module._clipboard_read_text,
         B._clipboard_write_text,
         B._clipboard_read_verdict,
     )
-    B._clipboard_read_text = clipboard.read_text  # type: ignore[assignment]
+    # F10: the dead ``_clipboard_read_text`` binding is retargeted to the clipboard
+    # module (its HOME); the patch stays a documented no-op (WP10a deletes it).
+    clipboard_module._clipboard_read_text = clipboard.read_text  # type: ignore[assignment]
     B._clipboard_write_text = clipboard.write_text  # type: ignore[assignment]
     B._clipboard_read_verdict = read_verdict or clipboard.verdict  # type: ignore[assignment]
     raised: Exception | None = None
@@ -136,7 +140,7 @@ def _run(
         raised = exc
     finally:
         (
-            B._clipboard_read_text,
+            clipboard_module._clipboard_read_text,
             B._clipboard_write_text,
             B._clipboard_read_verdict,
         ) = saved  # type: ignore[assignment]
@@ -160,22 +164,24 @@ def _patch_reader(
     non-Windows checkout where ``_user32``/``_kernel32`` are None)."""
     import types as _types
 
-    monkeypatch.setattr(backend_module, "_clipboard_open", lambda: openable)
-    if backend_module._user32 is None:
-        monkeypatch.setattr(backend_module, "_user32", _types.SimpleNamespace())
-    if backend_module._kernel32 is None:
-        monkeypatch.setattr(backend_module, "_kernel32", _types.SimpleNamespace())
+    # Driven reader: _clipboard_read_verdict/_write_text live in the clipboard module,
+    # so every binding the reader consults is patched THERE (not on backend).
+    monkeypatch.setattr(clipboard_module, "_clipboard_open", lambda: openable)
+    if clipboard_module._user32 is None:
+        monkeypatch.setattr(clipboard_module, "_user32", _types.SimpleNamespace())
+    if clipboard_module._kernel32 is None:
+        monkeypatch.setattr(clipboard_module, "_kernel32", _types.SimpleNamespace())
     monkeypatch.setattr(
-        backend_module._user32, "IsClipboardFormatAvailable", lambda fmt: available
+        clipboard_module._user32, "IsClipboardFormatAvailable", lambda fmt: available
     )
     # DELTA 1 (VAL-WP4b MINOR): the empty-clipboard discriminator (0 formats = nothing
     # was on the clipboard; >0 without CF_UNICODETEXT = a non-text payload).
-    monkeypatch.setattr(backend_module._user32, "CountClipboardFormats", lambda: count)
-    monkeypatch.setattr(backend_module._user32, "GetClipboardData", lambda fmt: handle)
-    monkeypatch.setattr(backend_module._user32, "CloseClipboard", lambda: 1)
+    monkeypatch.setattr(clipboard_module._user32, "CountClipboardFormats", lambda: count)
+    monkeypatch.setattr(clipboard_module._user32, "GetClipboardData", lambda fmt: handle)
+    monkeypatch.setattr(clipboard_module._user32, "CloseClipboard", lambda: 1)
     payload = ((text or "") + "\x00").encode("utf-16-le")
     monkeypatch.setattr(
-        backend_module._kernel32,
+        clipboard_module._kernel32,
         "GlobalLock",
         lambda ptr: ctypes.create_string_buffer(payload, len(payload)) if ptr.value else 0,
     )

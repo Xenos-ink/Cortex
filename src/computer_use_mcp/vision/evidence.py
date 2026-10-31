@@ -58,7 +58,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Literal
 
-from ..backend import _payload_is_raw_key  # noqa: SLF001 - the RAW-payload detector
+from ..desktop.capture import _payload_is_raw_key  # noqa: SLF001 - the RAW-payload detector
 
 #: The ``bundle.extra`` key the store lives under.  Written ONCE at bundle
 #: construction (``start_session``) and removed only by :func:`dispose_store`.

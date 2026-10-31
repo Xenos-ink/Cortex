@@ -38,7 +38,8 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp.backend import CAPTURE_BACKEND_ENV, LocalComputerBackend
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.capture import CAPTURE_BACKEND_ENV
 
 
 # =====================================================================================
@@ -94,7 +95,7 @@ def test_blt_backend_skips_dxgi_grab(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("the dxgi constructor must never run under blt")
 
     monkeypatch.setattr(
-        "computer_use_mcp.backend._DxgiDuplicator", _boom
+        "computer_use_mcp.desktop.backend._DxgiDuplicator", _boom
     )
     assert backend._dxgi_grab(1920, 1080) is None
 
@@ -108,7 +109,7 @@ def test_dxgi_construction_failure_falls_back_permanently(
         def __init__(self) -> None:
             raise OSError("no duplication on this session (RDP/protected)")
 
-    monkeypatch.setattr("computer_use_mcp.backend._DxgiDuplicator", _Broken)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend._DxgiDuplicator", _Broken)
     backend = _fresh_backend(monkeypatch, "dxgi")
     assert backend._capture_backend == "dxgi"
     assert backend._dxgi_grab(1920, 1080) is None
@@ -137,7 +138,7 @@ def test_dxgi_grab_failure_disables_path_and_closes_handle(
         def close(self) -> None:
             type(self).closed = True
 
-    monkeypatch.setattr("computer_use_mcp.backend._DxgiDuplicator", _Dying)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend._DxgiDuplicator", _Dying)
     backend = _fresh_backend(monkeypatch, "dxgi")
     assert backend._dxgi_grab(1920, 1080) is None
     assert backend._capture_backend == "blt"
@@ -161,7 +162,7 @@ def test_dxgi_bounds_mismatch_discards_frame_but_keeps_path(
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr("computer_use_mcp.backend._DxgiDuplicator", _WrongSize)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend._DxgiDuplicator", _WrongSize)
     backend = _fresh_backend(monkeypatch, "dxgi")
     assert backend._dxgi_grab(1920, 1080) is None
     assert backend._capture_backend == "dxgi"  # path still armed
@@ -185,7 +186,7 @@ def test_dxgi_timeout_returns_cached_frame_not_none(
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr("computer_use_mcp.backend._DxgiDuplicator", _Idle)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend._DxgiDuplicator", _Idle)
     backend = _fresh_backend(monkeypatch, "dxgi")
     frame = backend._dxgi_grab(1920, 1080)
     assert frame is not None and frame.size == (1920, 1080)
@@ -245,7 +246,7 @@ def test_dxgi_path_never_pollutes_payload_cache(
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr("computer_use_mcp.backend._DxgiDuplicator", _FakeDup)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend._DxgiDuplicator", _FakeDup)
     backend = _fresh_backend(monkeypatch, "dxgi")
     encoded, w, h, frame = _grab_with_stub(monkeypatch, backend, b"\x00" * 128)
     # dxgi frame served; cache not populated (no BGRA key)
@@ -378,7 +379,7 @@ def test_raw_key_requires_both_flags(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_raw_key_env_knob_forces_png(monkeypatch: pytest.MonkeyPatch) -> None:
     """CORTEX_TEXT_PNG=1 disables the fast key at construction: text sessions keep
     PNG payloads (the R-6 kill-switch)."""
-    from computer_use_mcp.backend import TEXT_PNG_ENV
+    from computer_use_mcp.desktop.capture import TEXT_PNG_ENV
 
     monkeypatch.setenv(TEXT_PNG_ENV, "1")
     monkeypatch.setattr(
@@ -391,7 +392,7 @@ def test_raw_key_env_knob_forces_png(monkeypatch: pytest.MonkeyPatch) -> None:
     # replicate the construction lines the knob owns
     backend._raw_payload_keys = False
     backend._raw_key_enabled = backend._internal_frame_reuse and (
-        not __import__("computer_use_mcp.backend", fromlist=["_env_bool"])._env_bool(
+        not __import__("computer_use_mcp.desktop.backend", fromlist=["_env_bool"])._env_bool(
             TEXT_PNG_ENV, False
         )
     )
@@ -546,7 +547,7 @@ def test_live_dxgi_constructor_survives_repeated_construction() -> None:
     IID temporary mid-call and get E_NOINTERFACE; the post-fix contract is clean
     construction every time (a closed duplication releases the output for the next).
     """
-    from computer_use_mcp.backend import _DxgiDuplicator
+    from computer_use_mcp.desktop.capture import _DxgiDuplicator
 
     for attempt in range(3):
         dup = _DxgiDuplicator()
@@ -562,7 +563,7 @@ def test_live_dxgi_first_frame_delivered_and_steady_path_fast() -> None:
     returns within the fast timeout budget (never starved on a quiet desktop)."""
     import time as _time
 
-    from computer_use_mcp.backend import _DxgiDuplicator
+    from computer_use_mcp.desktop.capture import _DxgiDuplicator
 
     dup = _DxgiDuplicator()
     try:
@@ -584,7 +585,7 @@ def test_live_dxgi_two_live_duplications_second_fails_open() -> None:
     live duplicator (the first not closed) fails construction; the failure is the
     documented fail-open path (OSError raised -> the backend keeps its blt fallback),
     never a crash or a silent wrong-size frame."""
-    from computer_use_mcp.backend import _DxgiDuplicator
+    from computer_use_mcp.desktop.capture import _DxgiDuplicator
 
     first = _DxgiDuplicator()
     try:

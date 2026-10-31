@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from ..backend import ComputerBackend
+from ..desktop.backend import ComputerBackend
 from ..core.models import Observation
 
 

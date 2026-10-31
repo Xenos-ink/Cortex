@@ -40,7 +40,7 @@ from typing import Any
 
 import pytest
 
-import computer_use_mcp.backend as backend_module
+import computer_use_mcp.desktop.backend as backend_module
 import desktop_tripwire
 from desktop_tripwire import (
     RealDesktopEffectInOfflineSuite,

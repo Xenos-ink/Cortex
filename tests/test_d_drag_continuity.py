@@ -34,11 +34,15 @@ from typing import Any
 import pytest
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import (
-    LocalComputerBackend,
-    SendInputEngine,
-    _drag_segment_points,
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.input_engine as input_engine_module
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.input_engine import SendInputEngine, _from_absolute_65535
+from computer_use_mcp.desktop.motion import _DRAG_MIN_SEGMENTS, _drag_segment_points
+from computer_use_mcp.desktop.win32 import (
+    _MOUSEEVENTF_LEFTDOWN,
+    _MOUSEEVENTF_LEFTUP,
+    _MOUSEEVENTF_MOVE,
 )
 from computer_use_mcp.core.models import GroundedAction
 
@@ -54,7 +58,7 @@ DRAG_DISTANCE = 400
 
 #: Default dense granularity is ~8 px -> 50 intermediate moves for 400 px.
 #: The pin accepts the floor of 4 minimum segments too (short strokes).
-EXPECTED_MIN_MOVES = DRAG_DISTANCE // backend_module._SENDINPUT_FACTORY_DRAG_STEP_PIXELS
+EXPECTED_MIN_MOVES = DRAG_DISTANCE // input_engine_module._SENDINPUT_FACTORY_DRAG_STEP_PIXELS
 
 #: Speed pin budget: the contract demands a 400 px line well under ~150 ms.
 SPEED_BUDGET_SECONDS = 0.150
@@ -101,8 +105,8 @@ class _StreamFakeUser32:
 
 def _to_pixel(dx: int, dy: int) -> tuple[int, int]:
     return (
-        backend_module._from_absolute_65535(dx, 0, 1920),
-        backend_module._from_absolute_65535(dy, 0, 1080),
+        _from_absolute_65535(dx, 0, 1920),
+        _from_absolute_65535(dy, 0, 1080),
     )
 
 
@@ -113,11 +117,11 @@ def _decode_stream(fake: _StreamFakeUser32) -> list[tuple[str, tuple[int, int] |
         for event in batch:
             if event["kind"] != 0:
                 continue  # keyboard events never appear in a drag
-            if event["flags"] & backend_module._MOUSEEVENTF_MOVE:
+            if event["flags"] & _MOUSEEVENTF_MOVE:
                 stream.append(("move", _to_pixel(event["dx"], event["dy"])))
-            elif event["flags"] & backend_module._MOUSEEVENTF_LEFTDOWN:
+            elif event["flags"] & _MOUSEEVENTF_LEFTDOWN:
                 stream.append(("down", None))
-            elif event["flags"] & backend_module._MOUSEEVENTF_LEFTUP:
+            elif event["flags"] & _MOUSEEVENTF_LEFTUP:
                 stream.append(("up", None))
     return stream
 
@@ -137,7 +141,7 @@ def _drag_action(
 @pytest.fixture
 def stubbed_user32(monkeypatch: pytest.MonkeyPatch) -> _StreamFakeUser32:
     fake = _StreamFakeUser32()
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    monkeypatch.setattr(input_engine_module, "_user32", fake)
     return fake
 
 
@@ -149,8 +153,8 @@ def _factory_engine() -> SendInputEngine:
     """
     return SendInputEngine(
         drag_interpolate=True,
-        drag_step_pause=backend_module._SENDINPUT_FACTORY_DRAG_STEP_PAUSE,
-        drag_step_pixels=backend_module._SENDINPUT_FACTORY_DRAG_STEP_PIXELS,
+        drag_step_pause=input_engine_module._SENDINPUT_FACTORY_DRAG_STEP_PAUSE,
+        drag_step_pixels=input_engine_module._SENDINPUT_FACTORY_DRAG_STEP_PIXELS,
     )
 
 
@@ -242,7 +246,7 @@ def test_drag_stream_monotonic_with_sane_deltas(
     max_delta = max(
         max(abs(b[0] - a[0]), abs(b[1] - a[1])) for a, b in zip(points, points[1:])
     )
-    assert max_delta <= backend_module._SENDINPUT_FACTORY_DRAG_STEP_PIXELS + 1
+    assert max_delta <= input_engine_module._SENDINPUT_FACTORY_DRAG_STEP_PIXELS + 1
 
 
 # --- (d) move count bounded (no floods) ---------------------------------------------------------
@@ -257,7 +261,7 @@ def test_drag_waypoint_count_bounded_no_flood() -> None:
     """
     dense = _drag_segment_points((0, 0), (1919, 1079), step_pixels=8)
     expected = max(
-        backend_module._DRAG_MIN_SEGMENTS,
+        _DRAG_MIN_SEGMENTS,
         -(-max(1919, 1079) // 8),
     )
     assert len(dense) == expected

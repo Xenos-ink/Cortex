@@ -41,9 +41,9 @@ from test_controller_integration import (
     make_session,
 )
 
-import computer_use_mcp.backend as backend_module
+import computer_use_mcp.desktop.backend as backend_module
 from computer_use_mcp import server
-from computer_use_mcp.backend import LocalComputerBackend
+from computer_use_mcp.desktop.backend import LocalComputerBackend
 from computer_use_mcp.core.models import ActionSpec, GroundedAction, Point
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
@@ -444,7 +444,7 @@ def test_bypass_move_without_marker_lands_on_the_settling_branch_when_a_settle_i
 def test_fake_backend_treats_the_marker_as_harness_only(real_backend: LocalComputerBackend) -> None:
     """The harness fake simulates no timing (the O3 precedent): a marked move records
     exactly one executed action and performs zero settle sleeps of its own."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     fake = FakeComputerBackend()
     observation = fake.observe()

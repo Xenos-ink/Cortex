@@ -40,7 +40,7 @@ def main() -> int:
     iters = 12
     from PIL import Image, ImageChops, ImageStat
 
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     backend = LocalComputerBackend()
     monitor = backend._monitors[0]

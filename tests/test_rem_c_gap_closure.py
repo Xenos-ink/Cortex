@@ -426,7 +426,8 @@ def test_f3_quote_breakout_needle_is_typed_rejected_and_nothing_spawns() -> None
     ``subprocess.Popen([needle], shell=True)`` and executed the smuggled second
     command is now a typed rejection — validation fires BEFORE any spawn (Popen
     never called)."""
-    from computer_use_mcp.backend import LaunchTargetError, LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.errors import LaunchTargetError
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)  # _launch_process touches no instance state
     with patch.object(subprocess, "Popen") as popen:
@@ -439,7 +440,8 @@ def test_f3_quote_breakout_needle_is_typed_rejected_and_nothing_spawns() -> None
 def test_f3_needle_charset_rejects_all_smuggled_forms() -> None:
     """F3 pin: every metachar-bearing needle (every cmd.exe operator and quote form
     V-2 tried, plus path separators/colons) is rejected by validation alone."""
-    from computer_use_mcp.backend import LaunchTargetError, validate_launch_needle
+    from computer_use_mcp.desktop.errors import LaunchTargetError
+    from computer_use_mcp.desktop.launch import validate_launch_needle
 
     for needle in (
         'x" & victim2.bat',
@@ -481,7 +483,7 @@ def test_f3_needle_charset_rejects_all_smuggled_forms() -> None:
 def test_f3_valid_needles_pass_validation() -> None:
     """F3 pin: legitimate process-name shapes (alnum, dot, underscore, space,
     hyphen) still validate — REM-B's mspaint launch keeps working."""
-    from computer_use_mcp.backend import validate_launch_needle
+    from computer_use_mcp.desktop.launch import validate_launch_needle
 
     for needle in (
         "mspaint.exe",
@@ -500,7 +502,7 @@ def test_f3_fake_backend_rejects_bad_needle_and_spawns_nothing() -> None:
     """F3 pin: the FAKE backend (used by the e2e REM-B launch tests) applies the
     same typed validation before recording a launch — a hostile target never
     reaches the ``launched=`` payload and is never recorded as spawned."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend()  # no app_windows: NO_INSTANCE path
     payload = backend.ensure_app('x" & victim2.bat', allow_launch=True)
@@ -514,7 +516,7 @@ def test_f3_real_ensure_app_folds_typed_rejection_into_payload() -> None:
     """F3 pin: the REAL backend's ensure_app folds the typed rejection into the
     NO_INSTANCE payload (probe-outcome contract preserved — the controller still
     sees a NO_INSTANCE probe, now with an explicit launch_rejected marker)."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)
     backend.enumerate_app_windows = lambda needle: []  # nothing to attach to
@@ -527,7 +529,7 @@ def test_f3_fake_backend_still_launches_valid_needle() -> None:
     """F3 preservation pin: the REM-B end-to-end launch scenario (allowlisted
     ``mspaint.exe`` target, no existing window) still launches and still reports
     ``launched=``."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend()  # no app_windows: nothing to attach to
     payload = backend.ensure_app("mspaint.exe", allow_launch=True)
@@ -539,7 +541,7 @@ def test_f3_valid_needle_resolves_via_which_and_spawns_without_shell() -> None:
     """F3 pin (mspaint must still launch): a valid needle resolves via
     ``shutil.which`` and is spawned as a plain one-element argv — ``shell`` is
     falsy (the cmd.exe quote-breakout surface is gone)."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)
     resolved = r"C:\Windows\System32\mspaint.exe"
@@ -557,7 +559,7 @@ def test_f3_unresolvable_bare_name_falls_back_to_raw_name() -> None:
     """F3 pin (PATH resolution preserved): when ``shutil.which`` cannot resolve the
     bare name, the raw name still goes to Popen (Windows CreateProcess searches
     PATH) — the pre-F3 launchability of bare names is kept, minus the shell."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)
     with patch.object(shutil, "which", return_value=None):
@@ -572,7 +574,7 @@ def test_f3_unknown_valid_name_still_fails_soft_not_raises() -> None:
     """F3 pin: a VALID-charset needle that does not exist keeps the REM-B
     soft-failure contract — ``None`` (payload degrade), never an exception; the
     typed rejection fires only for INVALID needles."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)
     with patch.object(shutil, "which", return_value=None):

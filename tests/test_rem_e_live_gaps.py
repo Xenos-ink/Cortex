@@ -78,7 +78,7 @@ def test_d1_alias_exists_which_none_popen_gets_alias_path(
 ) -> None:
     """Pin (a): which=None + the Store alias exists -> Popen receives the ALIAS
     PATH (plain one-element argv, no shell) — the mspaint.exe live-launch case."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     localappdata, windows_apps = _alias_dir(tmp_path)
     alias_path = str(windows_apps / "mspaint.exe")
@@ -107,7 +107,7 @@ def test_d1_alias_missing_which_none_keeps_raw_name_fallback(
 ) -> None:
     """Pin (b): which=None + NO alias file -> the raw-name Popen fallback is
     unchanged (Windows CreateProcess PATH search, soft contract preserved)."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     localappdata, windows_apps = _alias_dir(tmp_path)
     monkeypatch.setenv("LOCALAPPDATA", str(localappdata))
@@ -133,7 +133,7 @@ def test_d1_which_resolves_beats_alias(
 ) -> None:
     """Pin (c): when ``shutil.which`` resolves the needle, the which path wins —
     the alias dir is never consulted as a substitute for PATH resolution."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     localappdata, windows_apps = _alias_dir(tmp_path)
     windows_apps.joinpath("notepad.exe").write_bytes(b"")  # alias ALSO exists
@@ -161,7 +161,8 @@ def test_d1_needle_validation_rejects_smuggle_before_alias_construction(
     """Pin (d): the charset gate fires BEFORE any alias path is constructed — a
     smuggle needle (path separator / quote / metachar) raises the typed rejection
     and NOTHING is spawned, even with a hostile alias dir lying around."""
-    from computer_use_mcp.backend import LaunchTargetError, LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.errors import LaunchTargetError
 
     # A hostile LOCALAPPDATA whose WindowsApps "alias" is a smuggle name — the
     # gate must reject the NEEDLE before this dir is ever joined or read.

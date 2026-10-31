@@ -180,7 +180,7 @@ async def test_launch_failure_audit_verdict_equals_the_reply_verdict(
     demoted to ``failed`` in the probe branch itself, and the probe now emits exactly
     ONE verification audit event carrying that same ``failed`` verdict (the dev copy's
     probe branch emitted none)."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend()  # no app windows: NO_INSTANCE everywhere
     backend.launch_unresolvable = {"mspaint.exe"}

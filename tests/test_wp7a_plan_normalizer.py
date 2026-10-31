@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-import computer_use_mcp.backend as backend_module
+import computer_use_mcp.desktop.backend as backend_module
 import computer_use_mcp.planning.plan as plan_module
 from computer_use_mcp.core.models import ActionSpec, GroundedAction
 from computer_use_mcp.planning.plan import (

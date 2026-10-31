@@ -26,7 +26,7 @@ from typing import Any
 from PIL import Image
 
 from computer_use_mcp.pipeline.agent import ComputerUseAgent
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.interference import parse_interference
 from computer_use_mcp.core.limits import Limits
 from computer_use_mcp.core.models import GroundedAction, WindowInfo

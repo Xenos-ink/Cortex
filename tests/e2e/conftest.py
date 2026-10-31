@@ -292,7 +292,7 @@ def make_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     the ``start_session`` tool, and returns ``(session_id, bundle)``.
     """
     from computer_use_mcp import server
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
     from computer_use_mcp.core.state import SessionRegistry
 
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))

@@ -19,7 +19,8 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from computer_use_mcp.backend import FakeComputerBackend, FocusDriftError
+from computer_use_mcp.desktop.errors import FocusDriftError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.focus_guard import InterferenceGuard
 from computer_use_mcp.desktop.interference import FOCUS_DRIFTED, parse_interference
 from computer_use_mcp.core.models import FailureClass, GroundedAction, WindowInfo
@@ -139,7 +140,7 @@ def test_mid_type_drift_aborts_remaining_chunks_and_preserves_stop_precedence() 
 
     # LocalComputerBackend.execute chains stop.ensure_live BEFORE the hook; use the real
     # backend so the ordering contract is exercised end-to-end.
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     real = LocalComputerBackend.__new__(LocalComputerBackend)  # type: ignore[call-arg]
     real._engine = engine

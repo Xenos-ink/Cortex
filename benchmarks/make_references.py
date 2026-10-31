@@ -1,7 +1,7 @@
 """Human-reference builder for the harsh benchmark tasks (benchmarks/tasks_hard/).
 
 Replays a fixed competent-human action script per task through the REAL backend
-(``computer_use_mcp.backend.LocalComputerBackend``) at calibrated human cadence and
+(``computer_use_mcp.desktop.backend.LocalComputerBackend``) at calibrated human cadence and
 times itself -> ``evidence/perf-004/p3/human-references.json``.
 
 Cadence calibration (provisional, per mission; reconcile with
@@ -454,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     backend = LocalComputerBackend()
     backend.observe()  # warm capture + fix the coordinate context (physical pixels)

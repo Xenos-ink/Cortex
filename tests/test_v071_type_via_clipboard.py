@@ -28,17 +28,18 @@ from desktop_tripwire import LIVE_DESKTOP
 
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import (
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.clipboard as clipboard_module
+from computer_use_mcp.desktop.backend import (
     TYPE_UNCONFIRMED_HINT_CLIPBOARD,
     TYPE_UNCONFIRMED_HINT_SENDINPUT,
     TYPE_UNCONFIRMED_MARKER,
-    FakeComputerBackend,
-    InputBlockedError,
     LocalComputerBackend,
-    _clipboard_read_text,
     _clipboard_write_text,
 )
+from computer_use_mcp.desktop.clipboard import _clipboard_read_text, _clipboard_read_verdict
+from computer_use_mcp.desktop.errors import InputBlockedError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction, SessionState
 from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
 from computer_use_mcp.server import _grounded_shape_hint
@@ -145,7 +146,7 @@ def _clipboard_backend(
         writes.append(text)
         return text not in failures
 
-    monkeypatch.setattr(backend_module, "_clipboard_read_text", _read)
+    monkeypatch.setattr(clipboard_module, "_clipboard_read_text", _read)
     monkeypatch.setattr(backend_module, "_clipboard_read_verdict", _verdict)
     monkeypatch.setattr(backend_module, "_clipboard_write_text", _write)
     return engine, writes, reads_seen
@@ -417,7 +418,7 @@ def test_sendinput_via_and_default_pay_zero_clipboard_cost(
     def _bomb_write(text: str) -> bool:
         raise AssertionError("clipboard write reached on the sendinput path")
 
-    monkeypatch.setattr(backend_module, "_clipboard_read_text", _bomb_read)
+    monkeypatch.setattr(clipboard_module, "_clipboard_read_text", _bomb_read)
     # D13 / repair 3.3: the verdict form is the one the clipboard transport calls now,
     # so the "the default path pays ZERO clipboard cost" bomb is planted on it too.
     monkeypatch.setattr(backend_module, "_clipboard_read_verdict", _bomb_verdict)
@@ -503,7 +504,10 @@ def test_fake_kill_switch_does_not_disable_the_explicit_clipboard_transport(
 ) -> None:
     # CORTEX_TYPE_INTEGRITY=0 removes the read-back LADDER, not an explicitly requested
     # transport: the paste still rides the chord path and reports honestly.
-    monkeypatch.setattr(backend_module, "TYPE_INTEGRITY_ENABLED", False)
+    # C-4: the driven reader is FakeComputerBackend — patch ITS binding.
+    from computer_use_mcp.desktop import fake_backend as fake_backend_module
+
+    monkeypatch.setattr(fake_backend_module, "TYPE_INTEGRITY_ENABLED", False)
     backend = FakeComputerBackend()
     backend.focused_control_value = ""
     message = backend.execute(_type_action("abc", "clipboard"))
@@ -611,10 +615,10 @@ def test_clipboard_alloc_size_counts_utf16_code_units_not_characters(
     recorded size is simply wrong). Hermetic — no real clipboard.
     """
     kernel32 = _FakeAllocKernel32()
-    monkeypatch.setattr(backend_module, "_kernel32", kernel32)
-    monkeypatch.setattr(backend_module, "_user32", _FakeClipboardUser32(kernel32))
+    monkeypatch.setattr(clipboard_module, "_kernel32", kernel32)
+    monkeypatch.setattr(clipboard_module, "_user32", _FakeClipboardUser32(kernel32))
     # The fakes are plain callables: ctypes prototype binding is skipped (no-op needed).
-    monkeypatch.setattr(backend_module, "_CLIPBOARD_ARGTYPES_BOUND", True)
+    monkeypatch.setattr(clipboard_module, "_CLIPBOARD_ARGTYPES_BOUND", True)
     cases = [
         ("plain", (5 + 1) * 2),  # 5 BMP chars + NUL
         ("", (0 + 1) * 2),  # NUL only
@@ -744,10 +748,10 @@ class _OpenCountingClipboardUser32(_FakeClipboardUser32):
 def _install_stubbed_os(monkeypatch: pytest.MonkeyPatch) -> tuple[_FakeAllocKernel32, _OpenCountingClipboardUser32]:
     kernel32 = _FakeAllocKernel32()
     user32 = _OpenCountingClipboardUser32(kernel32)
-    monkeypatch.setattr(backend_module, "_kernel32", kernel32)
-    monkeypatch.setattr(backend_module, "_user32", user32)
+    monkeypatch.setattr(clipboard_module, "_kernel32", kernel32)
+    monkeypatch.setattr(clipboard_module, "_user32", user32)
     # The fakes are plain callables: ctypes prototype binding is skipped (no-op needed).
-    monkeypatch.setattr(backend_module, "_CLIPBOARD_ARGTYPES_BOUND", True)
+    monkeypatch.setattr(clipboard_module, "_CLIPBOARD_ARGTYPES_BOUND", True)
     return kernel32, user32
 
 

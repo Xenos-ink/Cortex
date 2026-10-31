@@ -26,15 +26,12 @@ from typing import Any
 import pytest
 from desktop_tripwire import LIVE_DESKTOP
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import (
-    FakeComputerBackend,
-    LocalComputerBackend,
-    _INPUT,
-    _key_event,
-    _text_to_key_units,
-    find_window_by_title,
-)
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.input_engine as input_engine_module
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.input_engine import _INPUT, _key_event, _text_to_key_units
+from computer_use_mcp.desktop.windows import find_window_by_title
 from computer_use_mcp.core.models import GroundedAction
 
 #: The exact incident payload shape: a raw single-backslash Windows path after a verb.
@@ -208,7 +205,7 @@ def test_offline_twin_backslash_path_through_real_sendinput_batching_completes_u
     never be reproduced with the OS call stubbed, by construction.
     """
     fake_user32 = _RecordingSendInputUser32()
-    monkeypatch.setattr(backend_module, "_user32", fake_user32)
+    monkeypatch.setattr(input_engine_module, "_user32", fake_user32)
     engine = backend_module.SendInputEngine()
 
     started = time.perf_counter()

@@ -49,7 +49,8 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.backend import ComputerBackend, FakeComputerBackend
+from computer_use_mcp.desktop.backend import ComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import Observation, WindowInfo
 from computer_use_mcp.vision.observation import digest_matches
 from computer_use_mcp.core.state import SessionRegistry

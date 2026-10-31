@@ -27,7 +27,8 @@ from typing import Any
 
 from PIL import Image
 
-from computer_use_mcp.backend import FakeComputerBackend, WindowFocusError
+from computer_use_mcp.desktop.errors import WindowFocusError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.focus_guard import InterferenceGuard
 from computer_use_mcp.desktop.interference import FOCUS_IDENTITY_UNKNOWN, FOCUS_TAKEN_BY, parse_interference
 from computer_use_mcp.core.models import FailureClass, GroundedAction, WindowInfo
@@ -608,7 +609,8 @@ def test_allow_owned_dialogs_false_still_rejects_owned_modal() -> None:
 
 def test_guard_and_sentinel_share_one_ownership_helper(monkeypatch: Any) -> None:
     """Guard and sentinel MUST agree on ownership (the A7b divergence is impossible)."""
-    import computer_use_mcp.backend as backend_module
+    import computer_use_mcp.desktop.backend as backend_module
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     calls: list[tuple[int | None, int | None]] = []
 
@@ -617,7 +619,6 @@ def test_guard_and_sentinel_share_one_ownership_helper(monkeypatch: Any) -> None
         return int(hwnd or 0) == CUSTOM_OWNED.hwnd and int(ancestor or 0) == EXCEL.hwnd
 
     monkeypatch.setattr(backend_module, "is_window_owned_by", _spy)
-    from computer_use_mcp.backend import LocalComputerBackend
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)  # probes only, no init
     guard = InterferenceGuard(backend, parse_interference(None))
@@ -633,8 +634,8 @@ def test_guard_and_sentinel_agree_on_one_real_window_table(monkeypatch: Any) -> 
     owner_chain match, shared helper verdict — the A7b divergence is structurally dead."""
     import ctypes
 
-    import computer_use_mcp.backend as backend_module
-    from computer_use_mcp.backend import LocalComputerBackend
+    import computer_use_mcp.desktop.windows as windows_module
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     hwnds: dict[int, dict[str, object]] = {
         40: {"class": "XLMAIN", "text": "Book1 - Excel", "pid": 200, "owner": 0},
@@ -681,15 +682,15 @@ def test_guard_and_sentinel_agree_on_one_real_window_table(monkeypatch: Any) -> 
                 pointer._obj.value = pid  # byref(DWORD) pointer
             return 1
 
-    monkeypatch.setattr(backend_module, "_user32", _FakeUser32())
+    monkeypatch.setattr(windows_module, "_user32", _FakeUser32())
     backend = LocalComputerBackend.__new__(LocalComputerBackend)  # probes only, no init
 
     modal = WindowInfo(hwnd=41, pid=200, process_name="EXCEL.EXE",
                        window_class=str(hwnds[41]["class"]), title="Microsoft Excel")
     bound = WindowInfo(hwnd=40, pid=200, process_name="EXCEL.EXE",
                        window_class="XLMAIN", title="Book1 - Excel")
-    # 1) shared helper: owned.
-    assert backend_module.is_window_owned_by(41, 40) is True
+    # 1) shared helper: owned (windows module is its HOME and the patched reader).
+    assert windows_module.is_window_owned_by(41, 40) is True
     # 2) the GUARD exempts the very same window (cross-pid not needed; same pid):
     guard = InterferenceGuard(backend, parse_interference(None))
     guard.rebind(bound)
@@ -702,7 +703,7 @@ def test_guard_and_sentinel_agree_on_one_real_window_table(monkeypatch: Any) -> 
 
 def test_shared_ownership_helper_traverses_owner_chain(monkeypatch: Any) -> None:
     """The shared GW_OWNER traversal roots multi-hop chains at the bound window."""
-    import computer_use_mcp.backend as backend_module
+    import computer_use_mcp.desktop.windows as windows_module
 
     class _FakeUser32:
         def __init__(self, chain: dict[int, int]) -> None:
@@ -725,7 +726,7 @@ def test_shared_ownership_helper_traverses_owner_chain(monkeypatch: Any) -> None
             return self._as_hwnd(hwnd)
 
     fake = _FakeUser32({41: 40})  # modal 41 owned by 40
-    monkeypatch.setattr(backend_module, "_user32", fake)
-    assert backend_module.is_window_owned_by(41, 40) is True
-    assert backend_module.is_window_owned_by(41, 999) is False
-    assert backend_module.is_window_owned_by(None, 40) is False
+    monkeypatch.setattr(windows_module, "_user32", fake)
+    assert windows_module.is_window_owned_by(41, 40) is True
+    assert windows_module.is_window_owned_by(41, 999) is False
+    assert windows_module.is_window_owned_by(None, 40) is False

@@ -39,7 +39,7 @@ import pytest
 from PIL import Image
 
 from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.pipeline.grounding import GroundingRouter
 from computer_use_mcp.core.models import (
     AgentDecision,

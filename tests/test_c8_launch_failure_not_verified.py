@@ -35,7 +35,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from computer_use_mcp.pipeline.agent import ComputerUseAgent
-from computer_use_mcp.backend import AppWindowCandidate, FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.launch import AppWindowCandidate
 from computer_use_mcp.core.limits import Limits
 from computer_use_mcp.desktop.interference import parse_interference
 from computer_use_mcp.core.models import GroundedAction, WindowInfo

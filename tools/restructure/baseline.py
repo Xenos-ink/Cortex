@@ -395,7 +395,7 @@ def dynamic_audit_shapes() -> tuple[dict[str, dict], list[str]]:
 
     from computer_use_mcp.pipeline.agent import ComputerUseAgent
     from computer_use_mcp.security.audit import AuditLogger, Metrics
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
     from computer_use_mcp.core.limits import Limits
     from computer_use_mcp.core.models import GroundedAction, WindowInfo
     from computer_use_mcp.vision.observation import ObservationEngine

@@ -772,4 +772,4 @@ def test_plan_py_imports_stay_in_the_declared_data_layer_set() -> None:
             for alias in node.names:
                 if alias.name.startswith("computer_use_mcp"):
                     local_modules.add(alias.name)
-    assert local_modules == {"backend", "core.models", "security.redaction"}
+    assert local_modules == {"desktop.backend", "core.models", "security.redaction"}

@@ -47,7 +47,8 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend, FocusDriftError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.errors import FocusDriftError
 from computer_use_mcp.core.models import WindowInfo
 
 
@@ -228,7 +229,7 @@ def test_chunked_type_counts_delivered_chars_before_the_abort(real_backend: Any)
     N records exactly the characters of chunks 0..N-1 (§1.1 K-05's source of truth)."""
     if platform.system() != "Windows":
         pytest.skip("Real Win32 backend requires Windows.")
-    from computer_use_mcp.backend import TYPE_CHUNK_CHARS
+    from computer_use_mcp.desktop.backend import TYPE_CHUNK_CHARS
     from computer_use_mcp.core.models import GroundedAction
 
     backend = real_backend
@@ -240,7 +241,7 @@ def test_chunked_type_counts_delivered_chars_before_the_abort(real_backend: Any)
             if len(chunks_seen) == 3:  # the guard aborts before chunk 3 dispatches
                 raise FocusDriftError("FOCUS_DRIFTED mid-chunk")
 
-    import computer_use_mcp.backend as backend_module
+    import computer_use_mcp.desktop.backend as backend_module
 
     monkeypatched = pytest.MonkeyPatch()
     try:
@@ -311,7 +312,7 @@ async def test_wait_marker_reply(fresh_server: Any, monkeypatch: pytest.MonkeyPa
 
 
 async def test_ensure_app_typed_outcome(fresh_server: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    from computer_use_mcp.backend import AppWindowCandidate, is_unsaved_candidate_title
+    from computer_use_mcp.desktop.launch import AppWindowCandidate, is_unsaved_candidate_title
 
     book = WindowInfo(
         hwnd=1, pid=4242, process_name="excel", window_class="FakeWnd",
@@ -493,7 +494,8 @@ def test_chunked_type_counts_per_character_drift(real_backend: Any) -> None:
     reports the exact dispatched prefix (29) through the real chunk loop."""
     if platform.system() != "Windows":
         pytest.skip("Real Win32 backend requires Windows.")
-    from computer_use_mcp.backend import TYPE_CHUNK_CHARS, PyAutoGuiInputEngine
+    from computer_use_mcp.desktop.backend import TYPE_CHUNK_CHARS
+    from computer_use_mcp.desktop.input_engine import PyAutoGuiInputEngine
     from computer_use_mcp.core.models import GroundedAction
 
     backend = real_backend
@@ -528,8 +530,8 @@ def test_integrity_off_path_counts_engine_dispatched_prefix(real_backend: Any) -
     per-character count (no outer chunk arithmetic to hide behind)."""
     if platform.system() != "Windows":
         pytest.skip("Real Win32 backend requires Windows.")
-    import computer_use_mcp.backend as backend_module
-    from computer_use_mcp.backend import PyAutoGuiInputEngine
+    import computer_use_mcp.desktop.backend as backend_module
+    from computer_use_mcp.desktop.input_engine import PyAutoGuiInputEngine
     from computer_use_mcp.core.models import GroundedAction
 
     backend = real_backend
@@ -773,7 +775,7 @@ async def test_ensure_app_failure_outcomes_are_failed_or_uncertain(
 ) -> None:
     """MAJOR-4: not_found / launch_rejected reply result ``failed`` (ok False);
     ambiguous replies ``uncertain`` (ok False) — the §1.3 verdicts, on real replies."""
-    from computer_use_mcp.backend import AppWindowCandidate
+    from computer_use_mcp.desktop.launch import AppWindowCandidate
 
     async def _drive(
         world: Any, target: str, policy: str | None = None,
@@ -899,7 +901,7 @@ def test_sendinput_counts_code_points_not_utf16_units(real_backend: Any) -> None
     ``_send``; no real input)."""
     if platform.system() != "Windows":
         pytest.skip("Real Win32 backend requires Windows.")
-    from computer_use_mcp.backend import SendInputEngine
+    from computer_use_mcp.desktop.input_engine import SendInputEngine
 
     probes = {"n": 0}
 
@@ -925,7 +927,7 @@ def test_sendinput_paced_per_char_drift_counts_dispatched(real_backend: Any) -> 
     input)."""
     if platform.system() != "Windows":
         pytest.skip("Real Win32 backend requires Windows.")
-    from computer_use_mcp.backend import SendInputEngine
+    from computer_use_mcp.desktop.input_engine import SendInputEngine
     from computer_use_mcp.core.models import GroundedAction
 
     probes = {"n": 0}

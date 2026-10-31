@@ -202,9 +202,11 @@ async def test_mid_drag_fault_in_a_step_is_classified_not_unclassified(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """T2 t3.11.4 verbatim — same plan, same fault, now an explicit reason."""
-    from computer_use_mcp import backend as backend_module
+    from computer_use_mcp.desktop import backend as backend_module
 
-    real_segments = backend_module._drag_segment_points
+    from computer_use_mcp.desktop import fake_backend as fake_module
+
+    real_segments = fake_module._drag_segment_points
 
     def exploding(start: Any, end: Any) -> Any:
         for index, point in enumerate(real_segments(start, end)):
@@ -212,7 +214,9 @@ async def test_mid_drag_fault_in_a_step_is_classified_not_unclassified(
                 raise RuntimeError("synthetic mid-drag fault inside a plan step")
             yield point
 
-    monkeypatch.setattr(backend_module, "_drag_segment_points", exploding)
+    # C-3: ScriptedBackend extends FakeComputerBackend, whose execute reads the
+    # fake_backend binding — the fault must be planted THERE.
+    monkeypatch.setattr(fake_module, "_drag_segment_points", exploding)
     backend = ScriptedBackend(flip=True)
     session_id, _bundle, _backend, _provider = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS

@@ -49,7 +49,7 @@ from test_controller_integration import (
     make_session,
 )
 
-import computer_use_mcp.backend as backend_module
+import computer_use_mcp.desktop.backend as backend_module
 from computer_use_mcp import server
 from computer_use_mcp.planning.plan import PLAN_EVIDENCE_KEY, PlanLeaseGuard
 from computer_use_mcp.core.models import WindowInfo

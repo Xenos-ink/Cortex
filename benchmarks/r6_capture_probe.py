@@ -50,7 +50,7 @@ def main() -> int:
 
     import mss
 
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     iters = 12
     backend = LocalComputerBackend()

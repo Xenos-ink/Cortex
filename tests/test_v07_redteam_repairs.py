@@ -63,7 +63,7 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.focus_guard import InterferenceGuard, _launcher_seed_tokens
 from computer_use_mcp.desktop.interference import parse_interference
 from computer_use_mcp.core.models import GroundedAction, SessionState, WindowInfo

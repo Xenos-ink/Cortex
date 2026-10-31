@@ -47,7 +47,7 @@ from computer_use_mcp.core.models import (
     WindowInfo,
 )
 from computer_use_mcp.pipeline.agent import ComputerUseAgent
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.limits import Limits
 from computer_use_mcp.vision.observation import ObservationEngine
 from computer_use_mcp.security.safety import SafetyPolicy
@@ -168,7 +168,7 @@ def test_fix1_no_instance_with_allowlisted_target_launches_end_to_end() -> None:
     """The logged failure end-to-end: no window exists, the target IS allowlisted,
     the default policy lets the backend spawn it (NO_INSTANCE payload gains
     ``launched=``) instead of leaving the driver to launch out-of-band."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend()  # no app_windows: nothing to attach to
     # A foreign foreground (the logged ZCode console) is fine now: the process

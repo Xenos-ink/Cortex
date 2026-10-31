@@ -29,7 +29,7 @@ from test_controller_integration import fresh_server as _shared_fresh_server_fix
 fresh_server = _shared_fresh_server_fixture
 
 from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.focus_guard import InterferenceGuard
 from computer_use_mcp.desktop.interference import (
     AMBIGUOUS_INSTANCE,

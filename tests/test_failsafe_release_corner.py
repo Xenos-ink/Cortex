@@ -24,19 +24,21 @@ from typing import Any
 import pytest
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.input_engine as input_engine_module
 from computer_use_mcp import server
-from computer_use_mcp.backend import (
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.errors import InputBlockedError, UnsupportedActionError
+from computer_use_mcp.desktop.input_engine import (
+    InputEngine,
+    PyAutoGuiInputEngine,
+    SendInputEngine,
+)
+from computer_use_mcp.desktop.win32 import (
     _KEYEVENTF_KEYUP,
     _MOUSEEVENTF_LEFTUP,
     _MOUSEEVENTF_RIGHTUP,
     _MOUSEEVENTF_WHEEL,
-    InputBlockedError,
-    InputEngine,
-    LocalComputerBackend,
-    PyAutoGuiInputEngine,
-    SendInputEngine,
-    UnsupportedActionError,
 )
 from computer_use_mcp.core.models import GroundedAction
 from computer_use_mcp.core.state import StopToken
@@ -48,8 +50,10 @@ CORNER = (0, 0)  # the top-left failsafe corner
 
 def corner(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub the cursor into the top-left failsafe corner (primary screen 100x100)."""
-    monkeypatch.setattr(backend_module, "get_cursor_position", lambda: CORNER)
-    monkeypatch.setattr(backend_module, "_primary_screen_size", lambda: (100, 100))
+    # D2: the driven reader is the ENGINE's failsafe check (SendInputEngine), which
+    # reads the input_engine bindings — patch THERE, not on backend.
+    monkeypatch.setattr(input_engine_module, "get_cursor_position", lambda: CORNER)
+    monkeypatch.setattr(input_engine_module, "_primary_screen_size", lambda: (100, 100))
 
 
 def recording_sendinput(monkeypatch: pytest.MonkeyPatch) -> tuple[SendInputEngine, list[Any]]:
@@ -326,7 +330,7 @@ def test_held_keypress_releases_in_the_corner(
     message = real_backend.execute(keypress(["right"], hold_ms=100))
     assert message == "Executed keypress."
     assert ("key_up", "right") in engine.calls
-    vk = backend_module._resolve_key_events("right")[0]
+    vk = input_engine_module._resolve_key_events("right")[0]
     assert _released_vk_flags(sent) == [vk]
 
 
@@ -339,8 +343,8 @@ def test_held_hotkey_releases_every_key_in_reverse_in_the_corner(
     message = real_backend.execute(hotkey(["ctrl", "c"], hold_ms=100))
     assert message == "Executed hotkey."
     assert [name for kind, name in engine.calls if kind == "key_up"] == ["c", "ctrl"]
-    ctrl_vk = backend_module._resolve_key_events("ctrl")[0]
-    c_vk = backend_module._resolve_key_events("c")[0]
+    ctrl_vk = input_engine_module._resolve_key_events("ctrl")[0]
+    c_vk = input_engine_module._resolve_key_events("c")[0]
     assert _released_vk_flags(sent) == [c_vk, ctrl_vk]  # reverse order
 
 
@@ -371,7 +375,7 @@ def test_release_modifiers_through_the_guard_releases_in_the_corner(
     release_engine, sent = recording_sendinput(monkeypatch)
     monkeypatch.setattr(real_backend, "_engine", release_engine)
     real_backend.release_modifiers(["ctrl"])  # the backend's release path
-    ctrl_vk = backend_module._resolve_key_events("ctrl")[0]
+    ctrl_vk = input_engine_module._resolve_key_events("ctrl")[0]
     assert _released_vk_flags(sent) == [ctrl_vk]
 
 

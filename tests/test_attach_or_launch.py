@@ -24,8 +24,8 @@ from typing import Any
 
 import pytest
 
-from computer_use_mcp.backend import (
-    FakeComputerBackend,
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.launch import (
     doc_token_from_title,
     is_unsaved_candidate_title,
 )
@@ -53,7 +53,7 @@ STALE_RESTORE = WindowInfo(
 def _backend_with(*windows: WindowInfo) -> FakeComputerBackend:
     backend = FakeComputerBackend()
     backend.windows = list(windows)
-    from computer_use_mcp.backend import AppWindowCandidate
+    from computer_use_mcp.desktop.launch import AppWindowCandidate
 
     backend.app_windows = [
         AppWindowCandidate(

@@ -483,7 +483,7 @@ async def test_item4_click_grounded_on_grid_view_executes_through_stock_transfor
 ) -> None:
     """F1: a click grounded on a GRID-view observation goes through the ONE stock
     transform (origin + screenshot*scale) — never a re-scale (H20 falsifier (c))."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend(
         640,

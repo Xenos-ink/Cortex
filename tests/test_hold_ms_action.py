@@ -31,9 +31,9 @@ import pytest
 from pydantic import ValidationError
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp import backend as backend_pkg
-from computer_use_mcp.backend import FakeComputerBackend
+import computer_use_mcp.desktop.backend as backend_module
+from computer_use_mcp.desktop import backend as backend_pkg
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction, Point
 from computer_use_mcp.core.state import StopToken, TaskStopped
 from computer_use_mcp.pipeline.validator import GroundingValidator

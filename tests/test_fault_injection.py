@@ -45,7 +45,7 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.backend import DisplayUnavailableError
+from computer_use_mcp.desktop.errors import DisplayUnavailableError
 from computer_use_mcp.core.models import (
     ActionType,
     GroundedAction,

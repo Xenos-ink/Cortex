@@ -26,8 +26,10 @@ from typing import Any
 import pytest
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import (
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.input_engine as input_engine_module
+import computer_use_mcp.desktop.windows as windows_module
+from computer_use_mcp.desktop.input_engine import (
     InputBlockedError,
     PyAutoGuiInputEngine,
     SendInputEngine,
@@ -37,6 +39,21 @@ from computer_use_mcp.backend import (
     _mouse_move_event,
     _text_to_key_units,
     _to_absolute_65535,
+)
+from computer_use_mcp.desktop.motion import _DRAG_STEP_PAUSE_SECONDS
+from computer_use_mcp.desktop.win32 import (
+    _KEYEVENTF_KEYUP,
+    _KEYEVENTF_UNICODE,
+    _MOUSEEVENTF_ABSOLUTE,
+    _MOUSEEVENTF_LEFTDOWN,
+    _MOUSEEVENTF_LEFTUP,
+    _MOUSEEVENTF_MOVE,
+    _MOUSEEVENTF_VIRTUALDESK,
+    _MOUSEEVENTF_WHEEL,
+    _SM_CXVIRTUALSCREEN,
+    _SM_CYVIRTUALSCREEN,
+    _SM_XVIRTUALSCREEN,
+    _SM_YVIRTUALSCREEN,
 )
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
@@ -87,10 +104,10 @@ class _FakeUser32:
         mapping = {0: self.primary[0], 1: self.primary[1]}
         mapping.update(
             {
-                backend_module._SM_XVIRTUALSCREEN: self.metrics[0],
-                backend_module._SM_YVIRTUALSCREEN: self.metrics[1],
-                backend_module._SM_CXVIRTUALSCREEN: self.metrics[2],
-                backend_module._SM_CYVIRTUALSCREEN: self.metrics[3],
+                _SM_XVIRTUALSCREEN: self.metrics[0],
+                _SM_YVIRTUALSCREEN: self.metrics[1],
+                _SM_CXVIRTUALSCREEN: self.metrics[2],
+                _SM_CYVIRTUALSCREEN: self.metrics[3],
             }
         )
         return mapping[index]
@@ -106,7 +123,7 @@ class _FakeUser32:
 @pytest.fixture
 def fake_user32(monkeypatch: pytest.MonkeyPatch) -> _FakeUser32:
     fake = _FakeUser32()
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    monkeypatch.setattr(input_engine_module, "_user32", fake)
     return fake
 
 
@@ -126,9 +143,9 @@ def test_move_dispatches_one_absolute_virtual_desk_event(fake_user32: _FakeUser3
     event = batch[0]
     assert event["kind"] == "mouse"
     assert event["flags"] == (
-        backend_module._MOUSEEVENTF_MOVE
-        | backend_module._MOUSEEVENTF_ABSOLUTE
-        | backend_module._MOUSEEVENTF_VIRTUALDESK
+        _MOUSEEVENTF_MOVE
+        | _MOUSEEVENTF_ABSOLUTE
+        | _MOUSEEVENTF_VIRTUALDESK
     )
     assert _from_absolute_65535(event["dx"], 0, 1920) == 960
     assert _from_absolute_65535(event["dy"], 0, 1080) == 540
@@ -150,7 +167,7 @@ def test_move_round_trips_every_axis_endpoint(fake_user32: _FakeUser32) -> None:
 def test_move_secondary_monitor_offset_round_trips(monkeypatch: pytest.MonkeyPatch) -> None:
     """VIRTUALDESK normalization covers the whole virtual desktop (negative origins)."""
     fake = _FakeUser32(metrics=(-1920, 0, 3840, 1080))
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    monkeypatch.setattr(input_engine_module, "_user32", fake)
     _engine().move(-1000, 500)
     event = fake.batches[0][0]
     assert (
@@ -177,11 +194,11 @@ def test_click_batches_move_down_up_in_one_call(fake_user32: _FakeUser32) -> Non
     assert len(fake_user32.batches) == 1
     flags = [event["flags"] for event in fake_user32.batches[0]]
     assert flags == [
-        backend_module._MOUSEEVENTF_MOVE
-        | backend_module._MOUSEEVENTF_ABSOLUTE
-        | backend_module._MOUSEEVENTF_VIRTUALDESK,
-        backend_module._MOUSEEVENTF_LEFTDOWN,
-        backend_module._MOUSEEVENTF_LEFTUP,
+        _MOUSEEVENTF_MOVE
+        | _MOUSEEVENTF_ABSOLUTE
+        | _MOUSEEVENTF_VIRTUALDESK,
+        _MOUSEEVENTF_LEFTDOWN,
+        _MOUSEEVENTF_LEFTUP,
     ]
 
 
@@ -216,7 +233,7 @@ def test_click_rejects_nonpositive_clicks(fake_user32: _FakeUser32) -> None:
 @WINDOWS_ONLY
 def test_sendinput_ret_zero_raises_input_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeUser32(send_input_results=[0])
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    monkeypatch.setattr(input_engine_module, "_user32", fake)
     with pytest.raises(InputBlockedError, match="blocked"):
         _engine().move(100, 100)
     assert len(fake.batches) == 1  # the dispatch was attempted, then failed closed
@@ -228,7 +245,10 @@ def test_failsafe_corner_raises_before_any_dispatch(
     monkeypatch: pytest.MonkeyPatch, corner: tuple[int, int]
 ) -> None:
     fake = _FakeUser32(cursor=corner)
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    # D3 dual patch: dispatch reads the input_engine binding, the corner check's
+    # get_cursor_position reads the windows binding — both must see the fake.
+    monkeypatch.setattr(input_engine_module, "_user32", fake)
+    monkeypatch.setattr(windows_module, "_user32", fake)
     with pytest.raises(InputBlockedError, match="failsafe"):
         _engine().move(500, 500)
     with pytest.raises(InputBlockedError, match="failsafe"):
@@ -247,7 +267,7 @@ def test_failsafe_mid_screen_cursor_dispatches(fake_user32: _FakeUser32) -> None
 @WINDOWS_ONLY
 def test_failsafe_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeUser32(cursor=(0, 0))
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    monkeypatch.setattr(input_engine_module, "_user32", fake)
     _engine(failsafe=False).move(100, 100)
     assert len(fake.batches) == 1
 
@@ -262,8 +282,8 @@ def test_type_text_batches_whole_string_as_unicode(fake_user32: _FakeUser32) -> 
     events = fake_user32.batches[0]
     assert len(events) == 4  # two chars x (down+up)
     assert [event["scan"] for event in events] == [ord("h"), ord("h"), ord("i"), ord("i")]
-    assert events[0]["flags"] == backend_module._KEYEVENTF_UNICODE
-    assert events[1]["flags"] == backend_module._KEYEVENTF_UNICODE | backend_module._KEYEVENTF_KEYUP
+    assert events[0]["flags"] == _KEYEVENTF_UNICODE
+    assert events[1]["flags"] == _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP
     assert all(event["vk"] == 0 for event in events)  # wVk must be 0 for VK_PACKET
 
 
@@ -284,9 +304,9 @@ def test_type_text_arabic_string_is_layout_proof(fake_user32: _FakeUser32) -> No
 def test_type_text_units_newline_tab_and_astral() -> None:
     units = _text_to_key_units("a\n\t\U0001f600")  # char, LF, TAB, astral smiley
     kinds = [(vk, scan, flags) for vk, scan, flags in units]
-    assert kinds[0] == (0, ord("a"), backend_module._KEYEVENTF_UNICODE)
+    assert kinds[0] == (0, ord("a"), _KEYEVENTF_UNICODE)
     assert kinds[2] == (0x0D, 0, 0)  # '\n' -> VK_RETURN down (pyautogui parity)
-    assert kinds[3] == (0x0D, 0, backend_module._KEYEVENTF_KEYUP)
+    assert kinds[3] == (0x0D, 0, _KEYEVENTF_KEYUP)
     assert kinds[4] == (0x09, 0, 0)  # '\t' -> VK_TAB down
     # astral char -> two surrogate code units, each down+up
     surrogate_units = [scan for _vk, scan, _flags in kinds[6::2]]
@@ -342,8 +362,8 @@ def test_chord_ctrl_s_is_one_batch_with_reverse_release(fake_user32: _FakeUser32
     assert [(event["vk"], event["flags"]) for event in events] == [
         (0x11, 0),  # ctrl down
         (0x53, 0),  # s down
-        (0x53, backend_module._KEYEVENTF_KEYUP),
-        (0x11, backend_module._KEYEVENTF_KEYUP),  # modifiers released in reverse order
+        (0x53, _KEYEVENTF_KEYUP),
+        (0x11, _KEYEVENTF_KEYUP),  # modifiers released in reverse order
     ]
 
 
@@ -355,7 +375,7 @@ def test_chord_three_keys_press_in_order_release_in_reverse(fake_user32: _FakeUs
     assert vks == [0x11, 0x10, 0x1B, 0x1B, 0x10, 0x11]  # VK_SHIFT=0x10 (pyautogui parity)
     flags = [event["flags"] for event in events]
     assert flags[:3] == [0, 0, 0]
-    assert flags[3:] == [backend_module._KEYEVENTF_KEYUP] * 3
+    assert flags[3:] == [_KEYEVENTF_KEYUP] * 3
 
 
 @WINDOWS_ONLY
@@ -365,8 +385,8 @@ def test_chord_uppercase_letter_injects_shift(fake_user32: _FakeUser32) -> None:
     assert [(event["vk"], event["flags"]) for event in events] == [
         (0x10, 0),  # shift down first
         (0x41, 0),
-        (0x41, backend_module._KEYEVENTF_KEYUP),
-        (0x10, backend_module._KEYEVENTF_KEYUP),  # shift released last
+        (0x41, _KEYEVENTF_KEYUP),
+        (0x10, _KEYEVENTF_KEYUP),  # shift released last
     ]
 
 
@@ -375,14 +395,14 @@ def test_chord_shift_member_via_vkkeyscan(monkeypatch: pytest.MonkeyPatch) -> No
     """'!' resolves through VkKeyScanW with its shift flag honored (pyautogui parity)."""
     fake = _FakeUser32()
     fake.VkKeyScanW = lambda char: 0x0031 | 0x0100  # VK '1' + shift flag
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    monkeypatch.setattr(input_engine_module, "_user32", fake)
     _engine().chord(["!"])
     events = fake.batches[0]
     assert [(event["vk"], event["flags"]) for event in events] == [
         (0x10, 0),  # shift down first
         (0x31, 0),
-        (0x31, backend_module._KEYEVENTF_KEYUP),
-        (0x10, backend_module._KEYEVENTF_KEYUP),  # shift released last
+        (0x31, _KEYEVENTF_KEYUP),
+        (0x10, _KEYEVENTF_KEYUP),  # shift released last
     ]
 
 
@@ -401,7 +421,7 @@ def test_scroll_wheel_event_carries_delta_times_120(fake_user32: _FakeUser32) ->
     _engine().scroll(-3)
     event = fake_user32.batches[0][0]
     assert event["kind"] == "mouse"
-    assert event["flags"] == backend_module._MOUSEEVENTF_WHEEL
+    assert event["flags"] == _MOUSEEVENTF_WHEEL
     assert event["mouseData"] == (-3 * 120) & 0xFFFFFFFF  # DWORD wrap, pyautogui parity
 
 
@@ -409,28 +429,28 @@ def test_scroll_wheel_event_carries_delta_times_120(fake_user32: _FakeUser32) ->
 
 
 def test_mouse_flag_event_defaults() -> None:
-    event = _decode_event(_mouse_flag_event(backend_module._MOUSEEVENTF_LEFTDOWN))
+    event = _decode_event(_mouse_flag_event(_MOUSEEVENTF_LEFTDOWN))
     assert event == {"kind": "mouse", "flags": 0x2, "dx": 0, "dy": 0, "mouseData": 0}
 
 
 def test_key_event_unicode_fields() -> None:
     event = _decode_event(
-        _key_event(0, 0x00E9, backend_module._KEYEVENTF_UNICODE | backend_module._KEYEVENTF_KEYUP)
+        _key_event(0, 0x00E9, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP)
     )
     assert event == {
         "kind": "keyboard",
         "vk": 0,
         "scan": 0x00E9,
-        "flags": backend_module._KEYEVENTF_UNICODE | backend_module._KEYEVENTF_KEYUP,
+        "flags": _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP,
     }
 
 
 def test_mouse_move_event_flags() -> None:
     event = _decode_event(_mouse_move_event(10, 20, METRICS))
     assert event["flags"] == (
-        backend_module._MOUSEEVENTF_MOVE
-        | backend_module._MOUSEEVENTF_ABSOLUTE
-        | backend_module._MOUSEEVENTF_VIRTUALDESK
+        _MOUSEEVENTF_MOVE
+        | _MOUSEEVENTF_ABSOLUTE
+        | _MOUSEEVENTF_VIRTUALDESK
     )
 
 
@@ -535,7 +555,7 @@ def test_engine_drag_policy_attributes() -> None:
     assert send.drag_step_pause == 0.0
     fallback = PyAutoGuiInputEngine(_FakePyautogui())
     assert fallback.drag_interpolate is True  # legacy interpolated stroke
-    assert fallback.drag_step_pause == backend_module._DRAG_STEP_PAUSE_SECONDS
+    assert fallback.drag_step_pause == _DRAG_STEP_PAUSE_SECONDS
 
 
 def test_recording_engine_matches_engine_contract() -> None:

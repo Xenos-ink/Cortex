@@ -96,7 +96,7 @@ from pydantic import BeforeValidator
 
 from .pipeline.agent import ComputerUseAgent, execute_result_token, rejection_reasons
 from .security.audit import AuditLogger, Metrics
-from .backend import ComputerBackend, LocalComputerBackend
+from .desktop.backend import ComputerBackend, LocalComputerBackend
 from .planning.checkpoint_manager import (
     CheckpointError,
     CheckpointManager,

@@ -1,4 +1,4 @@
-"""Fresh in-process import of ``computer_use_mcp.backend`` under a private alias.
+"""Fresh in-process import of ``computer_use_mcp.desktop.backend`` under a private alias.
 
 WP-H DELTA 1 (m2): the offline suite no longer spawns child interpreters — the
 launch tripwire rejects ``python -c`` children — so the import-time env-parsing
@@ -9,7 +9,7 @@ without any subprocess.
 
 Safety notes (for the WP-H audit):
 - the probe module is NEVER inserted into ``sys.modules`` (private alias), so the
-  installed ``computer_use_mcp.backend`` and every other test stay untouched;
+  installed ``computer_use_mcp.desktop.backend`` and every other test stay untouched;
 - backend.py's module level only DEFINES things and binds ctypes prototypes — it
   performs no desktop effect, so the fresh exec cannot act on the desktop and the
   trip log stays empty;
@@ -26,13 +26,13 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-import computer_use_mcp.backend as _installed_backend
+import computer_use_mcp.desktop.backend as _installed_backend
 from desktop_tripwire import EFFECT_DLL_BINDINGS
 
 _BACKEND_PATH = Path(_installed_backend.__file__).resolve()
 #: A submodule name INSIDE the real package so backend.py's relative imports
-#: (``from .models import ...``) resolve against the installed package.
-_PROBE_ALIAS = "computer_use_mcp._cortex_backend_fresh_probe"
+#: (``from .win32 import ...``) resolve against the installed desktop package.
+_PROBE_ALIAS = "computer_use_mcp.desktop._cortex_backend_fresh_probe"
 
 
 class _PrivateDllLoader:

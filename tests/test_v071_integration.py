@@ -32,7 +32,8 @@ import pytest
 from PIL import Image
 
 from computer_use_mcp.pipeline.agent import CAPTURE_SOURCE_SUSPECTED, ComputerUseAgent
-from computer_use_mcp.backend import TYPE_UNCONFIRMED_MARKER, FakeComputerBackend
+from computer_use_mcp.desktop.backend import TYPE_UNCONFIRMED_MARKER
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.limits import Limits
 from computer_use_mcp.core.models import GroundedAction
 from computer_use_mcp.security.safety import SafetyPolicy

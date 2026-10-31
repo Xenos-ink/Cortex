@@ -55,7 +55,7 @@ def ms(xs):
 async def run_config():
     from computer_use_mcp.pipeline.agent import ComputerUseAgent
     from computer_use_mcp.security.audit import AuditLogger, Metrics
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
     from computer_use_mcp.core.limits import LimitEnforcer, Limits
     from computer_use_mcp.core.models import GroundedAction, SessionState
     from computer_use_mcp.security.safety import SafetyPolicy

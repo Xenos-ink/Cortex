@@ -32,12 +32,10 @@ import benchmarks.score_task as score_task_module
 from benchmarks.score_task import append_run_log
 from benchmarks.score_task import main as score_main
 from computer_use_mcp import server
-from computer_use_mcp.backend import (
-    FakeComputerBackend,
-    InputBlockedError,
-    PyAutoGuiInputEngine,
-    SendInputEngine,
-)
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.errors import InputBlockedError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.input_engine import PyAutoGuiInputEngine, SendInputEngine
 from computer_use_mcp.desktop.focus_guard import InterferenceGuard
 from computer_use_mcp.desktop.interference import parse_interference
 from computer_use_mcp.core.limits import LimitEnforcer, Limits
@@ -410,7 +408,7 @@ def test_rt2_refocus_policy_reattaches_only_to_the_bound_target() -> None:
     assert backend.query_foreground_window().hwnd == TARGET.hwnd
     # (b) refocus REFUSED (alive bound window, but the focus primitive refuses):
     # reject fail-closed, never touch the foreign window.
-    from computer_use_mcp.backend import WindowFocusError
+    from computer_use_mcp.desktop.errors import WindowFocusError
 
     class RefusingFocusBackend(GuardBackend):
         def focus_window_title(self, title: str) -> str:
@@ -674,24 +672,24 @@ def test_rt4_sendinput_ret_zero_fails_closed_with_one_attempt() -> None:
     """SendInput returning 0 (UIPI/blocked) must raise InputBlockedError and deliver
     NOTHING — a single failed attempt, no retry storm (strictly stronger than
     pyautogui's silent swallow)."""
-    import computer_use_mcp.backend as backend_module
+    import computer_use_mcp.desktop.input_engine as input_engine_module
 
     fake = _ParityFakeUser32(send_results=[0])
-    original = backend_module._user32
-    backend_module._user32 = fake
+    original = input_engine_module._user32
+    input_engine_module._user32 = fake
     try:
         engine = SendInputEngine()
         with pytest.raises(InputBlockedError, match="blocked"):
             engine.click(30, 45)
         assert len(fake.batches) == 1  # one attempt, fail-closed, no retries
     finally:
-        backend_module._user32 = original
+        input_engine_module._user32 = original
 
 
 def test_rt4_failsafe_corner_blocks_both_engines_identically() -> None:
     """The failsafe corner maps to InputBlockedError on BOTH engines; the SendInput
     engine dispatches ZERO events when blocked."""
-    import computer_use_mcp.backend as backend_module
+    import computer_use_mcp.desktop.input_engine as input_engine_module
 
     pa = _ParityPyautogui(fail=True)  # emulates pyautogui's FailSafeException
     with pytest.raises(InputBlockedError):
@@ -699,14 +697,21 @@ def test_rt4_failsafe_corner_blocks_both_engines_identically() -> None:
     assert pa.calls == []  # nothing dispatched from the corner
 
     fake = _ParityFakeUser32(cursor=(0, 0))  # the REAL replicated corner check
-    original = backend_module._user32
-    backend_module._user32 = fake
+    # D3 dual patch: dispatch reads the input_engine binding, the corner check's
+    # get_cursor_position reads the windows binding — both must see the fake.
+    import computer_use_mcp.desktop.windows as windows_module
+
+    original = input_engine_module._user32
+    original_win = windows_module._user32
+    input_engine_module._user32 = fake
+    windows_module._user32 = fake
     try:
         with pytest.raises(InputBlockedError, match="failsafe"):
             SendInputEngine().click(30, 45)
         assert fake.batches == []  # blocked BEFORE any physical input
     finally:
-        backend_module._user32 = original
+        input_engine_module._user32 = original
+        windows_module._user32 = original_win
     assert METRICS == (0, 0, 1920, 1080)  # the corner math assumed this virtual screen
 
 

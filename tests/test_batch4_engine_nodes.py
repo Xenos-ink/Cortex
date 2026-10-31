@@ -31,8 +31,8 @@ import pytest
 
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import LocalComputerBackend
+import computer_use_mcp.desktop.backend as backend_module
+from computer_use_mcp.desktop.backend import LocalComputerBackend
 from computer_use_mcp.core.models import ActionType, GroundedAction, Point
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
@@ -78,8 +78,11 @@ def test_b4_2_model_construct_misuse_stops_before_engine_calls(
     assert engine.down is False
 
 
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+
+
 def test_b4_2_fake_backend_applies_model_construct_defense_before_recording() -> None:
-    backend = backend_module.FakeComputerBackend()
+    backend = FakeComputerBackend()
     bypassed = GroundedAction.model_construct(
         action=ActionType.CLICK,
         point=Point(x=1, y=2),

@@ -19,14 +19,11 @@ from PIL import Image
 from pydantic import ValidationError
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
+import computer_use_mcp.desktop.backend as backend_module
 from computer_use_mcp import server
 from computer_use_mcp.pipeline.agent import ComputerUseAgent
-from computer_use_mcp.backend import (
-    CoordinateSpaceError,
-    FakeComputerBackend,
-    InputBlockedError,
-)
+from computer_use_mcp.desktop.errors import CoordinateSpaceError, InputBlockedError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.pipeline.grounding import GroundingRouter, UnsupportedGroundingError
 from computer_use_mcp.core.models import (
     ActionType,

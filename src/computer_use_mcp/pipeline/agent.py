@@ -104,7 +104,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from ..security.audit import AuditLogger, Metrics
-from ..backend import ComputerBackend, FocusDriftError
+from ..desktop.backend import ComputerBackend
+from ..desktop.errors import FocusDriftError
 from ..desktop.focus_guard import GuardVerdict, InterferenceGuard
 from .grounding import GroundingRouter
 from ..desktop.interference import REFOCUS_HINT, InterferencePolicy, parse_interference

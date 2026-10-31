@@ -10,7 +10,7 @@ test stays green. This checker makes that class of mistake fail NOW.
 
 COLLECTED SITE FORMS (tests/ + benchmarks/, recursive):
 - ``monkeypatch.setattr(<module>, "name", ...)`` where ``<module>`` resolves to
-  a computer_use_mcp module (``import computer_use_mcp.backend as bm``,
+  a computer_use_mcp module (``import computer_use_mcp.desktop.backend as bm``,
   ``import computer_use_mcp.desktop.backend``, ``from computer_use_mcp import
   server``, ``from computer_use_mcp.desktop import backend as B`` — package ids
   are registered, F1);
@@ -724,7 +724,7 @@ EXPECTED_NOOP_PATCH_SITES: dict[tuple[str, str, str, int], str] = {
         "but benchmarks/runner.py calls ``server.stop_session(session_id)`` — an "
         "attribute lookup on the module at call time, so the spy patch IS "
         "effective for the harness run it drives.",
-    ("tests/test_v071_type_via_clipboard.py", "computer_use_mcp.backend", "_clipboard_read_text", 1):
+    ("tests/test_v071_type_via_clipboard.py", "computer_use_mcp.desktop.clipboard", "_clipboard_read_text", 1):
         "GENUINE SILENT NO-OP (Commander decision, VAL-WP-R2a-0-01/F10): the "
         "binding is dead in src since the D13/repair-3.3 transport switch to "
         "_clipboard_read_verdict (def backend.py:1703, zero call sites; "
@@ -732,15 +732,15 @@ EXPECTED_NOOP_PATCH_SITES: dict[tuple[str, str, str, int], str] = {
         "computer_use_mcp.desktop.clipboard (the defining module — no "
         "AttributeError, no bare re-export) and KEEPS it listed; WP10a deletes "
         "the dead function and the patch together.",
-    ("tests/test_v071_type_via_clipboard.py", "computer_use_mcp.backend", "_clipboard_read_text", 6):
+    ("tests/test_v071_type_via_clipboard.py", "computer_use_mcp.desktop.clipboard", "_clipboard_read_text", 6):
         "GENUINE SILENT NO-OP (same decision; the _bomb_read tripwire never "
         "arms because nothing reads the binding — v071:420; the "
         "_bomb_verdict/_bomb_write companions cover the path). Same step-1 "
         "retarget to desktop.clipboard.",
-    ("tests/test_d13_nontext_clipboard_annotated.py", "computer_use_mcp.backend", "_clipboard_read_text", 0):
+    ("tests/test_d13_nontext_clipboard_annotated.py", "computer_use_mcp.desktop.clipboard", "_clipboard_read_text", 0):
         "GENUINE SILENT NO-OP (F2 exposed this assign-form site): same dead "
         "binding; same step-1 retarget to desktop.clipboard.",
-    ("tests/test_d13_clipboard_restore_after_settle.py", "computer_use_mcp.backend", "_clipboard_read_text", 0):
+    ("tests/test_d13_clipboard_restore_after_settle.py", "computer_use_mcp.desktop.clipboard", "_clipboard_read_text", 0):
         "GENUINE SILENT NO-OP (F2 exposed this assign-form site): same dead "
         "binding; same step-1 retarget to desktop.clipboard.",
 }

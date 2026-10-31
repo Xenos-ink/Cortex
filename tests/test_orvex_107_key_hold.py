@@ -43,19 +43,19 @@ from test_controller_integration import (
     make_session,
 )
 
-import computer_use_mcp.backend as backend_module
+import computer_use_mcp.desktop.backend as backend_module
 from computer_use_mcp import server
-from computer_use_mcp.backend import (
-    _KEYEVENTF_KEYUP,
-    HOLD_SLICE_SECONDS,
-    FakeComputerBackend,
+from computer_use_mcp.desktop.backend import _validate_action_defense
+from computer_use_mcp.desktop.errors import UnsupportedActionError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.input_engine import (
     InputEngine,
     PyAutoGuiInputEngine,
     SendInputEngine,
-    UnsupportedActionError,
     _chord_key_units,
-    _validate_action_defense,
 )
+from computer_use_mcp.desktop.motion import HOLD_SLICE_SECONDS
+from computer_use_mcp.desktop.win32 import _KEYEVENTF_KEYUP
 from computer_use_mcp.core.models import MAX_HOLD_MS, ActionSpec, ActionType, GroundedAction, Point
 from computer_use_mcp.core.state import StopToken, TaskStopped
 from computer_use_mcp.pipeline.validator import GroundingValidator

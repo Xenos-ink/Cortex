@@ -36,7 +36,7 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.interference import LAUNCHED, NO_INSTANCE, REATTACHED
 from computer_use_mcp.core.models import GroundedAction, Observation, WindowInfo
 from computer_use_mcp.pipeline.agent import ComputerUseAgent
@@ -50,7 +50,7 @@ from computer_use_mcp.pipeline.validator import GroundingValidator
 def _foreign_foreground_observation() -> Observation:
     """The fresh-session screen: the DRIVER TERMINAL is in the foreground
     (the logged WindowsTerminal.exe/ZCode.exe), not any allowlisted app."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend()
     backend.set_active_window(
@@ -161,7 +161,11 @@ def test_pin4_fresh_session_ensure_app_reattaches_end_to_end() -> None:
     """End-to-end with an EXISTING instance: the fresh-session ensure_app on the
     allowlisted target executes (REATTACHED), ok=True — exactly the live-test flow
     that died in the FailedLog."""
-    from computer_use_mcp.backend import AppWindowCandidate, doc_token_from_title, is_unsaved_candidate_title
+    from computer_use_mcp.desktop.launch import (
+        AppWindowCandidate,
+        doc_token_from_title,
+        is_unsaved_candidate_title,
+    )
 
     backend = FakeComputerBackend()
     paint = WindowInfo(

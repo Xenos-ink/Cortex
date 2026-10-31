@@ -30,15 +30,16 @@ from typing import Any
 import pytest
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import (
-    FakeComputerBackend,
-    InputBlockedError,
-    LocalComputerBackend,
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.input_engine as input_engine_module
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.errors import InputBlockedError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.input_engine import (
     PyAutoGuiInputEngine,
     SendInputEngine,
-    _motion_path_points,
 )
+from computer_use_mcp.desktop.motion import _motion_path_points
 from computer_use_mcp.core.models import GroundedAction
 from computer_use_mcp.core.state import StopToken, TaskStopped
 
@@ -381,7 +382,7 @@ def test_parity_timed_move_same_points_on_both_engines(
     real_backend.execute(move((30, 45), duration_ms=60))
 
     fake_user32 = _ParityFakeUser32()
-    monkeypatch.setattr(backend_module, "_user32", fake_user32)
+    monkeypatch.setattr(input_engine_module, "_user32", fake_user32)
     monkeypatch.setattr(real_backend, "_engine", SendInputEngine())
     real_backend.execute(move((30, 45), duration_ms=60))
 

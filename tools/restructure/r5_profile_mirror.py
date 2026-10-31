@@ -49,7 +49,7 @@ def main() -> int:
     args = parser.parse_args()
     iters = max(3, args.iterations)
 
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
     from computer_use_mcp.core.limits import LimitEnforcer, Limits
     from computer_use_mcp.vision.observation import digest_matches, observation_digest
     from computer_use_mcp.pipeline.verification import (

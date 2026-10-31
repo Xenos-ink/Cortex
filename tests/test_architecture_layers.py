@@ -6,7 +6,7 @@ import of a HIGHER layer fails:
     core (0) < security (1) < desktop (2) < vision (3) < pipeline (4)
              < planning (5) < server (6) < cli (7)
 
-backend.py counts as desktop, server.py as server and cli.py as cli until
+server.py counts as server and cli.py as cli until
 WP-R2 moves them.  Every import of every module under
 ``src/computer_use_mcp`` (module-level AND function-level, absolute AND
 relative) is resolved to a layer; an import of a HIGHER layer fails.
@@ -25,8 +25,8 @@ PKG = Path(__file__).resolve().parents[1] / "src" / "computer_use_mcp"
 LAYER_ORDER = ("core", "security", "desktop", "vision", "pipeline",
                "planning", "server", "cli")
 _LAYER_INDEX = {name: idx for idx, name in enumerate(LAYER_ORDER)}
-# root-level modules until WP-R2 relocates them
-_ROOT_MODULE_LAYER = {"backend": "desktop", "server": "server", "cli": "cli"}
+# root-level modules until WP-R2 relocates them (backend now lives in desktop/)
+_ROOT_MODULE_LAYER = {"server": "server", "cli": "cli"}
 SUBPACKAGES = ("core", "security", "desktop", "vision", "pipeline", "planning")
 
 
@@ -205,6 +205,10 @@ def test_every_module_and_subpackage_has_a_layer_mapping() -> None:
 MOVED_MODULE_FILES = (
     "core/models.py", "core/state.py", "core/limits.py", "core/textnorm.py",
     "security/safety.py", "security/redaction.py", "security/audit.py",
+    "desktop/backend.py", "desktop/capture.py", "desktop/clipboard.py",
+    "desktop/coordinates.py", "desktop/errors.py", "desktop/fake_backend.py",
+    "desktop/input_engine.py", "desktop/launch.py", "desktop/motion.py",
+    "desktop/text_readers.py", "desktop/windows.py", "desktop/win32.py",
     "desktop/focus_guard.py", "desktop/interference.py",
     "vision/observation.py", "vision/visual_views.py",
     "vision/text_substrates.py", "vision/evidence.py",
@@ -215,7 +219,7 @@ MOVED_MODULE_FILES = (
     "planning/resume_manager.py", "planning/context_manager.py",
     "planning/long_running.py",
 )
-ROOT_MODULE_FILES = ("__init__.py", "backend.py", "server.py", "cli.py")
+ROOT_MODULE_FILES = ("__init__.py", "server.py", "cli.py")
 
 
 def all_package_module_relpaths() -> set[str]:

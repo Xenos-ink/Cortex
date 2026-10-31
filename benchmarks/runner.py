@@ -73,7 +73,7 @@ from benchmarks.appwin import (
 )
 from benchmarks.fakeworld import FakeWorldBackend
 from computer_use_mcp import server
-from computer_use_mcp.backend import LocalComputerBackend
+from computer_use_mcp.desktop.backend import LocalComputerBackend
 from computer_use_mcp.core.models import GroundedAction
 from computer_use_mcp.core.state import SessionRegistry
 

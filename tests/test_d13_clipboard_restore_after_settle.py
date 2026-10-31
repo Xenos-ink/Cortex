@@ -28,9 +28,12 @@ from typing import Any
 
 import pytest
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp import backend as B
-from computer_use_mcp.backend import TYPE_VERIFY_SETTLE_SECONDS, StopToken
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.clipboard as clipboard_module
+from computer_use_mcp.desktop import backend as B
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.core.state import StopToken
+from computer_use_mcp.desktop.backend import TYPE_VERIFY_SETTLE_SECONDS
 from computer_use_mcp.core.models import ActionType, GroundedAction
 
 # --- the in-memory OS clipboard ----------------------------------------------------------------
@@ -139,11 +142,13 @@ def run_transport(
     instance._apply_key_dispatch_gap = lambda keys: None  # type: ignore[method-assign]
 
     saved = (
-        B._clipboard_read_text,
+        clipboard_module._clipboard_read_text,
         B._clipboard_write_text,
         B._clipboard_read_verdict,
     )
-    B._clipboard_read_text = clipboard.read_text  # type: ignore[assignment]
+    # F10: the dead ``_clipboard_read_text`` binding is retargeted to the clipboard
+    # module (its HOME); the patch stays a documented no-op (WP10a deletes it).
+    clipboard_module._clipboard_read_text = clipboard.read_text  # type: ignore[assignment]
     B._clipboard_write_text = clipboard.write_text  # type: ignore[assignment]
     # F3 fix 3.3: production saves through the three-way verdict, so the double does too.
     B._clipboard_read_verdict = clipboard.verdict  # type: ignore[assignment]
@@ -155,7 +160,7 @@ def run_transport(
         raised = exc
     finally:
         (
-            B._clipboard_read_text,
+            clipboard_module._clipboard_read_text,
             B._clipboard_write_text,
             B._clipboard_read_verdict,
         ) = saved  # type: ignore[assignment]
@@ -276,7 +281,7 @@ def test_the_in_repo_fake_reads_the_clipboard_value_at_paste_time() -> None:
     paste payload is the clipboard's own value, so a restore ordered before the paste is
     visible to the fake too.
     """
-    world = B.FakeComputerBackend()
+    world = FakeComputerBackend()
     world.clipboard_value = "OLD"
     world.focused_control_value = ""
 
@@ -288,7 +293,7 @@ def test_the_in_repo_fake_reads_the_clipboard_value_at_paste_time() -> None:
 
 def test_the_fake_can_simulate_a_late_consumer_too() -> None:
     """``clipboard_app_latency_s`` makes the delivery-time read reachable from a test."""
-    world = B.FakeComputerBackend(clipboard_app_latency_s=0.025, initial_clipboard="OLD")
+    world = FakeComputerBackend(clipboard_app_latency_s=0.025, initial_clipboard="OLD")
     world.focused_control_value = ""
     assert world.clipboard_value == "OLD"
 
@@ -315,7 +320,7 @@ def test_the_fake_does_not_touch_the_real_clipboard(monkeypatch: pytest.MonkeyPa
         lambda text: reached.append("write") or True,
     )
 
-    world = B.FakeComputerBackend(initial_clipboard="OLD")
+    world = FakeComputerBackend(initial_clipboard="OLD")
     world.focused_control_value = ""
     world._simulate_type_clipboard(_action("NEW"), None)
 

@@ -36,9 +36,10 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp import backend as backend_module
+from computer_use_mcp.desktop import backend as backend_module
 from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend, LocalComputerBackend
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import GroundedAction, Observation, WindowInfo
 from computer_use_mcp.pipeline.verification import (
     ScreenshotDiffStrategy,

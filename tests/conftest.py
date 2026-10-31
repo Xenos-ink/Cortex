@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import LocalComputerBackend
+import computer_use_mcp.desktop.backend as backend_module
+from computer_use_mcp.desktop.backend import LocalComputerBackend
 
 
 @pytest.fixture(autouse=True)

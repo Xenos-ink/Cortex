@@ -49,7 +49,8 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
-from ..backend import ComputerBackend, WindowFocusError
+from .backend import ComputerBackend
+from .errors import WindowFocusError
 from .interference import (
     FOCUS_DRIFTED,
     FOCUS_TAKEN_BY,
@@ -860,7 +861,7 @@ class InterferenceGuard:
             return  # B10 (a): same-process / dialog-hosted / launcher surface
         payload = format_focus_drifted(_describe_target(bound), _describe_focus_target(target))
         self._audit("focus_drifted_mid_type", payload, action=action)
-        from ..backend import FocusDriftError
+        from .errors import FocusDriftError
 
         raise FocusDriftError(payload)
 

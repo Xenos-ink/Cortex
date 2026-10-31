@@ -31,15 +31,13 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
-import computer_use_mcp.backend as backend_module
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.windows as windows_module
 from computer_use_mcp import server
 from computer_use_mcp.pipeline.agent import ComputerUseAgent
-from computer_use_mcp.backend import (
-    ComputerBackend,
-    FakeComputerBackend,
-    InputBlockedError,
-    WindowFocusError,
-)
+from computer_use_mcp.desktop.backend import ComputerBackend
+from computer_use_mcp.desktop.errors import InputBlockedError, WindowFocusError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.pipeline.grounding import GroundingRouter
 from computer_use_mcp.core.limits import Limits
 from computer_use_mcp.core.models import (
@@ -296,8 +294,12 @@ def _install_fake_win32(
     monkeypatch: pytest.MonkeyPatch, user32: _FakeUser32
 ) -> tuple[_FakeUser32, _FakeKernel32]:
     kernel32 = _FakeKernel32()
+    # D3 dual patch: _execute_focus_window reads the backend binding,
+    # find_window_by_title reads the windows binding — both must see the fakes.
     monkeypatch.setattr(backend_module, "_user32", user32)
     monkeypatch.setattr(backend_module, "_kernel32", kernel32)
+    monkeypatch.setattr(windows_module, "_user32", user32)
+    monkeypatch.setattr(windows_module, "_kernel32", kernel32)
     return user32, kernel32
 
 

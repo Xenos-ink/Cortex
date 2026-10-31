@@ -8,7 +8,7 @@ resolves uniquely to this file.
 
 from __future__ import annotations
 
-from computer_use_mcp.backend import InputEngine
+from computer_use_mcp.desktop.input_engine import InputEngine
 
 
 class RecordingEngine(InputEngine):

@@ -53,7 +53,8 @@ from typing import Any
 
 import pytest
 
-import computer_use_mcp.backend as backend_module
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.windows as windows_module
 
 
 class RealDesktopEffectInOfflineSuite(AssertionError):
@@ -474,7 +475,7 @@ class _TrapLoader:
 
     def exec_module(self, module: Any) -> None:
         try:
-            backend_module._set_process_dpi_awareness()
+            windows_module._set_process_dpi_awareness()
         except Exception:  # noqa: BLE001 - the setter is best-effort in production too
             pass
         self._inner.exec_module(module)

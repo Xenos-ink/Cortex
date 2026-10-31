@@ -22,15 +22,27 @@ from PIL import Image
 from pydantic import ValidationError
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.input_engine as input_engine_module
 from computer_use_mcp import server
 from computer_use_mcp.pipeline.agent import ComputerUseAgent
-from computer_use_mcp.backend import (
-    CoordinateSpaceError,
-    FakeComputerBackend,
-    InputBlockedError,
-    PyAutoGuiInputEngine,
-    SendInputEngine,
+from computer_use_mcp.desktop.errors import CoordinateSpaceError, InputBlockedError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.input_engine import PyAutoGuiInputEngine, SendInputEngine, _MOUSE_BUTTON_FLAGS
+from computer_use_mcp.desktop.win32 import (
+    _KEYEVENTF_KEYUP,
+    _MOUSEEVENTF_ABSOLUTE,
+    _MOUSEEVENTF_LEFTDOWN,
+    _MOUSEEVENTF_LEFTUP,
+    _MOUSEEVENTF_MOVE,
+    _MOUSEEVENTF_RIGHTDOWN,
+    _MOUSEEVENTF_RIGHTUP,
+    _MOUSEEVENTF_VIRTUALDESK,
+    _MOUSEEVENTF_WHEEL,
+    _SM_CXVIRTUALSCREEN,
+    _SM_CYVIRTUALSCREEN,
+    _SM_XVIRTUALSCREEN,
+    _SM_YVIRTUALSCREEN,
 )
 from computer_use_mcp.pipeline.grounding import GroundingRouter, UnsupportedGroundingError
 from computer_use_mcp.core.models import (
@@ -256,10 +268,10 @@ class _FakeUser32:
         mapping = {0: 1920, 1: 1080}
         mapping.update(
             {
-                backend_module._SM_XVIRTUALSCREEN: 0,
-                backend_module._SM_YVIRTUALSCREEN: 0,
-                backend_module._SM_CXVIRTUALSCREEN: 1920,
-                backend_module._SM_CYVIRTUALSCREEN: 1080,
+                _SM_XVIRTUALSCREEN: 0,
+                _SM_YVIRTUALSCREEN: 0,
+                _SM_CXVIRTUALSCREEN: 1920,
+                _SM_CYVIRTUALSCREEN: 1080,
             }
         )
         return mapping[index]
@@ -277,7 +289,7 @@ class _FakeUser32:
 @pytest.fixture
 def fake_user32(monkeypatch: pytest.MonkeyPatch) -> _FakeUser32:
     fake = _FakeUser32()
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    monkeypatch.setattr(input_engine_module, "_user32", fake)
     return fake
 
 
@@ -288,11 +300,11 @@ def test_sendinput_engine_right_click_sends_rightdown_rightup(fake_user32: _Fake
     assert len(fake_user32.batches) == 1
     flags = [event["flags"] for event in fake_user32.batches[0]]
     assert flags == [
-        backend_module._MOUSEEVENTF_MOVE
-        | backend_module._MOUSEEVENTF_ABSOLUTE
-        | backend_module._MOUSEEVENTF_VIRTUALDESK,
-        backend_module._MOUSEEVENTF_RIGHTDOWN,
-        backend_module._MOUSEEVENTF_RIGHTUP,
+        _MOUSEEVENTF_MOVE
+        | _MOUSEEVENTF_ABSOLUTE
+        | _MOUSEEVENTF_VIRTUALDESK,
+        _MOUSEEVENTF_RIGHTDOWN,
+        _MOUSEEVENTF_RIGHTUP,
     ]
 
 
@@ -301,8 +313,8 @@ def test_sendinput_engine_default_click_stays_left(fake_user32: _FakeUser32) -> 
     SendInputEngine().click(30, 45)
     flags = [event["flags"] for event in fake_user32.batches[0]]
     assert flags[1:] == [
-        backend_module._MOUSEEVENTF_LEFTDOWN,
-        backend_module._MOUSEEVENTF_LEFTUP,
+        _MOUSEEVENTF_LEFTDOWN,
+        _MOUSEEVENTF_LEFTUP,
     ]
 
 
@@ -317,12 +329,12 @@ def test_sendinput_engine_click_rejects_unknown_button_before_dispatch(
 
 def test_mouse_button_flags_pin_right_vocabulary() -> None:
     """The Win32 plumbing right_click relies on: typed right down/up flag pair."""
-    assert backend_module._MOUSE_BUTTON_FLAGS["right"] == (
-        backend_module._MOUSEEVENTF_RIGHTDOWN,
-        backend_module._MOUSEEVENTF_RIGHTUP,
+    assert _MOUSE_BUTTON_FLAGS["right"] == (
+        _MOUSEEVENTF_RIGHTDOWN,
+        _MOUSEEVENTF_RIGHTUP,
     )
-    assert backend_module._MOUSEEVENTF_RIGHTDOWN == 0x0008
-    assert backend_module._MOUSEEVENTF_RIGHTUP == 0x0010
+    assert _MOUSEEVENTF_RIGHTDOWN == 0x0008
+    assert _MOUSEEVENTF_RIGHTUP == 0x0010
 
 
 # --- grounding: right_click is a spatial coordinate action (single point) ------------------------

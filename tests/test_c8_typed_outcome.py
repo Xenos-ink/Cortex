@@ -31,9 +31,9 @@ from test_controller_integration import FAST_LIMITS, SessionRegistry, execute_pa
 
 from computer_use_mcp import server
 from computer_use_mcp.pipeline.agent import ENSURE_APP_OUTCOMES, ensure_app_outcome
-from computer_use_mcp.backend import (
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.launch import (
     AppWindowCandidate,
-    FakeComputerBackend,
     is_unsaved_candidate_title,
 )
 from computer_use_mcp.core.models import WindowInfo

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.focus_guard import InterferenceGuard
 from computer_use_mcp.desktop.interference import REANCHOR_REFUSED, parse_interference
 from computer_use_mcp.core.models import GroundedAction, WindowInfo

@@ -39,7 +39,7 @@ from typing import Any
 import pytest
 
 from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import WindowInfo
 
 from test_controller_integration import (

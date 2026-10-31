@@ -22,7 +22,7 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from computer_use_mcp.backend import FakeComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.focus_guard import InterferenceGuard
 from computer_use_mcp.desktop.interference import FOCUS_TAKEN_BY, STUCK_MODIFIER, parse_interference
 from computer_use_mcp.core.models import FailureClass, GroundedAction, WindowInfo
@@ -113,7 +113,9 @@ def test_sweep_applies_to_keypress_and_hotkey_only() -> None:
 
 
 def test_key_dispatch_gap_waits_for_terminal_keys_only(monkeypatch: Any) -> None:
-    import computer_use_mcp.backend as backend_module
+    # C-4: the driven reader is FakeComputerBackend, which reads the binding in
+    # desktop.fake_backend (its import binding), not in desktop.backend.
+    import computer_use_mcp.desktop.fake_backend as backend_module
 
     monkeypatch.setattr(backend_module, "KEY_DISPATCH_GAP_SECONDS", 0.05)
     sleeps: list[float] = []
@@ -141,7 +143,9 @@ def test_key_dispatch_gap_waits_for_terminal_keys_only(monkeypatch: Any) -> None
 
 
 def test_key_dispatch_gap_skips_non_terminal_chords(monkeypatch: Any) -> None:
-    import computer_use_mcp.backend as backend_module
+    # C-4: the driven reader is FakeComputerBackend, which reads the binding in
+    # desktop.fake_backend (its import binding), not in desktop.backend.
+    import computer_use_mcp.desktop.fake_backend as backend_module
 
     monkeypatch.setattr(backend_module, "KEY_DISPATCH_GAP_SECONDS", 0.05)
     sleeps: list[float] = []
@@ -155,7 +159,9 @@ def test_key_dispatch_gap_skips_non_terminal_chords(monkeypatch: Any) -> None:
 
 
 def test_key_dispatch_gap_zero_disables_the_policy(monkeypatch: Any) -> None:
-    import computer_use_mcp.backend as backend_module
+    # C-4: the driven reader is FakeComputerBackend, which reads the binding in
+    # desktop.fake_backend (its import binding), not in desktop.backend.
+    import computer_use_mcp.desktop.fake_backend as backend_module
 
     monkeypatch.setattr(backend_module, "KEY_DISPATCH_GAP_SECONDS", 0.0)
     sleeps: list[float] = []
@@ -170,7 +176,9 @@ def test_key_dispatch_gap_zero_disables_the_policy(monkeypatch: Any) -> None:
 
 def test_batch_final_enter_gets_the_gap_end_to_end(monkeypatch: Any) -> None:
     """A queued [type, enter] batch paces the final Enter (the B3 incident shape)."""
-    import computer_use_mcp.backend as backend_module
+    # C-4: the driven reader is FakeComputerBackend, which reads the binding in
+    # desktop.fake_backend (its import binding), not in desktop.backend.
+    import computer_use_mcp.desktop.fake_backend as backend_module
     from computer_use_mcp.pipeline.agent import ComputerUseAgent
     from computer_use_mcp.core.limits import Limits
     from computer_use_mcp.core.models import ActionSpec
@@ -243,7 +251,9 @@ def test_batch_final_enter_gets_the_gap_end_to_end(monkeypatch: Any) -> None:
 
 def test_focus_transition_settle_paces_immediate_keyboard_dispatch(monkeypatch: Any) -> None:
     """Keys sent right after a window activation wait out the settle (B5 wedge topology)."""
-    import computer_use_mcp.backend as backend_module
+    # C-4: the driven reader is FakeComputerBackend, which reads the binding in
+    # desktop.fake_backend (its import binding), not in desktop.backend.
+    import computer_use_mcp.desktop.fake_backend as backend_module
 
     monkeypatch.setattr(backend_module, "FOCUS_TRANSITION_SETTLE_SECONDS", 0.25)
     sleeps: list[float] = []
@@ -264,7 +274,9 @@ def test_focus_transition_settle_paces_immediate_keyboard_dispatch(monkeypatch: 
 
 
 def test_focus_transition_settle_zero_disables(monkeypatch: Any) -> None:
-    import computer_use_mcp.backend as backend_module
+    # C-4: the driven reader is FakeComputerBackend, which reads the binding in
+    # desktop.fake_backend (its import binding), not in desktop.backend.
+    import computer_use_mcp.desktop.fake_backend as backend_module
 
     monkeypatch.setattr(backend_module, "FOCUS_TRANSITION_SETTLE_SECONDS", 0.0)
     sleeps: list[float] = []
