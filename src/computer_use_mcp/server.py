@@ -131,7 +131,13 @@ from .models import (
 )
 from .observation import observation_text_summary
 from . import plan as plan_layer
-from .plan import PLAN_EVIDENCE_KEY, PlanLease, PlanLeaseGuard
+from .plan import (
+    PLAN_EVIDENCE_KEY,
+    PLAN_FAILURE_REASONS,
+    PlanLease,
+    PlanLeaseGuard,
+    plan_failure_reason,
+)
 from .provider import OpenAICompatibleVisionProvider
 from .redaction import redact_text
 from .resume_manager import ResumeBundle, ResumeManager, ResumeRefusalError
@@ -362,6 +368,7 @@ def _close_stopped_bundle(
         # the WP-S idle reaper and the internal kill path all call this), so an
         # active lease can never outlive its session; the guard's release is
         # idempotent (exactly once, no double-release error).
+        active_plan_lease = _plan_guard.active_lease(bundle)
         _plan_guard.release(session_id, bundle)
         # WP5: dispose the evidence store HERE, inside the locked teardown and BEFORE
         # the bundle is popped — this is the ONE session-end path (stop_session, the
@@ -389,6 +396,21 @@ def _close_stopped_bundle(
     if released_frames:
         logger.debug(
             "evidence store disposed on stop; released %d frame(s)", released_frames
+        )
+    if active_plan_lease is not None:
+        # WP8: a killed session (stop_session / idle reap / internal kill path)
+        # ends any active plan as cancelled — audited OUTSIDE the lock, after the
+        # reply-shaped teardown decided the stop, with the kill source named.
+        # F3/F4: idempotent per lease (an in-step TaskStopped racing this funnel
+        # emits first and wins); the reason is the reply's own failure_reason
+        # ("cancelled"), the kill source rides the metadata.
+        _audit_plan_terminal(
+            bundle,
+            active_plan_lease,
+            reply_result="stopped",
+            reason="cancelled",
+            failure_reason="cancelled",
+            source=source,
         )
     return cancelled_wait_handles
 
@@ -671,11 +693,8 @@ def _redact_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _redact_queue_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """F2 defense-in-depth for PERF-004 C7 queue entries: redact text at the sink.
 
-    WP7b-SEAM(redact-delegate) — WIRED: this IS the plan layer's
-    ``computer_use_mcp.plan.redact_queue_entry`` (same three text keys, same
-    ``redact_text`` sink); delegating means the flat-queue and plan sinks cannot
-    drift. WP8's dead-code sweep owns the leftover duplicate in plan.py's docstring
-    history only.
+    Delegates to the plan layer's ``redact_queue_entry`` so the flat-queue and plan
+    sinks cannot drift.
     """
     return plan_layer.redact_queue_entry(entry)
 
@@ -1541,8 +1560,8 @@ NullableBool = Annotated[bool | None, _PLAIN_NULLABLE_BOOLEAN]
 NullableCoordinate = Annotated[TolerantInt | None, _PLAIN_WIDENED_NULLABLE_COORDINATE]
 NullableStrList = Annotated[TolerantStrList | None, _PLAIN_WIDENED_NULLABLE_STRING_ARRAY]
 NullableFollowUps = Annotated[TolerantFollowUps | None, _PLAIN_WIDENED_NULLABLE_OBJECT_ARRAY]
-# WP7b-SEAM(plan-param) — WIRED: the S-10 typed advertised schema from plan.py is
-# attached here. The ADVERTISED shape is the object-only PLAN_PARAM_PLAIN_SCHEMA (no
+# The S-10 typed advertised schema from plan.py is attached here. The ADVERTISED
+# shape is the object-only PLAN_PARAM_PLAIN_SCHEMA (no
 # anyOf/$ref, no "string" arm — the REM-G plain rule and S-10 hold verbatim); the
 # JSON-string tolerance is RUNTIME-only, behind the boundary, via the same
 # parse-only coercion the follow_ups queue uses (the strict fail-closed validation
@@ -2753,7 +2772,7 @@ async def computer_wait(
         bundle = _get_live_bundle(session_id)
     except (_StoppedSession, _UnknownSession) as exc:
         return _error_response(exc)
-    # WP7b-SEAM(wait-lease) — WIRED: while a waypoint-plan lease is active a wait
+    # While a waypoint-plan lease is active a wait
     # would interleave with the lease's step-by-step sequence and make the
     # handshake's own timing unaccounted for, so the call is refused with the typed
     # ``plan_lease`` rejection BEFORE anything starts (zero effect). The read-only
@@ -3609,6 +3628,89 @@ def computer_zoom(
 #: ONE exit for every terminal/session-end path.
 _plan_guard = PlanLeaseGuard()
 
+
+def _plan_counts(lease: PlanLease) -> dict[str, int]:
+    """The ONE bounded count pair for every plan audit event (F4/VAL-WP8-01).
+
+    Every emitter reads its counts here — no hand-summed copies, so the audit
+    record's counts can never drift from the prefix the reply was built from.
+    """
+    return {
+        "executed_count": sum(
+            entry.get("kind") in {"executed", "dispatched_unverified"} for entry in lease.prefix
+        ),
+        "resolved_count": len(lease.prefix),
+    }
+
+
+def _audit_plan_event(
+    bundle: Any,
+    event_type: str,
+    *,
+    lease: PlanLease,
+    result: str | None = None,
+    **metadata: Any,
+) -> None:
+    """Emit one bounded plan lifecycle audit event (WP8) through the agent's sink.
+
+    The redaction rules are the existing ones — the audit sink applies
+    ``redact_text`` to every string field and metadata value, exactly as for every
+    other event type; no plan-specific redaction exists.  Audit failures never
+    break the plan path (the agent's ``_audit`` swallows them).  Every caller emits
+    AFTER the reply's verdict fields are decided and reads ``result`` /
+    ``failure_reason`` off the reply itself, so the audit record and the reply
+    agree (E-05 rule).  Known sink convention (F4, documented in wp8-notes): the
+    shared ``agent._audit`` drops ``None`` metadata values, so an explicit
+    ``failure_reason: null`` (a verified step) is recorded as the key's ABSENCE —
+    tests and consumers treat absent as null for plan events.
+    """
+    audit = getattr(getattr(bundle, "agent", None), "_audit", None)
+    if audit is None:
+        return
+    audit(event_type, result=result, metadata={"plan_id": lease.context["plan_id"], **metadata})
+
+
+def _audit_plan_terminal(
+    bundle: Any,
+    lease: PlanLease,
+    *,
+    reply_result: str,
+    reason: str | None,
+    failure_reason: str | None = None,
+    **extra: Any,
+) -> None:
+    """Emit THE terminal lifecycle event of a plan — exactly once per lease.
+
+    F3 (VAL-WP8-01): the terminal emission is IDEMPOTENT per lease — the first
+    terminal path to reach it (an in-step TaskStopped handler or the session-end
+    funnel racing it) wins, so a session killed mid-step can never produce a
+    second terminal event for the same plan.
+
+    F4 (VAL-WP8-01): ``reply_result`` is the RESULT TOKEN the terminal reply
+    carries (verified / unknown / failed / stopped) — the event's ``result``
+    equals the reply's, and ``plan_complete`` is emitted iff the plan verified.
+    ``failure_reason`` is the reply's OWN failure_reason (null where the reply
+    has none — absent ≡ null at the sink); ``reason`` is the lifecycle cause,
+    consistent across paths: the reply's failure_reason where one exists
+    (cancelled / invalid_action / execution_error / verification_*),
+    ``completed`` for a verified plan, or the lifecycle cause no reply names
+    (stop / replaced / exception).
+    """
+    if lease.terminal_audited:
+        return
+    lease.terminal_audited = True
+    _audit_plan_event(
+        bundle,
+        "plan_complete" if reply_result == "verified" else "plan_stopped",
+        lease=lease,
+        result=reply_result,
+        reason=reason or "",
+        failure_reason=failure_reason,
+        **_plan_counts(lease),
+        **extra,
+    )
+
+
 #: Bounded retention for the lease's cross-call interference-event carry (D-3): the
 #: guard produces at most a handful of events per step, but an unbounded lease is a
 #: leak, so the retained list is deduped (order-preserving) and capped.
@@ -3979,85 +4081,6 @@ def _plan_step_result(step_entries: list[dict[str, Any]]) -> str:
     return "uncertain" if aggregate == "unknown" else aggregate
 
 
-# WP8-SEAM(failure-classification): the MINIMAL failure-reason plumbing a §1.3 step
-# reply needs. The dev copy's full B6/B7/B8 classification tables
-# (``_PLAN_ERROR_TO_FAILURE_REASON`` / the kind / specific-stop / stop-reason tables
-# and the closed ``PLAN_FAILURE_REASONS`` vocabulary with the ``unclassified``
-# escalation fallback) are WP8 scope and are NOT ported here; WP8 replaces this
-# helper with the table-driven classifier and ports
-# test_batch6/test_batch7/test_batch8. The step reply keeps carrying the typed
-# ``failure_reason`` key ALWAYS (None on a verified step) — only the CLASS set is
-# minimal until WP8.
-_PLAN_STEP_FAILURE_REASONS = frozenset(
-    {
-        "verification_failed",
-        "verification_uncertain",
-        "execution_error",
-        "limit_exceeded",
-        "cancelled",
-        "safety_denied",
-        "approval_required",
-        "rejected",
-        "invalid_action",
-        "awaiting_plan_action",
-    }
-)
-
-
-def _plan_step_failure_reason(
-    outcome: Any,
-    step_entries: list[dict[str, Any]],
-    *,
-    result: str,
-    error: str | None = None,
-) -> str | None:
-    """Classify a non-verified step into ONE minimal token (WP8 owns the tables).
-
-    ``None`` is the honest answer for a verified step (no failure happened). The
-    classification is a pure read of signals the reply already carries.
-    """
-    if result == "verified":
-        return None
-    if any(entry.get("requires_approval") for entry in step_entries):
-        return "approval_required"
-    if error is not None:
-        return {
-            "limit_exceeded": "limit_exceeded",
-            "action_error": "execution_error",
-            "invalid_action": "invalid_action",
-            "cancelled": "cancelled",
-        }.get(str(error), "execution_error")
-    kind = getattr(outcome, "kind", None)
-    if kind == "approval_required":
-        return "approval_required"
-    if kind in {"rejected", "safety_denied", "digest_surprise"}:
-        return "rejected" if kind == "rejected" else "safety_denied"
-    if kind == "error":
-        return "execution_error"
-    stopped = getattr(outcome, "follow_ups_stopped_reason", None)
-    if stopped == "limit_exceeded":
-        return "limit_exceeded"
-    if stopped == "cancelled" or stopped == "stopped":
-        return "cancelled"
-    if any(
-        entry.get("verification_outcome") == "failed"
-        or entry.get("result") == "failed"
-        for entry in step_entries
-    ):
-        return "verification_failed"
-    if result == "uncertain":
-        return "verification_uncertain"
-    if any(
-        entry.get("verification_outcome") == "uncertain"
-        or entry.get("kind") == "dispatched_unverified"
-        for entry in step_entries
-    ):
-        return "verification_uncertain"
-    if stopped == "policy_stop":
-        return "verification_failed"
-    return "rejected"
-
-
 def _plan_not_executed(lease: PlanLease, reason: str) -> list[dict[str, Any]]:
     """Decision 3: the explicit, bounded list of plan work that never executed.
 
@@ -4120,6 +4143,12 @@ def _plan_terminal_response(
     }
     response["plan"]["cutoff"] = dict(response["cutoff"])
     _plan_carry_events(response, lease)
+    # WP8: the host closed the plan on purpose — the lifecycle ends as ``stopped``
+    # (after the reply fields above are final, E-05); the reason names the
+    # lifecycle cause ("stop"), the reply's failure_reason stays null.
+    _audit_plan_terminal(
+        bundle, lease, reply_result=str(response["result"]), reason=reason
+    )
     return response
 
 
@@ -4133,20 +4162,21 @@ def _plan_exception_response(
     blocked: bool,
     stopped: bool = False,
     failure_reason: str | None = None,
+    limit_name: str | None = None,
 ) -> dict[str, Any]:
-    """Return a truthful failed/unknown step without claiming unobserved work."""
-    limit_name: str | None = None
-    if reason.startswith(("max_actions:", "max_steps:")):
-        limit_name = reason.split(":", 1)[0]
+    """Return a truthful failed/unknown step without claiming unobserved work.
+
+    F6 (VAL-WP8-01): ``limit_name`` comes from ``exc.limit_name`` at the handler —
+    EVERY limit trip (not only ``max_actions``/``max_steps``) gets the agreeing
+    ``error:"limit_exceeded"`` + ``limit`` + ``cutoff`` fields next to
+    ``failure_reason:"limit_exceeded"``.
+    """
     if failure_reason is None:
         failure_reason = (
             "cancelled"
             if stopped
             else ("limit_exceeded" if limit_name is not None else "execution_error")
         )
-    executed_count = sum(
-        entry.get("kind") in {"executed", "dispatched_unverified"} for entry in lease.prefix
-    )
     response: dict[str, Any] = {
         "ok": False,
         "result": result,
@@ -4186,7 +4216,9 @@ def _plan_exception_response(
                 bundle,
                 lease.context,
                 limit_name=cutoff_name,
-                executed_count=executed_count,
+                # F4: one count helper — the same executed_count every audit
+                # event reads.
+                executed_count=_plan_counts(lease)["executed_count"],
             ),
             "resolved_count": len(lease.prefix),
         }
@@ -4309,7 +4341,6 @@ def _plan_response(
         outcome, bundle, lease.context, prefix_entries=lease.prefix
     )
     if cutoff is not None:
-        lease.last_failure_reason = "limit_exceeded"
         response["cutoff"] = dict(cutoff)
         response["error"] = "limit_exceeded"
         response["limit"] = cutoff["limit_name"]
@@ -4322,7 +4353,7 @@ def _plan_response(
         lease,
         "awaiting_plan_action" if response["result"] != "failed" else "previous_step_failed",
     )
-    step_failure_reason = _plan_step_failure_reason(
+    step_failure_reason = plan_failure_reason(
         outcome, step_entries, result=response["result"], error=response.get("error")
     )
     response["failure_reason"] = step_failure_reason
@@ -4332,6 +4363,12 @@ def _plan_response(
     lease_active = _plan_guard.active_lease(bundle) is lease
     response["blocked"] = lease_active and not session_killed
     response["plan_id"] = lease.context["plan_id"]
+    if lease.replaced_plan_id is not None:
+        # WP7b M2 (VAL-WP7b-03): the replace disclosure rides the PAYLOAD (before the
+        # content blocks are built), so an image-bearing replace reply — a
+        # content-block LIST — keeps it too, exactly like a plain-dict reply.
+        response["replaced_plan_id"] = lease.replaced_plan_id
+        response["replaced_prefix"] = list(lease.replaced_prefix or [])
     response["message"] = response.get("message") or (
         f"Plan step {step_index + 1} executed; the lease awaits continue/stop/replace."
         if lease_active
@@ -4339,14 +4376,15 @@ def _plan_response(
     )
     if session_killed:
         # DELTA 1 #5: the session ended mid-step — the aggregate must not read as a
-        # finished plan either.
+        # finished plan either.  F2 (VAL-WP8-01): the failure_reason is
+        # UNCONDITIONALLY "cancelled" — the kill is the cause whatever the
+        # classifier saw, and an entry-derived token must not survive it.
         response["message"] = (
             "The session was stopped while the plan step was in flight; the plan "
             "did not finish."
         )
         response["stopped"] = True
-        if response.get("failure_reason") in (None, "awaiting_plan_action"):
-            response["failure_reason"] = "cancelled"
+        response["failure_reason"] = "cancelled"
     response["plan"] = _plan_aggregate_for_state(
         lease,
         status=(
@@ -4382,6 +4420,32 @@ def _plan_response(
         # everything else the step disclosed stays in the payload (the image tail
         # below still runs, so the walk-ending reply carries the frame + image_id).
         _apply_terminal_verdict_fields(bundle, lease, response)
+    # WP8: one plan_point audit event per step reply, emitted AFTER the verdict
+    # fields are final (E-05: the metadata is read off the reply itself, so the
+    # audit record and the reply can never disagree).  A walk-ending step ALSO
+    # closes the lifecycle — with the SAME result token and the SAME reason
+    # formula the terminal-walk reply uses (F4).
+    _audit_plan_event(
+        bundle,
+        "plan_point",
+        lease=lease,
+        result=str(response["result"]),
+        step_index=response["step_index"],
+        step_number=response["step_number"],
+        failure_reason=response.get("failure_reason"),
+        **_plan_counts(lease),
+    )
+    if complete_walk:
+        _audit_plan_terminal(
+            bundle,
+            lease,
+            reply_result=str(response["result"]),
+            reason=(
+                response.get("failure_reason")
+                or ("completed" if response["result"] == "verified" else "")
+            ),
+            failure_reason=response.get("failure_reason"),
+        )
     # v07-007 R-21: non-executed shapes embed model-proposed text in ``message`` —
     # the SAME redaction the flat path applies.
     if outcome.kind in {"rejected", "safety_denied", "approval_required", "digest_surprise", "error"}:
@@ -4478,7 +4542,7 @@ def _apply_terminal_verdict_fields(
     result = outcome.result
     failure_reason = (
         None if result == "verified"
-        else _plan_step_failure_reason(None, lease.prefix, result=result)
+        else plan_failure_reason(None, lease.prefix, result=result)
     )
     _plan_guard.release(str(bundle.context.session_id), bundle)
     response["result"] = result
@@ -4493,8 +4557,15 @@ def _apply_terminal_verdict_fields(
     response["next_step"] = None
     response["remaining"] = []
     response["not_executed"] = [] if result == "verified" else _plan_not_executed(lease, failure_reason)
+    # WP7b nit (VAL-WP7b-03, decided): for a terminal ``unknown`` the nested
+    # ``plan.status`` now reads ``"unknown"`` — the same token the top level uses —
+    # instead of ``"blocked"``.  ``blocked`` claims the plan is parked awaiting the
+    # host; a terminal walk is finished with nothing pending, and top-level
+    # ``blocked`` is false here.  "unknown" (§1.2: at least one step uncertain, none
+    # failed) is the honest aggregate status, and the nested status vocabulary gains
+    # it as a documented terminal-only member.
     response["plan"]["status"] = (
-        "completed" if result == "verified" else "failed" if result == "failed" else "blocked"
+        "completed" if result == "verified" else "failed" if result == "failed" else "unknown"
     )
     response["plan"]["stopped_reason"] = None if result == "verified" else failure_reason
 
@@ -4520,16 +4591,21 @@ def _plan_terminal_walk_reply(bundle: Any, lease: PlanLease) -> dict[str, Any]:
         expected_items=int(lease.context["normalized_item_count"]),
     )
     result = outcome.result
-    # The typed classification rides the entries themselves (DELTA 1 #1 audit): an
-    # approval-held prefix classifies ``approval_required``, a failed one
-    # ``verification_failed``, an uncertain one ``verification_uncertain`` — never
-    # a blanket "verification_failed" for every non-verified walk.
+    # The typed classification rides the entries themselves (DELTA 1 #1 + F1,
+    # VAL-WP8-01): with outcome=None the classifier reads the ENTRIES — an
+    # approval-held prefix classifies ``approval_required``, a rejected follow-up
+    # ``rejected``, a failed one ``verification_failed`` / ``execution_error``, an
+    # uncertain one ``verification_uncertain`` — never a blanket token and never
+    # ``unclassified`` for a prefix the entries can name.
     failure_reason = (
         None if result == "verified"
-        else _plan_step_failure_reason(None, lease.prefix, result=result)
+        else plan_failure_reason(None, lease.prefix, result=result)
     )
+    # WP7b nit (VAL-WP7b-03, decided): the aggregate status of a terminal ``unknown``
+    # is ``"unknown"`` — the same token the top level reports — never ``"blocked"``
+    # (a finished walk parks nothing; top-level ``blocked`` is false here).
     aggregate_status = (
-        "completed" if result == "verified" else "failed" if result == "failed" else "blocked"
+        "completed" if result == "verified" else "failed" if result == "failed" else "unknown"
     )
     aggregate_reason = None if result == "verified" else failure_reason
     completed: dict[str, Any] = {
@@ -4558,6 +4634,15 @@ def _plan_terminal_walk_reply(bundle: Any, lease: PlanLease) -> dict[str, Any]:
         "not_executed": [] if result == "verified" else _plan_not_executed(lease, failure_reason),
     }
     _plan_carry_events(completed, lease)
+    # WP8: the terminal walk reply closes the lifecycle — result token identical
+    # to the reply's, reason by the SAME formula the walk-ending step uses (F4).
+    _audit_plan_terminal(
+        bundle,
+        lease,
+        reply_result=result,
+        reason=failure_reason or ("completed" if result == "verified" else ""),
+        failure_reason=failure_reason,
+    )
     return completed
 
 
@@ -4583,6 +4668,14 @@ async def _execute_plan_step(
             spec.to_grounded(reason_prefix="MCP plan action")
     except Exception as exc:  # noqa: BLE001 - structural rejection is typed
         _plan_guard.release(session_id, bundle)
+        # WP8: the structural rejection ends the lease — audit the stop (E-05: the
+        # reply below carries result "failed" / failure_reason "invalid_action";
+        # F4: the counts are the real prefix, which may already hold executed
+        # entries from earlier steps).
+        _audit_plan_terminal(
+            bundle, lease, reply_result="failed", reason="invalid_action",
+            failure_reason="invalid_action",
+        )
         return _plan_exception_response(
             bundle,
             lease,
@@ -4617,6 +4710,14 @@ async def _execute_plan_step(
         if plan_layer.plan_step_attempted(step_entries):
             lease.cursor = plan_layer.plan_cursor_after(lease.cursor, step_index, step_entries)
         _plan_guard.release(session_id, bundle)
+        # WP8: the session/stop-token was killed mid-step — the plan did NOT
+        # finish; the lifecycle ends cancelled.  F3/F4: idempotent per lease (the
+        # session-end funnel may have raced us here); the reason is the reply's
+        # own failure_reason ("cancelled"), the result token is the reply's.
+        _audit_plan_terminal(
+            bundle, lease, reply_result="stopped", reason="cancelled",
+            failure_reason="cancelled",
+        )
         return _plan_exception_response(
             bundle,
             lease,
@@ -4631,7 +4732,6 @@ async def _execute_plan_step(
             failure_reason="cancelled",
         )
     except LimitExceeded as exc:
-        lease.last_failure_reason = exc.limit_name
         step_entries = list(step_context.get("partial_results") or [])
         plan_layer.merge_plan_step_prefix(
             lease,
@@ -4641,6 +4741,18 @@ async def _execute_plan_step(
         plan_layer.set_plan_step_remainder(lease, step_index, step_specs, step_entries)
         if plan_layer.plan_step_attempted(step_entries):
             lease.cursor = plan_layer.plan_cursor_after(lease.cursor, step_index, step_entries)
+        # WP8: the limit cut parks the lease (the plan continues on the host's
+        # ``continue``) — this step still gets its own plan_point event.
+        _audit_plan_event(
+            bundle,
+            "plan_point",
+            lease=lease,
+            result="failed",
+            step_index=step_index,
+            step_number=step_index + 1,
+            failure_reason="limit_exceeded",
+            **_plan_counts(lease),
+        )
         return _plan_exception_response(
             bundle,
             lease,
@@ -4649,6 +4761,9 @@ async def _execute_plan_step(
             reason=f"{exc.limit_name}: {exc}",
             blocked=True,
             failure_reason="limit_exceeded",
+            # F6: EVERY limit carries its name — error / limit / cutoff agree with
+            # failure_reason whatever limit tripped, not only the max_* ones.
+            limit_name=exc.limit_name,
         )
     except BaseException:
         # Structural/unexpected failures release the lease in this path; the outer
@@ -4660,6 +4775,11 @@ async def _execute_plan_step(
         )
         lease.cursor = step_index + 1
         _plan_guard.release(session_id, bundle)
+        # F3/F4: idempotent per lease; "exception" is the lifecycle cause no step
+        # reply names (the outer handler answers with a plain error envelope).
+        _audit_plan_terminal(
+            bundle, lease, reply_result="failed", reason="exception",
+        )
         raise
     step_entries = list(outcome.follow_up_results or step_context.get("partial_results") or [])
     plan_layer.merge_plan_step_prefix(
@@ -4677,6 +4797,11 @@ async def _execute_plan_step(
         # verdict: release the lease in the guaranteed path so no caller is
         # stranded behind it.
         _plan_guard.release(session_id, bundle)
+        # WP8: the lifecycle ends failed with the SAME reason the reply reports.
+        _audit_plan_terminal(
+            bundle, lease, reply_result="failed", reason="execution_error",
+            failure_reason="execution_error",
+        )
         return _plan_exception_response(
             bundle,
             lease,
@@ -4784,6 +4909,9 @@ async def _handle_plan_action(
         old_id = lease.context["plan_id"]
         old_prefix = [_redact_queue_entry(entry) for entry in lease.prefix]
         _plan_guard.release(session_id, bundle)
+        # WP8: the replaced plan's lifecycle ends as ``stopped`` (lifecycle reason
+        # "replaced") BEFORE the replacement starts its own lifecycle.
+        _audit_plan_terminal(bundle, lease, reply_result="stopped", reason="replaced")
         # O-03: approval was decided on the FIRST plan call; a replace INHERITS it.
         # The replace call's own ``approved`` parameter is deliberately NOT read —
         # an unapproved plan cannot be escalated into an approved one by replacing.
@@ -4794,8 +4922,24 @@ async def _handle_plan_action(
             steps=plan_layer.plan_step_slices(replacement_specs, replacement_context),
             approved=lease.approved,
             replaced_plan_id=old_id,
+            replaced_prefix=old_prefix,
         )
         _plan_guard.install(bundle, new_lease)
+        # WP8: the replacement starts its own lifecycle (with the replace
+        # disclosure, matching the reply the step call below returns).
+        _audit_plan_event(
+            bundle,
+            "plan_start",
+            lease=new_lease,
+            result="started",
+            point_count=replacement_context["point_count"],
+            action_types=[spec.action.value for spec in replacement_specs],
+            on_failure=replacement.on_failure,
+            on_uncertain=replacement.on_uncertain,
+            transition_duration_ms=replacement_specs[0].duration_ms,
+            final_wait_ms=replacement_context["final_wait_ms"],
+            replaced_plan_id=old_id,
+        )
         response = await _execute_plan_step(
             bundle,
             new_lease,
@@ -4803,9 +4947,16 @@ async def _handle_plan_action(
             image_mode=image_mode,
             view_provider=view_provider,
         )
+        # F11 (VAL-WP8-01): the replace disclosure rides ONLY the replace call's
+        # own reply. The dict arm covers exception-shaped replies (the payload
+        # builder attached the keys via the lease); afterwards BOTH leases'
+        # disclosure fields are cleared so no later step of the replacement (or
+        # of any further replace) re-carries the old plan's prefix.
         if isinstance(response, dict):
             response["replaced_plan_id"] = old_id
             response["replaced_prefix"] = old_prefix
+        new_lease.replaced_plan_id = None
+        new_lease.replaced_prefix = None
         return response
     return await _execute_plan_step(
         bundle,
@@ -5198,7 +5349,32 @@ async def computer_execute(
         try:
             _plan_guard.install(bundle, lease)
         except ValueError as exc:
-            return {"ok": False, "error": "plan_lease", "blocked": True, "message": str(exc)}
+            # F15 (VAL-WP8-01): a plan-lease refusal is a REJECTED reply like the
+            # other plan_lease refusals — the closed result token, ok False, and
+            # the typed code as the first reason (assert_plan_refusal).
+            return {
+                "ok": False,
+                "result": "rejected",
+                "reasons": ["plan_lease"],
+                "error": "plan_lease",
+                "blocked": True,
+                "message": str(exc),
+            }
+        # WP8: the plan lifecycle is audited from the FIRST call (E-05: the reply
+        # this call returns is the step reply built below; the start event records
+        # the declaration, the step reply's own plan_point records the verdict).
+        _audit_plan_event(
+            bundle,
+            "plan_start",
+            lease=lease,
+            result="started",
+            point_count=plan_context["point_count"],
+            action_types=[spec.action.value for spec in plan_specs],
+            on_failure=plan_model.on_failure,
+            on_uncertain=plan_model.on_uncertain,
+            transition_duration_ms=plan_specs[0].duration_ms,
+            final_wait_ms=plan_context["final_wait_ms"],
+        )
         return await _execute_plan_step(
             bundle,
             lease,

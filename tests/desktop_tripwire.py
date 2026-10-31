@@ -313,14 +313,40 @@ def check_launch(args: Any, *, shell: bool = False, executable: Any = None) -> N
                 f"python child {args!r} attempted in the OFFLINE suite ({where}): "
                 "python children must use sys.executable itself."
             )
-        if any(str(part) == "-c" for part in args[1:]):
-            _record_trip("subprocess spawn (python -c)")
-            raise RealDesktopEffectInOfflineSuite(
-                f"python -c child attempted in the OFFLINE suite ({where}): -c "
-                "children are banned (arbitrary-code children are invisible to "
-                "static analysis); use an in-process fresh import "
-                "(tests/fresh_backend_import.py)."
-            )
+        for position, part in enumerate(args[1:]):
+            text = str(part)
+            # WP-H NIT (VAL-WP-H-02) + F12 (VAL-WP8-01): option clusters are
+            # parsed, not matched literally. A single-dash cluster carrying 'c'
+            # is a banned ``python -c`` child in disguise (``-Ic``); a cluster
+            # carrying 'm' selects a module — the module name is either glued to
+            # the cluster (``-mwebbrowser``) or the next argument (``-Im
+            # webbrowser``) — and ONLY pytest is allowed; a bare ``-`` reads the
+            # program from stdin (arbitrary code, like -c).
+            if text == "-":
+                _record_trip("subprocess spawn (python stdin code)")
+                raise RealDesktopEffectInOfflineSuite(
+                    f"python child argument {text!r} reads the program from stdin "
+                    f"(arbitrary-code children are banned) ({where})."
+                )
+            if text.startswith("-") and not text.startswith("--"):
+                flags = text[1:]
+                if "c" in flags:
+                    _record_trip("subprocess spawn (python -c option cluster)")
+                    raise RealDesktopEffectInOfflineSuite(
+                        f"python child argument {text!r} carries 'c' as an option "
+                        f"cluster (a banned ``python -c`` in disguise) ({where})."
+                    )
+                if "m" in flags:
+                    tail = flags.split("m", 1)[1]
+                    module = tail if tail else (
+                        str(args[position + 2]) if position + 2 < len(args) else ""
+                    )
+                    if module != "pytest":
+                        _record_trip("subprocess spawn (python -m outside pytest)")
+                        raise RealDesktopEffectInOfflineSuite(
+                            f"python -m child {module!r} attempted in the OFFLINE "
+                            f"suite ({where}): '-m' is restricted to 'pytest'."
+                        )
         return
     if basename in SHELL_ONLY_ALLOWLIST:
         _record_trip("subprocess spawn (ver without shell)")
@@ -368,10 +394,15 @@ _startfile_trap._cortex_tripwire_trap = True  # type: ignore[attr-defined]
 # --- pyautogui (DELTA 1 M3): never imported by the fixture ----------------------------
 
 
-def _patch_pyautogui_effects(module: Any) -> None:
-    """Trap every effect function on an ALREADY-LOADED pyautogui module."""
+def _patch_pyautogui_effects(monkeypatch: pytest.MonkeyPatch, module: Any) -> None:
+    """Trap every effect function on an ALREADY-LOADED pyautogui module.
+
+    WP-H NIT (VAL-WP-H-02): the traps are installed through ``monkeypatch`` so they
+    are RESTORED after each test instead of persisting on pyautogui for the rest
+    of the process.
+    """
     for name in EFFECT_PYAUTOGUI_NAMES:
-        setattr(module, name, _EffectTrap(f"pyautogui.{name}"))
+        monkeypatch.setattr(module, name, _EffectTrap(f"pyautogui.{name}"), raising=False)
 
 
 class _TrapLoader:
@@ -383,7 +414,8 @@ class _TrapLoader:
     as production leaves it, whichever import path fires first.
     """
 
-    def __init__(self, inner: Any) -> None:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, inner: Any) -> None:
+        self._monkeypatch = monkeypatch
         self._inner = inner
 
     def __getattr__(self, name: str) -> Any:
@@ -398,13 +430,18 @@ class _TrapLoader:
         except Exception:  # noqa: BLE001 - the setter is best-effort in production too
             pass
         self._inner.exec_module(module)
-        _patch_pyautogui_effects(module)
+        _patch_pyautogui_effects(self._monkeypatch, module)
 
 
 class _PyautoguiTripwireFinder(importlib.abc.MetaPathFinder):
     """Intercept the FIRST ``import pyautogui`` (the fixture never imports it)."""
 
     _cortex_tripwire_finder = True
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # WP-H NIT (VAL-WP-H-02): effect traps are applied through monkeypatch so
+        # they are restored after the test instead of persisting on the module.
+        self._monkeypatch = monkeypatch
 
     def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
         if fullname != "pyautogui":
@@ -416,11 +453,26 @@ class _PyautoguiTripwireFinder(importlib.abc.MetaPathFinder):
             sys.meta_path.insert(0, self)
         if spec is None or spec.loader is None:
             return None
-        spec.loader = _TrapLoader(spec.loader)
+        spec.loader = _TrapLoader(self._monkeypatch, spec.loader)
         return spec
 
 
 # --- install --------------------------------------------------------------------------
+
+
+def _runtime_os_trap(name: str) -> Any:
+    """Build a trip-raising stand-in for an ``os``/``asyncio`` spawn entry point."""
+
+    def _trap(*args: Any, **kwargs: Any) -> None:
+        _record_trip(name)
+        raise RealDesktopEffectInOfflineSuite(
+            f"{name}(...) attempted in the OFFLINE suite (CUMCP_RUN_E2E != '1'), "
+            f"test node: {_CURRENT_NODE}. Runtime-only escape hatch for the static "
+            "scanner (VAL-WP-H-02 NIT) — use an allowed subprocess form instead."
+        )
+
+    _trap._cortex_tripwire_trap = True  # type: ignore[attr-defined]
+    return _trap
 
 
 def install_tripwire(monkeypatch: pytest.MonkeyPatch, node_id: str) -> None:
@@ -435,11 +487,33 @@ def install_tripwire(monkeypatch: pytest.MonkeyPatch, node_id: str) -> None:
 
     monkeypatch.setattr(subprocess, "Popen", _TripwirePopen)
     monkeypatch.setattr(os, "startfile", _startfile_trap, raising=False)
+    # WP-H NIT (VAL-WP-H-02): the static scanner cannot see getattr/partial shapes,
+    # and os.spawn*/os.system/os.popen/asyncio subprocesses were previously caught
+    # by NEITHER the scanner NOR a runtime trap. Trap them at runtime via
+    # monkeypatch (restored after each test, unlike a bare setattr).
+    for name in sorted(n for n in dir(os) if n.startswith("spawn") or n.startswith("exec")):
+        # F12 (VAL-WP8-01): os.exec* replaces THIS process with another program —
+        # as much a real-desktop effect as a spawn; os.posix_spawn* likewise when
+        # present. All runtime-trapped via monkeypatch (restored per test).
+        if name in ("execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp",
+                    "execvpe", "posix_spawn", "posix_spawnp",
+                    "spawnl", "spawnle", "spawnlp", "spawnlpe",
+                    "spawnv", "spawnve", "spawnvp", "spawnvpe"):
+            monkeypatch.setattr(os, name, _runtime_os_trap(f"os.{name}"), raising=False)
+    for name in ("system", "popen"):
+        monkeypatch.setattr(os, name, _runtime_os_trap(f"os.{name}"), raising=False)
+    import asyncio
+
+    for name in ("create_subprocess_exec", "create_subprocess_shell"):
+        if hasattr(asyncio, name):
+            monkeypatch.setattr(
+                asyncio, name, _runtime_os_trap(f"asyncio.{name}"), raising=False
+            )
 
     pyautogui = sys.modules.get("pyautogui")
     if pyautogui is not None:
-        _patch_pyautogui_effects(pyautogui)
+        _patch_pyautogui_effects(monkeypatch, pyautogui)
     else:
         # DELTA 1 M3: do NOT import pyautogui here. Trap it at first import via a
         # meta-path finder (which replays the backend's DPI ordering first).
-        monkeypatch.setattr(sys, "meta_path", [_PyautoguiTripwireFinder(), *sys.meta_path])
+        monkeypatch.setattr(sys, "meta_path", [_PyautoguiTripwireFinder(monkeypatch), *sys.meta_path])

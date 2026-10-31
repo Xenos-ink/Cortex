@@ -25,6 +25,7 @@ from test_controller_integration import (
     ScriptedBackend,
     audit_events,
     audit_types,
+    execute_payload,
     make_session,
 )
 
@@ -56,13 +57,20 @@ def _payload(result: Any) -> dict[str, Any]:
         return json.loads(result[0].text)
     return result
 
+
+def wire_plan(plan):
+    """WP8 (ported from dev): a submitted plan states its policies — a COMPLETE
+    plan, so the plan lifecycle events under assertion are the product's own."""
+    from plan_explicitness import complete_plan
+
+    return complete_plan(plan)
+
 async def _drive_audit_scenarios(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> list[tuple[str, Any]]:
     """Scripted sessions (RETARGETED to the five-tool surface, loop removal)
     that together cover every audit event type the direct path can emit."""
     scenarios: list[tuple[str, Any]] = []
-
     # 1. Happy path with approval: session_start/observation/grounding/validation/
     #    safety/approval-denial/execution/verification (the approval EVENT fires on
     #    the denial shape; an approved=True call executes without the approval phase).
@@ -134,6 +142,55 @@ async def _drive_audit_scenarios(
         follow_ups=[{"action": "click", "x": 20, "y": 20}],
     )
     scenarios.append((sid, bundle))
+
+    # 7. WP8 plan lifecycle: successful start/point/complete vocabulary. The point
+    #    is a CROSSING point (``"actions": []``) — it declares its actionlessness,
+    #    its move verifies, and the SAME call ends the walk: plan_start +
+    #    plan_point + plan_complete in one call.
+    sid, bundle, _, _ = make_session(
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    completed_plan = await server.computer_execute(
+        sid,
+        "done",
+        approved=True,
+        plan=wire_plan(
+            {
+                "transition_duration_ms": 0,
+                "points": [{"x": 10, "y": 10, "actions": []}],
+            }
+        ),
+    )
+    assert _payload(completed_plan)["plan"]["status"] == "completed"
+    scenarios.append((sid, bundle))
+
+    # 8. WP8 stopped terminal: start + point + declared limit stop, never complete.
+    sid, bundle, _, _ = make_session(
+        monkeypatch,
+        dry_run=False,
+        require_approval=False,
+        limits={**FAST_LIMITS, "max_actions": 1},
+    )
+    stopped_plan = _payload(
+        await server.computer_execute(
+            sid,
+            "done",
+            approved=True,
+            plan=wire_plan(
+                {
+                    "transition_duration_ms": 0,
+                    "points": [{"x": 10, "y": 10, "actions": [{"action": "click"}]}],
+                }
+            ),
+        )
+    )
+    # stable adaptation: with max_actions=1 the single slot is consumed by the
+    # transition move and the click is refused; the step PARKS (never completes),
+    # and the host stop below is what closes the lifecycle as stopped.
+    assert stopped_plan["result"] != "verified"
+    assert stopped_plan["blocked"] is True
+    await server.computer_execute(sid, "done", plan_action="stop")
+    scenarios.append((sid, bundle))
     return scenarios
 
 
@@ -194,6 +251,340 @@ async def test_audit_event_types_fields_and_jsonl_conformance(
         assert path.name == f"audit_{sid}.jsonl"
         for line in path.read_text(encoding="utf-8").splitlines():
             assert isinstance(json.loads(line), dict)
+
+
+async def test_plan_lifecycle_audit_events_agree_with_the_replies(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP8 (E-05 rule, ported from dev scenarios 7/8): the plan lifecycle audit
+    record and the reply verdict can never disagree — each event is emitted AFTER
+    the reply's verdict fields are decided and its metadata is READ OFF the reply.
+
+    The drive: a two-point click plan whose steps honestly abstain (pixel-only
+    backend) parks the lease; the host stop then closes the lifecycle."""
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    first = execute_payload(
+        await server.computer_execute(
+            sid,
+            "done",
+            plan=wire_plan(
+                {
+                    "transition_duration_ms": 0,
+                    "points": [
+                        {"x": 10, "y": 10, "actions": [{"action": "click"}]},
+                        {"x": 30, "y": 40, "actions": [{"action": "click"}]},
+                    ],
+                }
+            ),
+            approved=True,
+            include_screenshot_after=False,
+        )
+    )
+    assert first["blocked"] is True and first["result"] == "uncertain"
+    events = [
+        event
+        for event in audit_events(bundle, sid)
+        if event["event_type"].startswith("plan_")
+    ]
+    assert [event["event_type"] for event in events] == ["plan_start", "plan_point"], events
+    start, point = events
+    assert start["result"] == "started"
+    assert start["metadata"]["plan_id"] == first["plan_id"]
+    assert start["metadata"]["point_count"] == 2
+    assert point["result"] == first["result"]
+    assert point["metadata"]["failure_reason"] == first["failure_reason"]
+    assert point["metadata"]["step_index"] == first["step_index"]
+
+    stop = execute_payload(
+        await server.computer_execute(sid, "done", plan_action="stop", include_screenshot_after=False)
+    )
+    assert stop["result"] == "stopped" and stop["failure_reason"] is None
+    events = [
+        event
+        for event in audit_events(bundle, sid)
+        if event["event_type"].startswith("plan_")
+    ]
+    assert [event["event_type"] for event in events][-1] == "plan_stopped"
+    stopped_event = events[-1]
+    assert stopped_event["result"] == "stopped"
+    assert stopped_event["metadata"]["reason"] == "stop"
+    assert stopped_event["metadata"]["plan_id"] == first["plan_id"]
+    # F4: the counts come from the ONE helper over the same prefix the reply built.
+    assert stopped_event["metadata"]["resolved_count"] == len(stop["executed_prefix"])
+    assert stopped_event["metadata"]["executed_count"] == sum(
+        entry.get("kind") in ("executed", "dispatched_unverified")
+        for entry in stop["executed_prefix"]
+    )
+
+
+def _plan_events(bundle: Any, sid: str) -> list[dict[str, Any]]:
+    return [
+        event
+        for event in audit_events(bundle, sid)
+        if event["event_type"].startswith("plan_")
+    ]
+
+
+def _assert_agrees(event: dict[str, Any], reply: dict[str, Any]) -> None:
+    """F4/F5 (VAL-WP8-01): the audit record equals the reply it accompanies.
+
+    ``failure_reason``: the shared ``agent._audit`` sink drops None metadata
+    values, so an explicit null (a verified step) is recorded as the key's
+    ABSENCE — absent ≡ null for plan events (documented in wp8-notes).
+    """
+    assert event["result"] == reply["result"], (event, reply.get("result"))
+    assert event["metadata"].get("failure_reason") == reply.get("failure_reason")
+    assert event["metadata"]["plan_id"] == reply["plan_id"]
+    if "step_index" in event["metadata"]:
+        assert event["metadata"]["step_index"] == reply["step_index"]
+    assert event["metadata"]["resolved_count"] == len(reply["executed_prefix"])
+
+
+# --- F5 (VAL-WP8-01): every plan path's audit record agrees with its reply -----
+
+_CROSSING_TWO: dict[str, Any] = {
+    "transition_duration_ms": 0,
+    "points": [
+        {"x": 10, "y": 10, "actions": []},
+        {"x": 30, "y": 40, "actions": []},
+    ],
+}
+
+_STAT_TWO: dict[str, Any] = {
+    "transition_duration_ms": 0,
+    "points": [
+        {"x": 10, "y": 10, "actions": [{"action": "click"}]},
+        {"x": 30, "y": 40, "actions": [{"action": "click"}]},
+    ],
+}
+
+
+class _CancelAfterDispatch(ScriptedBackend):
+    def execute(self, action: Any, stop: Any = None, **kwargs: Any) -> str:
+        message = super().execute(action, stop)
+        from computer_use_mcp.state import TaskStopped
+
+        raise TaskStopped("synthetic stop immediately after dispatch")
+
+
+class _BrokenBackend(ScriptedBackend):
+    def execute(self, action: Any, stop: Any = None, **kwargs: Any) -> str:
+        raise RuntimeError("synthetic backend explosion")
+
+
+async def test_verified_walk_audit_agrees_with_the_walk_ending_and_terminal_replies(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk-ending step (plan_complete) and the parked step (plan_point)
+    records carry the replies' own result tokens; a verified plan_point records
+    failure_reason as ABSENT (= null); exactly one plan_start and one terminal."""
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    step0 = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan=wire_plan(_CROSSING_TWO), approved=True, include_screenshot_after=False
+        )
+    )
+    assert step0["result"] == "verified" and step0["blocked"] is True
+    events = _plan_events(bundle, sid)
+    assert [e["event_type"] for e in events] == ["plan_start", "plan_point"]
+    _assert_agrees(events[1], step0)
+    assert "failure_reason" not in events[1]["metadata"]  # explicit null ≡ absent
+
+    final = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan_action="continue", include_screenshot_after=False
+        )
+    )
+    assert final["result"] == "verified" and final["blocked"] is False
+    events = _plan_events(bundle, sid)
+    assert [e["event_type"] for e in events] == [
+        "plan_start", "plan_point", "plan_point", "plan_complete",
+    ]
+    _assert_agrees(events[2], final)  # the walk-ending step's own plan_point
+    terminal = events[3]
+    assert terminal["result"] == "verified"
+    assert terminal["metadata"]["reason"] == "completed"
+    _assert_agrees(terminal, final)
+    # exactly ONE plan_start and ONE terminal event for the whole plan
+    assert sum(e["event_type"] == "plan_start" for e in events) == 1
+    assert sum(e["event_type"] in ("plan_complete", "plan_stopped") for e in events) == 1
+
+
+async def test_replace_audit_sequence_agrees_with_the_replies(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replace: plan_stopped (result stopped, reason replaced) for the old plan,
+    then a fresh plan_start for the replacement — one terminal per plan."""
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    first = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+        )
+    )
+    assert first["blocked"] is True
+    replaced = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan=wire_plan(_CROSSING_TWO), plan_action="replace",
+            include_screenshot_after=False,
+        )
+    )
+    assert replaced["replaced_plan_id"] == first["plan_id"]
+    events = _plan_events(bundle, sid)
+    old_events = [e for e in events if e["metadata"]["plan_id"] == first["plan_id"]]
+    new_events = [e for e in events if e["metadata"]["plan_id"] == replaced["plan_id"]]
+    assert [e["event_type"] for e in old_events] == [
+        "plan_start", "plan_point", "plan_stopped",
+    ]
+    assert old_events[-1]["result"] == "stopped"
+    assert old_events[-1]["metadata"]["reason"] == "replaced"
+    assert [e["event_type"] for e in new_events] == ["plan_start", "plan_point"]
+    assert new_events[0]["metadata"]["replaced_plan_id"] == first["plan_id"]
+    _assert_agrees(new_events[1], replaced)
+    # one terminal per plan: the old plan's, and none yet for the replacement
+    assert sum(
+        e["event_type"] in ("plan_complete", "plan_stopped") for e in old_events
+    ) == 1
+    assert not [e for e in new_events if e["event_type"].startswith(("plan_complete", "plan_stopped"))]
+
+
+async def test_task_stopped_and_error_terminals_agree_exactly_once(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TaskStopped: one plan_stopped, result stopped, reason cancelled (the
+    reply's own failure_reason). Error kind: result failed, reason
+    execution_error. Each plan terminates EXACTLY once."""
+    backend = _CancelAfterDispatch(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    reply = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+        )
+    )
+    assert reply["result"] == "stopped" and reply["failure_reason"] == "cancelled"
+    events = _plan_events(bundle, sid)
+    assert [e["event_type"] for e in events] == ["plan_start", "plan_stopped"]
+    _assert_agrees(events[1], reply)
+    assert events[1]["metadata"]["reason"] == "cancelled"
+
+    backend = _BrokenBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    reply = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+        )
+    )
+    assert reply["result"] == "failed" and reply["failure_reason"] == "execution_error"
+    events = _plan_events(bundle, sid)
+    assert [e["event_type"] for e in events] == ["plan_start", "plan_stopped"]
+    _assert_agrees(events[1], reply)
+    assert events[1]["metadata"]["reason"] == "execution_error"
+
+
+async def test_limit_cut_parks_and_the_records_agree(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A limit cut parks the lease: the plan_point record carries the cut reply's
+    failed/limit_exceeded verdict; the host stop then terminates once. The cut
+    lands on the SECOND step's dispatch (the budget is spent after step 0), the
+    same shape batch6 pins."""
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch,
+        backend=backend,
+        dry_run=False,
+        require_approval=False,
+        limits={**FAST_LIMITS, "max_actions": 2},
+    )
+    await server.computer_execute(
+        sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+    )
+    cut = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan_action="continue", include_screenshot_after=False
+        )
+    )
+    assert cut["error"] == "limit_exceeded" and cut["failure_reason"] == "limit_exceeded"
+    assert cut["limit"] == "max_actions" and "cutoff" in cut
+    events = _plan_events(bundle, sid)
+    assert [e["event_type"] for e in events] == [
+        "plan_start", "plan_point", "plan_point",
+    ]
+    _assert_agrees(events[2], cut)
+    stop = execute_payload(
+        await server.computer_execute(sid, "done", plan_action="stop", include_screenshot_after=False)
+    )
+    events = _plan_events(bundle, sid)
+    assert events[-1]["event_type"] == "plan_stopped"
+    _assert_agrees(events[-1], stop)
+    assert sum(
+        e["event_type"] in ("plan_complete", "plan_stopped") for e in events
+    ) == 1
+
+
+async def test_idle_reap_funnel_emits_one_terminal_with_the_kill_source(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The WP-S reaper funnels through the same kill path: exactly ONE terminal
+    plan_stopped (result stopped, reason cancelled, source idle_timeout)."""
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    await server.computer_execute(
+        sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+    )
+    assert server._plan_guard.is_active(sid)
+    monkeypatch.setattr(server, "_session_idle_timeout", lambda: 0.05)
+    import asyncio as _asyncio
+
+    await _asyncio.sleep(0.08)
+    assert sid in server._sweep_idle_sessions()
+    events = _plan_events(bundle, sid)
+    terminals = [e for e in events if e["event_type"] in ("plan_complete", "plan_stopped")]
+    assert len(terminals) == 1, events
+    assert terminals[0]["event_type"] == "plan_stopped"
+    assert terminals[0]["result"] == "stopped"
+    assert terminals[0]["metadata"]["reason"] == "cancelled"
+    assert terminals[0]["metadata"]["source"] == "idle_timeout"
+
+
+async def test_a_raising_audit_writer_leaves_the_reply_unchanged(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit failures never break the plan path: a writer that RAISES leaves the
+    step reply byte-identical in its verdict fields."""
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+
+    def _raising_emit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("synthetic audit sink failure")
+
+    # patch the SINK (auditor.emit), not agent._audit — the agent's own _audit
+    # wrapper is the production swallow layer under test here.
+    monkeypatch.setattr(bundle.auditor, "emit", _raising_emit)
+    reply = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan=wire_plan(_CROSSING_TWO), approved=True, include_screenshot_after=False
+        )
+    )
+    assert reply["result"] == "verified"
+    assert reply["failure_reason"] is None
+    assert "failure_reason" in reply and "not_executed" in reply
 
 
 # --- redaction enforced at the sink ------------------------------------------------------------

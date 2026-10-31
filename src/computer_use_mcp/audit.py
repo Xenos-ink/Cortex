@@ -59,6 +59,15 @@ AuditEventType = Literal[
     # follow_ups) emit one per-queue summary event; every item still emits its
     # own per-phase events.
     "queue",
+    # WP8 (ORVEX-2026-108, additive): bounded plan lifecycle vocabulary. Existing
+    # event shapes are unchanged; consumers that understand the old closed
+    # vocabulary must treat these new members as the documented versioned
+    # extension. Emitted AFTER the reply verdict is decided so the audit record
+    # and the reply agree (E-05 rule).
+    "plan_start",
+    "plan_point",
+    "plan_complete",
+    "plan_stopped",
 ]
 
 _REDACTED_STR_FIELDS = (

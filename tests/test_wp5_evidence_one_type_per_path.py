@@ -2,10 +2,9 @@
 
 D·N2 / repair 3.5 (decision D-8a) pinned ONE ``evidence`` container type per response
 path.  The dev file's plan-handshake nodes (``evidence_by_backend`` on plan step and
-terminal replies) are PLAN-DEPENDENT — the plan machinery does not exist in the stable
-tree yet — and are DEFERRED to WP7 (owning WP), which builds ``evidence_by_backend``
-from the evidence store + lease at the ``WP7b-SEAM(evidence-by-backend)`` marker in
-``server.py``.  The two nodes below need no plan and are ported as-is in substance:
+terminal replies) are PLAN-DEPENDENT and are owned by WP7, which builds
+``evidence_by_backend`` from the evidence store + lease in ``server.py``.  The two
+nodes below need no plan and are ported as-is in substance:
 
 * the verification ``evidence`` stays a LIST on executed replies;
 * a non-plan execute reply never carries the plan-side dict key (after WP5 it also

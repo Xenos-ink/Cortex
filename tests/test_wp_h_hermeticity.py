@@ -246,6 +246,130 @@ def test_runtime_popen_goes_through_the_validator() -> None:
             subprocess.run([_PROBE_EXE], capture_output=True)  # never spawns: trap first
 
 
+# --- WP8 carry-overs (VAL-WP-H-02 NITs, N1, N2) -----------------------------------------
+
+
+def test_check_launch_rejects_dash_c_option_clusters() -> None:
+    """WP-H NIT: an option cluster that smuggles 'c' (e.g. ``-Ic``) is a banned
+    ``python -c`` child in disguise; the literal ``"-c"`` match missed it."""
+    _rejected([sys.executable, "-Ic", "import os; os.startfile('x')"])
+    _rejected([sys.executable, "-ccode"])
+    # ... while the plain compliant forms stay allowed:
+    check_launch([sys.executable, "-I", "somedir", "-m", "pytest", "-q", "tests/x.py"])
+
+
+def test_check_launch_restricts_dash_m_to_pytest() -> None:
+    """WP-H NIT + F12 (VAL-WP8-01): ``-m`` children are restricted to pytest —
+    including GLUED (``-mcode``) and CLUSTERED (``-Im code``) spellings, and a
+    bare ``-`` (stdin code) is rejected."""
+    check_launch([sys.executable, "-m", "pytest", "-q", "tests/x.py"])
+    check_launch([sys.executable, "-mpytest", "-q", "tests/x.py"])  # glued, still pytest
+    _rejected([sys.executable, "-m", "code"])
+    _rejected([sys.executable, "-mwebbrowser", "http://example.invalid"])
+    _rejected([sys.executable, "-Im", "webbrowser"])
+    _rejected([sys.executable, "-m"])
+    _rejected([sys.executable, "-"])
+    _rejected([sys.executable, "-m", "unittest", "discover"])
+
+
+def test_runtime_exec_and_posix_spawn_traps_are_armed_and_trip() -> None:
+    """F12 (VAL-WP8-01): ``os.exec*`` (process REPLACEMENT) and
+    ``os.posix_spawn*`` (when present) are runtime-trapped and trip."""
+    assert getattr(os.execv, "_cortex_tripwire_trap", False), "os.execv not trapped"
+    with expect_trips():
+        with pytest.raises(RealDesktopEffectInOfflineSuite, match="os\\.execv"):
+            os.execv(_PROBE_EXE, [_PROBE_EXE])  # never execs: trap first
+    posix_spawn = getattr(os, "posix_spawn", None)
+    if posix_spawn is not None:
+        assert getattr(posix_spawn, "_cortex_tripwire_trap", False)
+        with expect_trips():
+            with pytest.raises(RealDesktopEffectInOfflineSuite, match="os\\.posix_spawn"):
+                posix_spawn(_PROBE_EXE, [_PROBE_EXE])
+
+
+def test_runtime_os_spawn_traps_are_armed() -> None:
+    """WP-H NIT: ``os.system`` / ``os.popen`` / ``os.spawn*`` / ``os.exec*`` /
+    ``asyncio.create_subprocess_*`` are runtime-trapped (via monkeypatch, so the
+    traps are restored after each test instead of persisting)."""
+    import asyncio
+
+    assert getattr(os.system, "_cortex_tripwire_trap", False), "os.system not trapped"
+    assert getattr(os.popen, "_cortex_tripwire_trap", False), "os.popen not trapped"
+    for name in ("spawnl", "spawnle", "spawnv", "spawnve", "spawnlp", "spawnvp", "spawnlpe", "spawnvpe",
+                 "execl", "execle", "execv", "execve", "execvp", "execvpe"):
+        trap = getattr(os, name, None)
+        if trap is None:
+            continue  # POSIX-only spawners are absent on Windows
+        assert getattr(trap, "_cortex_tripwire_trap", False), f"os.{name} not trapped"
+    assert getattr(asyncio.create_subprocess_exec, "_cortex_tripwire_trap", False)
+    assert getattr(asyncio.create_subprocess_shell, "_cortex_tripwire_trap", False)
+
+
+def test_runtime_os_spawn_traps_trip_without_acting() -> None:
+    """The traps RAISE before any process is created or any shell command runs."""
+    import asyncio
+
+    with expect_trips():
+        with pytest.raises(RealDesktopEffectInOfflineSuite, match="os\\.system"):
+            os.system("notepad")  # never runs: the trap fires first
+    with expect_trips():
+        with pytest.raises(RealDesktopEffectInOfflineSuite, match="os\\.popen"):
+            os.popen("notepad")
+    with expect_trips():
+        with pytest.raises(RealDesktopEffectInOfflineSuite, match="os\\.spawnl"):
+            os.spawnl(0, _PROBE_EXE)  # never spawns: trap first
+    with expect_trips():
+        with pytest.raises(
+            RealDesktopEffectInOfflineSuite, match="asyncio\\.create_subprocess_exec"
+        ):
+            asyncio.create_subprocess_exec(_PROBE_EXE)  # no coroutine is created
+
+
+def test_pyautogui_traps_install_through_monkeypatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WP-H NIT: the pyautogui effect traps are installed through ``monkeypatch``
+    (restored after each test), never a bare ``setattr`` on the module."""
+    import types as _types
+
+    stub = _types.SimpleNamespace(click=lambda: None, moveTo=lambda: None)
+    desktop_tripwire._patch_pyautogui_effects(monkeypatch, stub)
+    assert getattr(stub.click, "_cortex_tripwire_trap", False)
+    assert getattr(stub.moveTo, "_cortex_tripwire_trap", False)
+
+
+def test_controlled_env_restores_an_ambient_cortex_key_also_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP-H N1 (VAL-WP-H-02): an override key that is ALSO an ambient ``CORTEX_*``
+    key must be restored to its AMBIENT value when the controlled env exits — the
+    old second save overwrote the ambient value with ``None`` and DELETED the key."""
+    from fresh_backend_import import _ControlledEnv
+
+    key = "CORTEX_WP8_N1_PROBE"
+    monkeypatch.setenv(key, "ambient-value")
+    with _ControlledEnv({key: "override-value"}):
+        assert os.environ[key] == "override-value"
+    assert os.environ[key] == "ambient-value"
+
+
+def test_fresh_module_user32_is_trapped_when_the_tripwire_is_armed() -> None:
+    """WP-H N2 (VAL-WP-H-02): the fresh module's PRIVATE ``_user32`` is replaced
+    with a tripwire wrapper when the desktop tripwire is armed — a future
+    fresh-exec expression cannot act on the desktop untrapped."""
+    from fresh_backend_import import fresh_backend
+
+    module = fresh_backend({})
+    user32 = getattr(module, "_user32", None)
+    assert user32 is not None, "the fresh exec bound no _user32"
+    assert isinstance(user32, _TripwireUser32), (
+        "the fresh module's _user32 is UNTRAPPED while the tripwire is armed"
+    )
+    trap = getattr(user32, "SetCursorPos")
+    assert isinstance(trap, _EffectTrap), "refusing to touch a non-trap member"
+    with expect_trips():
+        with pytest.raises(RealDesktopEffectInOfflineSuite, match="'SetCursorPos'"):
+            trap(10, 10)
+
+
 # --- M3: the fixture never imports pyautogui -------------------------------------------
 
 

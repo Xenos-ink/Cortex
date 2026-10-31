@@ -43,6 +43,7 @@ from test_controller_integration import (
     FAST_LIMITS,
     ScriptedBackend,
     SessionRegistry,
+    audit_events,
     execute_payload,
     executed_summary,
     make_session,
@@ -1435,6 +1436,62 @@ async def test_replace_inherits_the_first_call_approval_and_runs(
     assert server._plan_guard.active_lease(bundle) is not None
 
 
+async def test_replace_metadata_survives_on_an_image_bearing_reply(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP8 M2 (VAL-WP7b-03): ``replaced_plan_id`` / ``replaced_prefix`` survive on
+    an IMAGE-BEARING replace reply. With ``include_screenshot_after=True`` the
+    reply is a content-block LIST, which the replace branch's
+    ``isinstance(response, dict)`` augmentation cannot touch — the disclosure
+    must ride the payload BEFORE the blocks are built (now via the lease)."""
+    backend = ScriptedBackend(flip=True, width=1024, height=800)
+    session_id, bundle, backend, _ = make_session(
+        monkeypatch,
+        backend=backend,
+        dry_run=False,
+        require_approval=False,
+        limits=FAST_LIMITS,
+    )
+    await server.computer_execute(
+        session_id,
+        "done",
+        plan=wire_plan(STATIC_PLAN),
+        approved=True,
+        include_screenshot_after=False,
+    )
+    # the OLD plan's executed prefix, redacted exactly as the replace reply will
+    # carry it (F13: equality, not presence)
+    old_lease = server._plan_guard.active_lease(bundle)
+    first_prefix = [server._redact_queue_entry(dict(entry)) for entry in old_lease.prefix]
+    response = await server.computer_execute(
+        session_id,
+        "done",
+        plan=wire_plan(CROSSING_PLAN),
+        plan_action="replace",
+        include_screenshot_after=True,
+    )
+    # the reply IS the image-bearing shape M2 is about: a content-block list
+    assert isinstance(response, list) and response and response[0].type == "text"
+    payload = json.loads(response[0].text)
+    assert payload["replaced_plan_id"], sorted(payload)
+    # F13 (VAL-WP8-01): the replaced prefix EQUALS the old plan's executed prefix,
+    # entry for entry — not merely "some list is present".
+    assert payload["replaced_prefix"] == first_prefix
+    assert payload["plan_id"] != payload["replaced_plan_id"]
+    assert server._plan_guard.active_lease(bundle) is not None
+    # F11 (VAL-WP8-01): the disclosure rides ONLY the replace call's own reply —
+    # the NEXT step reply of the replacement carries neither key.
+    lease = server._plan_guard.active_lease(bundle)
+    assert lease.replaced_plan_id is None and lease.replaced_prefix is None
+    second = execute_payload(
+        await server.computer_execute(
+            session_id, "done", plan_action="continue", include_screenshot_after=True
+        )
+    )
+    assert "replaced_plan_id" not in second, sorted(second)
+    assert "replaced_prefix" not in second, sorted(second)
+
+
 async def test_replace_without_a_plan_is_refused_and_keeps_the_lease(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1779,6 +1836,27 @@ class ModalOnSecondDispatch(ScriptedBackend):
         return message
 
 
+class ModalOnFinalDispatch(ScriptedBackend):
+    """WP8 M1 (VAL-WP7b-03): the modal appears ONLY on the FINAL step's own
+    dispatch (dispatch #3), AFTER the backend executed it — every earlier
+    dispatch runs against a CLEAN window state. A completing step's guard event
+    can therefore reach the walk-ending reply through the completing step's own
+    outcome alone (the lease carries nothing from any earlier step)."""
+
+    def __init__(self, fire_on: int = 3, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.fire_on = fire_on
+        self.dispatches = 0
+
+    def execute(self, action: Any, stop: Any = None, **kwargs: Any) -> str:
+        message = super().execute(action, stop)
+        self.dispatches += 1
+        if self.dispatches == self.fire_on:
+            self.set_active_window(SAVE_AS)
+            self.system_dialog = dict(SAVE_AS.model_dump())
+        return message
+
+
 async def test_modal_on_the_action_item_reaches_the_step_and_lease(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1938,10 +2016,24 @@ async def test_stop_session_racing_a_step_reports_stopped_and_releases_once(
     reply = execute_payload(reply)
     assert reply["result"] == "stopped" and reply["ok"] is False, sorted(reply)
     assert reply["stopped"] is True
+    # F2 (VAL-WP8-01): the kill is the cause — the failure_reason says
+    # "cancelled" UNCONDITIONALLY, never an entry-derived or absent token.
+    assert reply["failure_reason"] == "cancelled", sorted(reply)
     assert reply["plan"]["status"] != "completed"
     assert server._plan_guard.active_lease(bundle) is None
     assert server._plan_guard.is_active(session_id) is False
     assert session_id in server._stopped_sessions
+    # F3 (VAL-WP8-01): the funnel and the in-step TaskStopped handler raced —
+    # the idempotent terminal emission yields EXACTLY ONE terminal event for the
+    # plan, carrying the reply's own result token and failure_reason.
+    plan_events = [
+        event for event in audit_events(bundle, session_id)
+        if event["event_type"] in ("plan_complete", "plan_stopped")
+    ]
+    assert len(plan_events) == 1, plan_events
+    assert plan_events[0]["event_type"] == "plan_stopped"
+    assert plan_events[0]["result"] == "stopped"
+    assert plan_events[0]["metadata"]["reason"] == "cancelled"
 
 
 # --- DELTA 1 #11: a whitespace-only action expected_effect is not a statement ---------------------
@@ -2121,19 +2213,20 @@ async def test_modal_on_the_last_point_reaches_the_parked_and_terminal_replies(
 async def test_walk_ending_reply_carries_the_final_step_event_frame_and_disclosure(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DELTA 2 N1: the walk-ending reply (a verified last step whose MOVE observed
-    a guard event) carries the step's event string, its registered frame (image_id,
-    fetchable), and does not erase the step's own disclosure — while the VERDICT is
-    the whole-plan aggregate (the earlier uncertain point caps it at ``unknown``,
-    ok false). The modal fires on the crossing last point's transition move: the
-    move still verifies (cursor predicate), so the last step itself verifies and
-    the SAME call ends the walk (N3)."""
+    """DELTA 2 N1 + WP8 M1 (VAL-WP7b-03): the walk-ending reply carries the
+    COMPLETING STEP'S OWN guard event — the modal fires on the FINAL step's
+    dispatch (#3, the last point's crossing move) with a CLEAN window state
+    before it, so the lease carries no event from any earlier step and the
+    completing step's outcome is the ONLY possible source. The reply also keeps
+    the step's registered frame (image_id, fetchable) and its per-item
+    disclosure — while the VERDICT is the whole-plan aggregate (the earlier
+    uncertain point caps it at ``unknown``, ok false)."""
     from computer_use_mcp.interference import MODAL_DIALOG
 
     from computer_use_mcp.models import WindowInfo
 
     target = WindowInfo(hwnd=1, pid=100, process_name="EXCEL.EXE", window_class="XLMAIN", title="Book1 - Excel")
-    backend = ModalOnSecondDispatch(flip=True, active_window=target, width=1024, height=800)
+    backend = ModalOnFinalDispatch(fire_on=3, flip=True, active_window=target, width=1024, height=800)
     session_id, bundle, backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
@@ -2158,11 +2251,15 @@ async def test_walk_ending_reply_carries_the_final_step_event_frame_and_disclosu
             include_screenshot_after=True,
         )
     )
-    # step 0 parks (the modal fires on its click dispatch); the lease carries the event
+    # step 0 parks and its dispatches (1 = move, 2 = click) saw a CLEAN window:
+    # the lease carries NO interference event from it
     assert reply["blocked"] is True and reply["step_index"] == 0
-    assert any(e.startswith(MODAL_DIALOG) for e in reply["interference_events"])
-    # the walk ends on the continue: the last step (the crossing move) verifies
-    # itself, so the SAME call ends the walk with the aggregate verdict
+    assert not reply.get("interference_events"), reply.get("interference_events")
+    assert not backend.system_dialog
+    assert backend.dispatches == 2
+    # the walk ends on the continue: the last step's OWN move dispatch (#3) fires
+    # the modal AFTER the dispatch, the move still verifies, so the SAME call ends
+    # the walk with the aggregate verdict
     reply = execute_payload(
         await server.computer_execute(
             session_id, "done", plan_action="continue", include_screenshot_after=True
@@ -2174,11 +2271,15 @@ async def test_walk_ending_reply_carries_the_final_step_event_frame_and_disclosu
     # abstained on a pixel change -> unknown, ok false) ...
     assert reply["result"] == "unknown" and reply["ok"] is False
     assert reply["failure_reason"] == "verification_uncertain"
+    # WP7b nit (decided): the nested aggregate status agrees with the top level
+    # (unknown = finished with nothing pending, not "blocked")
+    assert reply["plan"]["status"] == "unknown"
     assert reply["plan"]["points"][0]["status"] == "uncertain"
     assert reply["plan"]["points"][1]["status"] == "completed"
-    # ... but the completing step's data survives: the modal event, the frame, the id
+    # ... and the COMPLETING STEP'S OWN event is the only source: the lease was
+    # empty before this step, so this event can only have ridden its outcome
     assert reply["interference_events"], sorted(reply)
-    assert any(e.startswith(MODAL_DIALOG) for e in reply["interference_events"])
+    assert all(e.startswith(MODAL_DIALOG) for e in reply["interference_events"])
     assert any(
         e.startswith(MODAL_DIALOG) for e in reply["plan"]["interference_events"]
     )
@@ -2188,3 +2289,72 @@ async def test_walk_ending_reply_carries_the_final_step_event_frame_and_disclosu
     assert isinstance(fetched, list) and fetched[0].type == "text"  # the frame is fetchable
     assert json.loads(fetched[0].text)["image_id"] == image_id
     assert server._plan_guard.active_lease(bundle) is None
+
+
+# --- WP8 DELTA 1 (VAL-WP8-01): F6 + F15 ---------------------------------------------------
+
+
+async def test_a_second_plan_on_a_live_lease_is_a_rejected_plan_lease_refusal(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F15: the first-call plan_lease install failure is a REJECTED reply — the
+    closed result token, ok false, and the typed code as the first reason (the
+    same envelope as the other plan_lease refusals; assert_plan_refusal)."""
+    from reply_contract import validate_reply
+
+    backend = ScriptedBackend(flip=True)
+    session_id, _bundle, _backend, _provider = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    await server.computer_execute(
+        session_id, "done", plan=wire_plan(STATIC_PLAN), approved=True, include_screenshot_after=False
+    )
+    refusal = await server.computer_execute(
+        session_id, "done", plan=wire_plan(CROSSING_PLAN), approved=True, include_screenshot_after=False
+    )
+    assert isinstance(refusal, dict), type(refusal)
+    assert refusal["result"] == "rejected" and refusal["ok"] is False
+    assert refusal["reasons"] and refusal["reasons"][0] == "plan_lease"
+    assert refusal["error"] == "plan_lease"
+    validate_reply(refusal, "plan_refusal")
+
+
+def test_the_exception_builder_names_any_limit_and_agrees() -> None:
+    """F6: EVERY limit trip (here ``min_screenshot_interval_ms`` — a non-max_*
+    limit no end-to-end path can trip today, PERF-004 C2 made the pacing
+    non-raising) gets the agreeing error / limit / cutoff / failure_reason."""
+    from types import SimpleNamespace
+
+    from computer_use_mcp.plan import (
+        PlanLease,
+        coerce_tolerant_plan,
+        normalize_plan,
+        plan_step_slices,
+    )
+
+    model = coerce_tolerant_plan(wire_plan(CROSSING_PLAN))
+    specs, context = normalize_plan(model)
+    lease = PlanLease(
+        model=model, specs=specs, context=context, steps=plan_step_slices(specs, context)
+    )
+    bundle = SimpleNamespace(
+        extra={},
+        enforcer=SimpleNamespace(limits=SimpleNamespace(max_actions=5), _actions=0),
+        state=SimpleNamespace(max_steps=5, step_count=0),
+    )
+    response = server._plan_exception_response(
+        bundle,
+        lease,
+        step_index=0,
+        result="failed",
+        reason="min_screenshot_interval_ms: Screenshot interval below 5ms.",
+        blocked=True,
+        failure_reason="limit_exceeded",
+        limit_name="min_screenshot_interval_ms",
+    )
+    assert response["failure_reason"] == "limit_exceeded"
+    assert response["error"] == "limit_exceeded"
+    assert response["limit"] == "min_screenshot_interval_ms"
+    assert response["cutoff"]["limit_name"] == "min_screenshot_interval_ms"
+    for field in ("limit_name", "required", "available", "executed_count", "resolved_count"):
+        assert field in response["cutoff"], field

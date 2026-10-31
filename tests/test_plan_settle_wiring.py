@@ -17,10 +17,9 @@ side end-to-end through the real backend settle path:
 - the marker absent (``None``) -> the exact legacy policy (nothing sleeps on the
   shipped default; the unmarked move branch only, never the execute tail).
 
-WP7b-SEAM(plan-settle-stamping, replaced by plan.stamped_plan_actions in WP7a): the PRODUCER that stamps ``plan_point_settle`` /
-``plan_point_settle_ms`` from a waypoint's ``settle_ms`` is the WP7 plan normalizer
-(``plan.py`` does not exist yet). This module pins the consumer contract that
-producer must satisfy.
+The settle STAMPER is ``plan.stamped_plan_actions`` (WP7a): the plan normalizer
+stamps ``plan_point_settle`` / ``plan_point_settle_ms`` from a waypoint's
+``settle_ms``. This module pins that consumer contract.
 """
 
 from __future__ import annotations

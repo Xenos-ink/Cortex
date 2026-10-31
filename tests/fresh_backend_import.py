@@ -25,6 +25,7 @@ import os
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import computer_use_mcp.backend as _installed_backend
 
@@ -75,7 +76,11 @@ class _ControlledEnv:
         for key in [k for k in os.environ if k.startswith("CORTEX_")]:
             self._saved[key] = os.environ.pop(key)
         for key, value in self._overrides.items():
-            self._saved[key] = os.environ.get(key)
+            # WP-H N1 (VAL-WP-H-02): an override key that is ALSO an ambient
+            # ``CORTEX_*`` key was already saved by the strip above — re-saving
+            # here overwrote the ambient value with ``None`` and the restore
+            # DELETED it. ``setdefault`` keeps the first (ambient) save.
+            self._saved.setdefault(key, os.environ.get(key))
             if value is None:
                 os.environ.pop(key, None)
             else:
@@ -110,4 +115,34 @@ def fresh_backend(env_overrides: dict[str, str | None] | None = None) -> ModuleT
                 spec.loader.exec_module(module)
         finally:
             sys.modules.pop(_PROBE_ALIAS, None)
+    _trap_fresh_module_user32(module)
     return module
+
+
+def _tripwire_user32() -> Any:
+    """The installed backend's ``_user32`` WHEN the desktop tripwire is armed."""
+    installed = getattr(_installed_backend, "_user32", None)
+    if getattr(installed, "_cortex_tripwire", False):
+        return installed
+    return None
+
+
+def _trap_fresh_module_user32(module: ModuleType) -> None:
+    """WP-H N2 (VAL-WP-H-02): the fresh module's PRIVATE ``_user32`` is untrapped.
+
+    The exec binds its own ``WinDLL("user32")`` instances; the tripwire only
+    patches the INSTALLED ``backend_module._user32``. While today's fresh-exec
+    consumers only evaluate module-level CONSTANTS, any future expression that
+    called an effect function through the fresh module would act untrapped.
+    When the tripwire is armed, replace the fresh module's ``_user32`` with a
+    tripwire wrapper over it (fresh trap instances, same node id).
+    """
+    armed = _tripwire_user32()
+    if armed is None:
+        return
+    fresh_user32 = getattr(module, "_user32", None)
+    if fresh_user32 is None:
+        return
+    from desktop_tripwire import _TripwireUser32
+
+    module._user32 = _TripwireUser32(fresh_user32, str(getattr(armed, "_node_id", "fresh_backend_import")))

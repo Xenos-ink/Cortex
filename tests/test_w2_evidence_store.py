@@ -876,10 +876,9 @@ def test_the_two_wp7_seam_markers_exist_exactly_once() -> None:
       ``tests/test_wp7b_plan_surface.py::test_a_fetch_succeeds_mid_lease`` — the
       comment at the fetch entry still names the decision without carrying the
       marker token.
-    - ``WP7b-SEAM(evidence-by-backend)`` is WIRED: ``server._plan_evidence`` builds
-      the block from the store + lease; the marker comment above the evidence
-      section records the site (kept marker-free, so this pin now asserts the
-      absence of BOTH stale seam tokens and the presence of the wired helpers).
+    - the evidence-by-backend block is WIRED: ``server._plan_evidence`` builds
+      the block from the store + lease. This pin asserts the absence of the stale
+      seam tokens and the presence of the wired helpers.
     The pinned PROPERTY — exactly one implemented evidence/fetch site, no
     duplicated seam — is unchanged and unchanged in strength."""
     source = SERVER_PATH.read_text(encoding="utf-8")

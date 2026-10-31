@@ -1595,8 +1595,8 @@ class ComputerUseAgent:
         )
         return outcome
 
-    # WP7b-SEAM(plan-queue) — WIRED: the plan path enters through the additive
-    # ``plan_policies`` / ``plan_context`` parameters below. Per-policy settle
+    # The plan path enters through the additive ``plan_policies`` /
+    # ``plan_context`` parameters below. Per-policy settle
     # stamping (``item.plan_point_settle`` bool + ``plan_point_settle_ms`` value),
     # the TaskStopped partial-truth entry (``dispatched_unverified``), and the
     # point-end policy stop all live in ``_run_action_queue``; the LEASE-side

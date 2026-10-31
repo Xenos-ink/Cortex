@@ -908,8 +908,10 @@ class PlanLease:
     approved: bool = False
     repositions: list[dict[str, Any]] = field(default_factory=list)
     remainder: list[dict[str, Any]] = field(default_factory=list)
-    last_failure_reason: str | None = None
+    # F11 (VAL-WP8-01): the replace disclosure rides ONLY the replace call's own
+    # reply — the server clears both fields right after that reply is built.
     replaced_plan_id: str | None = None
+    replaced_prefix: list[dict[str, Any]] | None = None
     # ORVEX-2026-105 D-3: the Interference Guard's events are produced on the per-call
     # outcome and are therefore GONE by the time a later call builds a reply — a
     # terminal reply executes in a different stack frame that never saw the step's
@@ -917,6 +919,11 @@ class PlanLease:
     # cross-call carrier.  Appended at the one site where the step outcome and the
     # lease are simultaneously in scope, read back by the terminal aggregate.
     interference_events: list[str] = field(default_factory=list)
+    # F3 (VAL-WP8-01): the terminal lifecycle audit event is IDEMPOTENT per lease —
+    # the first terminal path to emit (the in-step TaskStopped handler or the
+    # session-end funnel racing it) sets this and the loser stays silent, so a
+    # killed session mid-step produces exactly ONE terminal event for the plan.
+    terminal_audited: bool = False
 
 
 def merge_plan_step_prefix(
@@ -1184,6 +1191,188 @@ def plan_terminal_outcome(
     if result == "verified" and len(entries) < int(expected_items):
         result = "unknown"
     return PlanTerminalOutcome(result=result, ok=result == "verified")
+
+
+# --- B6–B8 failure classification (WP8) --------------------------------------------------------
+#
+# Every token below is a literal that ALREADY exists in the product vocabulary — the
+# tables are keyed by the three pre-existing signals a step reply already carries (the
+# typed response ``error``, the agent's outcome ``kind``, and the queue's
+# ``follow_ups_stopped_reason``).  Nothing is invented: a code state that none of those
+# names classifies as ``unclassified`` rather than growing a new reason.  The tables
+# live HERE (not in the server) so plan.py stays import-free of server.py (the AST pin)
+# and the classifier is pure data + one function over the signals the reply carries.
+#
+# Completeness is enforced by ``tests/test_batch8_classification_completeness.py``:
+# it extracts every literal the product can put in ``SingleActionOutcome.kind``, in
+# ``follow_ups_stopped_reason`` and in the step reply's ``error``, then fails if any
+# of them is unnamed.  Adding a stop reason to the product without classifying it
+# fails that test instead of silently shipping ``unclassified``.
+_PLAN_ERROR_TO_FAILURE_REASON: dict[str, str] = {
+    "limit_exceeded": "limit_exceeded",
+    "action_error": "execution_error",
+}
+# F8 (VAL-WP8-01): the dev copy's ``digest_surprise`` error-table entry was
+# dropped (a digest surprise is a REJECTION kind here — rejected + reasons, no
+# error key), and the stable ``cancelled``/``invalid_action`` error keys are NOT
+# table entries: the exception reply builder passes those failure_reason tokens
+# EXPLICITLY and never consults the classifier, so the keys would be unreachable
+# (``no_table_key_is_unreachable`` keeps the tables honest).
+_PLAN_OUTCOME_KIND_TO_FAILURE_REASON: dict[str, str] = {
+    "safety_denied": "safety_denied",
+    "approval_required": "approval_required",
+    "digest_surprise": "digest_surprise",
+    "error": "execution_error",
+    "rejected": "rejected",
+}
+# Stop reasons that NAME the cause win over the per-item verdict; stop reasons that
+# only describe the MECHANISM ("the queue halted") must not mask it — a plan whose
+# on_failure policy stopped the batch after a failed verification is a
+# verification_failed step, not a policy_stop step.
+_PLAN_SPECIFIC_STOP_REASON_TO_FAILURE_REASON: dict[str, str] = {
+    "safety_denied": "safety_denied",
+    "limit_exceeded": "limit_exceeded",
+    "modal_dialog": "modal_dialog",
+    "focus_drifted": "focus_drifted",
+}
+# F8 (VAL-WP8-01): the dev copy's ``"stopped": "cancelled"`` entry is gone —
+# ``"stopped"`` is never a ``follow_ups_stopped_reason`` the queue can produce
+# (a TaskStopped kill is a TERMINAL exception path that carries its failure_reason
+# explicitly), so the key was unreachable.
+_PLAN_STOP_REASON_TO_FAILURE_REASON: dict[str, str] = {
+    "verification_failed": "verification_failed",
+    "invalid_follow_up": "invalid_follow_up",
+    "policy_stop": "policy_stop",
+    "no_post_action_observation": "no_post_action_observation",
+    # The queue sets this literal when a FOLLOW-UP item of the step raised
+    # (``stopped_reason = outcome.kind`` for a non-``executed`` kind, and that kind
+    # IS ``"error"``).  It is the same state the kind table already calls
+    # ``execution_error``; the two places the literal appears now agree.
+    "error": "execution_error",
+    # The queue copies a non-executed ``outcome.kind`` verbatim into the stop reason
+    # when the step's FIRST item succeeded, so the KIND table — keyed on that first
+    # outcome — is never consulted.  Each maps to exactly the token the KIND table
+    # already gives it, so the two places one literal appears agree.
+    "rejected": "rejected",
+    "approval_required": "approval_required",
+    "digest_surprise": "digest_surprise",
+    # Stable tree only (the queue's ensure-app guard): a follow-up ensure_app whose
+    # TYPED outcome is a failure/ambiguous stops the batch.  The item dispatched and
+    # produced no proof of a target, so — when the per-entry verdicts carry nothing —
+    # the honest class is the same "dispatched, unproven" one §1.2 uses.
+    "ensure_app_failed": "verification_uncertain",
+    # The four NAMED interference stops beyond the two with their own tokens: the
+    # focus events share the product's one focus-interference token with
+    # ``focus_drifted``, and the remaining two are refusals.  The exact cause stays
+    # verbatim in ``follow_ups_stopped_reason`` and in the entry's ``reasons``, so
+    # ``failure_reason`` carries the CLASS only.
+    "focus_taken_by": "focus_drifted",
+    "focus_identity_unknown": "focus_drifted",
+    "stuck_modifier": "rejected",
+    "target_gone": "rejected",
+}
+# The complete, closed set the reply surface may report.  A strict consumer can
+# validate against it; ``unclassified`` is the documented escalation fallback.
+PLAN_FAILURE_REASONS = frozenset(
+    {
+        "verification_failed",
+        "verification_uncertain",
+        "execution_error",
+        "limit_exceeded",
+        "cancelled",
+        "safety_denied",
+        "approval_required",
+        "digest_surprise",
+        "rejected",
+        "invalid_action",
+        "invalid_follow_up",
+        "policy_stop",
+        "modal_dialog",
+        "focus_drifted",
+        "no_post_action_observation",
+        "unclassified",
+    }
+)
+
+
+def plan_failure_reason(
+    outcome: Any,
+    step_entries: list[dict[str, Any]],
+    *,
+    result: str,
+    error: str | None = None,
+) -> str | None:
+    """Classify a non-verified step into ONE token of the closed vocabulary.
+
+    ``None`` is the honest answer for a verified step (no failure happened).  The
+    classification is a pure read of signals the reply already carries, so it can
+    never disagree with ``result``, ``error``, or the retained prefix.  Adapted from
+    the dev classifier to the unified reply contract: the per-entry verdicts also
+    read the entries' own ``result`` token (the same derivation the flat reply and
+    every ``follow_up_results[i]`` use), the entries alone classify a TERMINAL
+    prefix (outcome=None), and an explicit queue stop reason outranks
+    entry-derived uncertainty while entry-derived FAILURES keep theirs.
+    """
+    if result == "verified":
+        return None
+    if error is not None:
+        classified = _PLAN_ERROR_TO_FAILURE_REASON.get(str(error))
+        if classified is not None:
+            return classified
+    kind = getattr(outcome, "kind", None)
+    if kind is not None:
+        classified = _PLAN_OUTCOME_KIND_TO_FAILURE_REASON.get(str(kind))
+        if classified == "rejected" and any(
+            "invalid_action" in list(entry.get("reasons") or []) for entry in step_entries
+        ):
+            return "invalid_action"
+        if classified is not None:
+            return classified
+    stopped = getattr(outcome, "follow_ups_stopped_reason", None)
+    if stopped is not None:
+        classified = _PLAN_SPECIFIC_STOP_REASON_TO_FAILURE_REASON.get(str(stopped))
+        if classified is not None:
+            return classified
+    if any(entry.get("kind") == "safety_denied" for entry in step_entries):
+        return "safety_denied"
+    if any(entry.get("verification_outcome") == "failed" for entry in step_entries):
+        return "verification_failed"
+    # F7 (VAL-WP8-01): an EXPLICIT queue stop reason names the cause and must win
+    # over entry-derived UNCERTAINTY — an uncertain first item followed by an
+    # approval hold / rejection / named focus stop classifies as the STOP, not as
+    # verification_uncertain.  (Entry-derived FAILURES keep their earlier
+    # precedence: a policy stop over failed verifications stays
+    # verification_failed.)
+    if stopped is not None:
+        classified = _PLAN_STOP_REASON_TO_FAILURE_REASON.get(str(stopped))
+        if classified is not None:
+            return classified
+    # F1 (VAL-WP8-01): the terminal replies classify with outcome=None, so the
+    # ENTRIES must carry the refusal facts on their own — the unified result
+    # token and the approval marker are the same derivation the step surface
+    # used, so the terminal reply can never disagree with its own prefix.
+    if any(entry.get("requires_approval") for entry in step_entries):
+        return "approval_required"
+    if any(
+        entry.get("result") == "rejected"
+        or entry.get("kind") in ("rejected", "digest_surprise")
+        for entry in step_entries
+    ):
+        return "rejected"
+    if any(entry.get("result") == "failed" for entry in step_entries):
+        # a failed entry with NO failed verification outcome is an operation
+        # error (kind "error"); the verification-failed case returned above
+        return "execution_error"
+    if any(
+        entry.get("verification_outcome") == "uncertain"
+        or entry.get("result") == "uncertain"
+        or entry.get("kind") == "dispatched_unverified"
+        for entry in step_entries
+    ):
+        return "verification_uncertain"
+    if result in ("uncertain", "unknown"):
+        return "verification_uncertain"
+    return "unclassified"
 
 
 # --- S-10: the advertised wire schema ---------------------------------------------------------

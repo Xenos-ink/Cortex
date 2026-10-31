@@ -613,10 +613,13 @@ def test_a_lease_carries_every_retained_field() -> None:
     lease = _lease()
     for name in (
         "model", "specs", "context", "steps", "cursor", "prefix", "source_indices",
-        "approved", "repositions", "remainder", "last_failure_reason",
-        "replaced_plan_id", "interference_events",
+        "approved", "repositions", "remainder",
+        "replaced_plan_id", "replaced_prefix", "interference_events", "terminal_audited",
     ):
         assert hasattr(lease, name), name
     assert lease.cursor == 0 and lease.approved is False
     assert lease.prefix == [] and lease.source_indices == []
     assert lease.interference_events == []
+    # F10 (VAL-WP8-01): the write-only last_failure_reason field is gone; the
+    # failure reason lives on the REPLIES (one derivation), not on the lease.
+    assert not hasattr(lease, "last_failure_reason")
