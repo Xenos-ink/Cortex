@@ -22,6 +22,7 @@ that module. Removing the whole block fails on the first dependent.
 
 from __future__ import annotations
 
+import platform
 import sys
 import types
 from pathlib import Path
@@ -53,6 +54,11 @@ D8_PLACEHOLDERS = (
 )
 
 #: Fresh-exec order = dependency order (bottom cross-imports included).
+#: ``windows`` runs BEFORE ``text_readers`` so text_readers' bottom
+#: ``from .windows import ...`` resolves to the FRESH windows module (the
+#: pairing is exercised); fresh windows' own bottom ``from .text_readers
+#: import ...`` resolves to the real text_readers (preloaded — precondition
+#: asserted in the fixture).
 MODULES = (
     "win32",
     "errors",
@@ -60,8 +66,8 @@ MODULES = (
     "motion",
     "launch",
     "clipboard",
-    "text_readers",
     "windows",
+    "text_readers",
     "input_engine",
     "capture",
     "backend",
@@ -89,6 +95,12 @@ def _fresh_exec(monkeypatch: pytest.MonkeyPatch, dotted: str) -> types.ModuleTyp
 def non_windows_desktop(monkeypatch: pytest.MonkeyPatch) -> dict[str, types.ModuleType]:
     """Fresh-exec the whole desktop package as if platform.system() != 'Windows'."""
     monkeypatch.setitem(sys.modules, "platform", _NonWindowsPlatform)
+    # the windows <-> text_readers bottom cross-import: fresh windows' bottom
+    # `from .text_readers import ...` must not import text_readers against the
+    # fresh win32 (which would leave a non-Windows module in sys.modules after
+    # teardown) — both peers must be loaded for real BEFORE the fresh execs.
+    for peer in ("windows", "text_readers"):
+        assert f"computer_use_mcp.desktop.{peer}" in sys.modules, peer
     loaded: dict[str, types.ModuleType] = {}
     for name in MODULES:
         loaded[name] = _fresh_exec(monkeypatch, name)
@@ -124,6 +136,7 @@ def test_real_modules_are_restored_after_the_fresh_execs() -> None:
     sys.modules, so this import resolves to the REAL package module, not a fresh one."""
     import computer_use_mcp.desktop.win32 as real  # noqa: PLC0415 - the point
 
-    assert real.IS_WINDOWS is True  # we ARE on Windows here; no fake lingers
+    # platform-relative: this file must also pass on a non-Windows host
+    assert real.IS_WINDOWS is (platform.system() == "Windows")
     assert real.__file__ == str(DESKTOP / "win32.py")
     assert sys.modules["computer_use_mcp.desktop.win32"] is real

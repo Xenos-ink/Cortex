@@ -671,6 +671,8 @@ def function_load_names(source: str) -> set[str]:
 
 
 def _module_source_path(dotted: str) -> Path:
+    if dotted == "computer_use_mcp":
+        return PKG / "__init__.py"
     rel = dotted.removeprefix("computer_use_mcp.")
     base = PKG.joinpath(*rel.split("."))
     if base.is_dir():
@@ -1028,3 +1030,48 @@ def test_selftest_excludes_stdlib_and_inner_object_patches() -> None:
     sites = _scan(test)
     assert ("computer_use_mcp.synthetic_mod", "time") in _names(sites)
     assert len(sites) == 1  # the inner-object chains are all excluded
+
+
+def test_selftest_package_qualified_patch_on_an_unread_package_is_flagged() -> None:
+    """WP-R2b step 0 (plan §9.2): a patch on a PACKAGE-qualified target
+    (``monkeypatch.setattr(<cu package>, "name", ...)``) is collected, and when
+    the package ``__init__`` never reads the name it is FLAGGED — after the
+    server split a stale ``server_pkg.X`` patch must fail loud, not silently
+    patch nothing."""
+    test = (
+        "from computer_use_mcp import synthetic_pkg\n"
+        "def test_x(monkeypatch):\n"
+        "    monkeypatch.setattr(synthetic_pkg, 'TUNABLE', 9)\n"
+    )
+    sites = _scan(test)
+    assert len(sites) == 1
+    assert sites[0]["module"] == "computer_use_mcp.synthetic_pkg"
+    assert sites[0]["name"] == "TUNABLE"
+    assert sites[0]["name"] not in function_load_names("")  # an empty __init__
+
+
+def test_selftest_patch_on_the_real_package_init_is_flagged() -> None:
+    """Same rule against the REAL root package (docstring/__version__ only):
+    the site is collected and its name is not read by the package __init__."""
+    test = (
+        "import computer_use_mcp\n"
+        "def test_x(monkeypatch):\n"
+        "    monkeypatch.setattr(computer_use_mcp, 'stop_session', fake)\n"
+    )
+    sites = _scan(test)
+    assert len(sites) == 1
+    assert sites[0]["module"] == "computer_use_mcp"
+    assert sites[0]["name"] == "stop_session"
+    pkg_init_source = (PKG / "__init__.py").read_text(encoding="utf-8")
+    assert "stop_session" not in function_load_names(pkg_init_source)
+
+
+def test_selftest_package_targets_resolve_through_module_source_path() -> None:
+    """G2 (VAL-WP-R2b-0-01): the read-rule's file resolution goes through
+    ``_module_source_path`` — prove it maps a PACKAGE target (and the ROOT
+    package) to its real ``__init__.py`` instead of raising or mis-pathing."""
+    assert _module_source_path("computer_use_mcp.desktop") == PKG / "desktop" / "__init__.py"
+    assert _module_source_path("computer_use_mcp") == PKG / "__init__.py"
+    for dotted in ("computer_use_mcp.desktop", "computer_use_mcp"):
+        source = _module_source_path(dotted).read_text(encoding="utf-8")
+        assert function_load_names(source) is not None

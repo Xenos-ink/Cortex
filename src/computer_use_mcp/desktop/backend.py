@@ -109,7 +109,7 @@ from .errors import (
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # annotation-only names (lazy under __future__ annotations)
-    from ..core.models import MonitorInfo
+    # MonitorInfo is a runtime import above (shared with the models import).
     from .coordinates import CoordinateVerdict
     from .input_engine import InputEngine
     from .launch import AppWindowCandidate

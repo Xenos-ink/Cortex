@@ -29,6 +29,47 @@ _LAYER_INDEX = {name: idx for idx, name in enumerate(LAYER_ORDER)}
 _ROOT_MODULE_LAYER = {"server": "server", "cli": "cli"}
 SUBPACKAGES = ("core", "security", "desktop", "vision", "pipeline", "planning")
 
+#: D1 launch entries (WP-R2b plan §2/§9.3): package __init__ files allowed to
+#: carry EXACTLY one launch shim — ``def main(): from .app import main as
+#: _main; return _main()`` — plus a docstring, nothing else. Reviewed set.
+#: Inert on the UNsplit tree (server/ does not exist yet); the shim becomes
+#: live at the step-1 move (which also adds "server" to SUBPACKAGES).
+LAUNCH_ENTRY_INITS = {"server/__init__.py"}
+
+#: The exact D1 shim source (for the self-tests).
+LAUNCH_SHIM_SOURCE = (
+    '"""Console-script launch shim (D1)."""\n'
+    "\n"
+    "def main():\n"
+    "    from .app import main as _main\n"
+    "    return _main()\n"
+)
+
+
+def _is_launch_shim(node: ast.stmt) -> bool:
+    """True for EXACTLY the D1 shim shape: a bare zero-arg ``def main`` whose
+    body is the relative app re-import plus ``return _main()`` — nothing else."""
+    if not (isinstance(node, ast.FunctionDef) and node.name == "main"):
+        return False
+    if node.decorator_list or node.returns is not None or getattr(node, "type_params", None):
+        return False
+    a = node.args
+    if a.posonlyargs or a.args or a.kwonlyargs or a.vararg or a.kwarg \
+            or a.defaults or a.kw_defaults:
+        return False
+    if len(node.body) != 2:
+        return False
+    imp, ret = node.body
+    if not (isinstance(imp, ast.ImportFrom) and imp.level == 1 and imp.module == "app"
+            and len(imp.names) == 1 and imp.names[0].name == "main"
+            and imp.names[0].asname == "_main"):
+        return False
+    if not (isinstance(ret, ast.Return) and isinstance(ret.value, ast.Call)
+            and len(ret.value.args) == 0 and not ret.value.keywords):
+        return False
+    func = ret.value.func
+    return isinstance(func, ast.Name) and isinstance(func.ctx, ast.Load) and func.id == "_main"
+
 
 def layer_of(dotted: str) -> str | None:
     """Layer of a computer_use_mcp-internal dotted module path (None: external)."""
@@ -141,16 +182,18 @@ def layer_violations(owner: str, source: str) -> list[str]:
     return found
 
 
-def init_violations(source: str) -> list[str]:
-    """Descriptions of any non-docstring statement in an __init__.py source."""
+def init_violations(source: str, relpath: str | None = None) -> list[str]:
+    """Descriptions of any non-docstring statement in an __init__.py source.
+
+    A package listed in ``LAUNCH_ENTRY_INITS`` may additionally carry EXACTLY
+    one launch shim (``_is_launch_shim``)."""
     tree = ast.parse(source)
     if len(tree.body) == 0:
         return []
-    if (len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr)
-            and isinstance(tree.body[0].value, ast.Constant)
-            and isinstance(tree.body[0].value.value, str)):
+    body = tree.body[1:] if _is_docstring(tree.body[0]) else list(tree.body)
+    if relpath in LAUNCH_ENTRY_INITS and len(body) == 1 and _is_launch_shim(body[0]):
         return []
-    return [ast.dump(node, include_attributes=False) for node in tree.body[1 if _is_docstring(tree.body[0]) else 0:]]
+    return [ast.dump(node, include_attributes=False) for node in body]
 
 
 def _is_docstring(node: ast.stmt) -> bool:
@@ -181,7 +224,7 @@ def test_no_module_imports_a_higher_layer() -> None:
 @pytest.mark.parametrize("subpackage", SUBPACKAGES)
 def test_subpackage_init_is_empty_or_docstring_only(subpackage: str) -> None:
     source = (PKG / subpackage / "__init__.py").read_text(encoding="utf-8")
-    assert init_violations(source) == [], (
+    assert init_violations(source, relpath=f"{subpackage}/__init__.py") == [], (
         f"{subpackage}/__init__.py must stay empty (optional docstring only); "
         "re-exports belong in the modules themselves"
     )
@@ -316,6 +359,86 @@ def test_checker_catches_a_nonempty_subpackage_init() -> None:
     assert init_violations("__version__ = '1'\n") != []
     assert init_violations('"""docstring only."""\n') == []
     assert init_violations("") == []
+
+
+def test_selftest_launch_shim_passes_for_the_reviewed_entry() -> None:
+    assert init_violations(LAUNCH_SHIM_SOURCE, relpath="server/__init__.py") == []
+
+
+def test_selftest_launch_exception_is_inert_on_the_unsplit_tree() -> None:
+    """server/ does not exist yet — no current package is a launch entry, and
+    the docstring-only guard for every existing package is unchanged."""
+    assert not (PKG / "server").exists()
+    for path in sorted(PKG.rglob("__init__.py")):
+        if path == PKG / "__init__.py":
+            continue  # the root init guard lives in test_no_bare_reexport
+        rel = path.relative_to(PKG).as_posix()
+        assert rel not in LAUNCH_ENTRY_INITS, rel
+        assert init_violations(path.read_text(encoding="utf-8"), relpath=rel) == [], rel
+
+
+def test_selftest_any_other_statement_in_a_launch_init_fails() -> None:
+    assert init_violations(LAUNCH_SHIM_SOURCE + "\nX = 1\n", relpath="server/__init__.py") != []
+    assert init_violations(
+        LAUNCH_SHIM_SOURCE + "from .app import main\n", relpath="server/__init__.py"
+    ) != []
+    assert init_violations(
+        LAUNCH_SHIM_SOURCE
+        + "\ndef main():\n    from .app import main as _main\n    return _main()\n",
+        relpath="server/__init__.py",
+    ) != []  # a second shim-shaped def
+
+
+def test_selftest_shim_shape_deviations_and_other_packages_fail() -> None:
+    wrong_name = LAUNCH_SHIM_SOURCE.replace("def main():", "def run():")
+    assert init_violations(wrong_name, relpath="server/__init__.py") != []
+    absolute = LAUNCH_SHIM_SOURCE.replace(
+        "from .app import main as _main",
+        "from computer_use_mcp.server.app import main as _main",
+    )
+    assert init_violations(absolute, relpath="server/__init__.py") != []
+    assert init_violations(LAUNCH_SHIM_SOURCE, relpath="desktop/__init__.py") != []
+
+
+_SHIM_DEVIATIONS = (
+    '"""D."""\n\n@deco\ndef main():\n    from .app import main as _main\n    return _main()\n',
+    '"""D."""\n\nasync def main():\n    from .app import main as _main\n    return _main()\n',
+    '"""D."""\n\ndef main() -> int:\n    from .app import main as _main\n    return _main()\n',
+    '"""D."""\n\ndef main():\n    from ..app import main as _main\n    return _main()\n',
+    '"""D."""\n\ndef main():\n    from .app import *\n    return main()\n',
+)
+
+
+def test_selftest_shim_deviation_forms_fail() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "test_no_bare_reexport_module",
+        Path(__file__).resolve().parent / "test_no_bare_reexport.py")
+    sibling = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sibling)
+    for shim in (*_SHIM_DEVIATIONS, LAUNCH_SHIM_SOURCE):
+        parsed = ast.parse(shim).body[-1]
+        assert _is_launch_shim(parsed) == sibling._is_launch_shim(parsed), shim
+    assert not _is_launch_shim(ast.parse(_SHIM_DEVIATIONS[0]).body[-1])
+    assert _is_launch_shim(ast.parse(LAUNCH_SHIM_SOURCE).body[-1])
+
+
+def test_selftest_shim_with_type_params_is_rejected() -> None:
+    """3.12 generic-function shape (synthesized node; the source form does not
+    parse on Python 3.11). Both shim checkers must reject it identically."""
+    import importlib.util
+
+    node = ast.parse(LAUNCH_SHIM_SOURCE).body[-1]
+    assert _is_launch_shim(node)
+    node.type_params = [ast.Name(id="T", ctx=ast.Load())]
+    assert not _is_launch_shim(node)
+    spec = importlib.util.spec_from_file_location(
+        "test_no_bare_reexport_module_tp",
+        Path(__file__).resolve().parent / "test_no_bare_reexport.py")
+    sibling = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sibling)
+    assert not sibling._is_launch_shim(node)
 
 
 def test_every_layer_is_present_in_the_package() -> None:
