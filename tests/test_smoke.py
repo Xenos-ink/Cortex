@@ -3,9 +3,9 @@ from computer_use_mcp.security.safety import SafetyPolicy
 
 
 def test_server_module_imports() -> None:
-    from computer_use_mcp import server
+    import computer_use_mcp.server.app as srv_server_app
 
-    assert server.mcp.name == "Cortex"
+    assert srv_server_app.mcp.name == "Cortex"
 
 
 def test_stopped_session_rejects_actions() -> None:

@@ -142,11 +142,11 @@ async def main() -> int:
         t0 = time.perf_counter(); engine.verify(intent, before, after); xs.append((time.perf_counter() - t0) * 1000.0)
     report["verify_fastpath_after"] = _ms(xs)
 
-    from computer_use_mcp import server as srv
+    import computer_use_mcp.server.fetch as srv_server_fetch
     xs = []
     for _ in range(8):
         t0 = time.perf_counter()
-        srv._bound_outbound_image(after.image_base64, frame=getattr(after, "_frame", None))
+        srv_server_fetch._bound_outbound_image(after.image_base64, frame=getattr(after, "_frame", None))
         xs.append((time.perf_counter() - t0) * 1000.0)
     report["bound_outbound_after"] = _ms(xs)
 

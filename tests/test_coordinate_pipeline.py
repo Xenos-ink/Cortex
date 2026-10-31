@@ -38,7 +38,10 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.pipeline.grounding import GroundingRouter
 from computer_use_mcp.core.models import (
@@ -131,9 +134,11 @@ class _FlippingScaledBackend(FakeComputerBackend):
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir for full session isolation."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 def make_session(
@@ -144,12 +149,12 @@ def make_session(
     **start_kwargs: Any,
 ) -> tuple[str, Any, Any, Any]:
     """Start one session through the server tool with injected fake backend/provider."""
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: provider)
-    response = server.start_session(**start_kwargs)
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: provider)
+    response = srv_server_lifecycle.start_session(**start_kwargs)
     assert response.get("session_id"), response
     session_id = str(response["session_id"])
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     return session_id, bundle, backend, provider
 
 
@@ -219,7 +224,7 @@ async def test_scaled_125_percent_executes_origin_plus_screenshot_times_scale_on
         monkeypatch, backend=backend, provider=None,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=100, y=200, expected_effect="the screen changes"
     )
     response = _executed_payload(response)
@@ -253,7 +258,7 @@ async def test_scaled_150_percent_executes_origin_plus_screenshot_times_scale_on
         monkeypatch, backend=backend, provider=None,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=640, y=360, expected_effect="the screen changes"
     )
     response = _executed_payload(response)
@@ -283,7 +288,7 @@ async def test_negative_origin_secondary_monitor_executes_origin_plus_screenshot
         monkeypatch, backend=backend, provider=None,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=960, y=540, expected_effect="the screen changes"
     )
     response = _executed_payload(response)
@@ -317,7 +322,7 @@ async def test_unverifiable_coordinate_space_refuses_end_to_end_fail_closed(
         monkeypatch, backend=backend, provider=None,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=100, y=200, expected_effect="the screen changes"
     )
 
@@ -346,7 +351,7 @@ async def test_passthrough_scale_one_applies_no_transform(
         monkeypatch, backend=backend, provider=None,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=300, y=400, expected_effect="the screen changes"
     )
     response = _executed_payload(response)

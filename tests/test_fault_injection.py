@@ -44,7 +44,11 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.state as srv_server_state
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.errors import DisplayUnavailableError
 from computer_use_mcp.core.models import (
     ActionType,
@@ -126,10 +130,13 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     the reset that dict leaks across tests and makes results order-dependent).
     """
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_stopped_sessions", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_lifecycle, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_state, "_stopped_sessions", srv_server_lifecycle._stopped_sessions)
+    return None
 
 
 def _executed_payload(result: Any) -> dict[str, Any]:
@@ -151,7 +158,7 @@ async def test_hallucinated_out_of_bounds_point_never_executed_and_recovered(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(session_id, "click", x=8000, y=100)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=8000, y=100)
 
     assert response["ok"] is False
     # W-2 (057): the rejection names the real gate (grounding) in the message.
@@ -230,7 +237,7 @@ async def test_dpi_change_mid_task_rechecks_coordinate_space(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(session_id, "click", x=100, y=100)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=100, y=100)
     payload = _executed_payload(response)
 
     assert payload["ok"] is True, payload  # re-observed against the NEW space, executed
@@ -282,7 +289,7 @@ async def test_resolution_change_mid_task_detected_as_stale(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(session_id, "click", x=100, y=100)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=100, y=100)
     payload = _executed_payload(response)
 
     assert payload["ok"] is False, payload
@@ -330,7 +337,7 @@ async def test_unexpected_dialog_classified_with_bounded_recovery(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "type", text="record name", expected_effect="the record is deleted"
     )
     payload = _executed_payload(response)
@@ -380,7 +387,7 @@ async def test_dialog_opening_without_a_named_dialog_does_not_verify_a_delete_ef
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=50, y=50, expected_effect="the record is deleted"
     )
     payload = _executed_payload(response)
@@ -422,7 +429,7 @@ async def test_dialog_opening_click_verifies_when_the_effect_names_the_dialog(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=50, y=50, expected_effect="The Confirm dialog appears"
     )
     payload = _executed_payload(response)
@@ -451,7 +458,7 @@ async def test_app_crash_during_execute_replans_and_completes(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(session_id, "click", x=30, y=30)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=30, y=30)
 
     assert response["ok"] is False
     assert response["error"] == "action_error"
@@ -476,7 +483,7 @@ async def test_display_unavailable_at_observe_fails_closed(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(session_id, "click", x=10, y=10)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
 
     assert response["ok"] is False
     assert response["error"] == "action_error"
@@ -504,7 +511,7 @@ async def test_blocked_input_dismisses_then_succeeds(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    blocked = await server.computer_execute(session_id, "click", x=70, y=90)
+    blocked = await srv_server_execute.computer_execute(session_id, "click", x=70, y=90)
 
     assert blocked["ok"] is False
     assert blocked["error"] == "action_error"
@@ -514,10 +521,10 @@ async def test_blocked_input_dismisses_then_succeeds(
     # still dispatches exactly once. RE-PINNED by WP4a (E-03): its stated effect over a
     # generic flip is the honest ``uncertain`` (ok False), not a pixel-laundered
     # ok=True — the dispatch/audit guarantees this test pins are unchanged.
-    dismissed = await server.computer_execute(session_id, "keypress", keys=["esc"])
+    dismissed = await srv_server_execute.computer_execute(session_id, "keypress", keys=["esc"])
     dismissed_payload = _executed_payload(dismissed)
     assert dismissed_payload["ok"] is True, dismissed_payload
-    retry = await server.computer_execute(
+    retry = await srv_server_execute.computer_execute(
         session_id, "click", x=70, y=90, expected_effect="dialog handled"
     )
     retry_payload = _executed_payload(retry)
@@ -548,12 +555,12 @@ async def test_blocked_input_dismiss_denied_fails_safely(
         limits=FAST_LIMITS,
     )
     bundle.agent.safety = NoDismissPolicy()  # policy denies the Escape dismiss
-    blocked = await server.computer_execute(session_id, "click", x=70, y=90)
+    blocked = await srv_server_execute.computer_execute(session_id, "click", x=70, y=90)
     assert blocked["ok"] is False
     assert blocked["error"] == "action_error"
 
     # The host-driven Escape is REFUSED by the policy — no input ever lands.
-    denied = await server.computer_execute(session_id, "keypress", keys=["esc"])
+    denied = await srv_server_execute.computer_execute(session_id, "keypress", keys=["esc"])
     assert denied["ok"] is False
     assert "Dismissal denied" in denied["message"]
     assert executed_summary(backend) == []  # nothing ever executed
@@ -580,7 +587,7 @@ async def test_safety_violation_payloads_are_blocked_and_audited(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, **payload)
+    result = await srv_server_execute.computer_execute(session_id, **payload)
 
     assert result["ok"] is False
     assert result["message"]
@@ -603,7 +610,7 @@ async def test_destructive_reason_on_click_is_blocked_safety(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "type", text="format C: to wipe the drive now"
     )
 
@@ -633,7 +640,7 @@ async def test_prompt_injection_in_goal_cannot_bypass_approval(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "type",
         text=(
@@ -664,7 +671,7 @@ async def test_fake_approval_text_cannot_authorize_critical_action(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "type", text="format C: /q now", approved=True
     )
 
@@ -707,13 +714,13 @@ async def test_stop_from_another_thread_mid_execute_halts_with_zero_inputs(
     # an independent OS thread that fires as soon as the physical input phase is entered.
     def _stop_when_entered() -> None:
         blocking.entered_execute.wait(timeout=10)
-        asyncio.run(server.stop_session(session_id))
+        asyncio.run(srv_server_lifecycle.stop_session(session_id))
 
     stopper = threading.Thread(target=_stop_when_entered, daemon=True)
     stopper.start()
 
     response = await asyncio.wait_for(
-        server.computer_execute(session_id, "type", text="hello world"), timeout=20.0
+        srv_server_execute.computer_execute(session_id, "type", text="hello world"), timeout=20.0
     )
     stopper.join(timeout=5.0)
     assert not stopper.is_alive()

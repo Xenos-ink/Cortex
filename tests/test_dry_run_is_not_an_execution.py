@@ -29,15 +29,20 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 
 
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    yield
 
 
 def _state(**overrides: Any) -> SimpleNamespace:
@@ -165,7 +170,7 @@ async def test_a_dry_run_through_computer_execute_is_not_ok(
         monkeypatch, backend=backend, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(session_id, "click", x=10, y=10, approved=True)
+        await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, approved=True)
     )
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "dry_run", payload

@@ -721,7 +721,7 @@ def patch_sites_scan(
 #: file's collected patch sites, ordered by (line, col) (F10: line numbers
 #: churn as step 1 edits these files; the ordinal identifies the SITE).
 EXPECTED_NOOP_PATCH_SITES: dict[tuple[str, str, str, int], str] = {
-    ("tests/e2e/test_benchmark_harness.py", "computer_use_mcp.server", "stop_session", 0):
+    ("tests/e2e/test_benchmark_harness.py", "computer_use_mcp.server.lifecycle", "stop_session", 0):
         "REVIEWED cross-module reader: the patched module never calls the name, "
         "but benchmarks/runner.py calls ``server.stop_session(session_id)`` — an "
         "attribute lookup on the module at call time, so the spy patch IS "

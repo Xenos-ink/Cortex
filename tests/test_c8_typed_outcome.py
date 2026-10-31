@@ -29,7 +29,10 @@ import pytest
 from reply_contract import validate_reply
 from test_controller_integration import FAST_LIMITS, SessionRegistry, execute_payload
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.pipeline.agent import ENSURE_APP_OUTCOMES, ensure_app_outcome
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.launch import (
@@ -88,9 +91,11 @@ class LaunchingWorld(FakeComputerBackend):
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    yield
 
 
 async def _drive(
@@ -100,12 +105,12 @@ async def _drive(
     allowlist: list[str] | None = None,
     policy: str | None = None,
 ) -> dict[str, Any]:
-    server._backend_factory = lambda: world
-    server._provider_factory = lambda: _FakeProvider()
+    srv_server_lifecycle._backend_factory = lambda: world
+    srv_server_lifecycle._provider_factory = lambda: _FakeProvider()
     interference = (
         {"attach_or_launch": {"launch": policy}} if policy is not None else None
     )
-    response = server.start_session(
+    response = srv_server_lifecycle.start_session(
         dry_run=False,
         require_approval=False,
         limits=FAST_LIMITS,
@@ -115,11 +120,11 @@ async def _drive(
     session_id = str(response["session_id"])
     try:
         return execute_payload(
-            await server.computer_execute(session_id, "ensure_app", target=target)
+            await srv_server_execute.computer_execute(session_id, "ensure_app", target=target)
         )
     finally:
         try:
-            await server.stop_session(session_id=session_id)
+            await srv_server_lifecycle.stop_session(session_id=session_id)
         except Exception as exc:  # noqa: BLE001 - teardown must not mask a verdict
             assert "not a live session" not in str(exc)
 
@@ -316,20 +321,20 @@ async def test_the_field_is_present_on_every_ensure_app_reply(fresh_server: Any)
 
 async def test_the_field_is_null_on_a_non_ensure_app_action(fresh_server: Any) -> None:
     """Additive and typed: the key is present, and it is ``null`` for a click."""
-    server._backend_factory = lambda: FakeComputerBackend()
-    server._provider_factory = lambda: _FakeProvider()
-    response = server.start_session(
+    srv_server_lifecycle._backend_factory = lambda: FakeComputerBackend()
+    srv_server_lifecycle._provider_factory = lambda: _FakeProvider()
+    response = srv_server_lifecycle.start_session(
         dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     session_id = str(response["session_id"])
     try:
         payload = execute_payload(
-            await server.computer_execute(
+            await srv_server_execute.computer_execute(
                 session_id, "click", x=10, y=10, include_screenshot_after=False
             )
         )
     finally:
-        await server.stop_session(session_id=session_id)
+        await srv_server_lifecycle.stop_session(session_id=session_id)
 
     assert payload["ensure_app_outcome"] is None
 

@@ -42,7 +42,11 @@ from test_controller_integration import (
 )
 
 import computer_use_mcp.desktop.backend as backend_module
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.core.state as srv_core_state
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.backend import LocalComputerBackend
 from computer_use_mcp.core.models import ActionSpec, GroundedAction, Point
 
@@ -470,9 +474,11 @@ def test_fake_backend_treats_the_marker_as_harness_only(real_backend: LocalCompu
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Module-local copy of the shared ``fresh_server`` fixture (same body)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", server.SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", srv_core_state.SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    yield
 
 
 def _plan_settle_flags(backend: Any) -> list[bool | None]:
@@ -494,7 +500,7 @@ async def test_follow_ups_queue_without_plan_keeps_legacy_unset_markers(
         limits=FAST_LIMITS,
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id,
             "click",
             x=40,

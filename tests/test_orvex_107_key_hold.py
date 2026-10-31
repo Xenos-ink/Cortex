@@ -44,7 +44,11 @@ from test_controller_integration import (
 )
 
 import computer_use_mcp.desktop.backend as backend_module
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.core.state as srv_core_state
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.backend import _validate_action_defense
 from computer_use_mcp.desktop.errors import UnsupportedActionError
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
@@ -1097,9 +1101,11 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     """Per-module session isolation (the same fixture the other server-level modules
     declare locally)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", server.SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", srv_core_state.SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    yield
 
 
 @pytest.mark.parametrize(("action", "keys"), _KEY_HOLD_SPECS)
@@ -1120,7 +1126,7 @@ async def test_e1_follow_up_results_echo_the_hold_of_a_held_key(
         limits=FAST_LIMITS,
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id,
             "click",
             x=10,

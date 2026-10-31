@@ -33,7 +33,10 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.interference import FOCUS_TAKEN_BY
 from computer_use_mcp.core.models import WindowInfo
 
@@ -53,9 +56,11 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
     from computer_use_mcp.core.state import SessionRegistry
 
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    yield
 
 
 def _stolen_session(monkeypatch: pytest.MonkeyPatch) -> tuple[str, Any, ScriptedBackend]:
@@ -79,7 +84,7 @@ async def test_flat_reply_reports_the_pre_dispatch_guard_event(
     SAME event string as the first rejection reason, under ``interference_events``."""
     session_id, _bundle, backend = _stolen_session(monkeypatch)
     payload = execute_payload(
-        await server.computer_execute(session_id, "click", x=50, y=50)
+        await srv_server_execute.computer_execute(session_id, "click", x=50, y=50)
     )
 
     event = payload["reasons"][0]
@@ -100,7 +105,7 @@ async def test_queue_stops_on_the_pre_dispatch_rejection_and_keeps_the_event(
     foreign window."""
     session_id, _bundle, backend = _stolen_session(monkeypatch)
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, include_screenshot_after=False,
             follow_ups=[{"action": "click", "x": 30, "y": 30}],
         )
@@ -129,7 +134,7 @@ async def test_a_clean_reply_still_carries_no_interference_events_key(
     )
     bundle.agent.guard.rebind(TARGET)
     payload = execute_payload(
-        await server.computer_execute(session_id, "click", x=10, y=10)
+        await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     )
     assert payload["ok"] is True, payload
     assert "interference_events" not in payload, payload
@@ -165,7 +170,7 @@ async def test_queue_item_n_events_stay_on_the_items_own_outcome_until_wp7(
     backend.execute_hooks.append(steal_on_first_dispatch)
 
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, include_screenshot_after=False,
             follow_ups=[{"action": "click", "x": 30, "y": 30}],
         )

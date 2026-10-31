@@ -23,7 +23,14 @@ import pytest
 from reply_contract import validate_reply
 from test_controller_integration import FAST_LIMITS, ScriptedBackend, make_session
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.fetch as srv_server_fetch
+import computer_use_mcp.core.state as srv_core_state
+import computer_use_mcp.server.replies as srv_server_replies
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.vision.visual_views import (
     DEFAULT_GRID_DENSITY,
     outbound_view_scale,
@@ -40,9 +47,11 @@ IMAGE_OUTBOUND_SCALE_KEY = "image_outbound_scale"
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Module-local copy of the shared ``fresh_server`` fixture (same body)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", server.SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", srv_core_state.SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    yield
 
 
 def _noise_png_b64(width: int, height: int, seed: int) -> str:
@@ -109,10 +118,10 @@ async def test_default_observe_publishes_the_measured_outbound_scale(
     response names the scale that was applied, to 4 decimal places, and the
     AL-002 view keys stay absent (the scale key does not become a view key)."""
     png = _noise_png_b64(1920, 1080, seed=11)
-    assert len(base64.b64decode(png, validate=True)) > server._result_image_max_bytes()
+    assert len(base64.b64decode(png, validate=True)) > srv_server_replies._result_image_max_bytes()
     session_id = _session(monkeypatch, png, 1920, 1080)
 
-    blocks = server.computer_observe(session_id)
+    blocks = srv_server_observe.computer_observe(session_id)
     metadata = _metadata(blocks)
     served = _served_size(blocks)
 
@@ -140,10 +149,10 @@ async def test_under_budget_png_is_byte_identical_and_reports_pass_through_none(
     a raw PASS-THROUGH reports None — no downscale was applied; 1.0 would be a
     scale without a scale event."""
     png = _small_png_b64(640, 480)
-    assert len(base64.b64decode(png, validate=True)) <= server._result_image_max_bytes()
+    assert len(base64.b64decode(png, validate=True)) <= srv_server_replies._result_image_max_bytes()
     session_id = _session(monkeypatch, png, 640, 480)
 
-    blocks = server.computer_observe(session_id)
+    blocks = srv_server_observe.computer_observe(session_id)
     metadata = _metadata(blocks)
 
     assert blocks[1].data == png, "an in-budget PNG must stay byte-identical"
@@ -166,7 +175,7 @@ async def test_execute_path_publishes_the_measured_scale_when_the_ladder_fires(
     png = _noise_png_b64(2560, 1440, seed=3)
     session_id = _session(monkeypatch, png, 2560, 1440)
 
-    response = await server.computer_execute(session_id, "click", x=10, y=10)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     payload = json.loads(response[0].text)
     served = _served_size(response)
 
@@ -186,7 +195,7 @@ async def test_execute_default_path_publishes_the_true_half_scale(
     monkeypatch.delenv("CORTEX_RESULT_IMAGE_MAX_KB", raising=False)
     session_id = _session(monkeypatch, _noise_png_b64(1920, 1080, seed=5), 1920, 1080)
 
-    response = await server.computer_execute(session_id, "click", x=10, y=10)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     payload = json.loads(response[0].text)
     served = _served_size(response)
 
@@ -204,7 +213,7 @@ async def test_execute_full_resolution_path_publishes_the_measured_scale(
     monkeypatch.delenv("CORTEX_RESULT_IMAGE_MAX_KB", raising=False)
     session_id = _session(monkeypatch, _noise_png_b64(1920, 1080, seed=7), 1920, 1080)
 
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, include_screenshot_after=True
     )
     payload = json.loads(response[0].text)
@@ -230,7 +239,7 @@ async def test_grid_path_visual_view_scale_is_unchanged(
     png = _noise_png_b64(1920, 1080, seed=13)
     session_id = _session(monkeypatch, png, 1920, 1080)
 
-    blocks = server.computer_observe(session_id, visual_view="grid")
+    blocks = srv_server_observe.computer_observe(session_id, visual_view="grid")
     metadata = _metadata(blocks)
     served = _served_size(blocks)
 
@@ -261,7 +270,7 @@ async def test_execute_grid_path_visual_view_scale_is_unchanged(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=20, y=20, visual_view="grid"
     )
     payload = json.loads(response[0].text)
@@ -288,9 +297,9 @@ def test_ladder_reports_a_scale_without_changing_a_single_byte(
     frame.save(buffer, format="PNG", optimize=False)
     png = base64.b64encode(buffer.getvalue()).decode("ascii")
 
-    b64, mime, scale = server._bound_outbound_image(png)
+    b64, mime, scale = srv_server_fetch._bound_outbound_image(png)
     assert mime == "image/jpeg"
-    assert len(base64.b64decode(b64, validate=True)) <= server._result_image_max_bytes()
+    assert len(base64.b64decode(b64, validate=True)) <= srv_server_replies._result_image_max_bytes()
     served = Image.open(io.BytesIO(base64.b64decode(b64, validate=True)))
     served.load()
     assert scale == round(_derived_ratio(served.size, (1920, 1080)), 4), (scale, served.size)
@@ -300,4 +309,4 @@ def test_ladder_reports_a_scale_without_changing_a_single_byte(
     small_buffer = io.BytesIO()
     small.save(small_buffer, format="PNG", optimize=False)
     small_b64 = base64.b64encode(small_buffer.getvalue()).decode("ascii")
-    assert server._bound_outbound_image(small_b64) == (small_b64, "image/png", None)
+    assert srv_server_fetch._bound_outbound_image(small_b64) == (small_b64, "image/png", None)

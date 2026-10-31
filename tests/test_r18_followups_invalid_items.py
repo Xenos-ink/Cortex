@@ -30,10 +30,13 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.pipeline.agent import ComputerUseAgent
 from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction
-from computer_use_mcp.server import ACTION_VOCABULARY
+from computer_use_mcp.server.schemas import ACTION_VOCABULARY
 
 
 @pytest.fixture
@@ -42,16 +45,18 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     bounded registry/bundles + per-test audit dir for full session isolation. Kept
     local so test signatures never shadow an imported name."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 async def _execute_with_followups(
     session_id: str, primary: dict[str, Any], follow_ups: list[dict[str, Any]]
 ) -> dict[str, Any]:
     return execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id,
             approved=True,
             follow_ups=follow_ups,

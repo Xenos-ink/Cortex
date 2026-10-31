@@ -44,7 +44,12 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.plan_surface as srv_server_plan_surface
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.planning.plan as srv_planning_plan
 from computer_use_mcp.core.models import GroundedAction, WindowInfo
 from computer_use_mcp.planning.plan import PLAN_FAILURE_REASONS
 from computer_use_mcp.core.state import SessionRegistry, TaskStopped
@@ -114,10 +119,14 @@ LEGACY_CUTOFF_FIELDS = ("limit_name", "required", "available", "executed_count",
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_plan_guard", server.PlanLeaseGuard())
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_plan_surface, "_plan_guard", srv_planning_plan.PlanLeaseGuard())
+    monkeypatch.setattr(srv_server_execute, "_plan_guard", srv_server_plan_surface._plan_guard)
+    monkeypatch.setattr(srv_server_lifecycle, "_plan_guard", srv_server_plan_surface._plan_guard)
+    yield
 
 
 def _assert_legacy_surface(payload: dict[str, Any], *, extras: tuple[str, ...] = ()) -> None:
@@ -162,7 +171,7 @@ async def test_verification_failure_reports_typed_reason_and_not_executed(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan=wire_plan(FAIL_PLAN), approved=True, include_screenshot_after=False
         )
     )
@@ -195,7 +204,7 @@ async def test_execution_error_reports_typed_reason_error_and_not_executed(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan=wire_plan(OK_PLAN), approved=True, include_screenshot_after=False
         )
     )
@@ -205,7 +214,7 @@ async def test_execution_error_reports_typed_reason_error_and_not_executed(
     assert payload["error"] == "action_error"
     assert "uv6 synthetic explosion" in payload["message"]
     assert payload["blocked"] is False
-    assert not server._plan_guard.is_active(session_id)
+    assert not srv_server_plan_surface._plan_guard.is_active(session_id)
 
 
 # --- (c) a cutoff at a session limit -------------------------------------------------------
@@ -225,7 +234,7 @@ async def test_limit_cutoff_reports_typed_reason_and_not_executed(
     # §1.3 stable step token set: an abstaining step reports ``uncertain`` (the
     # terminal-only ``unknown`` of the dev copy); the typed class is unchanged.
     first = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan=wire_plan(OK_PLAN), approved=True, include_screenshot_after=False
         )
     )
@@ -233,7 +242,7 @@ async def test_limit_cutoff_reports_typed_reason_and_not_executed(
     assert first["failure_reason"] == "verification_uncertain"
 
     cut = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan_action="continue", include_screenshot_after=False
         )
     )
@@ -262,7 +271,7 @@ async def test_cancellation_reports_typed_reason_error_and_not_executed(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan=wire_plan(OK_PLAN), approved=True, include_screenshot_after=False
         )
     )
@@ -276,7 +285,7 @@ async def test_cancellation_reports_typed_reason_error_and_not_executed(
     assert payload["cutoff"]["limit_name"] == "cancel"
     for field in LEGACY_CUTOFF_FIELDS:
         assert field in payload["cutoff"], f"legacy cutoff field {field} vanished"
-    assert not server._plan_guard.is_active(session_id)
+    assert not srv_server_plan_surface._plan_guard.is_active(session_id)
 
 
 # --- (e) a verified step carries no failure ------------------------------------------------
@@ -290,7 +299,7 @@ async def test_verified_step_has_no_failure_reason_and_sensible_not_executed(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id,
             "done",
             plan=wire_plan(VERIFIED_PLAN),
@@ -308,7 +317,7 @@ async def test_verified_step_has_no_failure_reason_and_sensible_not_executed(
 
     # Completing the plan empties the unexecuted list and still names no failure.
     final = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan_action="continue", include_screenshot_after=False
         )
     )
@@ -330,11 +339,11 @@ async def test_host_stop_keeps_prefix_and_names_unexecuted_work(
     session_id, _bundle, _backend, _provider = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         session_id, "done", plan=wire_plan(OK_PLAN), approved=True, include_screenshot_after=False
     )
     stopped = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan_action="stop", include_screenshot_after=False
         )
     )
@@ -395,13 +404,13 @@ async def test_every_step_outcome_keeps_legacy_keys_and_adds_only_typed_fields(
             limits=limits,
         )
         payload = execute_payload(
-            await server.computer_execute(
+            await srv_server_execute.computer_execute(
                 session_id, "done", plan=plan, approved=True, include_screenshot_after=False
             )
         )
         if label == "limit_exceeded":
             payload = execute_payload(
-                await server.computer_execute(
+                await srv_server_execute.computer_execute(
                     session_id, "done", plan_action="continue", include_screenshot_after=False
                 )
             )

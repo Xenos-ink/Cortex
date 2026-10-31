@@ -72,7 +72,11 @@ from benchmarks.appwin import (
     window_text,
 )
 from benchmarks.fakeworld import FakeWorldBackend
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.backend import LocalComputerBackend
 from computer_use_mcp.core.models import GroundedAction
 from computer_use_mcp.core.state import SessionRegistry
@@ -352,9 +356,9 @@ class DirectCallDriver:
     def _observe(self, session_id: str) -> Any:
         import json as _json
 
-        from computer_use_mcp import server as srv
+        
 
-        response = srv.computer_observe(session_id)
+        response = srv_server_observe.computer_observe(session_id)
         if isinstance(response, list):  # [TextContent, ImageContent]
             return _json.loads(response[0].text).get("observation")
         if isinstance(response, dict):
@@ -364,7 +368,7 @@ class DirectCallDriver:
     async def _execute(self, session_id: str, action: GroundedAction, step: dict[str, Any]) -> dict[str, Any]:
         import json as _json
 
-        from computer_use_mcp import server as srv
+        
 
         kwargs: dict[str, Any] = {}
         if action.point is not None:
@@ -378,7 +382,7 @@ class DirectCallDriver:
             kwargs["delta"] = action.delta or 1
         if action.expected_effect:
             kwargs["expected_effect"] = action.expected_effect
-        response = await srv.computer_execute(session_id, str(getattr(action.action, "value", action.action)), **kwargs)
+        response = await srv_server_execute.computer_execute(session_id, str(getattr(action.action, "value", action.action)), **kwargs)
         if isinstance(response, list):  # executed shape: [TextContent, ImageContent]
             return _json.loads(response[0].text)
         return response
@@ -741,8 +745,8 @@ class BenchmarkRunner:
                 )
                 return result
             backend = world.backend if self.mode == "fake" else LocalComputerBackend()
-            server._backend_factory = lambda: backend  # type: ignore[method-assign]
-            response = server.start_session(
+            srv_server_lifecycle._backend_factory = lambda: backend  # type: ignore[method-assign]
+            response = srv_server_lifecycle.start_session(
                 dry_run=False,
                 require_approval=False,
                 max_steps=task.max_actions + 4,
@@ -753,24 +757,24 @@ class BenchmarkRunner:
                 return result
             session_id = str(response["session_id"])
             run_response = asyncio.run(driver.run(session_id))
-            bundle = server._get_bundle(session_id)
+            bundle = srv_server_lifecycle._get_bundle(session_id)
             # The real session metrics ride on the bundle (the loop response used to
             # carry them); hand them to the collector in the same shape.
             metrics_snapshot = bundle.metrics.snapshot()
             run_response["metrics"] = metrics_snapshot
             result.update(self._collect(task, run_response, bundle, session_id, world, scratch_dir))
-            asyncio.run(server.stop_session(session_id))
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))
             return result
         except Exception as exc:  # noqa: BLE001 - harness failures are recorded, never raised
             result["error"] = f"{type(exc).__name__}: {exc}"
             return result
         finally:
-            (
-                server._registry,
-                server._bundles,
-                server._backend_factory,
-                server._provider_factory,
-            ) = saved_state
+            srv_server_lifecycle._registry = saved_state[0]
+            srv_server_lifecycle._bundles = saved_state[1]
+            srv_server_wait_machine._bundles = srv_server_lifecycle._bundles
+            srv_server_wait._bundles = srv_server_lifecycle._bundles
+            srv_server_lifecycle._backend_factory = saved_state[2]
+            srv_server_lifecycle._provider_factory = saved_state[3]
             if self.mode == "env":
                 world.teardown()
 
@@ -781,9 +785,11 @@ class BenchmarkRunner:
         Fresh registry/bundles per task also prevent the bounded session registry from
         exhausting across tasks (stop_session arms the kill path but never deregisters).
         """
-        snapshot = (server._registry, server._bundles, server._backend_factory, server._provider_factory)
-        server._registry = SessionRegistry(max_sessions=8)
-        server._bundles = {}
+        snapshot = (srv_server_lifecycle._registry, srv_server_lifecycle._bundles, srv_server_lifecycle._backend_factory, srv_server_lifecycle._provider_factory)
+        srv_server_lifecycle._registry = SessionRegistry(max_sessions=8)
+        srv_server_lifecycle._bundles = {}
+        srv_server_wait_machine._bundles = srv_server_lifecycle._bundles
+        srv_server_wait._bundles = srv_server_lifecycle._bundles
         return snapshot
 
     def _collect(

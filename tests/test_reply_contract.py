@@ -46,7 +46,12 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.replies as srv_server_replies
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.errors import FocusDriftError
 from computer_use_mcp.core.models import WindowInfo
@@ -57,9 +62,11 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
     from computer_use_mcp.core.state import SessionRegistry
 
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    yield
 
 
 # --- flat execute: the verdict trio ---------------------------------------------------------------
@@ -71,7 +78,7 @@ async def test_flat_verified_reply(fresh_server: Any, monkeypatch: pytest.Monkey
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(session_id, "click", x=10, y=10, approved=True)
+        await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, approved=True)
     )
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "verified"
@@ -85,7 +92,7 @@ async def test_flat_uncertain_reply(fresh_server: Any, monkeypatch: pytest.Monke
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(session_id, "click", x=10, y=10, approved=True)
+        await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, approved=True)
     )
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "uncertain"
@@ -103,7 +110,7 @@ async def test_flat_failed_reply(fresh_server: Any, monkeypatch: pytest.MonkeyPa
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "keypress", keys=["enter"], approved=True, expected_effect="open Calculator"
         )
     )
@@ -121,7 +128,7 @@ async def test_follow_up_item_envelope(fresh_server: Any, monkeypatch: pytest.Mo
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
         follow_ups=[{"action": "done"}],
     )
@@ -144,7 +151,7 @@ async def test_rejection_envelope(fresh_server: Any, monkeypatch: pytest.MonkeyP
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    payload = await server.computer_execute(
+    payload = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, follow_ups=[{"action": "focus_window"}]
     )
     validate_reply(payload, "flat_execute")
@@ -163,7 +170,7 @@ async def test_validator_rejection_envelope(
         limits=FAST_LIMITS,
         allowed_processes=["excel.exe"],
     )
-    payload = await server.computer_execute(session_id, "click", x=10, y=10, approved=True)
+    payload = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, approved=True)
     validate_reply(payload, "flat_execute")
     assert_rejection(payload)
 
@@ -199,7 +206,7 @@ async def test_mid_type_drift_rejection_carries_partial_delivery(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    payload = await server.computer_execute(
+    payload = await srv_server_execute.computer_execute(
         session_id, "type", text="hello world", approved=True
     )
     validate_reply(payload, "flat_execute")
@@ -216,7 +223,7 @@ async def test_drift_before_any_chunk_has_no_partial_delivery_key(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    payload = await server.computer_execute(
+    payload = await srv_server_execute.computer_execute(
         session_id, "type", text="hello world", approved=True
     )
     validate_reply(payload, "flat_execute")
@@ -263,7 +270,7 @@ async def test_approval_gated_reply(fresh_server: Any, monkeypatch: pytest.Monke
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    payload = await server.computer_execute(session_id, "click", x=10, y=10)
+    payload = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     assert_approval_gate(payload)
     assert backend.executed == []  # nothing dispatched while approval is pending
 
@@ -275,7 +282,7 @@ async def test_dry_run_reply(fresh_server: Any, monkeypatch: pytest.MonkeyPatch)
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
-    payload = execute_payload(await server.computer_execute(session_id, "click", x=10, y=10))
+    payload = execute_payload(await srv_server_execute.computer_execute(session_id, "click", x=10, y=10))
     validate_reply(payload, "flat_execute")
     assert_dry_run_reply(payload)
     assert payload["dry_run"] is True
@@ -290,7 +297,7 @@ async def test_done_marker_reply(fresh_server: Any, monkeypatch: pytest.MonkeyPa
         require_approval=False,
         limits=FAST_LIMITS,
     )
-    payload = execute_payload(await server.computer_execute(session_id, "done"))
+    payload = execute_payload(await srv_server_execute.computer_execute(session_id, "done"))
     validate_reply(payload, "flat_execute")
     assert_marker_reply(payload)
 
@@ -303,7 +310,7 @@ async def test_wait_marker_reply(fresh_server: Any, monkeypatch: pytest.MonkeyPa
         require_approval=False,
         limits=FAST_LIMITS,
     )
-    payload = execute_payload(await server.computer_execute(session_id, "wait", delta=0))
+    payload = execute_payload(await srv_server_execute.computer_execute(session_id, "wait", delta=0))
     validate_reply(payload, "flat_execute")
     assert_marker_reply(payload)
 
@@ -332,7 +339,7 @@ async def test_ensure_app_typed_outcome(fresh_server: Any, monkeypatch: pytest.M
         allowed_processes=["excel.exe"],
     )
     payload = execute_payload(
-        await server.computer_execute(session_id, "ensure_app", target="excel|book1", approved=True)
+        await srv_server_execute.computer_execute(session_id, "ensure_app", target="excel|book1", approved=True)
     )
     validate_reply(payload, "flat_execute")
     assert payload["ensure_app_outcome"] == "reattached"
@@ -348,7 +355,7 @@ def test_observe_image_reply_contract(fresh_server: Any, monkeypatch: pytest.Mon
     )
     import json as _json
 
-    blocks = server.computer_observe(session_id)
+    blocks = srv_server_observe.computer_observe(session_id)
     metadata = _json.loads(blocks[0].text)
     validate_reply(metadata, "observe")
     scale = assert_image_scale_keys(metadata, image_required=True)
@@ -377,9 +384,9 @@ async def test_limit_trip_reply_is_a_rejection(
         monkeypatch, dry_run=False, require_approval=False,
         limits={"min_screenshot_interval_ms": 60_000},
     )
-    first = execute_payload(await server.computer_execute(session_id, "click", x=10, y=10))
+    first = execute_payload(await srv_server_execute.computer_execute(session_id, "click", x=10, y=10))
     assert first["ok"] is True
-    payload = await server.computer_execute(session_id, "click", x=20, y=20)
+    payload = await srv_server_execute.computer_execute(session_id, "click", x=20, y=20)
     validate_reply(payload, "flat_execute")
     assert_rejection(payload)
     assert payload["reasons"] == ["limit_exceeded: min_screenshot_interval_ms"]
@@ -390,7 +397,7 @@ async def test_limit_trip_reply_is_a_rejection(
 async def test_unknown_session_execute_reply_is_a_rejection(fresh_server: Any) -> None:
     """Execute-surface lifecycle refusals are rejections (§1.1); the read-only tools
     keep their typed ``_error_response`` shapes (§1.3)."""
-    payload = await server.computer_execute("does-not-exist", "wait", delta=0)
+    payload = await srv_server_execute.computer_execute("does-not-exist", "wait", delta=0)
     validate_reply(payload, "flat_execute")
     assert_rejection(payload)
     assert payload["reasons"] == ["unknown_session"]
@@ -403,8 +410,8 @@ async def test_stopped_session_execute_reply_is_a_rejection(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.stop_session(session_id)
-    payload = await server.computer_execute(session_id, "wait", delta=0)
+    await srv_server_lifecycle.stop_session(session_id)
+    payload = await srv_server_execute.computer_execute(session_id, "wait", delta=0)
     validate_reply(payload, "flat_execute")
     assert_rejection(payload)
     assert payload["reasons"] == ["session_stopped"]
@@ -419,7 +426,7 @@ async def test_invalid_visual_view_on_execute_is_a_rejection(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    payload = await server.computer_execute(session_id, "click", x=10, y=10, visual_view="3d")
+    payload = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, visual_view="3d")
     validate_reply(payload, "flat_execute")
     assert_rejection(payload)
     assert payload["reasons"][0].startswith("invalid_visual_view")
@@ -443,7 +450,7 @@ async def test_defensive_no_result_branch_is_failed_action_error(
         return SingleActionOutcome(kind="executed", result=None)
 
     monkeypatch.setattr(bundle.agent, "run_single", _empty_outcome)
-    payload = await server.computer_execute(session_id, "click", x=10, y=10)
+    payload = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     assert payload["result"] == "failed"
     assert_ok_rule(payload)
     assert payload["error"] == "action_error"
@@ -466,22 +473,22 @@ async def test_no_execute_rejection_reply_ever_carries_an_error_key(
         allowed_processes=["excel.exe"],
     )
     rejected_replies = [
-        await server.computer_execute(session_id, "teleport"),
+        await srv_server_execute.computer_execute(session_id, "teleport"),
         # 2. malformed follow-up item (boundary teaching rejection)
-        await server.computer_execute(session_id, "click", x=1, y=1,
+        await srv_server_execute.computer_execute(session_id, "click", x=1, y=1,
                                       follow_ups=[{"action": "focus_window"}]),
         # 3. validator rejection (allowlist identity unavailable)
-        await server.computer_execute(session_id_allow, "click", x=2, y=2),
+        await srv_server_execute.computer_execute(session_id_allow, "click", x=2, y=2),
         # 4. invalid visual_view parameter
-        await server.computer_execute(session_id, "click", x=3, y=3, visual_view="3d"),
+        await srv_server_execute.computer_execute(session_id, "click", x=3, y=3, visual_view="3d"),
     ]
     # 5. unknown session 6. stopped session
-    rejected_replies.append(await server.computer_execute("does-not-exist", "wait", delta=0))
+    rejected_replies.append(await srv_server_execute.computer_execute("does-not-exist", "wait", delta=0))
     session_id2, _bundle2, _backend2, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.stop_session(session_id2)
-    rejected_replies.append(await server.computer_execute(session_id2, "wait", delta=0))
+    await srv_server_lifecycle.stop_session(session_id2)
+    rejected_replies.append(await srv_server_execute.computer_execute(session_id2, "wait", delta=0))
     for payload in rejected_replies:
         assert payload["result"] == "rejected", payload
         assert "error" not in payload, payload
@@ -631,7 +638,7 @@ async def test_safety_denied_flat_reply_is_a_named_rejection(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    payload = await server.computer_execute(
+    payload = await srv_server_execute.computer_execute(
         session_id, "type", text="rm -rf C:/Windows && format C:", approved=True
     )
     validate_reply(payload, "flat_execute")
@@ -649,7 +656,7 @@ async def test_safety_denied_queue_entry_envelope(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True,
             follow_ups=[{"action": "type", "text": r"del C:\Windows\System32 /s /q",
                          "expected_effect": "x"}],
@@ -675,7 +682,7 @@ async def test_digest_surprise_queue_entry_envelope(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True,
             follow_ups=[{"action": "click", "x": 30, "y": 30}],
         )
@@ -709,7 +716,7 @@ async def test_operation_error_reply_is_failed_action_error(
         monkeypatch, backend=ExplodingScrollBackend(flip=True),
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    payload = await server.computer_execute(session_id, "scroll", delta=1, approved=True)
+    payload = await srv_server_execute.computer_execute(session_id, "scroll", delta=1, approved=True)
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "failed"
     assert payload["ok"] is False
@@ -733,7 +740,7 @@ async def test_task_stopped_reply_carries_the_stopped_token(
         raise TaskStopped("Stop requested; stopping before the next action.")
 
     monkeypatch.setattr(bundle.agent, "run_single", _raise_stopped)
-    payload = await server.computer_execute(session_id, "click", x=10, y=10)
+    payload = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "stopped"
     assert payload["ok"] is False
@@ -751,7 +758,7 @@ async def test_mid_batch_limit_keeps_the_partial_history(
         limits={"min_screenshot_interval_ms": 0, "max_actions": 1},
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True,
             follow_ups=[{"action": "click", "x": 30, "y": 30}],
         )
@@ -781,10 +788,10 @@ async def test_ensure_app_failure_outcomes_are_failed_or_uncertain(
         world: Any, target: str, policy: str | None = None,
         allowlist: list[str] | None = None,
     ) -> dict[str, Any]:
-        server._backend_factory = lambda: world
-        server._provider_factory = lambda: _FakeProvider()
+        srv_server_lifecycle._backend_factory = lambda: world
+        srv_server_lifecycle._provider_factory = lambda: _FakeProvider()
         interference = {"attach_or_launch": {"launch": policy}} if policy is not None else None
-        response = server.start_session(
+        response = srv_server_lifecycle.start_session(
             dry_run=False, require_approval=False, limits=FAST_LIMITS,
             allowed_processes=allowlist if allowlist is not None else ["excel.exe", "mspaint.exe"],
             **({"interference": interference} if interference is not None else {}),
@@ -792,10 +799,10 @@ async def test_ensure_app_failure_outcomes_are_failed_or_uncertain(
         session_id = str(response["session_id"])
         try:
             return execute_payload(
-                await server.computer_execute(session_id, "ensure_app", target=target)
+                await srv_server_execute.computer_execute(session_id, "ensure_app", target=target)
             )
         finally:
-            await server.stop_session(session_id=session_id)
+            await srv_server_lifecycle.stop_session(session_id=session_id)
 
     async def _drive_with_allowlist(world: Any, target: str, allowlist: list[str]) -> dict[str, Any]:
         return await _drive(world, target, allowlist=allowlist)
@@ -850,7 +857,7 @@ async def test_queue_entry_field_set_matches_flat_for_non_rejection_kinds(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
             follow_ups=[{"action": "done"}],
         )
@@ -862,7 +869,7 @@ async def test_queue_entry_field_set_matches_flat_for_non_rejection_kinds(
     session_id2, _b2, _bk2, _p2 = make_session(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    payload2 = await server.computer_execute(
+    payload2 = await srv_server_execute.computer_execute(
         session_id2, "click", x=10, y=10, follow_ups=[{"action": "click", "x": 30, "y": 30}]
     )
     assert payload2["result"] == "not_executed"
@@ -880,19 +887,19 @@ def test_half_res_one_by_one_source_reports_pass_through_none() -> None:
 
     from PIL import Image as _Image
 
-    from computer_use_mcp import server
+    
 
     image = _Image.new("RGB", (1, 1), "white")
     buffer = _io.BytesIO()
     image.save(buffer, format="PNG")
     png = _b64.b64encode(buffer.getvalue()).decode("ascii")
-    result = server._half_res_action_image(png)
+    result = srv_server_replies._half_res_action_image(png)
     assert result is not None
     _data, mime, scale = result
     assert mime == "image/jpeg"
     assert scale is None  # 1x1 -> half-res is a no-op: no downscale applied
     # and the scalar helper agrees for the identity case
-    assert server._outbound_image_scale(1, 1, 1, 1) is None
+    assert srv_server_replies._outbound_image_scale(1, 1, 1, 1) is None
 
 
 def test_sendinput_counts_code_points_not_utf16_units(real_backend: Any) -> None:
@@ -968,7 +975,7 @@ async def test_ensure_app_failed_outcome_stops_the_queue(
         interference={"attach_or_launch": {"launch": "driver"}},
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
             follow_ups=[{"action": "ensure_app", "target": "excel|book1"},
                         {"action": "click", "x": 30, "y": 30}],
@@ -1001,7 +1008,7 @@ async def test_mid_batch_limit_does_not_count_the_tripped_item_as_executed(
         monkeypatch, dry_run=False, require_approval=False,
         limits={"min_screenshot_interval_ms": 0, "max_actions": 1},
     )
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, approved=True,
         follow_ups=[{"action": "click", "x": 30, "y": 30}],
     )
@@ -1028,7 +1035,7 @@ async def test_held_click_follow_up_item_reply_verified(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
             follow_ups=[{"action": "click", "x": 30, "y": 30, "hold_ms": 250}],
         )
@@ -1054,7 +1061,7 @@ async def test_held_click_follow_up_item_reply_uncertain(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
             follow_ups=[{"action": "click", "x": 30, "y": 30, "hold_ms": 100}],
         )
@@ -1079,7 +1086,7 @@ async def test_hold_ms_misuse_is_a_rejection_envelope(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
             follow_ups=[{"action": "move", "x": 30, "y": 30, "hold_ms": 250}],
         )
@@ -1101,7 +1108,7 @@ async def test_duration_ms_misuse_is_a_rejection_envelope(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
             follow_ups=[{"action": "click", "x": 30, "y": 30, "duration_ms": 200}],
         )
@@ -1124,7 +1131,7 @@ async def test_queued_hold_ms_out_of_band_is_a_rejection_envelope(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False,
             follow_ups=[{"action": "keypress", "keys": ["a"], "hold_ms": 9999}],
         )
@@ -1214,7 +1221,7 @@ async def test_identity_change_with_the_named_identity_evidenced_verifies(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=50, y=50, expected_effect="The Confirm dialog appears"
         )
     )
@@ -1241,7 +1248,7 @@ async def test_identity_change_without_the_named_identity_is_an_honest_uncertain
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=50, y=50, expected_effect="the record is deleted"
         )
     )
@@ -1280,7 +1287,7 @@ async def test_rejection_reply_carries_the_retained_interference_events(
         WindowInfo(hwnd=9, pid=900, process_name="notepad.exe", window_class="Notepad",
                    title="user notes - Notepad")
     )
-    payload = await server.computer_execute(session_id, "click", x=10, y=10)
+    payload = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     validate_reply(payload, "flat_execute")
     assert_rejection(payload)
     event = payload["reasons"][0]
@@ -1317,7 +1324,7 @@ async def test_verified_follow_up_entry_evidence_names_the_matched_token(
 
     backend.execute_hooks.append(open_dialog_on_second_dispatch)
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=50, y=50, approved=True, include_screenshot_after=False,
             follow_ups=[
                 {"action": "click", "x": 50, "y": 50,
@@ -1358,7 +1365,7 @@ async def test_identity_change_plus_strong_pixel_change_with_unrelated_effect_is
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=50, y=50, expected_effect="the record is deleted"
         )
     )
@@ -1417,7 +1424,7 @@ async def test_type_integrity_mismatch_vetoes_verified_and_audit_agrees(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(session_id, "type", text="1234", approved=True)
+        await srv_server_execute.computer_execute(session_id, "type", text="1234", approved=True)
     )
     validate_reply(payload, "flat_execute")
     assert "integrity=mismatch" in payload["message"], payload["message"]
@@ -1448,7 +1455,7 @@ async def test_verification_audit_names_the_real_ladder_tier_on_the_plain_path(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(session_id, "click", x=10, y=10)
+        await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     )
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "verified"
@@ -1500,7 +1507,7 @@ async def test_verification_audit_names_the_real_ladder_tier_off_the_plain_path(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(session_id, "click", x=10, y=10)
+        await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     )
     validate_reply(payload, "flat_execute")
     # The frozen capture can prove no transition: dispatched, unproven — honest.

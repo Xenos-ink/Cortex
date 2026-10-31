@@ -23,7 +23,10 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.core.models import VerificationResult
 from computer_use_mcp.core.state import SessionRegistry
 
@@ -34,9 +37,11 @@ PLAN_EVIDENCE_KEY = "evidence_by_backend"
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    yield
 
 
 async def test_the_verification_evidence_is_still_a_list(
@@ -50,7 +55,7 @@ async def test_the_verification_evidence_is_still_a_list(
         limits=FAST_LIMITS,
     )
 
-    payload = execute_payload(await server.computer_execute(session_id, "click", x=100, y=100))
+    payload = execute_payload(await srv_server_execute.computer_execute(session_id, "click", x=100, y=100))
 
     assert isinstance(payload["verification"]["evidence"], list)
     assert all(isinstance(line, str) for line in payload["verification"]["evidence"])
@@ -69,7 +74,7 @@ async def test_a_single_execute_reply_carries_only_the_list_evidence(
         limits=FAST_LIMITS,
     )
 
-    payload = execute_payload(await server.computer_execute(session_id, "click", x=100, y=100))
+    payload = execute_payload(await srv_server_execute.computer_execute(session_id, "click", x=100, y=100))
 
     assert PLAN_EVIDENCE_KEY not in payload
     assert "evidence" not in payload  # the bare key is the plan-path one

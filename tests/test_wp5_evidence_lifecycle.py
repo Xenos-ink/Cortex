@@ -39,7 +39,13 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp.vision import evidence as evidence_module
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.fetch as srv_server_fetch
+import time as srv_time
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.state as srv_server_state
+import computer_use_mcp.server.observe as srv_server_observe
 
 
 class FakeClock:
@@ -62,7 +68,7 @@ TEST_IDLE_TIMEOUT = "60"
 def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
     """Patch the monotonic clock EVERYWHERE (server + state + evidence share it)."""
     fake = FakeClock()
-    monkeypatch.setattr(server.time, "monotonic", fake)
+    monkeypatch.setattr(srv_time, "monotonic", fake)
     return fake
 
 
@@ -72,11 +78,14 @@ def fresh_server(
 ) -> Any:
     """Fresh registry/bundles/stopped-memory + short idle timeout + per-test audit dir."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setenv(server.SESSION_IDLE_TIMEOUT_ENV, TEST_IDLE_TIMEOUT)
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_stopped_sessions", {})
-    return server
+    monkeypatch.setenv(srv_server_lifecycle.SESSION_IDLE_TIMEOUT_ENV, TEST_IDLE_TIMEOUT)
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_lifecycle, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_state, "_stopped_sessions", srv_server_lifecycle._stopped_sessions)
+    return None
 
 
 def _metadata(result: Any) -> dict[str, Any]:
@@ -88,14 +97,14 @@ def _metadata(result: Any) -> dict[str, Any]:
 def _fetch(session_id: str, image_id: str) -> Any:
     """The fetch tool (ASYNC since DELTA 1 / VAL-WP5 F5) awaited from a sync test
     body via a private loop."""
-    return asyncio.run(server.computer_fetch_image(session_id, image_id))
+    return asyncio.run(srv_server_fetch.computer_fetch_image(session_id, image_id))
 
 
 def _dispose_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Spy on ``dispose_store`` AS THE SERVER SEES IT (name-imported) and return the
     list of session ids it was called with — the exactly-once instrument."""
     calls: list[str] = []
-    original = server.dispose_store
+    original = srv_server_lifecycle.dispose_store
 
     def spy(extra: dict[str, Any]) -> int:
         store = extra.get(evidence_module.EVIDENCE_STORE_KEY)
@@ -103,7 +112,7 @@ def _dispose_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
             calls.append(str(store.session_id))
         return original(extra)
 
-    monkeypatch.setattr(server, "dispose_store", spy)
+    monkeypatch.setattr(srv_server_lifecycle, "dispose_store", spy)
     return calls
 
 
@@ -117,13 +126,13 @@ def test_stop_session_disposes_exactly_once_and_a_later_fetch_is_refused(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     store = bundle.extra[evidence_module.EVIDENCE_STORE_KEY]
-    image_id = _metadata(server.computer_observe(session_id))["image_id"]
+    image_id = _metadata(srv_server_observe.computer_observe(session_id))["image_id"]
     calls = _dispose_calls(monkeypatch)
 
-    asyncio.run(server.stop_session(session_id))
+    asyncio.run(srv_server_lifecycle.stop_session(session_id))
     # The dispose spy fired exactly once even though the teardown also runs through
     # _close_stopped_bundle internals; a re-stop finds no key and fires nothing.
-    asyncio.run(server.stop_session(session_id))  # idempotent re-stop
+    asyncio.run(srv_server_lifecycle.stop_session(session_id))  # idempotent re-stop
     assert calls == [session_id], calls
     assert bundle.extra.get(evidence_module.EVIDENCE_STORE_KEY) is None
     assert store.disposed is True
@@ -144,14 +153,14 @@ def test_idle_reap_disposes_exactly_once_and_a_later_fetch_reports_the_inactivit
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     store = bundle.extra[evidence_module.EVIDENCE_STORE_KEY]
-    image_id = _metadata(server.computer_observe(session_id))["image_id"]
+    image_id = _metadata(srv_server_observe.computer_observe(session_id))["image_id"]
     calls = _dispose_calls(monkeypatch)
 
     clock.advance(61)  # past the 60 s test timeout, nothing in flight
-    reaped = server._sweep_idle_sessions()
+    reaped = srv_server_lifecycle._sweep_idle_sessions()
     assert reaped == [session_id]
     assert calls == [session_id], calls
-    assert server._sweep_idle_sessions() == []  # nothing left to reap → no second dispose
+    assert srv_server_lifecycle._sweep_idle_sessions() == []  # nothing left to reap → no second dispose
     assert calls == [session_id], calls
 
     # DOCUMENTED: fetch after an idle reap → ``session_stopped``, and the message
@@ -174,7 +183,7 @@ def test_a_failed_resume_start_disposes_exactly_once_and_the_session_is_unreacha
     dispose it exactly once before the bundle is dropped."""
     calls = _dispose_calls(monkeypatch)
 
-    response = server.start_session(
+    response = srv_server_lifecycle.start_session(
         dry_run=False,
         require_approval=False,
         limits=FAST_LIMITS,
@@ -185,7 +194,7 @@ def test_a_failed_resume_start_disposes_exactly_once_and_the_session_is_unreacha
     # resume refusal does not echo it): exactly one store, exactly one disposal.
     assert len(calls) == 1, calls
     session_id = calls[0]
-    assert session_id not in server._bundles
+    assert session_id not in srv_server_lifecycle._bundles
 
     # DOCUMENTED: fetch after a start failure → ``unknown_session`` (the session was
     # never reachable: not live, and not remembered stopped — it never served a call).
@@ -204,7 +213,7 @@ def test_a_fetch_counts_as_session_activity_for_the_idle_timeout(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    image_id = _metadata(server.computer_observe(session_id))["image_id"]
+    image_id = _metadata(srv_server_observe.computer_observe(session_id))["image_id"]
 
     clock.advance(50)  # near the 60 s timeout
     fetched = _fetch(session_id, image_id)
@@ -212,10 +221,10 @@ def test_a_fetch_counts_as_session_activity_for_the_idle_timeout(
 
     clock.advance(50)  # 100 s past the LAST observe — past the ORIGINAL deadline,
     # but only 50 s past the FETCH: the fetch re-based the idle clock.
-    assert server._sweep_idle_sessions() == [], "the fetch must count as activity"
+    assert srv_server_lifecycle._sweep_idle_sessions() == [], "the fetch must count as activity"
 
     clock.advance(11)  # 61 s past the fetch with nothing else in between
-    assert server._sweep_idle_sessions() == [session_id]
+    assert srv_server_lifecycle._sweep_idle_sessions() == [session_id]
 
 
 def test_the_idle_reaper_never_reaps_a_fetch_in_flight(
@@ -228,18 +237,18 @@ def test_the_idle_reaper_never_reaps_a_fetch_in_flight(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    image_id = _metadata(server.computer_observe(session_id))["image_id"]
+    image_id = _metadata(srv_server_observe.computer_observe(session_id))["image_id"]
 
     entered = threading.Event()
     release = threading.Event()
-    real = server._fetch_image_response
+    real = srv_server_fetch._fetch_image_response
 
     async def blocking_fetch_response(store: Any, img: str) -> Any:
         entered.set()  # we are INSIDE the tool body: the marks are already held
         await asyncio.to_thread(release.wait, 10)
         return await real(store, img)
 
-    monkeypatch.setattr(server, "_fetch_image_response", blocking_fetch_response)
+    monkeypatch.setattr(srv_server_fetch, "_fetch_image_response", blocking_fetch_response)
 
     clock.advance(120)  # far past the 60 s timeout before the fetch even starts
     result: dict[str, Any] = {}
@@ -253,16 +262,16 @@ def test_the_idle_reaper_never_reaps_a_fetch_in_flight(
     assert bundle.context.in_flight_count() == 1, "the fetch itself must hold the mark"
 
     clock.advance(120)  # 240 s idle while the fetch is in flight
-    assert server._sweep_idle_sessions() == [], "an in-flight fetch is never reaped"
+    assert srv_server_lifecycle._sweep_idle_sessions() == [], "an in-flight fetch is never reaped"
 
     release.set()
     thread.join(timeout=10)
     assert not thread.is_alive()
     assert isinstance(result["reply"], list), "the released fetch serves the frame"
 
-    assert server._sweep_idle_sessions() == []  # the completed call re-based the clock
+    assert srv_server_lifecycle._sweep_idle_sessions() == []  # the completed call re-based the clock
     clock.advance(61)
-    assert server._sweep_idle_sessions() == [session_id]
+    assert srv_server_lifecycle._sweep_idle_sessions() == [session_id]
 
 
 async def test_a_blocked_fetch_encode_leaves_the_event_loop_free(
@@ -277,12 +286,12 @@ async def test_a_blocked_fetch_encode_leaves_the_event_loop_free(
     sid_b, _bundle_b, _backend_b, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    id_a = _metadata(server.computer_observe(sid_a))["image_id"]
-    id_b = _metadata(server.computer_observe(sid_b))["image_id"]
+    id_a = _metadata(srv_server_observe.computer_observe(sid_a))["image_id"]
+    id_b = _metadata(srv_server_observe.computer_observe(sid_b))["image_id"]
 
     entered = threading.Event()
     release = threading.Event()
-    real = server._bound_outbound_image
+    real = srv_server_fetch._bound_outbound_image
     calls = {"n": 0}
 
     def blocking_first_encode(data_b64: str, frame: Any = None) -> Any:
@@ -292,10 +301,10 @@ async def test_a_blocked_fetch_encode_leaves_the_event_loop_free(
             assert release.wait(timeout=10), "the blocked encode was never released"
         return real(data_b64, frame=frame)
 
-    monkeypatch.setattr(server, "_bound_outbound_image", blocking_first_encode)
+    monkeypatch.setattr(srv_server_fetch, "_bound_outbound_image", blocking_first_encode)
 
     async def scenario() -> None:
-        task_a = asyncio.create_task(server.computer_fetch_image(sid_a, id_a))
+        task_a = asyncio.create_task(srv_server_fetch.computer_fetch_image(sid_a, id_a))
         for _ in range(100):  # let A reach its (blocked) encode on the worker thread
             if entered.is_set():
                 break
@@ -303,7 +312,7 @@ async def test_a_blocked_fetch_encode_leaves_the_event_loop_free(
         assert entered.is_set(), "the first fetch never reached its encode"
         # B runs on the SAME loop while A's encode is still blocked: the loop is free.
         reply_b = await asyncio.wait_for(
-            server.computer_fetch_image(sid_b, id_b), timeout=5.0
+            srv_server_fetch.computer_fetch_image(sid_b, id_b), timeout=5.0
         )
         assert isinstance(reply_b, list)
         release.set()
@@ -327,7 +336,7 @@ def test_the_age_cap_is_enforced_end_to_end_with_a_patched_clock(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    image_id = _metadata(server.computer_observe(session_id))["image_id"]
+    image_id = _metadata(srv_server_observe.computer_observe(session_id))["image_id"]
 
     clock.advance(3599)
     fetched = _fetch(session_id, image_id)

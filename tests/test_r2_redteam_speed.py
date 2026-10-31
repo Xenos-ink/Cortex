@@ -37,7 +37,10 @@ import pytest
 from PIL import Image
 
 from computer_use_mcp.desktop import backend as backend_module
-from computer_use_mcp import server
+import computer_use_mcp.server.replies as srv_server_replies
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.server.app as srv_server_app
 from computer_use_mcp.desktop.backend import LocalComputerBackend
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import GroundedAction, Observation, WindowInfo
@@ -126,7 +129,7 @@ def _decode_image(data_b64: str) -> Image.Image:
 
 
 async def _run(session_id: str, spec: dict[str, Any]) -> dict[str, Any]:
-    return execute_payload(await server.computer_execute(session_id, **spec))
+    return execute_payload(await srv_server_execute.computer_execute(session_id, **spec))
 
 
 class ShiftingScreenBackend(ScriptedBackend):
@@ -397,7 +400,7 @@ async def test_r2_d10_photographic_gradient_default_response_under_100kb(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     backend.observe_override_png = _gradient_png_b64()
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     assert isinstance(result, list) and len(result) == 2
     text_block, image_block = result
     assert image_block.mimeType == "image/jpeg"
@@ -419,7 +422,7 @@ async def test_r2_d10_h7_budget_holds_on_every_path_even_tightened(
     deliberately tightened 64KB budget (the half-res q60 output itself gets laddered)."""
     monkeypatch.delenv(ACTION_IMAGE_FULL_ENV, raising=False)
     monkeypatch.setenv(RESULT_IMAGE_MAX_KB_ENV, "64")
-    budget = server._result_image_max_bytes()
+    budget = srv_server_replies._result_image_max_bytes()
     assert budget == 64 * 1024
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
@@ -428,7 +431,7 @@ async def test_r2_d10_h7_budget_holds_on_every_path_even_tightened(
     # Default path: half-res JPEG, bounded by the tightened budget. For this
     # pathological frame the q60 half-res output itself exceeds 64KB, so the H7
     # ladder engages and shrinks it further — the CONTRACT is the budget, held.
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     _text_block, image_block = result
     raw_bytes = len(base64.b64decode(image_block.data, validate=True))
     assert raw_bytes <= budget, (image_block.mimeType, raw_bytes)
@@ -436,7 +439,7 @@ async def test_r2_d10_h7_budget_holds_on_every_path_even_tightened(
     assert 0 < _decode_image(image_block.data).size[0] <= 960  # never up-scaled, bounded
     # Explicit full path with the same impossible frame: the ladder still governs.
     backend.observe_override_png = _noise_png_b64(seed=3)
-    result = await server.computer_execute(
+    result = await srv_server_execute.computer_execute(
         session_id, "click", x=20, y=20, include_screenshot_after=True
     )
     _text_block, image_block = result
@@ -456,9 +459,9 @@ async def test_r2_d10_full_env_plus_explicit_optin_no_double_encode(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     structured = _structured_png_b64()
-    assert len(base64.b64decode(structured, validate=True)) <= server._result_image_max_bytes()
+    assert len(base64.b64decode(structured, validate=True)) <= srv_server_replies._result_image_max_bytes()
     backend.observe_override_png = structured
-    result = await server.computer_execute(
+    result = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, include_screenshot_after=True
     )
     text_block, image_block = result
@@ -482,9 +485,9 @@ async def test_r2_d10_text_mode_with_explicit_optin_zero_image_blocks(
     images — the response stays the slim dict with zero image blocks and zero
     screenshot bytes even though the capture succeeded."""
     backend = ScriptedBackend()
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(
         dry_run=False, require_approval=False, limits=FAST_LIMITS, image_delivery="text",
     )
     session_id = str(response["session_id"])
@@ -811,10 +814,10 @@ async def test_r2_surface_is_exactly_ten_plain_tools() -> None:
     decision D-1 added the wait family as 7-9; WP5 added the evidence-retrieval
     tool as the tenth); every advertised inputSchema contains ZERO anyOf and
     ZERO $ref/$defs (the wire-compat contract, re-walked independently)."""
-    tools = await server.mcp.list_tools()
+    tools = await srv_server_app.mcp.list_tools()
     assert sorted(tool.name for tool in tools) == sorted(ALL_TOOLS)
     for name in ALL_TOOLS:
-        registered = server.mcp._tool_manager.get_tool(name)
+        registered = srv_server_app.mcp._tool_manager.get_tool(name)
         assert registered is not None, name
         schema_text = json.dumps(registered.fn_metadata.arg_model.model_json_schema())
         assert "anyOf" not in schema_text, name
@@ -825,7 +828,7 @@ def test_r2_served_computer_execute_text_teaches_d9_and_d10(fresh_server: Any) -
     """The SERVED computer_execute text (what a driving model actually reads) must
     teach BOTH fixes: the half-size JPEG default (action-image) and the
     queue-continues-while-the-attached-window-is-constant semantics (queue-premise)."""
-    doc = inspect.getdoc(server.computer_execute) or ""
+    doc = inspect.getdoc(srv_server_execute.computer_execute) or ""
     assert "HALF-SIZE JPEG" in doc, "served text must teach the action-image default weight"
     assert "0.5x" in doc and "60KB" in doc
     assert "include_screenshot_after=true" in doc  # the full-res opt-in is documented

@@ -38,7 +38,8 @@ from typing import Any
 
 import pytest
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import WindowInfo
 
@@ -89,13 +90,13 @@ class _EnsureAppRecordingBackend(ScriptedBackend):
 
 async def _run(session_id: str, spec: dict[str, Any]) -> dict[str, Any]:
     """computer_execute + payload unwrap (executed responses arrive as MCP blocks)."""
-    return execute_payload(await server.computer_execute(session_id, **spec))
+    return execute_payload(await srv_server_execute.computer_execute(session_id, **spec))
 
 
 def _session(monkeypatch: pytest.MonkeyPatch, backend: Any, **start: Any) -> str:
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(
         dry_run=False, require_approval=False, limits=FAST_LIMITS, **start
     )
     return str(response["session_id"])
@@ -513,7 +514,7 @@ async def test_attack5b_staleness_rejection_names_the_staleness_gate(
     monkeypatch.delenv(QUEUE_ENV, raising=False)
     backend = _DriftingForegroundBackend()
     session_id = _session(monkeypatch, backend)
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     original_ground = bundle.agent._ground
     ground_calls = {"n": 0}
 
@@ -627,7 +628,7 @@ async def test_attack7_flagged_degrade_adds_no_extra_captures(
     await _run(session_id, spec)
     expected_captures = 4 if flagged else 3
     assert len(backend.observed) == expected_captures, len(backend.observed)
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     phases = [
         (event.get("metadata") or {}).get("phase")
         for event in audit_events(bundle, session_id)

@@ -46,7 +46,9 @@ import helpers_runtime as rt
 import helpers_win32 as w32
 import pytest
 
-from computer_use_mcp import server
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.execute as srv_server_execute
 
 pytestmark = pytest.mark.e2e
 
@@ -95,7 +97,7 @@ def attach_notepad(deadline: w32.Deadline, token: str):
 
 def observe(evidence: Any, session_id: str, when: str) -> dict[str, Any]:
     """Capture an observation through the MCP tool and save it as evidence."""
-    response = w32.observe_tool_metadata(server.computer_observe(session_id))
+    response = w32.observe_tool_metadata(srv_server_observe.computer_observe(session_id))
     observation = response["observation"]
     if evidence is not None:
         evidence.save_observation(when, observation)
@@ -163,7 +165,7 @@ def test_notepad_window_identity_observation(
                 evidence.add_extra("monitor", monitor)
                 evidence.save_audit(bundle, session_id)
         finally:
-            asyncio.run(server.stop_session(session_id))
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))
 
 
 def test_notepad_type_semantic_verification(
@@ -191,7 +193,7 @@ def test_notepad_type_semantic_verification(
             # expected_effect carries the typed text: the injected window-text strategy
             # reads the REAL Edit control (WM_GETTEXT) and verifies semantically.
             response = asyncio.run(
-                server.computer_execute(session_id, "type", text=TYPED_MARKER,
+                srv_server_execute.computer_execute(session_id, "type", text=TYPED_MARKER,
                                         expected_effect=TYPED_MARKER)
             )
             # D6: right-window proof BEFORE anything else — the window that now holds
@@ -227,7 +229,7 @@ def test_notepad_type_semantic_verification(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            asyncio.run(server.stop_session(session_id))
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))
 
 
 def test_notepad_moved_window_verification_failure_returns_to_host(
@@ -277,7 +279,7 @@ def test_notepad_moved_window_verification_failure_returns_to_host(
             # reads the real Edit/foreground window and finds the decoy instead ->
             # typed failure. (D6: expected_effect carries our unique token filename.)
             response = asyncio.run(
-                server.computer_execute(
+                srv_server_execute.computer_execute(
                     session_id, "click", x=center[0], y=center[1],
                     expected_effect=target_path.name,
                 )
@@ -317,7 +319,7 @@ def test_notepad_moved_window_verification_failure_returns_to_host(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            asyncio.run(server.stop_session(session_id))
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))
 
 
 def test_notepad_window_switch_stale_observation(
@@ -367,7 +369,7 @@ def test_notepad_window_switch_stale_observation(
             # expected_effect names the TARGET marker file: the fresh capture sees the
             # decoy foreground, the window_state verification fails the title match typed.
             response = asyncio.run(
-                server.computer_execute(
+                srv_server_execute.computer_execute(
                     session_id, "click", x=center[0], y=center[1],
                     expected_effect=target_path.name,
                 )
@@ -404,4 +406,4 @@ def test_notepad_window_switch_stale_observation(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            asyncio.run(server.stop_session(session_id))
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))

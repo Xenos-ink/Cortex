@@ -33,7 +33,10 @@ from pydantic import ValidationError
 
 import computer_use_mcp.desktop.backend as backend_module
 import computer_use_mcp.desktop.windows as windows_module
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.pipeline.agent import ComputerUseAgent
 from computer_use_mcp.desktop.backend import ComputerBackend
 from computer_use_mcp.desktop.errors import InputBlockedError, WindowFocusError
@@ -715,15 +718,17 @@ FAST_LIMITS = {"min_screenshot_interval_ms": 0}
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (mirrors integration suites)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 def _make_session(monkeypatch: pytest.MonkeyPatch, backend: Any, **start_kwargs: Any) -> str:
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: object())
-    response = server.start_session(**start_kwargs)
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: object())
+    response = srv_server_lifecycle.start_session(**start_kwargs)
     assert response.get("session_id"), response
     return str(response["session_id"])
 
@@ -742,7 +747,7 @@ async def test_computer_execute_focus_window_swaps_active_window_and_verifies(
     session_id = _make_session(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "focus_window", target="Calculator")
+    result = await srv_server_execute.computer_execute(session_id, "focus_window", target="Calculator")
     result = _execute_payload(result)  # REM-A: executed -> content blocks
     assert result["ok"] is True, result
     assert result["message"] == "Simulated focus_window."
@@ -764,12 +769,12 @@ async def test_computer_execute_focus_window_requires_approval_then_approved(
     session_id = _make_session(
         monkeypatch, backend, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "focus_window", target="Calculator")
+    result = await srv_server_execute.computer_execute(session_id, "focus_window", target="Calculator")
     assert result["ok"] is False
     assert result["requires_approval"] is True
     assert "Calculator" in result["message"]  # the approval message names the target
     assert backend.executed == []
-    approved = await server.computer_execute(
+    approved = await srv_server_execute.computer_execute(
         session_id, "focus_window", target="Calculator", approved=True
     )
     approved = _execute_payload(approved)  # REM-A: executed -> content blocks
@@ -785,7 +790,7 @@ async def test_computer_execute_focus_window_without_target_fails_closed(
     session_id = _make_session(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "focus_window")
+    result = await srv_server_execute.computer_execute(session_id, "focus_window")
     assert result["ok"] is False
     assert result["result"] == "rejected" and "invalid_action" in result["reasons"]
     assert backend.executed == []

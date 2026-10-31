@@ -26,7 +26,10 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.core.models import WindowInfo
 
 
@@ -35,9 +38,11 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
     from computer_use_mcp.core.state import SessionRegistry
 
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    yield
 
 
 class _MaskedPinWorld(ScriptedBackend):
@@ -80,7 +85,7 @@ async def test_mismatch_demotion_audit_verdict_equals_the_reply_verdict(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(session_id, "type", text="1234", approved=True)
+        await srv_server_execute.computer_execute(session_id, "type", text="1234", approved=True)
     )
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "uncertain"
@@ -146,11 +151,11 @@ async def test_drift_demotion_audit_verdict_equals_the_reply_verdict(
     # Bind the guard to the session's own window first (the anchor the type then
     # drifts AWAY from — the same arming test_focus_continuity does with rebind).
     focus_payload = execute_payload(
-        await server.computer_execute(session_id, "focus_window", target="Sign in")
+        await srv_server_execute.computer_execute(session_id, "focus_window", target="Sign in")
     )
     assert focus_payload["ok"] is True, focus_payload
     payload = execute_payload(
-        await server.computer_execute(session_id, "type", text="hello", approved=True)
+        await srv_server_execute.computer_execute(session_id, "type", text="hello", approved=True)
     )
     validate_reply(payload, "flat_execute")
     # The drift demotion is an honest not-ok (the text may have landed elsewhere)...
@@ -188,7 +193,7 @@ async def test_launch_failure_audit_verdict_equals_the_reply_verdict(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(session_id, "ensure_app", target="mspaint.exe")
+        await srv_server_execute.computer_execute(session_id, "ensure_app", target="mspaint.exe")
     )
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "failed", payload
@@ -213,7 +218,7 @@ async def test_marker_audit_event_still_exactly_one_and_equal(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    payload = execute_payload(await server.computer_execute(session_id, "done"))
+    payload = execute_payload(await srv_server_execute.computer_execute(session_id, "done"))
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "marker" and payload["ok"] is True
     verification_events = [
@@ -235,7 +240,7 @@ async def test_done_and_wait_markers_each_emit_the_verification_audit_event(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    payload = execute_payload(await server.computer_execute(session_id, action))
+    payload = execute_payload(await srv_server_execute.computer_execute(session_id, action))
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "marker"
     events = [

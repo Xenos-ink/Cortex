@@ -29,7 +29,13 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.plan_surface as srv_server_plan_surface
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.state as srv_server_state
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.planning.plan as srv_planning_plan
 from computer_use_mcp.security.audit import AuditEventType, AuditLogger, Metrics
 from computer_use_mcp.desktop.errors import DisplayUnavailableError
 from computer_use_mcp.core.limits import LimitExceeded
@@ -46,10 +52,13 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     the reset that dict leaks across tests and makes results order-dependent).
     """
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_stopped_sessions", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_lifecycle, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_state, "_stopped_sessions", srv_server_lifecycle._stopped_sessions)
+    return None
 
 
 def _payload(result: Any) -> dict[str, Any]:
@@ -78,9 +87,9 @@ async def _drive_audit_scenarios(
     sid, bundle, _, _ = make_session(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    denied = await server.computer_execute(sid, "click", x=100, y=100)  # approval_required
+    denied = await srv_server_execute.computer_execute(sid, "click", x=100, y=100)  # approval_required
     assert denied.get("requires_approval") is True, denied
-    approved = await server.computer_execute(sid, "click", x=100, y=100, approved=True)
+    approved = await srv_server_execute.computer_execute(sid, "click", x=100, y=100, approved=True)
     _ = _payload(approved)
     scenarios.append((sid, bundle))
 
@@ -90,7 +99,7 @@ async def _drive_audit_scenarios(
     sid, bundle, _, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    rejected = await server.computer_execute(sid, "click", x=8000, y=10)
+    rejected = await srv_server_execute.computer_execute(sid, "click", x=8000, y=10)
     assert rejected.get("ok") is False, rejected
     scenarios.append((sid, bundle))
 
@@ -100,7 +109,7 @@ async def _drive_audit_scenarios(
     sid, bundle, _, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    failed = await server.computer_execute(sid, "click", x=40, y=50)
+    failed = await srv_server_execute.computer_execute(sid, "click", x=40, y=50)
     assert failed.get("error") == "action_error", failed
     scenarios.append((sid, bundle))
 
@@ -109,9 +118,9 @@ async def _drive_audit_scenarios(
         monkeypatch, dry_run=False, require_approval=False,
         limits={**FAST_LIMITS, "max_actions": 1},
     )
-    first = await server.computer_execute(sid, "click", x=1, y=1)
+    first = await srv_server_execute.computer_execute(sid, "click", x=1, y=1)
     _ = _payload(first)
-    limited = await server.computer_execute(sid, "click", x=2, y=2)
+    limited = await srv_server_execute.computer_execute(sid, "click", x=2, y=2)
     # §1.4 delta (ORVEX-2026-108): a limit trip is a pre-dispatch gate refusal —
     # rejection envelope, typed limit as the first reason, no error key.
     assert limited.get("result") == "rejected", limited
@@ -122,8 +131,8 @@ async def _drive_audit_scenarios(
     sid, bundle, _, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.stop_session(sid)
-    stopped = await server.computer_execute(sid, "wait", delta=1)
+    await srv_server_lifecycle.stop_session(sid)
+    stopped = await srv_server_execute.computer_execute(sid, "wait", delta=1)
     # §1.4 delta (ORVEX-2026-108): execute-surface stopped refusal = rejection
     # envelope; the stop itself is what this scenario's audit assertions read below.
     assert stopped.get("result") == "rejected", stopped
@@ -135,7 +144,7 @@ async def _drive_audit_scenarios(
     sid, bundle, _, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         sid,
         "click",
         x=10,
@@ -151,7 +160,7 @@ async def _drive_audit_scenarios(
     sid, bundle, _, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    completed_plan = await server.computer_execute(
+    completed_plan = await srv_server_execute.computer_execute(
         sid,
         "done",
         approved=True,
@@ -173,7 +182,7 @@ async def _drive_audit_scenarios(
         limits={**FAST_LIMITS, "max_actions": 1},
     )
     stopped_plan = _payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid,
             "done",
             approved=True,
@@ -190,7 +199,7 @@ async def _drive_audit_scenarios(
     # and the host stop below is what closes the lifecycle as stopped.
     assert stopped_plan["result"] != "verified"
     assert stopped_plan["blocked"] is True
-    await server.computer_execute(sid, "done", plan_action="stop")
+    await srv_server_execute.computer_execute(sid, "done", plan_action="stop")
     scenarios.append((sid, bundle))
     return scenarios
 
@@ -268,7 +277,7 @@ async def test_plan_lifecycle_audit_events_agree_with_the_replies(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     first = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid,
             "done",
             plan=wire_plan(
@@ -300,7 +309,7 @@ async def test_plan_lifecycle_audit_events_agree_with_the_replies(
     assert point["metadata"]["step_index"] == first["step_index"]
 
     stop = execute_payload(
-        await server.computer_execute(sid, "done", plan_action="stop", include_screenshot_after=False)
+        await srv_server_execute.computer_execute(sid, "done", plan_action="stop", include_screenshot_after=False)
     )
     assert stop["result"] == "stopped" and stop["failure_reason"] is None
     events = [
@@ -387,7 +396,7 @@ async def test_verified_walk_audit_agrees_with_the_walk_ending_and_terminal_repl
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     step0 = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan=wire_plan(_CROSSING_TWO), approved=True, include_screenshot_after=False
         )
     )
@@ -398,7 +407,7 @@ async def test_verified_walk_audit_agrees_with_the_walk_ending_and_terminal_repl
     assert "failure_reason" not in events[1]["metadata"]  # explicit null ≡ absent
 
     final = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan_action="continue", include_screenshot_after=False
         )
     )
@@ -427,13 +436,13 @@ async def test_replace_audit_sequence_agrees_with_the_replies(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     first = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
         )
     )
     assert first["blocked"] is True
     replaced = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan=wire_plan(_CROSSING_TWO), plan_action="replace",
             include_screenshot_after=False,
         )
@@ -468,7 +477,7 @@ async def test_task_stopped_and_error_terminals_agree_exactly_once(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     reply = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
         )
     )
@@ -485,7 +494,7 @@ async def test_task_stopped_and_error_terminals_agree_exactly_once(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     reply = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
         )
     )
@@ -511,11 +520,11 @@ async def test_limit_cut_parks_and_the_records_agree(
         require_approval=False,
         limits={**FAST_LIMITS, "max_actions": 2},
     )
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
     )
     cut = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan_action="continue", include_screenshot_after=False
         )
     )
@@ -527,7 +536,7 @@ async def test_limit_cut_parks_and_the_records_agree(
     ]
     _assert_agrees(events[2], cut)
     stop = execute_payload(
-        await server.computer_execute(sid, "done", plan_action="stop", include_screenshot_after=False)
+        await srv_server_execute.computer_execute(sid, "done", plan_action="stop", include_screenshot_after=False)
     )
     events = _plan_events(bundle, sid)
     assert events[-1]["event_type"] == "plan_stopped"
@@ -551,13 +560,13 @@ class _LimitCutThenKill(ScriptedBackend):
             import asyncio as _asyncio
             import threading as _threading
 
-            from computer_use_mcp import server as _server
+            
 
             self.kill_started = True
-            session_ids = list(_server._bundles.keys())
+            session_ids = list(srv_server_lifecycle._bundles.keys())
             assert session_ids, "no live session to stop"
             thread = _threading.Thread(
-                target=lambda: _asyncio.run(_server.stop_session(session_ids[0]))
+                target=lambda: _asyncio.run(srv_server_lifecycle.stop_session(session_ids[0]))
             )
             thread.start()
             thread.join()  # the funnel already ran (deferred) BEFORE the cut
@@ -579,21 +588,21 @@ async def test_limit_cut_then_stop_session_emits_exactly_one_terminal(
         require_approval=False,
         limits={**FAST_LIMITS, "max_actions": 2},
     )
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
     )
     cut = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan_action="continue", include_screenshot_after=False
         )
     )
     assert cut["failure_reason"] == "limit_exceeded" and cut["blocked"] is True
     # the LimitExceeded handler cleared the in-flight marker (R1 invariant)
-    lease = server._plan_guard.active_lease(bundle)
+    lease = srv_server_plan_surface._plan_guard.active_lease(bundle)
     assert lease is not None and lease.step_in_flight is False
     import asyncio as _asyncio
 
-    await _asyncio.wait_for(server.stop_session(sid), 5)
+    await _asyncio.wait_for(srv_server_lifecycle.stop_session(sid), 5)
     terminals = [
         event for event in _plan_events(bundle, sid)
         if event["event_type"] in ("plan_complete", "plan_stopped")
@@ -626,15 +635,15 @@ async def test_the_funnel_defer_decision_is_atomic_with_the_step_finally(
     sid, bundle, _, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
     )
-    lease = server._plan_guard.active_lease(bundle)
+    lease = srv_server_plan_surface._plan_guard.active_lease(bundle)
     assert lease is not None
     # simulate the in-flight step: the funnel must consult the flag under the lock
     lease.step_in_flight = True
 
-    real_lock = server._plan_terminal_audit_lock
+    real_lock = srv_server_plan_surface._plan_terminal_audit_lock
 
     class _StepFinishesInsideTheFunnelDecision:
         """A lock whose acquisition completes the step's lifecycle FIRST — the
@@ -650,8 +659,9 @@ async def test_the_funnel_defer_decision_is_atomic_with_the_step_finally(
             real_lock.release()
             return False
 
-    monkeypatch.setattr(server, "_plan_terminal_audit_lock", _StepFinishesInsideTheFunnelDecision())
-    await _asyncio.wait_for(server.stop_session(sid), 5)
+    monkeypatch.setattr(srv_server_plan_surface, "_plan_terminal_audit_lock", _StepFinishesInsideTheFunnelDecision())
+    monkeypatch.setattr(srv_server_lifecycle, "_plan_terminal_audit_lock", srv_server_plan_surface._plan_terminal_audit_lock)
+    await _asyncio.wait_for(srv_server_lifecycle.stop_session(sid), 5)
     terminals = [
         event for event in _plan_events(bundle, sid)
         if event["event_type"] in ("plan_complete", "plan_stopped")
@@ -676,20 +686,20 @@ async def test_limit_cut_then_idle_reap_emits_exactly_one_terminal(
         require_approval=False,
         limits={**FAST_LIMITS, "max_actions": 2},
     )
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
     )
     cut = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan_action="continue", include_screenshot_after=False
         )
     )
     assert cut["failure_reason"] == "limit_exceeded"
-    monkeypatch.setattr(server, "_session_idle_timeout", lambda: 0.05)
+    monkeypatch.setattr(srv_server_lifecycle, "_session_idle_timeout", lambda: 0.05)
     import asyncio as _asyncio
 
     await _asyncio.sleep(0.08)
-    assert sid in server._sweep_idle_sessions()
+    assert sid in srv_server_lifecycle._sweep_idle_sessions()
     terminals = [
         event for event in _plan_events(bundle, sid)
         if event["event_type"] in ("plan_complete", "plan_stopped")
@@ -712,7 +722,7 @@ async def _kill_lands_mid_step(
     done = _threading.Event()
 
     def _kill() -> None:
-        _asyncio.run(server.stop_session(sid))
+        _asyncio.run(srv_server_lifecycle.stop_session(sid))
         done.set()
 
     thread = _threading.Thread(target=_kill)
@@ -780,10 +790,10 @@ async def test_kill_then_step_exit_always_closes_the_lifecycle(
     sid, bundle, _, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
     )
-    lease = server._plan_guard.active_lease(bundle)
+    lease = srv_server_plan_surface._plan_guard.active_lease(bundle)
     assert lease is not None and lease.step_in_flight is False
     real_run_single = bundle.agent.run_single
     merge_fault = {"v": False}
@@ -817,25 +827,25 @@ async def test_kill_then_step_exit_always_closes_the_lifecycle(
     if case == "base":
         # the BaseException handler re-raises: no reply reaches the caller
         with pytest.raises(RuntimeError, match="synthetic kill-then-base"):
-            await server.computer_execute(
+            await srv_server_execute.computer_execute(
                 sid, "done", plan_action="continue", include_screenshot_after=False
             )
     elif case == "merge":
-        real_merge = server.plan_layer.merge_plan_step_prefix
+        real_merge = srv_planning_plan.merge_plan_step_prefix
 
         def faulting_merge(lease_arg: Any, entries: Any, **kwargs: Any) -> None:
             if merge_fault["v"]:
                 raise ValueError("synthetic merge failure")
             real_merge(lease_arg, entries, **kwargs)
 
-        monkeypatch.setattr(server.plan_layer, "merge_plan_step_prefix", faulting_merge)
+        monkeypatch.setattr(srv_server_plan_surface.plan_layer, "merge_plan_step_prefix", faulting_merge)
         with pytest.raises(ValueError, match="synthetic merge failure"):
-            await server.computer_execute(
+            await srv_server_execute.computer_execute(
                 sid, "done", plan_action="continue", include_screenshot_after=False
             )
     else:
         reply = execute_payload(
-            await server.computer_execute(
+            await srv_server_execute.computer_execute(
                 sid, "done", plan_action="continue", include_screenshot_after=False
             )
         )
@@ -857,15 +867,15 @@ async def test_idle_reap_funnel_emits_one_terminal_with_the_kill_source(
     sid, bundle, _, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
     )
-    assert server._plan_guard.is_active(sid)
-    monkeypatch.setattr(server, "_session_idle_timeout", lambda: 0.05)
+    assert srv_server_plan_surface._plan_guard.is_active(sid)
+    monkeypatch.setattr(srv_server_lifecycle, "_session_idle_timeout", lambda: 0.05)
     import asyncio as _asyncio
 
     await _asyncio.sleep(0.08)
-    assert sid in server._sweep_idle_sessions()
+    assert sid in srv_server_lifecycle._sweep_idle_sessions()
     events = _plan_events(bundle, sid)
     terminals = [e for e in events if e["event_type"] in ("plan_complete", "plan_stopped")]
     assert len(terminals) == 1, events
@@ -892,7 +902,7 @@ async def test_a_raising_audit_writer_leaves_the_reply_unchanged(
     # wrapper is the production swallow layer under test here.
     monkeypatch.setattr(bundle.auditor, "emit", _raising_emit)
     reply = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan=wire_plan(_CROSSING_TWO), approved=True, include_screenshot_after=False
         )
     )
@@ -916,16 +926,16 @@ async def test_concurrent_terminal_emitters_produce_exactly_one_event(
     sid, bundle, _, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
     )
-    lease = server._plan_guard.active_lease(bundle)
+    lease = srv_server_plan_surface._plan_guard.active_lease(bundle)
     assert lease is not None
     start = threading.Barrier(2)
 
     def _emit() -> None:
         start.wait()
-        server._audit_plan_terminal(
+        srv_server_plan_surface._audit_plan_terminal(
             bundle, lease, reply_result="stopped", reason="cancelled",
             failure_reason="cancelled",
         )
@@ -961,11 +971,11 @@ async def test_non_verified_walk_ending_and_terminal_walk_records_agree(
             {"x": 30, "y": 40, "actions": []},
         ],
     }
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         sid, "done", plan=wire_plan(plan), approved=True, include_screenshot_after=False
     )
     walk_end = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan_action="continue", include_screenshot_after=False
         )
     )
@@ -993,16 +1003,16 @@ async def test_non_verified_walk_ending_and_terminal_walk_records_agree(
         ],
     }
     step0 = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan=wire_plan(failed_plan), approved=True, include_screenshot_after=False
         )
     )
     assert step0["result"] in ("failed", "uncertain"), step0.get("result")
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         sid, "done", plan_action="continue", include_screenshot_after=False
     )
     terminal = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan_action="continue", include_screenshot_after=False
         )
     )
@@ -1032,7 +1042,7 @@ async def test_invalid_conversion_and_base_exception_paths_agree(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     real_to_grounded = ActionSpec.to_grounded
-    real_install = server._plan_guard.install
+    real_install = srv_server_plan_surface._plan_guard.install
     seen_specs: "list[weakref.ref]" = []
     started = {"v": False}
 
@@ -1040,7 +1050,7 @@ async def test_invalid_conversion_and_base_exception_paths_agree(
         started["v"] = True
         real_install(bundle, lease, **kwargs)
 
-    monkeypatch.setattr(server._plan_guard, "install", wrapped_install)
+    monkeypatch.setattr(srv_server_plan_surface._plan_guard, "install", wrapped_install)
 
     def exploding_to_grounded(self: Any, **kwargs: Any) -> Any:
         # only the STEP's own re-conversion (after the lease is installed) fails;
@@ -1055,7 +1065,7 @@ async def test_invalid_conversion_and_base_exception_paths_agree(
 
     monkeypatch.setattr(ActionSpec, "to_grounded", exploding_to_grounded)
     reply = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
         )
     )
@@ -1088,7 +1098,7 @@ async def test_base_exception_terminal_record_agrees(
     import pytest as _pytest
 
     with _pytest.raises(RuntimeError, match="synthetic base exception"):
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
         )
     events = _plan_events(bundle, sid)
@@ -1142,7 +1152,7 @@ async def test_redaction_enforced_for_secrets_in_goal_through_runtime(
         monkeypatch, backend=ScriptedBackend(flip=False), dry_run=False,
         require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         sid,
         "click",
         x=10,
@@ -1181,7 +1191,7 @@ async def test_redaction_enforced_on_the_flip_screen_evidence_channel(
         monkeypatch, backend=ScriptedBackend(flip=True), dry_run=False,
         require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         sid,
         "click",
         x=10,
@@ -1241,7 +1251,7 @@ async def test_metrics_snapshot_invariants_after_scripted_runs(
     sid, bundle, _, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(sid, "click", x=10, y=10, expected_effect="window appears")
+    response = await srv_server_execute.computer_execute(sid, "click", x=10, y=10, expected_effect="window appears")
     response = _payload(response)
     # RE-PINNED by WP4a (E-03): the stated effect over a generic flip is the honest
     # ``uncertain`` (ok False, uncertain is never success) — the counter/latency
@@ -1276,7 +1286,7 @@ async def test_metrics_snapshot_invariants_after_scripted_runs(
         require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         sid, "keypress", keys=["enter"], expected_effect="open Calculator"
     )
     response = _payload(response)

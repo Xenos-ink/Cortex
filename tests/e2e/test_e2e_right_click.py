@@ -36,7 +36,9 @@ import helpers_runtime as rt
 import helpers_win32 as w32
 import pytest
 
-from computer_use_mcp import server
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
 
 pytestmark = pytest.mark.e2e
 
@@ -99,7 +101,7 @@ def _menu_windows(pid: int) -> list[dict[str, Any]]:
 
 def observe(evidence: Any, session_id: str, when: str) -> dict[str, Any]:
     """Capture an observation through the MCP tool and save it (dump + image) as evidence."""
-    response = server.computer_observe(session_id)
+    response = srv_server_observe.computer_observe(session_id)
     metadata = w32.observe_tool_metadata(response)
     observation = metadata["observation"]
     if evidence is not None:
@@ -182,7 +184,7 @@ def test_right_click_opens_real_context_menu(
             # change" the doctrine reports as honest `uncertain` (never false success).
             # The CAPABILITY PROOF is the Win32 menu-window enumeration below.
             response = asyncio.run(
-                server.computer_execute(session_id, "right_click", x=target_x, y=target_y)
+                srv_server_execute.computer_execute(session_id, "right_click", x=target_x, y=target_y)
             )
             response = _payload(response)
             assert response.get("error") is None, response
@@ -237,7 +239,7 @@ def test_right_click_opens_real_context_menu(
             # Cleanup through our OWN session: ESC closes the menu (the menu of our
             # process holds foreground). The menu window must be gone afterwards.
             esc_response = _payload(
-                asyncio.run(server.computer_execute(session_id, "keypress", keys=["esc"]))
+                asyncio.run(srv_server_execute.computer_execute(session_id, "keypress", keys=["esc"]))
             )
             if evidence is not None:
                 evidence.record("computer_execute(keypress esc)", ok=esc_response.get("ok"))
@@ -248,7 +250,7 @@ def test_right_click_opens_real_context_menu(
                 evidence.assert_that("menu closed after ESC", True)
         finally:
             with suppress(Exception):  # teardown never masks the test result
-                asyncio.run(server.stop_session(session_id))
+                asyncio.run(srv_server_lifecycle.stop_session(session_id))
 
 
 def _payload(response: Any) -> dict[str, Any]:

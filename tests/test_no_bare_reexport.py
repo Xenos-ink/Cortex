@@ -33,9 +33,12 @@ REVIEWED_BARE_REEXPORTS: set[tuple[str, str]] = {
     ("desktop/focus_guard.py", "MODAL_DIALOG"),
     ("desktop/focus_guard.py", "STUCK_MODIFIER"),
     ("desktop/focus_guard.py", "TARGET_GONE"),
-    # server imports the planning failure-reason set without reading it (dead).
-    ("server.py", "PLAN_FAILURE_REASONS"),
 }
+
+#: WP-R2b D4/§1: the registration hub (server/app.py) carries the five tool-module
+#: imports for their decorator side effects (plan.md §4 import order). Equality-checked
+#: by the self-tests; a registration import in ANY other file stays a violation.
+REGISTRATION_IMPORT_FILES = {"server/app.py"}
 
 #: D1 launch entries (WP-R2b plan §2/§9.3): package __init__ files allowed to
 #: carry EXACTLY one launch shim — ``def main(): from .app import main as
@@ -96,10 +99,43 @@ def _read_names(tree: ast.Module) -> set[str]:
     return reads
 
 
-def reexport_violations(source: str) -> list[str]:
-    """Bare re-export names in one module's source (empty when clean)."""
+def reexport_violations(source: str, relpath: str = "") -> list[str]:
+    """Bare re-export names in one module's source (empty when clean).
+
+    WP-R2b plan §1/§4 (D4): ``server/app.py`` imports the five tool modules at
+    module level PURELY for their registration side effects (the ``@mcp.tool()``
+    decorators must run in the monolith's source order); app.py reads none of the
+    module bindings by design. ``from . import <submodule>`` statements in exactly
+    the files in ``REGISTRATION_IMPORT_FILES`` are exempt — everywhere else they
+    remain violations, so the exemption cannot hide a compatibility shim.
+
+    DELTA 2 (F3, VAL-WP-R2b-1-01): a name imported ONLY under ``if TYPE_CHECKING:``
+    is exempt IF it also appears in one of the module's string constants (a quoted
+    lazy annotation like ``list["_WaitHandle"]`` — the type IS used, lazily). A
+    TYPE_CHECKING import whose name appears nowhere else is still a violation."""
     tree = ast.parse(source)
-    return sorted(_imported_names(tree) - _read_names(tree))
+    registration = relpath in REGISTRATION_IMPORT_FILES
+    imported = _imported_names(tree)
+    tc_names: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.If) and isinstance(node.test, ast.Name)
+                and node.test.id == "TYPE_CHECKING"):
+            for stmt in node.body:
+                if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                    for alias in stmt.names:
+                        tc_names.add(alias.asname or alias.name)
+    string_text = " ".join(
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+    imported -= {n for n in tc_names if n in string_text}
+    if registration:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level == 1 \
+                    and node.module is None \
+                    and len(node.names) == 1 and node.names[0].asname is None:
+                imported.discard(node.names[0].name)
+    return sorted(imported - _read_names(tree))
 
 
 def init_violations_source(source: str, relpath: str, is_root: bool) -> list[str]:
@@ -140,7 +176,7 @@ def test_every_relative_import_is_read_by_its_own_module() -> None:
         if path.name == "__init__.py":
             continue
         relpath = path.relative_to(PKG).as_posix()
-        found = reexport_violations(path.read_text(encoding="utf-8"))
+        found = reexport_violations(path.read_text(encoding="utf-8"), relpath)
         for name in found:
             if (relpath, name) in REVIEWED_BARE_REEXPORTS:
                 reviewed.add((relpath, name))
@@ -170,15 +206,50 @@ def test_selftest_launch_shim_passes_for_the_reviewed_entry() -> None:
     assert init_violations_source(LAUNCH_SHIM_SOURCE, "server/__init__.py", is_root=False) == []
 
 
-def test_selftest_launch_exception_is_inert_on_the_unsplit_tree() -> None:
-    """server/ does not exist yet, so NO existing __init__ is a launch entry —
-    the mechanism must not loosen any current package guard."""
-    assert not (PKG / "server").exists()
-    assert not (PKG / "server" / "__init__.py").exists()
+def test_selftest_launch_exception_is_live_on_the_split_tree() -> None:
+    """The split landed: server/ exists, its __init__ IS the reviewed launch entry
+    and carries EXACTLY the shim; every other package __init__ stays clean."""
+    assert (PKG / "server" / "__init__.py").is_file()
     for path in sorted(PKG.rglob("__init__.py")):
-        assert path.relative_to(PKG).as_posix() not in LAUNCH_ENTRY_INITS, path
+        relpath = path.relative_to(PKG).as_posix()
         is_root = path == PKG / "__init__.py"
-        assert init_violations(path, is_root) == [], path
+        if relpath in LAUNCH_ENTRY_INITS:
+            assert init_violations(path, is_root) == [], path
+        else:
+            assert relpath not in LAUNCH_ENTRY_INITS, path
+            assert init_violations(path, is_root) == [], path
+
+
+def test_selftest_registration_imports_are_exempt_only_in_app() -> None:
+    """server/app.py's five `from . import <toolmod>` registration imports (D4/§4)
+    are exempt ONLY there; the same shape anywhere else stays a violation, and a
+    NAMED import in app.py is still flagged (no shim channel)."""
+    assert (PKG / "server" / "app.py").is_file()
+    reg = "from . import lifecycle\nfrom . import wait\n"
+    assert reexport_violations(reg, "server/app.py") == []
+    assert reexport_violations(reg, "desktop/other.py") == ["lifecycle", "wait"]
+    named = "from .lifecycle import start_session\n"
+    assert reexport_violations(named, "server/app.py") == ["start_session"]
+    aliased = "from . import lifecycle as lc\n"
+    assert reexport_violations(aliased, "server/app.py") == ["lc"]
+
+
+def test_selftest_type_checking_string_annotation_is_read() -> None:
+    """DELTA 2 (F3): a TYPE_CHECKING-only import is exempt exactly when the name
+    also appears in a string constant (a quoted lazy annotation); otherwise it
+    stays a violation (a bare type re-export shim cannot hide behind the block)."""
+    used = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .wait_machine import _WaitHandle\n"
+        "\n"
+        "\n"
+        "def f() -> list[\"_WaitHandle\"]:\n"
+        "    return []\n"
+    )
+    assert reexport_violations(used) == []
+    unused = used.replace("list[\"_WaitHandle\"]", "list")
+    assert reexport_violations(unused) == ["_WaitHandle"]
 
 
 def test_selftest_any_other_statement_in_a_launch_init_fails() -> None:

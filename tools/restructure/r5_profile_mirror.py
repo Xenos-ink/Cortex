@@ -58,7 +58,7 @@ def main() -> int:
         VerificationIntent,
         VerificationKind,
     )
-    import computer_use_mcp.server as srv
+    import computer_use_mcp.server.fetch as srv_server_fetch
 
     report: dict[str, dict] = {}
     backend = LocalComputerBackend()
@@ -166,7 +166,7 @@ def main() -> int:
     bound_ms = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        bounded, mime, _scale = srv._bound_outbound_image(before.image_base64)
+        bounded, mime, _scale = srv_server_fetch._bound_outbound_image(before.image_base64)
         bound_ms.append((time.perf_counter() - t0) * 1000.0)
     report["bound_outbound_image"] = _ms(bound_ms)
     report["bound_outbound_mime"] = {"n": 1, "p50": 1.0 if mime == "image/jpeg" else 0.0,

@@ -187,7 +187,7 @@ def test_restore_rejects_malformed_snapshots_fail_closed() -> None:
 
 
 def test_new_limits_accepted_by_existing_parse_limits() -> None:
-    from computer_use_mcp.server import _parse_limits
+    from computer_use_mcp.server.state import _parse_limits
 
     parsed = _parse_limits(
         {"max_session_seconds": 100_000.0, "max_session_actions": 9999.0,

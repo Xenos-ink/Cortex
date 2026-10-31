@@ -34,7 +34,10 @@ from typing import Any
 import pytest
 from test_controller_integration import FAST_LIMITS, execute_payload, make_session
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.core.models import GroundedAction
 from computer_use_mcp.security.redaction import contains_secret, redact_text
 from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
@@ -241,9 +244,11 @@ def _type_decision_via(action: GroundedAction) -> Any:
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same isolation as test_p5)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 async def test_ac23b_dispatched_text_keeps_the_original_bytes(
@@ -256,7 +261,7 @@ async def test_ac23b_dispatched_text_keeps_the_original_bytes(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
     original = f"hello {ZWSP}world from the integrity probe"
-    response = await server.computer_execute(session_id, "type", text=original, approved=True)
+    response = await srv_server_execute.computer_execute(session_id, "type", text=original, approved=True)
     payload = execute_payload(response)
     assert payload.get("ok") is False or payload.get("ok") is True  # any outcome: it dispatched
     assert backend.executed, "the type action must reach the backend"

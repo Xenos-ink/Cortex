@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import importlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -213,17 +215,21 @@ def test_r4_generated_alias_collision_is_a_refusal(tmp_path: Path) -> None:
 
 
 def test_r5_indented_import_inside_a_function_reparses() -> None:
-    # VAL B6 scenario: e2e conftest imports server at function level (C4).
+    # VAL B6 scenario, strengthened (VAL-WP-R2b-0-02 MINOR 1): TWO modules in an
+    # indented multi-line inserted import (the old unindented behaviour would
+    # also pass a single-module pin).
     source = (
         "def make():\n"
         "    from computer_use_mcp import server\n"
         "\n"
         "    server.computer_wait('s')\n"
+        "    assert 1 not in server._bundles\n"
         "    return None\n"
     )
     new, _edits, sites = _rt(source)
     assert sites == []
     assert "    import computer_use_mcp.server.wait as srv_server_wait\n" in new
+    assert "    import computer_use_mcp.server.lifecycle as srv_server_lifecycle\n" in new
     assert _parse(new) is not None  # R5: the output parses
 
 
@@ -257,16 +263,22 @@ def test_r6_crlf_survives_through_main_write_mode(tmp_path: Path) -> None:
     assert b'monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)\r\n' in raw
 
 
-def test_r6_non_ascii_edited_line_is_refused(tmp_path: Path) -> None:
+def test_r6_non_ascii_line_is_converted_not_refused(tmp_path: Path) -> None:
+    # VAL-WP-R2b-0-02 MINOR 2: the byte->character column conversion on a
+    # non-ASCII line is CORRECT (the old test's '©' was an identifier, so it
+    # refused on SyntaxError instead of proving the conversion).
     tool = _load_tool()
     target = tmp_path / "t.py"
     target.write_text(
         "from computer_use_mcp import server\n\n\n"
         "def test_x():\n"
-        "    r\xc3\xa9sultat = server.computer_wait('s')  # caf\xc3\xa9\n",
+        "    r\u00e9sultat = server.computer_wait('s')  # caf\u00e9 \u2014 na\u00efve\n",
         encoding="utf-8")
-    rc = tool.main(["--dry-run", str(REAL_MAP), str(target)])
-    assert rc == 2
+    rc = tool.main([str(REAL_MAP), str(target)])
+    assert rc == 0
+    text = target.read_text(encoding="utf-8")
+    assert "srv_server_wait.computer_wait('s')  # café — naïve" in text
+    assert _parse(text) is not None
 
 
 # --- R7: all-or-nothing ------------------------------------------------------------------------
@@ -334,6 +346,7 @@ def test_member_and_module_import_bindings_retarget() -> None:
         "    lease = server.plan_layer.PLAN_GUARD\n"
         "    now = server.time.monotonic()\n"
         "    store = server.dispose_store\n"
+        "    flds = server.dataclass_fields\n"  # member read: fields, not dataclass_fields
     )
     new, _edits, sites = _rt(source)
     assert sites == []
@@ -342,6 +355,10 @@ def test_member_and_module_import_bindings_retarget() -> None:
     assert "srv_time.monotonic()" in new
     # M1: dispose_store has readers [lifecycle] -> the reference goes there
     assert "srv_server_lifecycle.dispose_store" in new
+    # VAL-WP-R2b-0-02 MINOR 4: the map's `member` key is honored on READS
+    assert "srv_dataclasses.fields" in new
+    assert "srv_dataclasses.dataclass_fields" not in new
+    assert "import dataclasses as srv_dataclasses" in new
     assert "import computer_use_mcp.planning.plan as srv_planning_plan" in new
     assert "import computer_use_mcp.core.state as srv_core_state" in new
     assert "import time as srv_time" in new
@@ -435,6 +452,27 @@ def test_rewrite_is_idempotent() -> None:
     assert sites2 == [] and edits2 == [] and twice == once
 
 
+def test_rewrite_is_idempotent_on_the_w1_package_root_override() -> None:
+    # VAL-WP-R2b-0-02 MINOR 3: the generated `import computer_use_mcp as
+    # srv_computer_use_mcp` (w1 __file__ override) must NOT count as an old
+    # server import — running the tool TWICE on the w1 file is a no-op.
+    tool = _load_tool()
+    names, bindings, overrides = _real_map()
+    source = (
+        "from computer_use_mcp import server\n\n\n"
+        "def test_x():\n"
+        "    root = Path(server.__file__).parent\n"
+    )
+    once, _e1, sites1 = tool.retarget_source(
+        source, "tests/test_w1_cancellable_wait.py", names, bindings, overrides)
+    assert sites1 == []
+    assert "import computer_use_mcp as srv_computer_use_mcp" in once
+    twice, edits2, sites2 = tool.retarget_source(
+        once, "tests/test_w1_cancellable_wait.py", names, bindings, overrides)
+    assert sites2 == [], [s.reason for s in sites2]
+    assert edits2 == [] and twice == once
+
+
 def test_untouched_lines_are_byte_identical() -> None:
     source = (
         "import os\n"
@@ -451,13 +489,56 @@ def test_untouched_lines_are_byte_identical() -> None:
         assert new_lines[index] == old_lines[index]
 
 
-def test_real_map_audits_clean_against_the_real_server() -> None:
+def test_real_map_homes_resolve_to_real_modules() -> None:
+    """Post-split map↔reality check (the pre-split --audit against server.py
+    ran clean at 492267b and that file is now the plan_surface git-mv target).
+    FULL strength (F4, VAL-WP-R2b-1-01): every `names` entry must be a REAL
+    top-level binding OF ITS HOME MODULE (per-module audit, not just "some file
+    exists"), and every `import_bindings` home must be an importable module that
+    actually binds the name."""
     tool = _load_tool()
     root = Path(__file__).resolve().parents[1]
     names, bindings, _overrides = tool.load_map(str(REAL_MAP))
-    problems = tool.audit_map(str(root / "src" / "computer_use_mcp" / "server.py"),
-                              names, bindings)
-    assert problems == [], problems
+    server_pkg = root / "src" / "computer_use_mcp" / "server"
+    bindings_by_leaf: dict[str, set[str]] = {}
+    for name, entry in names.items():
+        leaf = entry["home"].rsplit(".", 1)[-1]
+        assert (server_pkg / f"{leaf}.py").is_file(), (
+            f"names[{name!r}] home {entry['home']} is not a server/ module"
+        )
+        if leaf not in bindings_by_leaf:
+            module = ast.parse((server_pkg / f"{leaf}.py").read_text(encoding="utf-8"))
+            bound: set[str] = set()
+            for node in module.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    bound.add(node.name)
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        for sub in ast.walk(target):
+                            if isinstance(sub, ast.Name):
+                                bound.add(sub.id)
+                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    bound.add(node.target.id)
+                elif isinstance(node, ast.ImportFrom):
+                    bound.update(a.asname or a.name for a in node.names)
+                elif isinstance(node, ast.Import):
+                    bound.update((a.asname or a.name).split(".")[0] for a in node.names)
+            bindings_by_leaf[leaf] = bound
+        assert name in bindings_by_leaf[leaf], (
+            f"names[{name!r}] is NOT a top-level binding of {entry['home']}"
+        )
+    for binding, entry in bindings.items():
+        if entry.get("kind") == "member":
+            module = importlib.import_module(entry["home"])
+            bound_name = entry.get("member", binding)
+            assert hasattr(module, bound_name), (
+                f"import_bindings[{binding!r}]: {entry['home']} does not bind "
+                f"{bound_name!r}"
+            )
+        else:  # kind "module": the binding IS the imported module
+            assert importlib.util.find_spec(entry["home"]) is not None, (
+                f"import_bindings[{binding!r}]: {entry['home']} is not importable"
+            )
 
 
 def test_audit_flags_missing_and_extra_names(tmp_path: Path) -> None:

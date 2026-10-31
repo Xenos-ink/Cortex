@@ -291,21 +291,25 @@ def make_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     (``server._backend_factory`` / ``server._provider_factory``), starts the session via
     the ``start_session`` tool, and returns ``(session_id, bundle)``.
     """
-    from computer_use_mcp import server
+    import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+    import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+    import computer_use_mcp.server.wait as srv_server_wait
     from computer_use_mcp.desktop.backend import LocalComputerBackend
     from computer_use_mcp.core.state import SessionRegistry
 
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
 
     def factory(backend: Any = None, provider: Any = None, **start_kwargs: Any) -> tuple[str, Any]:
-        monkeypatch.setattr(server, "_backend_factory", lambda: backend or LocalComputerBackend())
-        monkeypatch.setattr(server, "_provider_factory", lambda: provider)
-        response = server.start_session(**start_kwargs)
+        monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend or LocalComputerBackend())
+        monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: provider)
+        response = srv_server_lifecycle.start_session(**start_kwargs)
         assert response.get("session_id"), response
         session_id = str(response["session_id"])
-        bundle = server._get_bundle(session_id)
+        bundle = srv_server_lifecycle._get_bundle(session_id)
         return session_id, bundle
 
     return factory

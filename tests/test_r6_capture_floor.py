@@ -524,10 +524,10 @@ def test_raw_key_never_reaches_outbound_paths(monkeypatch: pytest.MonkeyPatch) -
     outbound bounding never receives one (text mode never calls it; image mode
     never produces one) — a RAW payload handed to it anyway degrades to the
     original-string fail-safe, never a decode crash."""
-    import computer_use_mcp.server as server_mod
+    import computer_use_mcp.server.fetch as srv_server_fetch
 
     raw_payload = "RAW:AAAA;4x4"
-    out, mime, _scale = server_mod._bound_outbound_image(raw_payload)
+    out, mime, _scale = srv_server_fetch._bound_outbound_image(raw_payload)
     assert out == raw_payload  # fail-safe: unusable env returns the original
     # the PIL open on b64decode("AAAA") garbage raises -> caught -> original returned
     assert mime in ("image/png",)  # the degraded mimeType is the fail-safe one

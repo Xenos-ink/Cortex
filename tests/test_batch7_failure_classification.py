@@ -26,7 +26,12 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.plan_surface as srv_server_plan_surface
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.planning.plan as srv_planning_plan
 from computer_use_mcp.core.models import GroundedAction, WindowInfo
 from computer_use_mcp.planning.plan import PLAN_FAILURE_REASONS, plan_failure_reason
 from computer_use_mcp.core.state import SessionRegistry
@@ -119,10 +124,14 @@ class FollowUpExplodesBackend(ScriptedBackend):
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_plan_guard", server.PlanLeaseGuard())
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_plan_surface, "_plan_guard", srv_planning_plan.PlanLeaseGuard())
+    monkeypatch.setattr(srv_server_execute, "_plan_guard", srv_server_plan_surface._plan_guard)
+    monkeypatch.setattr(srv_server_lifecycle, "_plan_guard", srv_server_plan_surface._plan_guard)
+    yield
 
 
 def _assert_legacy_surface(payload: dict[str, Any]) -> None:
@@ -147,7 +156,7 @@ async def test_follow_up_action_exception_is_not_unclassified(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan=wire_plan(FOLLOW_UP_PLAN), approved=True, include_screenshot_after=False
         )
     )
@@ -175,7 +184,7 @@ async def test_follow_up_action_exception_is_not_unclassified(
         assert set(entry["point"]) == {"id", "x", "y"}
     assert [entry["step_index"] for entry in payload["remaining"]] == [1]
     assert payload["remaining"][0]["reason"] == "previous_step_failed"
-    assert server._plan_guard.is_active(session_id)
+    assert srv_server_plan_surface._plan_guard.is_active(session_id)
     json.dumps(payload)
 
 
@@ -188,7 +197,7 @@ async def test_follow_up_action_exception_keeps_every_legacy_key(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan=wire_plan(FOLLOW_UP_PLAN), approved=True, include_screenshot_after=False
         )
     )
@@ -222,7 +231,7 @@ async def test_mid_drag_fault_in_a_step_is_classified_not_unclassified(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan=wire_plan(DRAG_PLAN), approved=True, include_screenshot_after=False
         )
     )
@@ -235,7 +244,7 @@ async def test_mid_drag_fault_in_a_step_is_classified_not_unclassified(
         entry["kind"] == "error" and "mid-drag fault" in str(entry.get("message"))
         for entry in payload["executed_prefix"]
     ), payload["executed_prefix"]
-    assert server._plan_guard.is_active(session_id)
+    assert srv_server_plan_surface._plan_guard.is_active(session_id)
 
 
 # --- (c) the classification itself: one table entry, existing vocabulary --------------------
@@ -383,7 +392,7 @@ async def test_the_pre_batch6_scenarios_still_classify_as_before(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id,
             "done",
             plan=wire_plan(
@@ -422,7 +431,7 @@ async def test_no_flip_backend_verification_failure_still_classifies(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id,
             "done",
             plan=wire_plan(
@@ -500,7 +509,7 @@ async def test_a_dry_run_walk_terminal_is_classified_not_unclassified(
         monkeypatch, backend=backend, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
     first = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id,
             "done",
             plan=wire_plan(
@@ -516,7 +525,7 @@ async def test_a_dry_run_walk_terminal_is_classified_not_unclassified(
     )
     assert first["failure_reason"] in (PLAN_FAILURE_REASONS | {None})
     terminal = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan_action="continue", include_screenshot_after=False
         )
     )

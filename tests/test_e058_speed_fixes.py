@@ -40,7 +40,9 @@ import pytest
 from PIL import Image
 
 from computer_use_mcp.desktop import backend as backend_module
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.replies as srv_server_replies
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.backend import LocalComputerBackend
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import WindowInfo
@@ -132,7 +134,7 @@ def _decode_image(data_b64: str) -> Image.Image:
 
 
 async def _run(session_id: str, spec: dict[str, Any]) -> dict[str, Any]:
-    return execute_payload(await server.computer_execute(session_id, **spec))
+    return execute_payload(await srv_server_execute.computer_execute(session_id, **spec))
 
 
 # --- queue-premise: queue batching that works on real desktops -----------------------------------------
@@ -378,7 +380,7 @@ async def test_d10_default_executed_image_is_half_res_jpeg_within_budget(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     backend.observe_override_png = _busy_desktop_png_b64()
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     assert isinstance(result, list) and len(result) == 2
     text_block, image_block = result
     assert image_block.mimeType == "image/jpeg"
@@ -389,7 +391,7 @@ async def test_d10_default_executed_image_is_half_res_jpeg_within_budget(
     # Worst case: pure noise (no real screen looks like this; no lossy codec can
     # shrink entropy). Still bounded and far under the legacy per-action weight.
     backend.observe_override_png = _noisy_png_b64()
-    result = await server.computer_execute(session_id, "click", x=20, y=20)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=20, y=20)
     _text_block, image_block = result
     noise_bytes = len(base64.b64decode(image_block.data, validate=True))
     assert noise_bytes <= 150_000, noise_bytes
@@ -410,7 +412,7 @@ async def test_d10_include_screenshot_after_true_returns_full_resolution(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     backend.observe_override_png = _structured_png_b64()
-    result = await server.computer_execute(
+    result = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, include_screenshot_after=True
     )
     _text_block, image_block = result
@@ -428,12 +430,12 @@ async def test_d10_action_image_full_env_restores_full_res_default(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     backend.observe_override_png = _structured_png_b64()
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     _text_block, image_block = result
     assert _decode_image(image_block.data).size == (1920, 1080)
     monkeypatch.delenv(ACTION_IMAGE_FULL_ENV, raising=False)
     backend.observe_override_png = _structured_png_b64()
-    result = await server.computer_execute(session_id, "click", x=20, y=20)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=20, y=20)
     _text_block, image_block = result
     assert _decode_image(image_block.data).size == (960, 540)  # lazy re-read: default again
 
@@ -445,16 +447,16 @@ async def test_d10_text_mode_still_ships_no_images(
     ``image_delivery="text"`` mode is the slim dict with NO image block and NO
     screenshot bytes — the half-res default must not leak images into text mode."""
     backend = ScriptedBackend()
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(
         dry_run=False,
         require_approval=False,
         limits=FAST_LIMITS,
         image_delivery="text",
     )
     session_id = str(response["session_id"])
-    payload = execute_payload(await server.computer_execute(session_id, "click", x=10, y=10))
+    payload = execute_payload(await srv_server_execute.computer_execute(session_id, "click", x=10, y=10))
     assert isinstance(payload, dict)  # slim dict — never content blocks in text mode
     assert payload["ok"] is True
     assert "screenshot_after_base64" not in json.dumps(payload)
@@ -466,15 +468,15 @@ def test_d10_half_res_encoder_unit_contract() -> None:
     outbound budget still governs the result; a failed encode falls back to the
     full-resolution budget ladder (never no image)."""
     noisy = _noisy_png_b64()
-    halved = server._half_res_action_image(noisy)
+    halved = srv_server_replies._half_res_action_image(noisy)
     assert halved is not None
     data_b64, mime, applied_scale = halved
     assert mime == "image/jpeg"
     assert applied_scale == 0.5  # §1.1 D-3: the measured applied downscale
     assert _decode_image(data_b64).size == (960, 540)
-    assert len(base64.b64decode(data_b64, validate=True)) <= server._result_image_max_bytes()
+    assert len(base64.b64decode(data_b64, validate=True)) <= srv_server_replies._result_image_max_bytes()
     # Garbage input degrades to the budget ladder (None here), never raises.
-    assert server._half_res_action_image("not-base64-###") is None
+    assert srv_server_replies._half_res_action_image("not-base64-###") is None
 
 
 # --- alias-launch: ensure_app bare-name alias resolution ------------------------------------------------
@@ -512,9 +514,9 @@ async def test_d8_bare_name_resolves_through_store_alias_and_launches(
     monkeypatch.delenv("CORTEX_ATTACH_OR_LAUNCH", raising=False)
     backend = _LaunchRecordingBackend(flip=False)  # app_windows empty -> NO_INSTANCE
     backend.store_aliases.add("mspaint")
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
         allowed_processes=["mspaint.exe"],
     )
@@ -543,9 +545,9 @@ async def test_d8_unresolvable_target_never_claims_launched(
     monkeypatch.delenv("CORTEX_ATTACH_OR_LAUNCH", raising=False)
     backend = _LaunchRecordingBackend(flip=False)
     backend.launch_unresolvable.add("nosuchapp")
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
         allowed_processes=["nosuchapp.exe"],
     )

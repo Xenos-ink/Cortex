@@ -25,9 +25,11 @@ PKG = Path(__file__).resolve().parents[1] / "src" / "computer_use_mcp"
 LAYER_ORDER = ("core", "security", "desktop", "vision", "pipeline",
                "planning", "server", "cli")
 _LAYER_INDEX = {name: idx for idx, name in enumerate(LAYER_ORDER)}
-# root-level modules until WP-R2 relocates them (backend now lives in desktop/)
-_ROOT_MODULE_LAYER = {"server": "server", "cli": "cli"}
-SUBPACKAGES = ("core", "security", "desktop", "vision", "pipeline", "planning")
+# root-level modules (backend lives in desktop/; server.py became the server/
+# package at WP-R2b step 1 — intra-server layer order is guarded by
+# tests/test_server_import_order.py, not visible to this first-segment test)
+_ROOT_MODULE_LAYER = {"cli": "cli"}
+SUBPACKAGES = ("core", "security", "desktop", "vision", "pipeline", "planning", "server")
 
 #: D1 launch entries (WP-R2b plan §2/§9.3): package __init__ files allowed to
 #: carry EXACTLY one launch shim — ``def main(): from .app import main as
@@ -262,7 +264,7 @@ MOVED_MODULE_FILES = (
     "planning/resume_manager.py", "planning/context_manager.py",
     "planning/long_running.py",
 )
-ROOT_MODULE_FILES = ("__init__.py", "server.py", "cli.py")
+ROOT_MODULE_FILES = ("__init__.py", "cli.py")
 
 
 def all_package_module_relpaths() -> set[str]:
@@ -365,16 +367,20 @@ def test_selftest_launch_shim_passes_for_the_reviewed_entry() -> None:
     assert init_violations(LAUNCH_SHIM_SOURCE, relpath="server/__init__.py") == []
 
 
-def test_selftest_launch_exception_is_inert_on_the_unsplit_tree() -> None:
-    """server/ does not exist yet — no current package is a launch entry, and
-    the docstring-only guard for every existing package is unchanged."""
-    assert not (PKG / "server").exists()
+def test_selftest_launch_exception_is_live_on_the_split_tree() -> None:
+    """The split landed: server/ exists, its __init__ IS the reviewed launch
+    entry and carries EXACTLY the shim; every other package __init__ is clean
+    and is NOT a launch entry."""
+    assert (PKG / "server" / "__init__.py").is_file()
     for path in sorted(PKG.rglob("__init__.py")):
+        rel = path.relative_to(PKG).as_posix()
         if path == PKG / "__init__.py":
             continue  # the root init guard lives in test_no_bare_reexport
-        rel = path.relative_to(PKG).as_posix()
-        assert rel not in LAUNCH_ENTRY_INITS, rel
-        assert init_violations(path.read_text(encoding="utf-8"), relpath=rel) == [], rel
+        if rel in LAUNCH_ENTRY_INITS:
+            assert init_violations(path.read_text(encoding="utf-8"), relpath=rel) == [], rel
+        else:
+            assert rel not in LAUNCH_ENTRY_INITS, rel
+            assert init_violations(path.read_text(encoding="utf-8"), relpath=rel) == [], rel
 
 
 def test_selftest_any_other_statement_in_a_launch_init_fails() -> None:

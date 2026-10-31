@@ -24,7 +24,12 @@ from recording_engine import RecordingEngine
 
 import computer_use_mcp.desktop.backend as backend_module
 import computer_use_mcp.desktop.input_engine as input_engine_module
-from computer_use_mcp import server
+import computer_use_mcp.server.app as srv_server_app
+import computer_use_mcp.server.schemas as srv_server_schemas
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.pipeline.agent import ComputerUseAgent
 from computer_use_mcp.desktop.errors import CoordinateSpaceError, InputBlockedError
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
@@ -532,14 +537,14 @@ def test_verification_right_click_stated_effect_requires_change_without_focus_fl
 
 
 def _tool_meta(tool_name: str) -> Any:
-    tool = server.mcp._tool_manager.get_tool(tool_name)
+    tool = srv_server_app.mcp._tool_manager.get_tool(tool_name)
     assert tool is not None, f"tool {tool_name} not registered"
     return tool.fn_metadata
 
 
 def test_served_computer_execute_schema_advertises_right_click() -> None:
     """The WIRE contract: the served description lists right_click; the schema is plain."""
-    tool = server.mcp._tool_manager.get_tool("computer_execute")
+    tool = srv_server_app.mcp._tool_manager.get_tool("computer_execute")
     description = tool.description or ""
     assert "right_click" in description
     schema = _tool_meta("computer_execute").arg_model.model_json_schema()
@@ -550,7 +555,7 @@ def test_served_computer_execute_schema_advertises_right_click() -> None:
 
 
 def test_teaching_invalid_action_hints_right_click_for_context_menu_misnomers() -> None:
-    result = server._teaching_invalid_action(ValueError("bad"), "context_menu")
+    result = srv_server_schemas._teaching_invalid_action(ValueError("bad"), "context_menu")
     hints = " ".join(str(reason) for reason in result["reasons"])
     assert 'action="right_click"' in hints
 
@@ -559,15 +564,17 @@ def test_teaching_invalid_action_hints_right_click_for_context_menu_misnomers() 
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (mirrors integration suites)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 def _make_session(monkeypatch: pytest.MonkeyPatch, backend: Any, **start_kwargs: Any) -> str:
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: object())
-    response = server.start_session(**start_kwargs)
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: object())
+    response = srv_server_lifecycle.start_session(**start_kwargs)
     assert response.get("session_id"), response
     return str(response["session_id"])
 
@@ -611,7 +618,7 @@ async def test_server_execute_right_click_through_full_pipeline(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     result = _execute_payload(
-        await server.computer_execute(session_id, "right_click", x=400, y=300)
+        await srv_server_execute.computer_execute(session_id, "right_click", x=400, y=300)
     )
     assert result["ok"] is True, result
     assert result["action"]["action"] == "right_click"
@@ -630,7 +637,7 @@ async def test_server_rejects_right_click_out_of_bounds_typed(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     result = _execute_payload(
-        await server.computer_execute(session_id, "right_click", x=8000, y=10)
+        await srv_server_execute.computer_execute(session_id, "right_click", x=8000, y=10)
     )
     assert result["ok"] is False
     assert backend.executed == []
@@ -647,7 +654,7 @@ async def test_server_right_click_respects_approval_gate(
         monkeypatch, backend, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
     result = _execute_payload(
-        await server.computer_execute(session_id, "right_click", x=400, y=300)
+        await srv_server_execute.computer_execute(session_id, "right_click", x=400, y=300)
     )
     assert result["ok"] is False
     assert result.get("requires_approval") is True

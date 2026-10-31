@@ -18,7 +18,7 @@ from pathlib import Path
 CHILD = (
     "import time\n\n"
     "t0 = time.perf_counter()\n"
-    "import computer_use_mcp.server  # noqa: E402,F401\n\n"
+    "import computer_use_mcp.server.app  # noqa: E402,F401\n\n"
     "print(time.perf_counter() - t0)\n"
 )
 BASELINE_MEDIAN_MS = 1015.0

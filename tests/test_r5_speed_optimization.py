@@ -48,7 +48,13 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.state as srv_server_state
+import computer_use_mcp.server.fetch as srv_server_fetch
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.server.replies as srv_server_replies
 from computer_use_mcp.desktop.backend import ComputerBackend
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import Observation, WindowInfo
@@ -70,10 +76,13 @@ from computer_use_mcp.pipeline.verification import (
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (full session isolation)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_stopped_sessions", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_lifecycle, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_state, "_stopped_sessions", srv_server_lifecycle._stopped_sessions)
+    return None
 
 
 def _png_image_b64(image: Image.Image) -> str:
@@ -123,7 +132,7 @@ async def test_w1_fresh_premise_reused_as_validate_no_second_capture(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    await server.computer_execute(session_id, "click", x=10, y=10)
+    await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     events = audit_events(bundle, session_id)
     observations = [e for e in events if e["event_type"] == "observation"]
     phases = [(e.get("metadata") or {}).get("phase") for e in observations]
@@ -147,7 +156,7 @@ async def test_w1_stale_premise_not_reused_full_validate_capture_taken(
         limits=FAST_LIMITS,
     )
     monkeypatch.setenv("CORTEX_VALIDATE_REUSE_MS", "0")  # disable: every premise stale
-    await server.computer_execute(session_id, "click", x=10, y=10)
+    await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     events = audit_events(bundle, session_id)
     phases = [
         (e.get("metadata") or {}).get("phase")
@@ -181,7 +190,7 @@ async def test_w1_probe_drift_never_reuses_premise(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(session_id, "click", x=10, y=10)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     assert execute_payload(response) is not None
     events = audit_events(bundle, session_id)
     assert bundle.agent.metrics.snapshot()["counters"]["identity_probe_drift"] == 1
@@ -216,7 +225,7 @@ async def test_w1_queued_follow_ups_keep_their_fresh_validate_capture(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10,
         follow_ups=[{"action": "click", "x": 20, "y": 20}],
     )
@@ -246,7 +255,7 @@ async def test_w1_env_knob_zero_restores_full_capture(
         limits=FAST_LIMITS,
     )
     monkeypatch.setenv("CORTEX_VALIDATE_REUSE_MS", "0")
-    await server.computer_execute(session_id, "keypress", keys=["enter"])
+    await srv_server_execute.computer_execute(session_id, "keypress", keys=["enter"])
     phases = [
         (e.get("metadata") or {}).get("phase")
         for e in audit_events(bundle, session_id)
@@ -415,9 +424,9 @@ def test_w4_outbound_from_raw_frame_byte_identical() -> None:
     ladder (same budget, same qualities/scales — only the decode is skipped)."""
     png_b64, frame = _oversized_png_b64()
     decoded = base64.b64decode(png_b64, validate=True)
-    assert len(decoded) > server._result_image_max_bytes()  # ladder will run
-    slow_b64, slow_mime, _slow_scale = server._bound_outbound_image(png_b64)
-    fast_b64, fast_mime, _fast_scale = server._bound_outbound_image(png_b64, frame=frame)
+    assert len(decoded) > srv_server_replies._result_image_max_bytes()  # ladder will run
+    slow_b64, slow_mime, _slow_scale = srv_server_fetch._bound_outbound_image(png_b64)
+    fast_b64, fast_mime, _fast_scale = srv_server_fetch._bound_outbound_image(png_b64, frame=frame)
     assert slow_mime == fast_mime
     assert slow_b64 == fast_b64  # exact byte identity
 
@@ -426,7 +435,7 @@ def test_w4_png_under_budget_untouched_both_paths() -> None:
     """A PNG inside the budget is returned AS-IS on both paths (no re-encode ever)."""
     small = Image.new("RGB", (64, 48), "white")
     png_b64 = _png_image_b64(small)
-    out_b64, mime, _scale = server._bound_outbound_image(png_b64, frame=small)
+    out_b64, mime, _scale = srv_server_fetch._bound_outbound_image(png_b64, frame=small)
     assert out_b64 == png_b64 and mime == "image/png"
 
 
@@ -448,7 +457,7 @@ def test_w4_jpeg_ladder_encodes_linearly_no_reencode_storm(monkeypatch: pytest.M
         return original_save(self, *args, **kwargs)
 
     monkeypatch.setattr(Image.Image, "save", counting_save)
-    out_b64, mime, _scale = server._bound_outbound_image(png_b64, frame=frame)
+    out_b64, mime, _scale = srv_server_fetch._bound_outbound_image(png_b64, frame=frame)
     assert mime == "image/jpeg"
     assert saves, "ladder never encoded"
     # linear descent: at most one encode per step, monotonically shrinking frames,
@@ -465,9 +474,9 @@ def test_w4_jpeg_ladder_encodes_linearly_no_reencode_storm(monkeypatch: pytest.M
 def test_w4_garbage_budget_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Env-knob robustness: garbage/non-positive budgets fall back to 180 KB."""
     monkeypatch.setenv("CORTEX_RESULT_IMAGE_MAX_KB", "not-a-number")
-    assert server._result_image_max_bytes() == 180 * 1024
+    assert srv_server_replies._result_image_max_bytes() == 180 * 1024
     monkeypatch.setenv("CORTEX_RESULT_IMAGE_MAX_KB", "-5")
-    assert server._result_image_max_bytes() == 180 * 1024
+    assert srv_server_replies._result_image_max_bytes() == 180 * 1024
 
 
 # =====================================================================================

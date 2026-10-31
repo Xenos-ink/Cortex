@@ -25,7 +25,10 @@ from typing import Any
 import pytest
 from test_controller_integration import FAST_LIMITS, make_session
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.state as srv_server_state
 from computer_use_mcp.core.state import SessionRegistry
 
 TEST_SEGMENT_SECONDS = 0.2
@@ -35,18 +38,23 @@ TEST_SEGMENT_SECONDS = 0.2
 def wait_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh registries + short blocking segment (same as the w6 suite)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=16))
-    monkeypatch.setattr(server, "_WAITS_IN_FLIGHT", {})
-    monkeypatch.setattr(server, "_WAIT_TOMBSTONES", {})
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_stopped_sessions", {})
-    monkeypatch.setattr(server, "_wait_segment_seconds", lambda: TEST_SEGMENT_SECONDS)
-    yield server
-    for registry in list(server._WAITS_IN_FLIGHT.values()):
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=16))
+    monkeypatch.setattr(srv_server_wait_machine, "_WAITS_IN_FLIGHT", {})
+    monkeypatch.setattr(srv_server_wait, "_WAITS_IN_FLIGHT", srv_server_wait_machine._WAITS_IN_FLIGHT)
+    monkeypatch.setattr(srv_server_wait_machine, "_WAIT_TOMBSTONES", {})
+    monkeypatch.setattr(srv_server_wait, "_WAIT_TOMBSTONES", srv_server_wait_machine._WAIT_TOMBSTONES)
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_lifecycle, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_state, "_stopped_sessions", srv_server_lifecycle._stopped_sessions)
+    monkeypatch.setattr(srv_server_wait, "_wait_segment_seconds", lambda: TEST_SEGMENT_SECONDS)
+    yield
+    for registry in list(srv_server_wait_machine._WAITS_IN_FLIGHT.values()):
         handles = list(registry.values())
         for handle in handles:
             handle.cancel.set()
-        server._join_wait_threads(handles)
+        srv_server_wait_machine._join_wait_threads(handles)
 
 
 def test_status_on_a_second_loop_is_woken_on_its_own_loop(
@@ -64,7 +72,7 @@ def test_status_on_a_second_loop_is_woken_on_its_own_loop(
 
     # Loop A: create the wait (0.5 s > one 0.2 s segment) and let its call RETURN —
     # the reply is ``running`` + wait_id, and loop A is closed by asyncio.run.
-    first = asyncio.run(server.computer_wait(session_id, 0.5))
+    first = asyncio.run(srv_server_wait.computer_wait(session_id, 0.5))
     assert first["status"] == "running", first
     wait_id = str(first["wait_id"])
     deadline_gap = 0.5 - TEST_SEGMENT_SECONDS  # ~0.3 s of wait left when B starts
@@ -73,7 +81,7 @@ def test_status_on_a_second_loop_is_woken_on_its_own_loop(
 
     def _status_on_own_loop() -> None:
         started = time.monotonic()
-        reply = asyncio.run(server.computer_wait_status(session_id, wait_id))
+        reply = asyncio.run(srv_server_wait.computer_wait_status(session_id, wait_id))
         box["elapsed"] = time.monotonic() - started
         box["reply"] = reply
 
@@ -93,7 +101,7 @@ def test_status_on_a_second_loop_is_woken_on_its_own_loop(
     rounds = 0
     while reply["status"] == "running" and rounds < 4:
         started = time.monotonic()
-        reply = asyncio.run(server.computer_wait_status(session_id, wait_id))
+        reply = asyncio.run(srv_server_wait.computer_wait_status(session_id, wait_id))
         rounds += 1
     assert reply["status"] == "completed", reply
     assert box["elapsed"] < deadline_gap + 0.15, box["elapsed"]

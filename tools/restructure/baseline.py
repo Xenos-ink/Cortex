@@ -519,7 +519,7 @@ IMPORT_CHILD = '''"""Spawned by tools/restructure/baseline.py — fresh-interpre
 import time
 
 t0 = time.perf_counter()
-import computer_use_mcp.server  # noqa: E402,F401
+import computer_use_mcp.server.app  # noqa: E402,F401  (D6: the registration surface)
 
 print(time.perf_counter() - t0)
 '''

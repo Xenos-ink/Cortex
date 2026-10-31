@@ -28,7 +28,7 @@ from test_controller_integration import fresh_server as _shared_fresh_server_fix
 
 fresh_server = _shared_fresh_server_fixture
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.focus_guard import InterferenceGuard
 from computer_use_mcp.desktop.interference import (
@@ -139,7 +139,7 @@ def test_auto_handle_spec_shape_is_validated() -> None:
 def test_start_session_interference_param_is_trailing_optional() -> None:
     import inspect
 
-    parameters = list(inspect.signature(server.start_session).parameters.values())
+    parameters = list(inspect.signature(srv_server_lifecycle.start_session).parameters.values())
     # D1 (ORVEX-CORTEX-056-LIVEFIX): ``image_delivery`` is now the newest
     # trailing-optional parameter; ``interference`` stays trailing-optional behind it.
     assert [p.name for p in parameters][-1] == "image_delivery"
@@ -150,16 +150,16 @@ def test_start_session_interference_param_is_trailing_optional() -> None:
 
 
 def test_start_session_rejects_malformed_interference_fail_closed() -> None:
-    response = server.start_session(interference={"bogus_section": {}})
+    response = srv_server_lifecycle.start_session(interference={"bogus_section": {}})
     assert response["ok"] is False
     assert response["error"] == "invalid_interference"
     assert "bogus_section" in str(response["message"])
 
 
 def test_start_session_legacy_callers_get_protective_defaults(fresh_server: Any) -> None:
-    response = server.start_session(dry_run=True)
+    response = srv_server_lifecycle.start_session(dry_run=True)
     assert "session_id" in response  # success shape (no ok key on legacy success payloads)
-    bundle = server._get_bundle(str(response["session_id"]))
+    bundle = srv_server_lifecycle._get_bundle(str(response["session_id"]))
     policy = bundle.agent.interference
     assert isinstance(policy, InterferencePolicy)
     assert policy.focus_guard.policy == "abort"
@@ -168,11 +168,11 @@ def test_start_session_legacy_callers_get_protective_defaults(fresh_server: Any)
 
 
 def test_start_session_custom_policy_reaches_the_agent(fresh_server: Any) -> None:
-    response = server.start_session(
+    response = srv_server_lifecycle.start_session(
         dry_run=True, interference={"focus_guard": {"policy": "observe_only"}}
     )
     assert "session_id" in response
-    bundle = server._get_bundle(str(response["session_id"]))
+    bundle = srv_server_lifecycle._get_bundle(str(response["session_id"]))
     assert bundle.agent.interference.focus_guard.policy == "observe_only"
     assert bundle.extra["interference_policy"] is bundle.agent.interference
 

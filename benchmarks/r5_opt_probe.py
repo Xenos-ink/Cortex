@@ -173,16 +173,17 @@ def main() -> int:
     png_b64 = base64.b64encode(png_bytes).decode("ascii")
 
     cur_bound_ms = []
-    from computer_use_mcp import server as srv
+    import computer_use_mcp.server.replies as srv_server_replies
+    import computer_use_mcp.server.fetch as srv_server_fetch
 
     for _ in range(iters):
         t0 = time.perf_counter()
-        srv._bound_outbound_image(png_b64)
+        srv_server_fetch._bound_outbound_image(png_b64)
         cur_bound_ms.append((time.perf_counter() - t0) * 1000.0)
     fmt("P5 current outbound (b64dec+PNGdec+JPEG)", _ms(cur_bound_ms))
 
     raw_jpeg_ms = []
-    budget = srv._result_image_max_bytes()
+    budget = srv_server_replies._result_image_max_bytes()
     for _ in range(iters):
         t0 = time.perf_counter()
         img = Image.frombytes("RGB", shot.size, rgb_bytes)

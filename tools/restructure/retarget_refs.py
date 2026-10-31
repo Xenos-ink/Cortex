@@ -28,8 +28,10 @@ Rules (Commander DELTA 1, R1-R8):
   input that is already unparsable), NOTHING is written and the CLI exits
   non-zero listing every problem.
 - R8 Builtin ``setattr`` extras use builtin setattr; raw/quoted string targets
-  keep their original quote; ast byte-offset columns are used for slicing only
-  on pure-ASCII lines (a non-ASCII edited line is a refusal).
+  keep their original quote; ast byte-offset columns are converted to character
+  offsets on every edited line, so non-ASCII lines are handled correctly
+  (only a line whose bytes do not decode as UTF-8 — impossible after the
+  decode above — would be a refusal).
 
 Also rewrites dotted string patch targets and ``from computer_use_mcp.server
 import X`` lines; inserts the needed ``import <module> as srv_<dotted_path>``
@@ -178,7 +180,11 @@ def retarget_source(
     import_stmts: list[ast.stmt] = [
         node for node in ast.walk(tree)
         if (isinstance(node, ast.Import)
-            and any(a.name == SERVER or (a.name == PKG and a.asname)
+            and any(a.name == SERVER or (a.name == PKG and a.asname
+                                         # a generated `import <pkg> as srv_<pkg>`
+                                         # (the w1 package-root override) is this
+                                         # tool's own output, not an old import
+                                         and not a.asname.startswith(ALIAS_PREFIX))
                     for a in node.names))
         or (isinstance(node, ast.ImportFrom) and node.level == 0
             and node.module == PKG and any(a.name == "server" for a in node.names))
@@ -295,10 +301,11 @@ def retarget_source(
         entry, kind = got
         suffix = "." + ".".join(tail) if tail else ""
         alias = require_module(primary_of(entry), node)  # R1/R3: references only
+        imported = entry.get("member", name)
         if kind == "module":
             replace(node, alias + suffix, "read")
         else:
-            replace(node, alias + "." + name + suffix, "read")
+            replace(node, alias + "." + imported + suffix, "read")
         readers = entry.get("readers") or []
         if isinstance(node.ctx, ast.Store) and len(readers) > 1:
             # plain-assignment rebind: R2 same-object extras (assign form)
@@ -368,7 +375,7 @@ def retarget_source(
                         if kind == "module":
                             replace(node, alias, "read")
                         else:
-                            replace(node, f"{alias}.{name_node.value}", "read")
+                            replace(node, f"{alias}.{entry.get('member', name_node.value)}", "read")
                     continue
                 refuse(node, "getattr on the server module with a non-constant name")
                 continue

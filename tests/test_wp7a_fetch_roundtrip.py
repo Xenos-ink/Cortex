@@ -33,7 +33,12 @@ from test_controller_integration import (
 )
 from test_w2_evidence_store import fetch_metadata, image_blocks
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.server.fetch as srv_server_fetch
 from computer_use_mcp.core.state import SessionRegistry
 
 
@@ -41,9 +46,11 @@ from computer_use_mcp.core.state import SessionRegistry
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same as the controller suite)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 def asyncio_run_tool(coroutine: Any) -> Any:
@@ -79,7 +86,7 @@ def test_a_default_execute_reply_publishes_an_id_whose_fetch_serves_the_same_pic
         limits=FAST_LIMITS,
     )
     result = asyncio_run_tool(
-        server.computer_execute(session_id, "click", x=10, y=10, approved=True)
+        srv_server_execute.computer_execute(session_id, "click", x=10, y=10, approved=True)
     )
     payload = execute_payload(result)
     assert payload["ok"] is True, payload
@@ -93,7 +100,7 @@ def test_a_default_execute_reply_publishes_an_id_whose_fetch_serves_the_same_pic
     assert payload["image_format"] == "image/jpeg"
     assert payload["image_outbound_scale"] == 0.5
 
-    fetched = asyncio_run_tool(server.computer_fetch_image(session_id, image_id))
+    fetched = asyncio_run_tool(srv_server_fetch.computer_fetch_image(session_id, image_id))
     meta = fetch_metadata(fetched)
     validate_reply(meta, "fetch_image")
     fetched_blocks = image_blocks(fetched)
@@ -126,10 +133,10 @@ def test_a_raw_capture_fetches_with_a_normalized_visual_view_of_none(
         limits=FAST_LIMITS,
     )
     result = asyncio_run_tool(
-        server.computer_execute(session_id, "click", x=10, y=10, approved=True)
+        srv_server_execute.computer_execute(session_id, "click", x=10, y=10, approved=True)
     )
     image_id = execute_payload(result)["image_id"]
-    meta = fetch_metadata(asyncio_run_tool(server.computer_fetch_image(session_id, image_id)))
+    meta = fetch_metadata(asyncio_run_tool(srv_server_fetch.computer_fetch_image(session_id, image_id)))
     assert meta["ok"] is True
     assert meta["visual_view"] is None
 
@@ -145,7 +152,7 @@ def _visual_view_rule_session(
         require_approval=False,
         limits=FAST_LIMITS,
     )
-    reply = server.computer_observe(session_id, **observe_kwargs)
+    reply = srv_server_observe.computer_observe(session_id, **observe_kwargs)
     from test_w2_evidence_store import observe_metadata
 
     return session_id, observe_metadata(reply)
@@ -163,7 +170,7 @@ def test_an_explicit_raw_observe_stores_visual_view_none(
     assert meta["visual_view"] == "raw"  # the reply's view marker (caller-facing)
     image_id = meta["image_id"]
     fetched = fetch_metadata(
-        asyncio_run_tool(server.computer_fetch_image(session_id, image_id))
+        asyncio_run_tool(srv_server_fetch.computer_fetch_image(session_id, image_id))
     )
     assert fetched["ok"] is True
     assert fetched["visual_view"] is None  # the STORED frame: normalized None
@@ -175,7 +182,7 @@ def test_a_default_observe_stores_visual_view_none(
     session_id, meta = _visual_view_rule_session(monkeypatch)
     image_id = meta["image_id"]
     fetched = fetch_metadata(
-        asyncio_run_tool(server.computer_fetch_image(session_id, image_id))
+        asyncio_run_tool(srv_server_fetch.computer_fetch_image(session_id, image_id))
     )
     assert fetched["ok"] is True
     assert fetched["visual_view"] is None
@@ -198,13 +205,13 @@ def test_a_default_zoom_stores_visual_view_none(
         require_approval=False,
         limits=FAST_LIMITS,
     )
-    reply = server.computer_zoom(session_id, [8, 8, 32, 16])
+    reply = srv_server_observe.computer_zoom(session_id, [8, 8, 32, 16])
     zoom_meta = observe_metadata(reply)
     image_id = zoom_meta.get("image_id")
     assert image_id, zoom_meta
     assert zoom_meta["visual_view"] == "raw"  # the reply's caller-facing marker
     fetched = fetch_metadata(
-        asyncio_run_tool(server.computer_fetch_image(session_id, image_id))
+        asyncio_run_tool(srv_server_fetch.computer_fetch_image(session_id, image_id))
     )
     assert fetched["ok"] is True
     assert fetched["visual_view"] is None

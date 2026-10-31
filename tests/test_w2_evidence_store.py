@@ -55,9 +55,25 @@ from test_controller_integration import (  # noqa: F401 - pytest fixture import
 
 from computer_use_mcp import cli as cli_module
 from computer_use_mcp.vision import evidence as evidence_module
-from computer_use_mcp import server
+import computer_use_mcp.server.fetch as srv_server_fetch
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.vision.visual_views as srv_vision_visual_views
+import computer_use_mcp.server.app as srv_server_app
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.server.state as srv_server_state
 
-SERVER_PATH = Path(server.__file__)
+SERVER_PATH = Path(srv_server_fetch.__file__)
+# WP-R2b step-1 (Commander rule): server.py is now a PACKAGE. Every NEGATIVE
+# source scan covers ALL server/*.py sources (sorted); every POSITIVE check
+# points at the module that actually holds the text.
+ALL_SERVER_MODULES = sorted(SERVER_PATH.parent.glob("*.py"))
+
+
+def _all_server_source() -> str:
+    return "\n".join(
+        path.read_text(encoding="utf-8") for path in ALL_SERVER_MODULES
+    )
 
 #: The shipped retention bounds, restated here as literals so a silent change to a
 #: constant fails a test instead of quietly re-scoping the policy.
@@ -167,7 +183,7 @@ def _run(coro: Any) -> Any:
 def fetch_result(session_id: str, image_id: str) -> Any:
     """The fetch tool (ASYNC since DELTA 1 / VAL-WP5 F5) awaited from a SYNC test
     body or a worker thread via a private loop."""
-    return asyncio.run(server.computer_fetch_image(session_id, image_id))
+    return asyncio.run(srv_server_fetch.computer_fetch_image(session_id, image_id))
 
 
 def _assert_fetch_rejection(reply: Any, token: str) -> dict[str, Any]:
@@ -323,7 +339,7 @@ def test_a_text_session_reply_stores_nothing_and_carries_no_evidence_keys(
     store = store_of(bundle)
     assert store.image_delivery == "text"
 
-    metadata = observe_metadata(server.computer_observe(session_id))
+    metadata = observe_metadata(srv_server_observe.computer_observe(session_id))
     assert metadata["image_format"] == "none"
     for key in (
         "image_stored",
@@ -359,7 +375,7 @@ def test_evidence_store_key_is_written_at_bundle_construction(
     assert store.session_id == session_id
     assert store.disposed is False
     assert store.frame_count == 0
-    assert evidence_module.EVIDENCE_STORE_KEY in server._bundles[session_id].extra
+    assert evidence_module.EVIDENCE_STORE_KEY in srv_server_lifecycle._bundles[session_id].extra
 
 
 def test_stop_session_disposes_the_store_and_empties_it(
@@ -371,10 +387,10 @@ def test_stop_session_disposes_the_store_and_empties_it(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     store = store_of(bundle)
-    server.computer_observe(session_id)
+    srv_server_observe.computer_observe(session_id)
     assert store.frame_count == 1
 
-    _run(server.stop_session(session_id))
+    _run(srv_server_lifecycle.stop_session(session_id))
     assert "evidence_store" not in bundle.extra
     assert store.disposed is True
     assert store.frame_count == 0
@@ -409,18 +425,18 @@ def test_stop_during_computer_execute_does_not_resurrect_the_store(
             message = super().execute(action, stop)
             if not self.stopped_once:
                 self.stopped_once = True
-                server._close_stopped_bundle(target, server._bundles[target], source="stop_session")
+                srv_server_lifecycle._close_stopped_bundle(target, srv_server_lifecycle._bundles[target], source="stop_session")
             return message
 
         stopped_once = False
 
     target = session_id
     backend = _StopsItselfBackend()
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
     bundle.backend = backend
     bundle.agent.backend = backend  # the agent holds the same backend reference
 
-    result = _run(server.computer_execute(session_id, "click", x=10, y=10, approved=True))
+    result = _run(srv_server_execute.computer_execute(session_id, "click", x=10, y=10, approved=True))
     payload = execute_payload(result)
     assert backend.stopped_once is True, "the teardown must have landed mid-execute"
     assert "image_id" not in payload
@@ -428,8 +444,8 @@ def test_stop_during_computer_execute_does_not_resurrect_the_store(
     assert "evidence_store" not in bundle.extra
     assert store.disposed is True
     assert store.frame_count == 0
-    with pytest.raises(server._StoppedSession):
-        server._get_live_bundle(session_id)
+    with pytest.raises(srv_server_state._StoppedSession):
+        srv_server_lifecycle._get_live_bundle(session_id)
 
 
 def test_the_hook_never_creates_a_store_that_is_not_there(
@@ -462,11 +478,11 @@ async def test_the_mandatory_scenario_observe_to_id_to_fetch(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    first = observe_metadata(server.computer_observe(session_id))
+    first = observe_metadata(srv_server_observe.computer_observe(session_id))
     image_id = first["image_id"]
     assert image_id.startswith("img_")
 
-    fetched = await server.computer_fetch_image(session_id, image_id)
+    fetched = await srv_server_fetch.computer_fetch_image(session_id, image_id)
     validate_reply(fetch_metadata(fetched), "fetch_image")
     blocks = image_blocks(fetched)
     assert len(blocks) == 1
@@ -491,9 +507,9 @@ async def test_fetch_twice_returns_byte_identical_bytes(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    image_id = observe_metadata(server.computer_observe(session_id))["image_id"]
-    one = await server.computer_fetch_image(session_id, image_id)
-    two = await server.computer_fetch_image(session_id, image_id)
+    image_id = observe_metadata(srv_server_observe.computer_observe(session_id))["image_id"]
+    one = await srv_server_fetch.computer_fetch_image(session_id, image_id)
+    two = await srv_server_fetch.computer_fetch_image(session_id, image_id)
     assert image_blocks(one)[0].data == image_blocks(two)[0].data
     assert image_blocks(one)[0].mimeType == image_blocks(two)[0].mimeType
     assert fetch_metadata(one)["image_id"] == fetch_metadata(two)["image_id"]
@@ -508,16 +524,16 @@ async def test_a_png_under_budget_is_stored_and_served_untouched(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    server.computer_observe(session_id)
+    srv_server_observe.computer_observe(session_id)
     store = store_of(bundle)
     stored = store.frames()[0]
     assert stored.image_base64 == backend.observed[-1].image_base64
     image_id = stored.image_id
-    served = image_blocks(await server.computer_fetch_image(session_id, image_id))[0]
+    served = image_blocks(await srv_server_fetch.computer_fetch_image(session_id, image_id))[0]
     assert served.mimeType == "image/png"
     assert served.data == stored.image_base64
     assert (
-        fetch_metadata(await server.computer_fetch_image(session_id, image_id))["image_outbound_scale"]
+        fetch_metadata(await srv_server_fetch.computer_fetch_image(session_id, image_id))["image_outbound_scale"]
         is None
     )
 
@@ -533,7 +549,7 @@ async def test_an_executed_reply_that_carries_the_image_stores_and_names_it(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "click", x=10, y=10, approved=True)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, approved=True)
     assert len(image_blocks(result)) == 1
     payload = execute_payload(result)
     assert payload["image_stored"] is True
@@ -542,7 +558,7 @@ async def test_an_executed_reply_that_carries_the_image_stores_and_names_it(
     assert payload["evidence_retention"]["max_frames"] == EXPECTED_MAX_FRAMES
     assert "computer_fetch_image" in payload["evidence_fetch"]
     assert store_of(bundle).lookup(payload["image_id"]).outcome == "found"
-    fetched = await server.computer_fetch_image(session_id, payload["image_id"])
+    fetched = await srv_server_fetch.computer_fetch_image(session_id, payload["image_id"])
     assert len(image_blocks(fetched)) == 1
 
 
@@ -560,7 +576,7 @@ async def test_a_reply_that_carries_no_image_stores_nothing(
     store = store_of(bundle)
 
     opted_out = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, approved=True, include_screenshot_after=False
         )
     )
@@ -569,7 +585,7 @@ async def test_a_reply_that_carries_no_image_stores_nothing(
         assert key not in opted_out, key
 
     rejected = execute_payload(
-        await server.computer_execute(session_id, "drag", x=10, y=10, approved=True)
+        await srv_server_execute.computer_execute(session_id, "drag", x=10, y=10, approved=True)
     )
     assert rejected["ok"] is False
     for key in ("image_stored", "image_id", "evidence_fetch"):
@@ -596,7 +612,7 @@ def _observe_text_session(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
         limits=FAST_LIMITS,
         image_delivery="text",
     )
-    return server.computer_observe(session_id)
+    return srv_server_observe.computer_observe(session_id)
 
 
 # --- the four distinguishable fetch outcomes ------------------------------------------------
@@ -608,7 +624,7 @@ async def test_unknown_image_id_reports_image_not_found(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    reply = await server.computer_fetch_image(session_id, "img_0000000000000000")
+    reply = await srv_server_fetch.computer_fetch_image(session_id, "img_0000000000000000")
     _assert_fetch_rejection(reply, "image_not_found")
     assert "img_0000000000000000" not in json.dumps(reply)
 
@@ -624,7 +640,7 @@ def test_foreign_session_id_is_byte_identical_to_unknown(
     second, _b2, _be2, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    foreign_id = observe_metadata(server.computer_observe(first))["image_id"]
+    foreign_id = observe_metadata(srv_server_observe.computer_observe(first))["image_id"]
 
     unknown = fetch_result(second, "img_deadbeefdeadbeef")
     foreign = fetch_result(second, foreign_id)
@@ -638,7 +654,7 @@ def test_expired_image_id_reports_image_expired_naming_the_policy(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    image_id = observe_metadata(server.computer_observe(session_id))["image_id"]
+    image_id = observe_metadata(srv_server_observe.computer_observe(session_id))["image_id"]
     store = store_of(bundle)
     # Retire it through the REAL count cap: deterministic, no clock needed.
     _retire_by_count_cap(store, image_id)
@@ -662,9 +678,9 @@ async def test_expired_by_the_age_cap_reports_the_age_policy(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    image_id = observe_metadata(server.computer_observe(session_id))["image_id"]
+    image_id = observe_metadata(srv_server_observe.computer_observe(session_id))["image_id"]
     clock.advance(EXPECTED_MAX_AGE_SECONDS + 1.0)
-    reply = await server.computer_fetch_image(session_id, image_id)
+    reply = await srv_server_fetch.computer_fetch_image(session_id, image_id)
     _assert_fetch_rejection(reply, "image_expired")
     assert reply["retired_by"] == "age_cap"
     assert "3600" in reply["message"]
@@ -676,8 +692,8 @@ def test_fetch_on_a_stopped_session_reports_session_stopped(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    image_id = observe_metadata(server.computer_observe(session_id))["image_id"]
-    _run(server.stop_session(session_id))
+    image_id = observe_metadata(srv_server_observe.computer_observe(session_id))["image_id"]
+    _run(srv_server_lifecycle.stop_session(session_id))
     reply = fetch_result(session_id, image_id)
     assert isinstance(reply, dict)
     assert reply["ok"] is False
@@ -703,7 +719,7 @@ def test_a_disposed_store_on_a_live_bundle_reports_store_disposed(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    image_id = observe_metadata(server.computer_observe(session_id))["image_id"]
+    image_id = observe_metadata(srv_server_observe.computer_observe(session_id))["image_id"]
     evidence_module.dispose_store(bundle.extra)  # simulate the mid-teardown state
     reply = fetch_result(session_id, image_id)
     _assert_fetch_rejection(reply, "store_disposed")
@@ -718,7 +734,7 @@ def test_frame_too_large_is_a_typed_fail_closed_fetch_refusal(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    image_id = observe_metadata(server.computer_observe(session_id))["image_id"]
+    image_id = observe_metadata(srv_server_observe.computer_observe(session_id))["image_id"]
     store = store_of(bundle)
     store.max_bytes = 10  # shrink the ceiling AFTER the frame was legitimately stored
     reply = fetch_result(session_id, image_id)
@@ -734,9 +750,9 @@ async def test_a_malformed_image_id_is_byte_identical_to_an_unknown_one(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    unknown = await server.computer_fetch_image(session_id, "img_0000000000000000")
+    unknown = await srv_server_fetch.computer_fetch_image(session_id, "img_0000000000000000")
     for value in ("", "   ", "not-an-id", 12345, None, ["img_x"]):
-        other = await server.computer_fetch_image(session_id, value)  # type: ignore[arg-type]
+        other = await srv_server_fetch.computer_fetch_image(session_id, value)  # type: ignore[arg-type]
         assert json.dumps(other, sort_keys=True) == json.dumps(unknown, sort_keys=True), value
     _assert_fetch_rejection(unknown, "image_not_found")
 
@@ -768,7 +784,7 @@ async def test_an_observe_grid_reply_stores_and_fetches_the_carried_grid_bytes(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    blocks = server.computer_observe(session_id, visual_view="grid")
+    blocks = srv_server_observe.computer_observe(session_id, visual_view="grid")
     reply_meta = observe_metadata(blocks)
     assert reply_meta["visual_view"] == "grid"
     assert len(image_blocks(blocks)) == 1
@@ -777,14 +793,14 @@ async def test_an_observe_grid_reply_stores_and_fetches_the_carried_grid_bytes(
     store = store_of(bundle)
     stored = store.frames()[0]
     assert stored.visual_view == "grid"
-    view_provider = server.resolve_view("grid")
-    derived = view_provider.derive(backend.observed[-1], density=server.resolve_density(None))
-    assert stored.image_base64 == server.encode_png_b64(derived.image)
+    view_provider = srv_vision_visual_views.resolve_view("grid")
+    derived = view_provider.derive(backend.observed[-1], density=srv_vision_visual_views.resolve_density(None))
+    assert stored.image_base64 == srv_vision_visual_views.encode_png_b64(derived.image)
     assert stored.image_base64 != backend.observed[-1].image_base64, (
         "the derived grid bytes must differ from the raw capture"
     )
 
-    fetched = await server.computer_fetch_image(session_id, reply_meta["image_id"])
+    fetched = await srv_server_fetch.computer_fetch_image(session_id, reply_meta["image_id"])
     fetched_meta = fetch_metadata(fetched)
     validate_reply(fetched_meta, "fetch_image")
     # Byte-identity: same pre-ladder input, same outbound ladder, same bytes.
@@ -803,7 +819,7 @@ async def test_an_execute_grid_reply_stores_and_fetches_the_carried_view_bytes(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    blocks = await server.computer_execute(
+    blocks = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -828,7 +844,7 @@ async def test_an_execute_grid_reply_stores_and_fetches_the_carried_view_bytes(
         stored.image_base64 != observation.image_base64 for observation in backend.observed
     ), "the stored bytes must be the derived view, never a raw capture"
 
-    fetched = await server.computer_fetch_image(session_id, payload["image_id"])
+    fetched = await srv_server_fetch.computer_fetch_image(session_id, payload["image_id"])
     fetched_meta = fetch_metadata(fetched)
     validate_reply(fetched_meta, "fetch_image")
     assert image_blocks(fetched)[0].data == image_blocks(blocks)[0].data
@@ -854,8 +870,8 @@ def test_a_late_spatial_text_failure_stores_nothing(
     def _explode(*args: Any, **kwargs: Any) -> None:
         raise VisualViewError("forced after-capture failure")
 
-    monkeypatch.setattr(server, "_spatial_text_for", _explode)
-    reply = server.computer_observe(session_id, visual_view="grid")
+    monkeypatch.setattr(srv_server_observe, "_spatial_text_for", _explode)
+    reply = srv_server_observe.computer_observe(session_id, visual_view="grid")
     assert isinstance(reply, dict)
     assert reply["error"] == "view_derive_failed"
     assert "image_id" not in reply
@@ -881,11 +897,15 @@ def test_the_two_wp7_seam_markers_exist_exactly_once() -> None:
       seam tokens and the presence of the wired helpers.
     The pinned PROPERTY — exactly one implemented evidence/fetch site, no
     duplicated seam — is unchanged and unchanged in strength."""
-    source = SERVER_PATH.read_text(encoding="utf-8")
-    assert source.count("WP7b-SEAM(fetch-lease)") == 0
-    assert source.count("WP7b-SEAM(evidence-by-backend)") == 0
-    assert "def _plan_evidence(" in source
-    assert "S-04 (WP7b, wired)" in source
+    union = _all_server_source()
+    assert union.count("WP7b-SEAM(fetch-lease)") == 0
+    assert union.count("WP7b-SEAM(evidence-by-backend)") == 0
+    # the positive pins name their holding modules (WP-R2b split):
+    # _plan_evidence lives in plan_surface.py, the wired comment in fetch.py
+    assert "def _plan_evidence(" in (SERVER_PATH.parent / "plan_surface.py").read_text(
+        encoding="utf-8"
+    )
+    assert "S-04 (WP7b, wired)" in SERVER_PATH.read_text(encoding="utf-8")
 
 
 def test_the_store_read_api_for_evidence_by_backend_exists_and_is_backend_agnostic() -> None:
@@ -913,8 +933,9 @@ def test_the_store_read_api_for_evidence_by_backend_exists_and_is_backend_agnost
         "visual_view",
     }
     assert "image_base64" not in json.dumps(captures)
-    # No fake-only backend reads in the evidence path (S-03): the hooks read the store.
-    source = SERVER_PATH.read_text(encoding="utf-8")
+    # No fake-only backend reads in the evidence path (S-03): the hooks read the
+    # store — scanned across the WHOLE server package (WP-R2b split).
+    source = _all_server_source()
     assert "backend.executed" not in source
     assert "backend.observed" not in source
 
@@ -933,12 +954,12 @@ def test_captures_are_filled_on_any_backend(
             require_approval=False,
             limits=FAST_LIMITS,
         )
-        metadata = observe_metadata(server.computer_observe(session_id))
+        metadata = observe_metadata(srv_server_observe.computer_observe(session_id))
         store = store_of(bundle)
         assert store.frame_count == 1
         assert metadata["image_id"] in [entry["image_id"] for entry in store.captures()]
         assert len(image_blocks(fetch_result(session_id, metadata["image_id"]))) == 1
-        _run(server.stop_session(session_id))
+        _run(srv_server_lifecycle.stop_session(session_id))
 
 
 # --- the wire contract ----------------------------------------------------------------------
@@ -947,12 +968,12 @@ def test_captures_are_filled_on_any_backend(
 def test_fetch_image_publishes_no_output_schema(fresh_server: Any) -> None:
     """The reply is a content-block list, so the annotation MUST be ``Any``.
     ``-> dict[str, object]`` on such a tool crashes the SDK in ``convert_result``."""
-    meta = server.mcp._tool_manager.get_tool("computer_fetch_image")
+    meta = srv_server_app.mcp._tool_manager.get_tool("computer_fetch_image")
     assert meta is not None
     assert meta.fn_metadata.output_model is None
     assert meta.fn_metadata.output_schema is None
     assert "outputSchema" not in json.dumps(meta.parameters)
-    annotation = server.computer_fetch_image.__annotations__["return"]
+    annotation = srv_server_fetch.computer_fetch_image.__annotations__["return"]
     assert annotation in (Any, "Any", "typing.Any"), annotation
     assert "dict" not in str(annotation), (
         "a dict annotation on a content-block-returning tool is the D3 crash shape"
@@ -963,8 +984,8 @@ def test_fetch_image_is_an_async_def_with_plain_parameters(fresh_server: Any) ->
     """Two required non-nullable strings keep the schema free of anyOf/$ref.
     (WP5 DELTA 1 / VAL-WP5 F5: the tool is now ASYNC — the PIL re-encode ladder runs
     off the loop via asyncio.to_thread; the advertised schema is unchanged.)"""
-    assert inspect.iscoroutinefunction(server.computer_fetch_image)
-    meta = server.mcp._tool_manager.get_tool("computer_fetch_image")
+    assert inspect.iscoroutinefunction(srv_server_fetch.computer_fetch_image)
+    meta = srv_server_app.mcp._tool_manager.get_tool("computer_fetch_image")
     schema_text = json.dumps(meta.fn_metadata.arg_model.model_json_schema())
     assert "anyOf" not in schema_text
     assert "$ref" not in schema_text and "$defs" not in schema_text
@@ -973,7 +994,7 @@ def test_fetch_image_is_an_async_def_with_plain_parameters(fresh_server: Any) ->
 
 async def test_the_served_surface_is_ten_tools() -> None:
     """WP5 restates the two tool-count pins to 10, never deletes them."""
-    names = {tool.name for tool in await server.mcp.list_tools()}
+    names = {tool.name for tool in await srv_server_app.mcp.list_tools()}
     assert len(names) == 10, sorted(names)
     assert "computer_fetch_image" in names
     assert cli_module.EXPECTED_TOOLS == names
@@ -993,8 +1014,8 @@ def test_two_sessions_store_and_fetch_independently(
     second, bundle_b, _be_b, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    ids_a = [observe_metadata(server.computer_observe(first))["image_id"] for _ in range(3)]
-    ids_b = [observe_metadata(server.computer_observe(second))["image_id"] for _ in range(3)]
+    ids_a = [observe_metadata(srv_server_observe.computer_observe(first))["image_id"] for _ in range(3)]
+    ids_b = [observe_metadata(srv_server_observe.computer_observe(second))["image_id"] for _ in range(3)]
     assert not set(ids_a) & set(ids_b)
     assert store_of(bundle_a) is not store_of(bundle_b)
     for image_id in ids_a:
@@ -1004,7 +1025,7 @@ def test_two_sessions_store_and_fetch_independently(
     for image_id in ids_b:
         assert image_blocks(fetch_result(second, image_id))
     # Stopping one session must not touch the other.
-    _run(server.stop_session(first))
+    _run(srv_server_lifecycle.stop_session(first))
     assert store_of(bundle_b).disposed is False
     assert image_blocks(fetch_result(second, ids_b[0]))
 
@@ -1023,7 +1044,7 @@ def test_concurrent_stores_and_fetches_stay_bounded_and_consistent(
     def worker(session_id: str) -> None:
         try:
             for _ in range(per_session):
-                image_id = observe_metadata(server.computer_observe(session_id))["image_id"]
+                image_id = observe_metadata(srv_server_observe.computer_observe(session_id))["image_id"]
                 if not image_blocks(fetch_result(session_id, image_id)):
                     errors.append(f"{session_id}: fetch returned no image for {image_id}")
         except Exception as exc:  # noqa: BLE001 - the point of the soak
@@ -1037,7 +1058,7 @@ def test_concurrent_stores_and_fetches_stay_bounded_and_consistent(
     assert all(not thread.is_alive() for thread in threads)
     assert errors == []
     for session_id in sessions:
-        store = store_of(server._get_bundle(session_id))
+        store = store_of(srv_server_lifecycle._get_bundle(session_id))
         assert store.frame_count == per_session
         assert store.frame_count <= EXPECTED_MAX_FRAMES
         assert store.total_bytes <= EXPECTED_MAX_BYTES
@@ -1053,7 +1074,7 @@ def test_a_fetch_racing_stop_session_never_serves_a_disposed_frame(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     store = store_of(bundle)
-    ids = [observe_metadata(server.computer_observe(session_id))["image_id"] for _ in range(8)]
+    ids = [observe_metadata(srv_server_observe.computer_observe(session_id))["image_id"] for _ in range(8)]
     outcomes: list[Any] = []
     failures: list[str] = []
     barrier = threading.Barrier(2)
@@ -1069,7 +1090,7 @@ def test_a_fetch_racing_stop_session_never_serves_a_disposed_frame(
     def stopper() -> None:
         try:
             barrier.wait(timeout=10)
-            _run(server.stop_session(session_id))
+            _run(srv_server_lifecycle.stop_session(session_id))
         except Exception as exc:  # noqa: BLE001
             failures.append(f"stop: {type(exc).__name__}: {exc}")
 
@@ -1109,11 +1130,11 @@ def test_a_store_reference_held_across_a_stop_is_empty_and_refuses(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     held = store_of(bundle)
-    image_id = observe_metadata(server.computer_observe(session_id))["image_id"]
+    image_id = observe_metadata(srv_server_observe.computer_observe(session_id))["image_id"]
     assert image_blocks(fetch_result(session_id, image_id))
     assert held.frame_count == 1
 
-    _run(server.stop_session(session_id))
+    _run(srv_server_lifecycle.stop_session(session_id))
     assert held.disposed is True
     assert held.frame_count == 0
     assert held.total_bytes == 0

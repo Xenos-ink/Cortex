@@ -46,7 +46,12 @@ from test_controller_integration import (
 
 from computer_use_mcp.pipeline import agent as agent_module
 from computer_use_mcp.planning import plan as plan_module
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.plan_surface as srv_server_plan_surface
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.planning.plan as srv_planning_plan
 from computer_use_mcp.desktop.focus_guard import GuardVerdict
 from computer_use_mcp.core.models import FailureClass, WindowInfo
 from computer_use_mcp.planning.plan import PLAN_FAILURE_REASONS, plan_failure_reason
@@ -61,9 +66,22 @@ def wire_plan(plan):
 
 _PACKAGE_DIR = Path(agent_module.__file__).resolve().parent
 
+_SERVER_PKG_DIR = _PACKAGE_DIR.parent / "server"
+
 
 def _parse(name: str) -> ast.Module:
     return ast.parse((_PACKAGE_DIR / name).read_text(encoding="utf-8"))
+
+
+def _parse_server_sources() -> list[ast.Module]:
+    """Every module of the split ``server/`` package, sorted (WP-R2b step-1).
+
+    The old monolith ``../server.py`` is now a package; the literal universe is
+    the UNION over all of its modules, so nothing that moved can drop out."""
+    return [
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for path in sorted(_SERVER_PKG_DIR.glob("*.py"))
+    ]
 
 
 # --- (A) the literal universe, extracted from the real source ------------------------------
@@ -145,32 +163,33 @@ def _reply_error_literals() -> set[str]:
     scans both builders, not ``_plan_response`` alone.
     """
     found: set[str] = set()
-    for node in ast.walk(_parse("../server.py")):
-        if not (
-            isinstance(node, ast.FunctionDef)
-            and node.name in ("_plan_response", "_plan_exception_response")
-        ):
-            continue
-        for inner in ast.walk(node):
-            if isinstance(inner, ast.Assign) and len(inner.targets) == 1:
-                target = inner.targets[0]
-                if (
-                    isinstance(target, ast.Subscript)
-                    and isinstance(target.slice, ast.Constant)
-                    and target.slice.value == "error"
-                    and isinstance(inner.value, ast.Constant)
-                    and isinstance(inner.value.value, str)
-                ):
-                    found.add(inner.value.value)
-            if isinstance(inner, ast.Assign) and isinstance(inner.value, ast.Dict):
-                for key, value in zip(inner.value.keys, inner.value.values):
+    for tree in _parse_server_sources():
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.FunctionDef)
+                and node.name in ("_plan_response", "_plan_exception_response")
+            ):
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Assign) and len(inner.targets) == 1:
+                    target = inner.targets[0]
                     if (
-                        isinstance(key, ast.Constant)
-                        and key.value == "error"
-                        and isinstance(value, ast.Constant)
-                        and isinstance(value.value, str)
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.slice, ast.Constant)
+                        and target.slice.value == "error"
+                        and isinstance(inner.value, ast.Constant)
+                        and isinstance(inner.value.value, str)
                     ):
-                        found.add(value.value)
+                        found.add(inner.value.value)
+                if isinstance(inner, ast.Assign) and isinstance(inner.value, ast.Dict):
+                    for key, value in zip(inner.value.keys, inner.value.values):
+                        if (
+                            isinstance(key, ast.Constant)
+                            and key.value == "error"
+                            and isinstance(value, ast.Constant)
+                            and isinstance(value.value, str)
+                        ):
+                            found.add(value.value)
     return found
 
 
@@ -195,8 +214,8 @@ def _failure_reason_literals() -> set[str]:
             _harvest(node.body)
             _harvest(node.orelse)
 
-    for module_name in ("../server.py", "../planning/plan.py"):
-        for node in ast.walk(_parse(module_name)):
+    for tree in [*_parse_server_sources(), _parse("../planning/plan.py")]:
+        for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
                 is_failure_target = any(
                     (isinstance(t, ast.Name) and t.id == "failure_reason")
@@ -294,10 +313,14 @@ STOP_TABLES = (
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_plan_guard", server.PlanLeaseGuard())
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_plan_surface, "_plan_guard", srv_planning_plan.PlanLeaseGuard())
+    monkeypatch.setattr(srv_server_execute, "_plan_guard", srv_server_plan_surface._plan_guard)
+    monkeypatch.setattr(srv_server_lifecycle, "_plan_guard", srv_server_plan_surface._plan_guard)
+    yield
 
 
 TWO_ITEM_PLAN: dict[str, Any] = {
@@ -384,7 +407,7 @@ async def _run_step_with_grounding_fault(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     return session_id, bundle, execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan=wire_plan(TWO_ITEM_PLAN), approved=True, include_screenshot_after=False
         )
     )
@@ -420,7 +443,7 @@ async def _run_step_with_guard_refusal(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     return execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan=wire_plan(TWO_ITEM_PLAN), approved=True, include_screenshot_after=False
         )
     )
@@ -682,11 +705,11 @@ async def test_terminal_walk_over_a_rejected_prefix_is_not_unclassified(
     assert payload["failure_reason"] == "rejected"
     assert payload["blocked"] is True
     # step 1 runs (uncertain, parks), then the explicit walk-end request
-    await server.computer_execute(
+    await srv_server_execute.computer_execute(
         session_id, "done", plan_action="continue", include_screenshot_after=False
     )
     terminal = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan_action="continue", include_screenshot_after=False
         )
     )
@@ -719,7 +742,7 @@ async def test_terminal_walk_over_an_approval_held_prefix_is_not_unclassified(
         limits=FAST_LIMITS,
     )
     step = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id,
             "done",
             plan=wire_plan(
@@ -736,7 +759,7 @@ async def test_terminal_walk_over_an_approval_held_prefix_is_not_unclassified(
     assert step["result"] == "not_executed" and step["requires_approval"] is True
     assert step["failure_reason"] == "approval_required"
     terminal = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan_action="continue", include_screenshot_after=False
         )
     )
@@ -754,7 +777,7 @@ async def test_terminal_walk_over_an_error_prefix_is_not_unclassified(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     step = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id,
             "done",
             plan=wire_plan(
@@ -779,7 +802,7 @@ async def test_terminal_walk_over_an_error_prefix_is_not_unclassified(
     assert step["failure_reason"] == "execution_error"
     assert step["blocked"] is True
     terminal = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan_action="continue", include_screenshot_after=False
         )
     )
@@ -833,7 +856,7 @@ async def test_an_uncertain_first_item_does_not_mask_the_stop_reason(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     payload = execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id, "done", plan=wire_plan(uncertain_first_plan),
             approved=True, include_screenshot_after=False,
         )

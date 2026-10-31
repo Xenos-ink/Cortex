@@ -208,7 +208,8 @@ def test_direct_call_driver_end_to_end_stops_the_session(
 
     from benchmarks.runner import BenchmarkRunner
 
-    from computer_use_mcp import server
+    import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+    import computer_use_mcp.server.observe as srv_server_observe
 
     tasks = tmp_path / "tasks"
     tasks.mkdir()
@@ -221,20 +222,20 @@ def test_direct_call_driver_end_to_end_stops_the_session(
 
     def _spy_isolate(*args: Any, **kwargs: Any) -> Any:
         snapshot = original_isolate(*args, **kwargs)
-        installed["registry"] = server._registry
-        installed["bundles"] = server._bundles
+        installed["registry"] = srv_server_lifecycle._registry
+        installed["bundles"] = srv_server_lifecycle._bundles
         return snapshot
 
     monkeypatch.setattr(BenchmarkRunner, "_isolate_server", staticmethod(_spy_isolate))
 
     stop_calls: list[str] = []
-    real_stop = server.stop_session
+    real_stop = srv_server_lifecycle.stop_session
 
     async def _spy_stop(session_id: str, *args: Any, **kwargs: Any) -> Any:
         stop_calls.append(str(session_id))
         return await real_stop(session_id, *args, **kwargs)
 
-    monkeypatch.setattr(server, "stop_session", _spy_stop)
+    monkeypatch.setattr(srv_server_lifecycle, "stop_session", _spy_stop)
 
     runner = BenchmarkRunner("fake", tasks, tmp_path / "out", "harness-stop")
     payload = runner.run()
@@ -245,7 +246,7 @@ def test_direct_call_driver_end_to_end_stops_the_session(
     assert len(stop_calls) == 1, stop_calls
     session_id = stop_calls[0]
     assert installed["registry"].get(session_id) is None, "session leaked in the registry"
-    observe = server.computer_observe(session_id)
+    observe = srv_server_observe.computer_observe(session_id)
     observe_payload = observe if isinstance(observe, dict) else json.loads(observe[0].text)
     assert observe_payload["ok"] is False
     assert observe_payload["error"] == "session_stopped"

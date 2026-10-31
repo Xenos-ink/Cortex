@@ -62,7 +62,10 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.focus_guard import InterferenceGuard, _launcher_seed_tokens
 from computer_use_mcp.desktop.interference import parse_interference
@@ -198,9 +201,11 @@ def test_s3_copula_then_colon_detected_and_redacted(text: str, raw_value: str) -
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same isolation as test_r21)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 async def test_s3_copula_colon_secret_never_reaches_the_served_sinks(
@@ -214,7 +219,7 @@ async def test_s3_copula_colon_secret_never_reaches_the_served_sinks(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(session_id, "type", text=raw)
+    response = await srv_server_execute.computer_execute(session_id, "type", text=raw)
     payload = execute_payload(response)
     message = str(payload.get("message", ""))
     assert "[REDACTED:" in message, message

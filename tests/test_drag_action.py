@@ -27,7 +27,10 @@ from pydantic import ValidationError
 from recording_engine import RecordingEngine
 
 import computer_use_mcp.desktop.backend as backend_module
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.desktop.errors import CoordinateSpaceError, InputBlockedError
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.pipeline.grounding import GroundingRouter, UnsupportedGroundingError
@@ -516,17 +519,19 @@ def test_response_schema_documents_drag() -> None:
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (mirrors integration suites)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 def _make_session(
     monkeypatch: pytest.MonkeyPatch, backend: Any, **start_kwargs: Any
 ) -> str:
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: object())
-    response = server.start_session(**start_kwargs)
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: object())
+    response = srv_server_lifecycle.start_session(**start_kwargs)
     assert response.get("session_id"), response
     return str(response["session_id"])
 
@@ -545,7 +550,7 @@ async def test_computer_execute_drag_via_x2_y2_executes_and_fake_records(
     session_id = _make_session(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "drag", x=10, y=20, x2=110, y2=70)
+    result = await srv_server_execute.computer_execute(session_id, "drag", x=10, y=20, x2=110, y2=70)
     result = _execute_payload(result)  # REM-A: executed -> content blocks
     assert result["ok"] is True, result
     assert result["message"] == "Simulated drag."
@@ -565,7 +570,7 @@ async def test_computer_execute_drag_without_end_point_fails_closed(
     session_id = _make_session(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "drag", x=10, y=20)  # no x2/y2
+    result = await srv_server_execute.computer_execute(session_id, "drag", x=10, y=20)  # no x2/y2
     assert result["ok"] is False
     assert result["result"] == "rejected" and "invalid_action" in result["reasons"]
     assert backend.executed == []
@@ -578,7 +583,7 @@ async def test_computer_execute_drag_out_of_bounds_end_point_rejected(
     session_id = _make_session(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "drag", x=10, y=20, x2=5000, y2=70)
+    result = await srv_server_execute.computer_execute(session_id, "drag", x=10, y=20, x2=5000, y2=70)
     assert result["ok"] is False
     # W-2 (057): the rejection names the real gate (grounding) in the message.
     assert result["message"].startswith("Action rejected by grounding:")
@@ -593,12 +598,12 @@ async def test_computer_execute_drag_requires_approval_by_default(
     session_id = _make_session(
         monkeypatch, backend, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "drag", x=10, y=20, x2=110, y2=70)
+    result = await srv_server_execute.computer_execute(session_id, "drag", x=10, y=20, x2=110, y2=70)
     assert result["ok"] is False
     assert result["requires_approval"] is True
     assert result["message"]
     assert backend.executed == []
-    approved = await server.computer_execute(
+    approved = await srv_server_execute.computer_execute(
         session_id, "drag", x=10, y=20, x2=110, y2=70, approved=True
     )
     approved = _execute_payload(approved)  # REM-A: executed -> content blocks

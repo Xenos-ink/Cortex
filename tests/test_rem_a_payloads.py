@@ -28,7 +28,12 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp import server
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.server.replies as srv_server_replies
 from computer_use_mcp.core.models import Observation, TextRegion
 
 from test_controller_integration import (
@@ -44,11 +49,13 @@ from test_controller_integration import (
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same as controller suite)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", __import__(
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", __import__(
         "computer_use_mcp.core.state", fromlist=["SessionRegistry"]
     ).SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 # --- helpers ---------------------------------------------------------------------------------
@@ -101,7 +108,7 @@ async def test_computer_execute_returns_content_block_pair(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "click", x=15, y=15)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=15, y=15)
     assert isinstance(result, list) and len(result) == 2, result
     text_block, image_block = result
     assert text_block.type == "text"
@@ -138,16 +145,16 @@ async def test_computer_execute_error_shapes_stay_plain_dicts(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    rejected = await server.computer_execute(session_id, "key", keys=["a"])
+    rejected = await srv_server_execute.computer_execute(session_id, "key", keys=["a"])
     assert isinstance(rejected, dict) and rejected["ok"] is False
     # The shipped SafetyPolicy classifies destructive text as safety_denied (a plain
     # dict too); the approval gate shape is pinned in the controller suite. What
     # matters here: NO non-executed path ever returns content blocks.
-    denied = await server.computer_execute(session_id, "type", text="rm -rf /")
+    denied = await srv_server_execute.computer_execute(session_id, "type", text="rm -rf /")
     assert isinstance(denied, dict) and denied["ok"] is False
-    unknown = await server.computer_execute("no-such-session", "wait", delta=1)
+    unknown = await srv_server_execute.computer_execute("no-such-session", "wait", delta=1)
     assert isinstance(unknown, dict) and unknown["ok"] is False
-    stopped = await server.computer_execute("never-started", "click", x=1, y=1)
+    stopped = await srv_server_execute.computer_execute("never-started", "click", x=1, y=1)
     assert isinstance(stopped, dict) and stopped["ok"] is False
 
 
@@ -163,7 +170,7 @@ async def test_computer_execute_opt_out_returns_slim_text_only(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(
+    result = await srv_server_execute.computer_execute(
         session_id, "click", x=25, y=25, include_screenshot_after=False
     )
     assert isinstance(result, dict)  # legacy opt-out shape, never content blocks
@@ -184,7 +191,7 @@ async def test_follow_up_results_carry_no_images_and_are_slim(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(
+    result = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -232,7 +239,7 @@ async def test_include_screenshot_after_false_holds_on_follow_ups(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(
+    result = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -260,7 +267,7 @@ async def test_oversized_png_reencoded_as_jpeg_under_budget(
     session_id, _bundle, _b, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     text_block, image_block = result
     assert image_block.mimeType == "image/jpeg"
     decoded = base64.b64decode(image_block.data, validate=True)
@@ -286,11 +293,11 @@ async def test_outbound_reencode_never_touches_internal_png(
     session_id, bundle, _b, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     _text_block, image_block = result
     assert image_block.mimeType == "image/jpeg"  # outbound was re-encoded...
     # ...but the INTERNAL ExecutionResult (verification + audit source) keeps PNG.
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     agent = bundle.agent
     outcome = await agent.run_single(bundle.state, _click_action())
     assert outcome.result is not None
@@ -319,7 +326,7 @@ async def test_small_png_travels_untouched(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(
+    result = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, include_screenshot_after=True
     )
     _text_block, image_block = result
@@ -333,9 +340,9 @@ def test_result_image_knob_parsing_is_fail_safe(monkeypatch: pytest.MonkeyPatch)
     """Bogus/negative knob values fall back to the default, never blow up."""
     for bogus in ("not-a-number", "-5", "0", "", "1e999"):
         monkeypatch.setenv("CORTEX_RESULT_IMAGE_MAX_KB", bogus)
-        assert server._result_image_max_bytes() > 0
+        assert srv_server_replies._result_image_max_bytes() > 0
     monkeypatch.delenv("CORTEX_RESULT_IMAGE_MAX_KB", raising=False)
-    assert server._result_image_max_bytes() == server.RESULT_IMAGE_MAX_KB_DEFAULT * 1024
+    assert srv_server_replies._result_image_max_bytes() == srv_server_replies.RESULT_IMAGE_MAX_KB_DEFAULT * 1024
 
 
 # --- H8: observe metadata bounds ocr_text / ui_elements ------------------------------------------
@@ -348,7 +355,7 @@ async def test_observe_metadata_caps_ocr_text_and_ui_elements(
     session_id, _bundle, _backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)
     # Seed an oversized observation through the engine's backend surface: the fake
     # backend's next observe() returns a bloated model; computer_observe must cap it.
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     bloated = Observation(
         image_base64=_png(),
         width=64,
@@ -367,13 +374,13 @@ async def test_observe_metadata_caps_ocr_text_and_ui_elements(
     original = bundle.agent.observation.backend
     bundle.agent.observation.backend = BloatedBackend()
     try:
-        result = server.computer_observe(session_id)
+        result = srv_server_observe.computer_observe(session_id)
     finally:
         bundle.agent.observation.backend = original
     text_block = result[0]
     payload = json.loads(text_block.text)
     observation = payload["observation"]
-    cap = server.OBSERVE_METADATA_ELEMENT_CAP
+    cap = srv_server_observe.OBSERVE_METADATA_ELEMENT_CAP
     assert len(observation["ocr_text"]) == cap
     assert observation["ocr_text_omitted_count"] == 60 - cap
     assert len(observation["ui_elements"]) == cap
@@ -387,7 +394,7 @@ async def test_observe_metadata_cap_omitted_when_lists_fit(
 ) -> None:
     """Short lists serialize in full and carry no omitted-count fields."""
     session_id, _bundle, _backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     small = Observation(
         image_base64=_png(),
         width=64,
@@ -403,7 +410,7 @@ async def test_observe_metadata_cap_omitted_when_lists_fit(
     original = bundle.agent.observation.backend
     bundle.agent.observation.backend = SmallBackend()
     try:
-        result = server.computer_observe(session_id)
+        result = srv_server_observe.computer_observe(session_id)
     finally:
         bundle.agent.observation.backend = original
     payload = json.loads(result[0].text)
@@ -424,7 +431,7 @@ async def test_provider_judge_reuses_encoded_base64(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     agent = bundle.agent
 
     captured: dict[str, str] = {}

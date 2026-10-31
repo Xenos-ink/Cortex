@@ -38,7 +38,9 @@ import helpers_runtime as rt
 import helpers_win32 as w32
 import pytest
 
-from computer_use_mcp import server
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.observe as srv_server_observe
 
 pytestmark = pytest.mark.e2e
 
@@ -131,7 +133,7 @@ def test_browser_local_page_window_state_verification(
             # The hosting console can steal foreground during fixture setup; make the
             # identity observation deterministic by explicitly focusing the browser.
             assert w32.focus_window(hwnd), "could not focus the Edge window"
-            observation = w32.observe_tool_metadata(server.computer_observe(session_id))["observation"]
+            observation = w32.observe_tool_metadata(srv_server_observe.computer_observe(session_id))["observation"]
             info = observation["active_window_info"]
             if evidence is not None:
                 evidence.save_observation("before", observation)
@@ -145,7 +147,7 @@ def test_browser_local_page_window_state_verification(
             assert observation["coordinate_space"] == "verified_passthrough", observation
 
             response = asyncio.run(
-                server.computer_execute(
+                srv_server_execute.computer_execute(
                     session_id, "wait", delta=1, expected_effect=PAGE_TITLE_MARKER
                 )
             )
@@ -173,7 +175,7 @@ def test_browser_local_page_window_state_verification(
                 evidence.add_extra("verification", verification)
                 evidence.save_audit(bundle, session_id)
                 evidence.save_observation(
-                    "after", w32.observe_tool_metadata(server.computer_observe(session_id))["observation"]
+                    "after", w32.observe_tool_metadata(srv_server_observe.computer_observe(session_id))["observation"]
                 )
         finally:
-            asyncio.run(server.stop_session(session_id))
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))

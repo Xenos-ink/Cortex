@@ -285,6 +285,6 @@ async def test_allowlist_rejection_message_names_the_real_gate(
 
 async def server_execute(session_id: str, spec: dict[str, Any]) -> Any:
     """Thin indirection over ``server.computer_execute`` (keeps the test body readable)."""
-    from computer_use_mcp import server
+    import computer_use_mcp.server.execute as srv_server_execute
 
-    return await server.computer_execute(session_id, **spec)
+    return await srv_server_execute.computer_execute(session_id, **spec)

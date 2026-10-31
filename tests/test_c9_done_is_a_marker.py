@@ -34,7 +34,10 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
 from computer_use_mcp.pipeline.agent import _NO_OP_MARKER_KINDS, ComputerUseAgent
 from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction, Point
 
@@ -42,9 +45,11 @@ from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction,
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    yield server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    yield
 
 
 def _state() -> SimpleNamespace:
@@ -247,7 +252,7 @@ async def test_a_done_through_computer_execute_is_a_marker_ok_true(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    payload = execute_payload(await server.computer_execute(session_id, "done"))
+    payload = execute_payload(await srv_server_execute.computer_execute(session_id, "done"))
     validate_reply(payload, "flat_execute")
     assert payload["result"] == "marker", payload
     assert payload["ok"] is True, payload
@@ -257,7 +262,7 @@ async def test_a_done_through_computer_execute_is_a_marker_ok_true(
     assert len(backend.observed) == 1, len(backend.observed)
     # the session is still live: `done` is a marker, not a terminator
     follow_up = execute_payload(
-        await server.computer_execute(session_id, "done", include_screenshot_after=False)
+        await srv_server_execute.computer_execute(session_id, "done", include_screenshot_after=False)
     )
     validate_reply(follow_up, "flat_execute")
     assert follow_up["result"] == "marker"

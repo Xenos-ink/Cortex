@@ -204,7 +204,7 @@ def main() -> int:
     # ---------------------------------------------------------------- stage E: outbound bound (REM-E)
     bound_ms = []
     enc_counts = []
-    import computer_use_mcp.server as srv
+    import computer_use_mcp.server.fetch as srv_server_fetch
 
     orig_save = Image.Image.save
 
@@ -215,7 +215,7 @@ def main() -> int:
     for _ in range(iters):
         enc_counts.clear()
         t0 = time.perf_counter()
-        bounded, mime = srv._bound_outbound_image(before.image_base64)
+        bounded, mime = srv_server_fetch._bound_outbound_image(before.image_base64)
         bound_ms.append((time.perf_counter() - t0) * 1000.0)
     report["bound_outbound_image"] = {**_ms(bound_ms), "jpeg_encodes_per_call": len(enc_counts)}
     report["bound_outbound_mime"] = {"n": 1, "p50": 1.0 if mime == "image/jpeg" else 0.0,
@@ -225,7 +225,7 @@ def main() -> int:
     enc_counts.clear()
     Image.Image.save = counting_save
     try:
-        _b, _m = srv._bound_outbound_image(before.image_base64)
+        _b, _m = srv_server_fetch._bound_outbound_image(before.image_base64)
     finally:
         Image.Image.save = orig_save
     report["bound_outbound_encodes"] = {"n": 1, "p50": float(len(enc_counts)), "p95": float(len(enc_counts)),

@@ -42,7 +42,7 @@ from computer_use_mcp.desktop.errors import InputBlockedError
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction, SessionState
 from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
-from computer_use_mcp.server import _grounded_shape_hint
+from computer_use_mcp.server.schemas import _grounded_shape_hint
 from computer_use_mcp.core.state import StopToken, TaskStopped
 from computer_use_mcp.pipeline.validator import GroundingValidator
 
