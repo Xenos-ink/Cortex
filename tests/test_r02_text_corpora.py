@@ -26,9 +26,9 @@ from __future__ import annotations
 
 import pytest
 
-from computer_use_mcp.models import GroundedAction, RiskLevel, SessionState
-from computer_use_mcp.redaction import contains_secret, redact_text
-from computer_use_mcp.safety import SafetyContext, SafetyPolicy
+from computer_use_mcp.core.models import GroundedAction, RiskLevel, SessionState
+from computer_use_mcp.security.redaction import contains_secret, redact_text
+from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
 
 #: Benign text (finance/academic prose and its neighborhood) that must pass BOTH the
 #: safety keyword gate AND the redaction value scan. Order-stable for failure output.

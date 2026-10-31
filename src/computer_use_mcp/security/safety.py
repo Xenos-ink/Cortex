@@ -32,8 +32,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .models import ActionType, GroundedAction, RiskLevel, SessionState, WindowInfo
-from .textnorm import _FOLD_MARK, canonical_views, fold_marked
+from ..core.models import ActionType, GroundedAction, RiskLevel, SessionState, WindowInfo
+from ..core.textnorm import _FOLD_MARK, canonical_views, fold_marked
 
 __all__ = ["SafetyContext", "SafetyDecision", "SafetyPolicy"]
 

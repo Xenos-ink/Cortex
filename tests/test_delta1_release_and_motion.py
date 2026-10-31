@@ -29,15 +29,15 @@ from computer_use_mcp.backend import (
     FakeComputerBackend,
     LocalComputerBackend,
 )
-from computer_use_mcp.models import (
+from computer_use_mcp.core.models import (
     MAX_DURATION_MS,
     ActionSpec,
     ActionType,
     GroundedAction,
     Point,
 )
-from computer_use_mcp.state import StopToken, TaskStopped
-from computer_use_mcp.validator import GroundingValidator
+from computer_use_mcp.core.state import StopToken, TaskStopped
+from computer_use_mcp.pipeline.validator import GroundingValidator
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 

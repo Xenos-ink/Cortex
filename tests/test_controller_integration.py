@@ -33,17 +33,17 @@ import pytest
 from PIL import Image
 
 from computer_use_mcp import server
-from computer_use_mcp.agent import ComputerUseAgent
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
 from computer_use_mcp.backend import DisplayUnavailableError, FakeComputerBackend
-from computer_use_mcp.limits import LimitExceeded
-from computer_use_mcp.models import (
+from computer_use_mcp.core.limits import LimitExceeded
+from computer_use_mcp.core.models import (
     AgentDecision,
     GroundedAction,
     SessionState,
     TextRegion,
     WindowInfo,
 )
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.state import SessionRegistry
 
 # --- fakes ---------------------------------------------------------------------------------
 

@@ -20,9 +20,9 @@ import pytest
 from pydantic import ValidationError
 
 import computer_use_mcp.backend as backend_module
-import computer_use_mcp.plan as plan_module
-from computer_use_mcp.models import ActionSpec, GroundedAction
-from computer_use_mcp.plan import (
+import computer_use_mcp.planning.plan as plan_module
+from computer_use_mcp.core.models import ActionSpec, GroundedAction
+from computer_use_mcp.planning.plan import (
     WaypointPlan,
     normalize_plan,
     plan_settle_markers,
@@ -65,7 +65,7 @@ def _smuggled_plan() -> Any:
     """A plan built with ``model_construct`` — pydantic validation skipped entirely,
     so only the model-defense recheck stands between the garbage and ActionSpec's
     lax coercion."""
-    from computer_use_mcp.plan import Waypoint
+    from computer_use_mcp.planning.plan import Waypoint
 
     return WaypointPlan.model_construct(
         points=[
@@ -88,8 +88,8 @@ def test_normalize_plan_rejects_a_smuggled_point_level_non_int() -> None:
 
 
 def test_normalize_plan_rejects_a_smuggled_action_level_non_int() -> None:
-    from computer_use_mcp.models import ActionSpec
-    from computer_use_mcp.plan import Waypoint
+    from computer_use_mcp.core.models import ActionSpec
+    from computer_use_mcp.planning.plan import Waypoint
 
     plan = WaypointPlan.model_construct(
         points=[

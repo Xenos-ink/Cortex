@@ -103,13 +103,13 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
-from .audit import AuditLogger, Metrics
-from .backend import ComputerBackend, FocusDriftError
-from .focus_guard import GuardVerdict, InterferenceGuard
+from ..security.audit import AuditLogger, Metrics
+from ..backend import ComputerBackend, FocusDriftError
+from ..desktop.focus_guard import GuardVerdict, InterferenceGuard
 from .grounding import GroundingRouter
-from .interference import REFOCUS_HINT, InterferencePolicy, parse_interference
-from .limits import LimitEnforcer, LimitExceeded, Limits
-from .models import (
+from ..desktop.interference import REFOCUS_HINT, InterferencePolicy, parse_interference
+from ..core.limits import LimitEnforcer, LimitExceeded, Limits
+from ..core.models import (
     MAX_FOLLOW_UPS,
     ActionSpec,
     ActionType,
@@ -121,9 +121,9 @@ from .models import (
     VerificationResult,
     ok_from_result,
 )
-from .observation import ObservationEngine, digest_matches
-from .safety import SafetyPolicy
-from .state import StopToken, TaskState, TaskStopped
+from ..vision.observation import ObservationEngine, digest_matches
+from ..security.safety import SafetyPolicy
+from ..core.state import StopToken, TaskState, TaskStopped
 from .validator import (
     COORDINATE_ACTIONS,
     GroundingValidator,
@@ -151,7 +151,7 @@ from .verification import (
 )
 
 try:  # E4 lands SafetyContext in parallel; absent -> policy called without context.
-    from .safety import SafetyContext  # type: ignore[attr-defined]
+    from ..security.safety import SafetyContext  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover - pre-E4 state
     SafetyContext = None  # type: ignore[assignment]
 
@@ -1002,7 +1002,7 @@ class ComputerUseAgent:
     def _denied_decision(self, reason: str) -> Any:
         """Fail-closed SafetyDecision-compatible object when the policy itself fails."""
         try:
-            from .safety import SafetyDecision
+            from ..security.safety import SafetyDecision
 
             return SafetyDecision(allowed=False, requires_approval=False, reason=reason)
         except Exception:  # noqa: BLE001 - E4 field drift tolerated via shim

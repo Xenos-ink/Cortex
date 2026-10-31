@@ -37,14 +37,14 @@ from types import SimpleNamespace
 from typing import Any
 
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.interference import LAUNCHED, NO_INSTANCE, REATTACHED
-from computer_use_mcp.models import GroundedAction, Observation, WindowInfo
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.observation import ObservationEngine
-from computer_use_mcp.safety import SafetyPolicy
-from computer_use_mcp.state import StopToken, TaskState
-from computer_use_mcp.validator import GroundingValidator
+from computer_use_mcp.desktop.interference import LAUNCHED, NO_INSTANCE, REATTACHED
+from computer_use_mcp.core.models import GroundedAction, Observation, WindowInfo
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.core.limits import Limits
+from computer_use_mcp.vision.observation import ObservationEngine
+from computer_use_mcp.security.safety import SafetyPolicy
+from computer_use_mcp.core.state import StopToken, TaskState
+from computer_use_mcp.pipeline.validator import GroundingValidator
 
 
 def _foreign_foreground_observation() -> Observation:

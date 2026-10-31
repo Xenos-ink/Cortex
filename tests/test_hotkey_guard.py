@@ -23,9 +23,9 @@ from types import SimpleNamespace
 from typing import Any
 
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import FOCUS_TAKEN_BY, STUCK_MODIFIER, parse_interference
-from computer_use_mcp.models import FailureClass, GroundedAction, WindowInfo
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import FOCUS_TAKEN_BY, STUCK_MODIFIER, parse_interference
+from computer_use_mcp.core.models import FailureClass, GroundedAction, WindowInfo
 
 TARGET = WindowInfo(
     hwnd=1, pid=100, process_name="EXCEL.EXE", window_class="XLMAIN", title="Book1 - Excel",
@@ -171,12 +171,12 @@ def test_key_dispatch_gap_zero_disables_the_policy(monkeypatch: Any) -> None:
 def test_batch_final_enter_gets_the_gap_end_to_end(monkeypatch: Any) -> None:
     """A queued [type, enter] batch paces the final Enter (the B3 incident shape)."""
     import computer_use_mcp.backend as backend_module
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.models import ActionSpec
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import ActionSpec
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     monkeypatch.setattr(backend_module, "KEY_DISPATCH_GAP_SECONDS", 0.02)
     sleeps: list[float] = []

@@ -77,7 +77,7 @@ class Replay:
         self.log: list[dict[str, Any]] = []
 
     def act(self, action: str, **kwargs: Any) -> None:
-        from computer_use_mcp.models import GroundedAction
+        from computer_use_mcp.core.models import GroundedAction
 
         grounded = GroundedAction(action=action, confidence=1.0,
                                   reason="human reference replay", **kwargs)

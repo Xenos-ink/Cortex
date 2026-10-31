@@ -1,5 +1,5 @@
-from computer_use_mcp.models import GroundedAction, SessionState
-from computer_use_mcp.safety import SafetyPolicy
+from computer_use_mcp.core.models import GroundedAction, SessionState
+from computer_use_mcp.security.safety import SafetyPolicy
 
 
 def test_server_module_imports() -> None:

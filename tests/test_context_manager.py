@@ -16,8 +16,8 @@ from typing import Any
 
 import pytest
 
-from computer_use_mcp.context_manager import ContextManager, safe_truncate
-from computer_use_mcp.redaction import contains_secret
+from computer_use_mcp.planning.context_manager import ContextManager, safe_truncate
+from computer_use_mcp.security.redaction import contains_secret
 
 HUGE = 50_000
 

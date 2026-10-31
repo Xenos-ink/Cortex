@@ -44,13 +44,13 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import agent as agent_module
-from computer_use_mcp import plan as plan_module
+from computer_use_mcp.pipeline import agent as agent_module
+from computer_use_mcp.planning import plan as plan_module
 from computer_use_mcp import server
-from computer_use_mcp.focus_guard import GuardVerdict
-from computer_use_mcp.models import FailureClass, WindowInfo
-from computer_use_mcp.plan import PLAN_FAILURE_REASONS, plan_failure_reason
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.desktop.focus_guard import GuardVerdict
+from computer_use_mcp.core.models import FailureClass, WindowInfo
+from computer_use_mcp.planning.plan import PLAN_FAILURE_REASONS, plan_failure_reason
+from computer_use_mcp.core.state import SessionRegistry
 
 
 def wire_plan(plan):
@@ -145,7 +145,7 @@ def _reply_error_literals() -> set[str]:
     scans both builders, not ``_plan_response`` alone.
     """
     found: set[str] = set()
-    for node in ast.walk(_parse("server.py")):
+    for node in ast.walk(_parse("../server.py")):
         if not (
             isinstance(node, ast.FunctionDef)
             and node.name in ("_plan_response", "_plan_exception_response")
@@ -195,7 +195,7 @@ def _failure_reason_literals() -> set[str]:
             _harvest(node.body)
             _harvest(node.orelse)
 
-    for module_name in ("server.py", "plan.py"):
+    for module_name in ("../server.py", "../planning/plan.py"):
         for node in ast.walk(_parse(module_name)):
             if isinstance(node, ast.Assign):
                 is_failure_target = any(
@@ -338,7 +338,7 @@ class FollowUpExplodesBackend(ScriptedBackend):
         self.dispatches = 0
 
     def execute(self, action: Any, stop: Any = None, **kwargs: Any) -> str:
-        from computer_use_mcp.models import GroundedAction
+        from computer_use_mcp.core.models import GroundedAction
 
         self.dispatches += 1
         if self.dispatches == self.explode_on:

@@ -36,8 +36,8 @@ import httpx
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import Field, ValidationError, field_validator
 
-from .models import ActionType, AgentDecision, GroundedAction, Point
-from .redaction import redact_text
+from ..core.models import ActionType, AgentDecision, GroundedAction, Point
+from ..security.redaction import redact_text
 
 __all__ = [
     "CHANNEL_ENVIRONMENT_CONTENT",

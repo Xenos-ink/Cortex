@@ -41,7 +41,7 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.state import SessionRegistry
 
 #: The deterministic MCP tools exposed on the stdio boundary (fixed contract).
 # AMENDED (loop removal): the internal-loop tool family is deleted from the surface.

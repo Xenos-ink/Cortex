@@ -26,7 +26,7 @@ from computer_use_mcp.backend import (
     LocalComputerBackend,
     WindowFocusError,
 )
-from computer_use_mcp.models import WindowInfo
+from computer_use_mcp.core.models import WindowInfo
 
 TITLED = WindowInfo(hwnd=11, pid=100, process_name="excel.exe", window_class="XLMAIN", title="Book1 - Excel")
 UNTITLED = WindowInfo(hwnd=12, pid=100, process_name="excel.exe", window_class="XLMAIN", title="")

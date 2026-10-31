@@ -403,8 +403,8 @@ def test_raw_key_digest_and_staleness_semantics_preserved() -> None:
     stable hash of the key (same screen -> same digest; changed screen -> changed
     digest), and ``digest_matches`` equality on the key mirrors PNG-payload equality
     (identical pixels -> identical payload; changed pixels -> different payload)."""
-    from computer_use_mcp.models import Observation
-    from computer_use_mcp.observation import digest_matches, observation_digest
+    from computer_use_mcp.core.models import Observation
+    from computer_use_mcp.vision.observation import digest_matches, observation_digest
 
     def obs(payload: str) -> Observation:
         return Observation(
@@ -426,8 +426,8 @@ def test_focus_change_signal_verdict_identical_png_vs_rawkey() -> None:
     historical PNG base64 or the R-6 raw key — the text-session fast path cannot
     change any verdict (the comparison reads each payload verbatim; the
     corroboration magnitude uses the identical stashed frames on both paths)."""
-    from computer_use_mcp.models import Observation
-    from computer_use_mcp.verification import (
+    from computer_use_mcp.core.models import Observation
+    from computer_use_mcp.pipeline.verification import (
         FocusChangeStrategy,
         ScreenshotDiffStrategy,
         VerificationIntent,
@@ -488,8 +488,8 @@ def test_focus_change_derivation_memoized_and_pure() -> None:
     identical screens compare equal and changed screens compare unequal exactly as
     the PNG base64 always did — the text-session fast path cannot change any
     comparison, and there is no per-comparison derivation cost at all."""
-    from computer_use_mcp.models import Observation
-    from computer_use_mcp.verification import FocusChangeStrategy
+    from computer_use_mcp.core.models import Observation
+    from computer_use_mcp.pipeline.verification import FocusChangeStrategy
 
     img = Image.new("RGB", (16, 16), (7, 8, 9))
     o = Observation(image_base64="RAW:KEYA;16x16", width=16, height=16)

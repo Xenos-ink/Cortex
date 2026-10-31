@@ -60,7 +60,7 @@ import pytest
 
 from computer_use_mcp import cli as cli_module
 from computer_use_mcp import server
-from computer_use_mcp.limits import Limits
+from computer_use_mcp.core.limits import Limits
 from computer_use_mcp.server import _parse_limits
 
 from test_controller_integration import (  # noqa: F401 - pytest fixture import
@@ -1058,7 +1058,7 @@ def test_max_task_seconds_is_not_newly_enforced() -> None:
     src = pathlib.Path(server.__file__).parent
     call_sites = [
         path.name
-        for path in sorted(src.glob("*.py"))
+        for path in sorted(src.rglob("*.py"))
         if path.name != "limits.py" and ".check_task_duration(" in path.read_text(encoding="utf-8")
     ]
     assert call_sites == []

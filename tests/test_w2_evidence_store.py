@@ -54,7 +54,7 @@ from test_controller_integration import (  # noqa: F401 - pytest fixture import
 )
 
 from computer_use_mcp import cli as cli_module
-from computer_use_mcp import evidence as evidence_module
+from computer_use_mcp.vision import evidence as evidence_module
 from computer_use_mcp import server
 
 SERVER_PATH = Path(server.__file__)
@@ -849,7 +849,7 @@ def test_a_late_spatial_text_failure_stores_nothing(
     )
     store = store_of(bundle)
 
-    from computer_use_mcp.visual_views import VisualViewError
+    from computer_use_mcp.vision.visual_views import VisualViewError
 
     def _explode(*args: Any, **kwargs: Any) -> None:
         raise VisualViewError("forced after-capture failure")

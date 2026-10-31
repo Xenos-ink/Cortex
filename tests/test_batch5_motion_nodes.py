@@ -23,7 +23,7 @@ from recording_engine import RecordingEngine
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp.backend import LocalComputerBackend, _motion_path_points
-from computer_use_mcp.models import GroundedAction
+from computer_use_mcp.core.models import GroundedAction
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 

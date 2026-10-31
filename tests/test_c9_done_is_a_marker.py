@@ -35,8 +35,8 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.agent import _NO_OP_MARKER_KINDS, ComputerUseAgent
-from computer_use_mcp.models import ActionSpec, ActionType, GroundedAction, Point
+from computer_use_mcp.pipeline.agent import _NO_OP_MARKER_KINDS, ComputerUseAgent
+from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction, Point
 
 
 @pytest.fixture
@@ -79,9 +79,9 @@ async def _marker(
 
 
 def _agent_for(backend: Any) -> ComputerUseAgent:
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     return ComputerUseAgent(
         backend,

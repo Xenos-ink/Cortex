@@ -16,9 +16,9 @@ from __future__ import annotations
 from typing import Any
 
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import REANCHOR_REFUSED, parse_interference
-from computer_use_mcp.models import GroundedAction, WindowInfo
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import REANCHOR_REFUSED, parse_interference
+from computer_use_mcp.core.models import GroundedAction, WindowInfo
 
 TARGET = WindowInfo(
     hwnd=1, pid=100, process_name="EXCEL.EXE", window_class="XLMAIN", title="Book1 - Excel",

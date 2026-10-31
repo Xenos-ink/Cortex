@@ -5,11 +5,11 @@ import io
 
 from PIL import Image
 
-from computer_use_mcp.agent import ComputerUseAgent
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.models import GroundedAction, Observation, SessionState
-from computer_use_mcp.validator import GroundingValidator
-from computer_use_mcp.verification import VerificationEngine
+from computer_use_mcp.core.models import GroundedAction, Observation, SessionState
+from computer_use_mcp.pipeline.validator import GroundingValidator
+from computer_use_mcp.pipeline.verification import VerificationEngine
 
 
 class ChangingBackend(FakeComputerBackend):

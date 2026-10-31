@@ -55,16 +55,16 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.checkpoint_manager import (
+from computer_use_mcp.planning.checkpoint_manager import (
     INTEGRITY_KEY_FILENAME,
     SEAL_ALGORITHM,
     CheckpointManager,
     CheckpointValidationError,
 )
-from computer_use_mcp.limits import Limits, SessionBudgetExceeded
-from computer_use_mcp.long_running import LongRunningRuntime
-from computer_use_mcp.resume_manager import ResumeManager
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.limits import Limits, SessionBudgetExceeded
+from computer_use_mcp.planning.long_running import LongRunningRuntime
+from computer_use_mcp.planning.resume_manager import ResumeManager
+from computer_use_mcp.core.state import SessionRegistry
 
 
 @pytest.fixture

@@ -44,16 +44,16 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp import text_substrates, visual_views
-from computer_use_mcp.models import CoordinateSpace, MonitorInfo, Observation, TextRegion
-from computer_use_mcp.text_substrates import (
+from computer_use_mcp.vision import text_substrates, visual_views
+from computer_use_mcp.core.models import CoordinateSpace, MonitorInfo, Observation, TextRegion
+from computer_use_mcp.vision.text_substrates import (
     SIDE_SUBSTRATE_BUDGET_SECONDS,
     SIDE_SUBSTRATE_PACKAGE,
     SubstrateVerdict,
     boxes_overlap,
     detect_side_substrate,
 )
-from computer_use_mcp.visual_views import spatial_text_of
+from computer_use_mcp.vision.visual_views import spatial_text_of
 
 #: The A2-baseline spatial-text block keys (pre-A3, the W2.4 state — the delta A3 adds
 #: is the provenance keys, nothing else).

@@ -45,7 +45,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from PIL import Image, ImageChops
 
-from .models import CaptureProvenance, Observation, VerificationResult
+from ..core.models import CaptureProvenance, Observation, VerificationResult
 
 __all__ = [
     "DEFAULT_STRATEGY_CHAIN",

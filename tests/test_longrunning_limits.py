@@ -17,7 +17,7 @@ import time
 
 import pytest
 
-from computer_use_mcp.limits import (
+from computer_use_mcp.core.limits import (
     Limits,
     SessionBudgetExceeded,
     SessionBudgetTracker,

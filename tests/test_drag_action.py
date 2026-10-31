@@ -33,8 +33,8 @@ from computer_use_mcp.backend import (
     FakeComputerBackend,
     InputBlockedError,
 )
-from computer_use_mcp.grounding import GroundingRouter, UnsupportedGroundingError
-from computer_use_mcp.models import (
+from computer_use_mcp.pipeline.grounding import GroundingRouter, UnsupportedGroundingError
+from computer_use_mcp.core.models import (
     ActionType,
     GroundedAction,
     MonitorInfo,
@@ -44,10 +44,10 @@ from computer_use_mcp.models import (
     SessionState,
     WindowInfo,
 )
-from computer_use_mcp.provider import RESPONSE_SCHEMA_TEXT, ProviderParseError, parse_decision
-from computer_use_mcp.safety import SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry, StopToken, TaskStopped
-from computer_use_mcp.validator import (
+from computer_use_mcp.pipeline.provider import RESPONSE_SCHEMA_TEXT, ProviderParseError, parse_decision
+from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry, StopToken, TaskStopped
+from computer_use_mcp.pipeline.validator import (
     GroundingValidator,
     MissingObservationBindingError,
     StaleObservationError,

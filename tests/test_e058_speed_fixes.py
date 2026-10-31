@@ -42,8 +42,8 @@ from PIL import Image
 from computer_use_mcp import backend as backend_module
 from computer_use_mcp import server
 from computer_use_mcp.backend import FakeComputerBackend, LocalComputerBackend
-from computer_use_mcp.models import WindowInfo
-from computer_use_mcp.verification import (
+from computer_use_mcp.core.models import WindowInfo
+from computer_use_mcp.pipeline.verification import (
     ScreenshotDiffStrategy,
     VerificationEngine,
     VerificationIntent,
@@ -694,7 +694,7 @@ def test_d11_bare_change_expectation_keeps_legacy_definitive_failed() -> None:
     class _Obs:
         pass
 
-    from computer_use_mcp.models import Observation
+    from computer_use_mcp.core.models import Observation
 
     def _obs(png: str) -> Observation:
         return Observation(

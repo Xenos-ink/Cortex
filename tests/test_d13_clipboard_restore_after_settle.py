@@ -31,7 +31,7 @@ import pytest
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp import backend as B
 from computer_use_mcp.backend import TYPE_VERIFY_SETTLE_SECONDS, StopToken
-from computer_use_mcp.models import ActionType, GroundedAction
+from computer_use_mcp.core.models import ActionType, GroundedAction
 
 # --- the in-memory OS clipboard ----------------------------------------------------------------
 

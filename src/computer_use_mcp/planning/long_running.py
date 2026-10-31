@@ -31,7 +31,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .audit import AuditLogger, Metrics
+from ..security.audit import AuditLogger, Metrics
 from .checkpoint_manager import (
     CHECKPOINT_EVERY_SECONDS,
     CHECKPOINT_EVERY_STEPS,
@@ -44,9 +44,9 @@ from .checkpoint_manager import (
     should_checkpoint,
 )
 from .context_manager import ContextManager
-from .limits import Limits, SessionBudgetTracker
-from .models import MAX_SUBTASKS, TerminationReason
-from .redaction import redact_text
+from ..core.limits import Limits, SessionBudgetTracker
+from ..core.models import MAX_SUBTASKS, TerminationReason
+from ..security.redaction import redact_text
 from .subtask_manager import SubtaskManager
 
 logger = logging.getLogger(__name__)

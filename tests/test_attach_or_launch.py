@@ -29,14 +29,14 @@ from computer_use_mcp.backend import (
     doc_token_from_title,
     is_unsaved_candidate_title,
 )
-from computer_use_mcp.interference import (
+from computer_use_mcp.desktop.interference import (
     AMBIGUOUS_INSTANCE,
     LAUNCHED,
     NO_INSTANCE,
     REATTACHED,
     parse_interference,
 )
-from computer_use_mcp.models import GroundedAction, WindowInfo
+from computer_use_mcp.core.models import GroundedAction, WindowInfo
 
 EXCEL = WindowInfo(
     hwnd=1, pid=100, process_name="EXCEL.EXE", window_class="XLMAIN", title="Book1 - Excel",
@@ -111,7 +111,7 @@ def test_process_only_match_attaches_any_instance() -> None:
 
 
 def test_reattach_rebinds_the_focus_guard() -> None:
-    from computer_use_mcp.focus_guard import InterferenceGuard
+    from computer_use_mcp.desktop.focus_guard import InterferenceGuard
 
     backend = _backend_with(DOC)
     guard = InterferenceGuard(backend, parse_interference(None))
@@ -149,10 +149,10 @@ def test_server_launch_requires_explicit_allow_launch() -> None:
 
 
 def test_agent_launch_gate_requires_server_policy_and_allowlist() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     backend = _backend_with()
     action = GroundedAction(action="ensure_app", target="excel.exe", confidence=1.0)
@@ -198,11 +198,11 @@ def test_non_matching_windows_of_the_process_are_ambiguous() -> None:
 
 
 def _run(backend: FakeComputerBackend, action: GroundedAction) -> Any:
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     agent = ComputerUseAgent(
         backend, provider=None, safety=SafetyPolicy(), task=TaskState(), stop=StopToken(),
@@ -255,7 +255,7 @@ def test_ensure_app_probe_outcome_is_evidence_not_a_screen_claim() -> None:
 
 
 def test_ensure_app_without_target_is_rejected_fail_closed() -> None:
-    from computer_use_mcp.models import GroundedAction as GA
+    from computer_use_mcp.core.models import GroundedAction as GA
 
     with pytest.raises(ValueError):
         GA(action="ensure_app", confidence=1.0)  # target required (model validator)

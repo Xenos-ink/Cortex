@@ -293,7 +293,7 @@ def make_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """
     from computer_use_mcp import server
     from computer_use_mcp.backend import LocalComputerBackend
-    from computer_use_mcp.state import SessionRegistry
+    from computer_use_mcp.core.state import SessionRegistry
 
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
     monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
@@ -320,7 +320,7 @@ def with_verifier():
     """
 
     def inject(session_id: str, bundle: Any, *strategies: Any) -> None:
-        from computer_use_mcp.verification import VerificationEngine, default_strategy_chain
+        from computer_use_mcp.pipeline.verification import VerificationEngine, default_strategy_chain
 
         bundle.agent.verifier = VerificationEngine(
             strategies=[*strategies, *default_strategy_chain(None)]

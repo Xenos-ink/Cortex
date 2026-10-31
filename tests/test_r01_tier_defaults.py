@@ -37,9 +37,9 @@ from typing import Any
 
 from PIL import Image, ImageDraw
 
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.models import ActionType, GroundedAction, Observation
-from computer_use_mcp.verification import (
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.core.models import ActionType, GroundedAction, Observation
+from computer_use_mcp.pipeline.verification import (
     FOCUS_CHANGE_INTENT_FLAG,
     ScreenshotDiffStrategy,
     VerificationEngine,

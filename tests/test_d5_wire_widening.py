@@ -34,7 +34,7 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.state import SessionRegistry
 
 
 @pytest.fixture

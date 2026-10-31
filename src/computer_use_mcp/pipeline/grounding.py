@@ -38,7 +38,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
-from .models import ActionType, CoordinateSpace, GroundedAction, GroundingResult, Observation, Point
+from ..core.models import ActionType, CoordinateSpace, GroundedAction, GroundingResult, Observation, Point
 
 __all__ = [
     "AccessibilityGroundingStrategy",

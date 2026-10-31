@@ -31,8 +31,8 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.models import ActionSpec, ActionType, GroundedAction
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction
 from computer_use_mcp.server import ACTION_VOCABULARY
 
 

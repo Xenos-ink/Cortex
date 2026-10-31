@@ -42,7 +42,7 @@ import pytest
 from PIL import Image
 
 from computer_use_mcp import server
-from computer_use_mcp.models import Observation
+from computer_use_mcp.core.models import Observation
 
 from test_controller_integration import (
     FAST_LIMITS,
@@ -57,7 +57,7 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same as controller suite)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
     monkeypatch.setattr(server, "_registry", __import__(
-        "computer_use_mcp.state", fromlist=["SessionRegistry"]
+        "computer_use_mcp.core.state", fromlist=["SessionRegistry"]
     ).SessionRegistry(max_sessions=8))
     monkeypatch.setattr(server, "_bundles", {})
     return server

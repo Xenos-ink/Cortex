@@ -78,8 +78,8 @@ from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .backend import PLAN_MOVE_DURATION_MS
-from .models import (
+from ..backend import PLAN_MOVE_DURATION_MS
+from ..core.models import (
     MAX_DURATION_MS,
     MAX_HOLD_MS,
     MAX_PLAN_SETTLE_MS,
@@ -89,7 +89,7 @@ from .models import (
     Point,
     _new_id,
 )
-from .redaction import redact_text
+from ..security.redaction import redact_text
 
 # --- limits (master-mission WP9 list; read from ONE place) -----------------------------------
 # The numeric bands live on the pydantic fields below and on the WP2 constants imported

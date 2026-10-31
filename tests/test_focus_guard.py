@@ -28,9 +28,9 @@ from typing import Any
 from PIL import Image
 
 from computer_use_mcp.backend import FakeComputerBackend, WindowFocusError
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import FOCUS_IDENTITY_UNKNOWN, FOCUS_TAKEN_BY, parse_interference
-from computer_use_mcp.models import FailureClass, GroundedAction, WindowInfo
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import FOCUS_IDENTITY_UNKNOWN, FOCUS_TAKEN_BY, parse_interference
+from computer_use_mcp.core.models import FailureClass, GroundedAction, WindowInfo
 
 TARGET = WindowInfo(
     hwnd=1, pid=100, process_name="EXCEL.EXE", exe_path="C:\\apps\\EXCEL.EXE",
@@ -236,11 +236,11 @@ def test_rejected_outcome_carries_payload_and_backend_never_runs() -> None:
     """The controller turns a blocking verdict into a structured rejection (kind=rejected)."""
     from types import SimpleNamespace
 
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     backend = ExecuteCounter()
     backend.set_active_window(TARGET)
@@ -273,11 +273,11 @@ def test_rejected_outcome_carries_payload_and_backend_never_runs() -> None:
 def test_focus_window_action_re_binds_and_stays_reachable_under_steal() -> None:
     from types import SimpleNamespace
 
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     backend = ExecuteCounter()
     backend.set_active_window(TARGET)
@@ -419,11 +419,11 @@ EDGE = WindowInfo(hwnd=20, pid=700, process_name="msedge.exe", window_class="Chr
 def _flow_agent(backend: FlowBackend, processes: list[str]) -> Any:
     from types import SimpleNamespace
 
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     agent = ComputerUseAgent(
         backend, provider=None, safety=SafetyPolicy(), task=TaskState(), stop=StopToken(),
@@ -523,7 +523,7 @@ def test_reanchor_skipped_for_unverified_outcomes() -> None:
     """The agent only re-anchors on VERIFIED actions (helper contract)."""
     from types import SimpleNamespace
 
-    from computer_use_mcp.agent import ComputerUseAgent
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
 
     backend = FlowBackend()
     guard = InterferenceGuard(backend, parse_interference(None))

@@ -19,7 +19,7 @@ import io
 import pytest
 from PIL import Image
 
-from computer_use_mcp.grounding import (
+from computer_use_mcp.pipeline.grounding import (
     AccessibilityGroundingStrategy,
     CoordinateGroundingStrategy,
     GroundingRouter,
@@ -27,7 +27,7 @@ from computer_use_mcp.grounding import (
     TextAnchorGroundingStrategy,
     UnsupportedGroundingError,
 )
-from computer_use_mcp.models import (
+from computer_use_mcp.core.models import (
     CoordinateSpace,
     GroundedAction,
     MonitorInfo,
@@ -36,12 +36,12 @@ from computer_use_mcp.models import (
     TextRegion,
     WindowInfo,
 )
-from computer_use_mcp.validator import (
+from computer_use_mcp.pipeline.validator import (
     GroundingValidator,
     ProcessNotAllowedError,
     StaleObservationError,
 )
-from computer_use_mcp.verification import (
+from computer_use_mcp.pipeline.verification import (
     DEFAULT_STRATEGY_CHAIN,
     DeterministicPredicateStrategy,
     ModelVisualStrategy,
@@ -686,14 +686,14 @@ def test_model_visual_strategy_degrades_without_judge_and_never_trusts_garbage()
 
     class UncertainJudge:
         def judge(self, intent: VerificationIntent, before_img: object, after_img: object) -> object:
-            from computer_use_mcp.models import VerificationResult
+            from computer_use_mcp.core.models import VerificationResult
 
             return VerificationResult(outcome="uncertain", changed=True, note="judge unsure", confidence=0.4)
 
     result = ModelVisualStrategy(UncertainJudge()).verify(intent, before, after)
     assert result.outcome == "uncertain" and result.verified is False
 
-    from computer_use_mcp.models import VerificationResult
+    from computer_use_mcp.core.models import VerificationResult
 
     class RealJudge:
         def judge(self, intent: VerificationIntent, before_img: object, after_img: object) -> VerificationResult:

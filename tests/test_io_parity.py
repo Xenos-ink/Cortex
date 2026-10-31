@@ -31,7 +31,7 @@ from computer_use_mcp.backend import (
     _CaptureContext,
     _from_absolute_65535,
 )
-from computer_use_mcp.models import CoordinateSpace, GroundedAction, MonitorInfo
+from computer_use_mcp.core.models import CoordinateSpace, GroundedAction, MonitorInfo
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 

@@ -65,7 +65,7 @@ from typing import Any
 
 from PIL import Image
 
-from .models import (
+from .core.models import (
     MAX_DURATION_MS,
     MAX_HOLD_MS,
     MAX_PLAN_SETTLE_MS,
@@ -76,7 +76,7 @@ from .models import (
     TextRegion,
     WindowInfo,
 )
-from .state import StopToken
+from .core.state import StopToken
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -694,7 +694,7 @@ def _launch_unresolved_suffix(exc: BaseException, *, resolved: bool) -> str:
     needle is never embedded in either suffix (path-lookup-missed is fully static;
     spawn-failed's bounded OS text may echo the local operator-configured target).
     """
-    from .interference import (
+    from .desktop.interference import (
         format_launch_unresolved_path_miss,
         format_launch_unresolved_spawn_failed,
     )
@@ -5713,7 +5713,7 @@ class LocalComputerBackend(ComputerBackend):
         ``CORTEX_LAUNCH_PATHS`` (``needle=path;...``, see README "Environment
         variables") — the mapping is consulted FIRST.
         """
-        from .interference import (
+        from .desktop.interference import (
             LAUNCHED,
             format_ambiguous_instance,
             format_no_instance,
@@ -6240,7 +6240,7 @@ class FakeComputerBackend(ComputerBackend):
 
     def ensure_app(self, target: str, allow_launch: bool = False) -> str:
         """Simulated attach-or-launch over the injected ``app_windows`` population."""
-        from .interference import (
+        from .desktop.interference import (
             LAUNCHED,
             format_ambiguous_instance,
             format_no_instance,
@@ -6265,7 +6265,7 @@ class FakeComputerBackend(ComputerBackend):
                 # the pre-0.7.1 silent bare probe; a Store-alias name or a
                 # ``CORTEX_LAUNCH_PATHS`` mapping launches and records the real
                 # ``<name>.exe`` identity.
-                from .interference import format_launch_unresolved_path_miss
+                from .desktop.interference import format_launch_unresolved_path_miss
 
                 try:
                     validate_launch_needle(process_needle)

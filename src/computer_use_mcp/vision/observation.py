@@ -23,8 +23,8 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from .backend import ComputerBackend
-from .models import Observation
+from ..backend import ComputerBackend
+from ..core.models import Observation
 
 
 def observation_digest(observation: Observation) -> str:

@@ -66,9 +66,9 @@ def main() -> int:
 
     # import server for _bound_outbound_image (importable; no server start)
     from computer_use_mcp.backend import LocalComputerBackend
-    from computer_use_mcp.limits import LimitEnforcer, Limits
-    from computer_use_mcp.observation import observation_digest
-    from computer_use_mcp.verification import (
+    from computer_use_mcp.core.limits import LimitEnforcer, Limits
+    from computer_use_mcp.vision.observation import observation_digest
+    from computer_use_mcp.pipeline.verification import (
         ScreenshotDiffStrategy,
         VerificationEngine,
         VerificationIntent,
@@ -260,7 +260,7 @@ def main() -> int:
     report["composite_action_two_observes_plus_verify"] = _ms(comp_ms)
 
     # composite with digest comparisons (validator staleness + strict digest)
-    from computer_use_mcp.observation import digest_matches
+    from computer_use_mcp.vision.observation import digest_matches
 
     comp2 = []
     for _ in range(iters):

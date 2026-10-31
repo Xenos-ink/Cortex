@@ -34,8 +34,8 @@ from computer_use_mcp.backend import (
     _split_type_chunks,
     _typed_index_for_norm_len,
 )
-from computer_use_mcp.models import GroundedAction
-from computer_use_mcp.state import StopToken, TaskStopped
+from computer_use_mcp.core.models import GroundedAction
+from computer_use_mcp.core.state import StopToken, TaskStopped
 
 
 class _ScriptedReader:

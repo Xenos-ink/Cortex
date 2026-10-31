@@ -29,8 +29,8 @@ the required response — the fix is never to relax the assertion here.
 
 from __future__ import annotations
 
-from computer_use_mcp.models import Observation, WindowInfo
-from computer_use_mcp.verification import (
+from computer_use_mcp.core.models import Observation, WindowInfo
+from computer_use_mcp.pipeline.verification import (
     FOCUS_CHANGE_INTENT_FLAG,
     VerificationIntent,
     VerificationKind,

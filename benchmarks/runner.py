@@ -74,8 +74,8 @@ from benchmarks.appwin import (
 from benchmarks.fakeworld import FakeWorldBackend
 from computer_use_mcp import server
 from computer_use_mcp.backend import LocalComputerBackend
-from computer_use_mcp.models import GroundedAction
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.models import GroundedAction
+from computer_use_mcp.core.state import SessionRegistry
 
 DISCLAIMER = "Harness validation output — NOT benchmark scores."
 CATEGORIES = (

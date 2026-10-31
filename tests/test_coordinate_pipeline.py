@@ -40,8 +40,8 @@ from PIL import Image
 
 from computer_use_mcp import server
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.grounding import GroundingRouter
-from computer_use_mcp.models import (
+from computer_use_mcp.pipeline.grounding import GroundingRouter
+from computer_use_mcp.core.models import (
     AgentDecision,
     CoordinateSpace,
     GroundedAction,
@@ -49,8 +49,8 @@ from computer_use_mcp.models import (
     Observation,
     SessionState,
 )
-from computer_use_mcp.state import SessionRegistry
-from computer_use_mcp.validator import GroundingValidator
+from computer_use_mcp.core.state import SessionRegistry
+from computer_use_mcp.pipeline.validator import GroundingValidator
 
 FAST_LIMITS = {"min_screenshot_interval_ms": 0}
 

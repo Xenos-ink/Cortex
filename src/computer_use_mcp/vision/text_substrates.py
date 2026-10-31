@@ -70,7 +70,7 @@ from typing import Any, Callable, Protocol
 
 from PIL import Image
 
-from .models import MonitorInfo, Observation, TextRegion
+from ..core.models import MonitorInfo, Observation, TextRegion
 
 #: The well-known side-package name the side-install ships (A3 §1). Detection is BY
 #: THIS NAME only — there is deliberately no config file, env toggle, or flag: installing

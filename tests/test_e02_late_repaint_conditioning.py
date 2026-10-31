@@ -22,12 +22,12 @@ from typing import Any
 
 import pytest
 
-from computer_use_mcp.agent import ComputerUseAgent
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.models import GroundedAction, Observation, Point
-from computer_use_mcp.safety import SafetyPolicy
-from computer_use_mcp.state import StopToken, TaskState
+from computer_use_mcp.core.limits import Limits
+from computer_use_mcp.core.models import GroundedAction, Observation, Point
+from computer_use_mcp.security.safety import SafetyPolicy
+from computer_use_mcp.core.state import StopToken, TaskState
 
 WIDTH = 1280
 HEIGHT = 720

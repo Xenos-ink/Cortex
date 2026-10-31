@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from pydantic import ConfigDict, Field, PrivateAttr
 
-from .models import (
+from ..core.models import (
     MAX_DURATION_MS,
     MAX_HOLD_MS,
     ActionType,

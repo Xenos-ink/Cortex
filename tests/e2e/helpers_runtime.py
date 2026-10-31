@@ -37,8 +37,8 @@ from typing import Any
 
 import helpers_win32 as w32
 
-from computer_use_mcp.models import AgentDecision, GroundedAction, Observation, VerificationResult
-from computer_use_mcp.verification import VerificationIntent, VerificationKind
+from computer_use_mcp.core.models import AgentDecision, GroundedAction, Observation, VerificationResult
+from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
 
 def step(

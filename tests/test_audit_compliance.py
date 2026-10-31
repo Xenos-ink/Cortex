@@ -30,11 +30,11 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.audit import AuditEventType, AuditLogger, Metrics
+from computer_use_mcp.security.audit import AuditEventType, AuditLogger, Metrics
 from computer_use_mcp.backend import DisplayUnavailableError
-from computer_use_mcp.limits import LimitExceeded
-from computer_use_mcp.models import WindowInfo
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.limits import LimitExceeded
+from computer_use_mcp.core.models import WindowInfo
+from computer_use_mcp.core.state import SessionRegistry
 
 
 @pytest.fixture
@@ -366,7 +366,7 @@ _STAT_TWO: dict[str, Any] = {
 class _CancelAfterDispatch(ScriptedBackend):
     def execute(self, action: Any, stop: Any = None, **kwargs: Any) -> str:
         message = super().execute(action, stop)
-        from computer_use_mcp.state import TaskStopped
+        from computer_use_mcp.core.state import TaskStopped
 
         raise TaskStopped("synthetic stop immediately after dispatch")
 
@@ -772,9 +772,9 @@ async def test_kill_then_step_exit_always_closes_the_lifecycle(
     LimitExceeded out of run_single (N-A), a TaskStopped, a BaseException, and a
     normal return — ends with EXACTLY ONE terminal event, AFTER the plan_point,
     with the final prefix counts and the in-flight marker cleared."""
-    from computer_use_mcp.agent import SingleActionOutcome
-    from computer_use_mcp.models import ExecutionResult, GroundedAction
-    from computer_use_mcp.state import TaskStopped
+    from computer_use_mcp.pipeline.agent import SingleActionOutcome
+    from computer_use_mcp.core.models import ExecutionResult, GroundedAction
+    from computer_use_mcp.core.state import TaskStopped
 
     backend = ScriptedBackend(flip=True)
     sid, bundle, _, _ = make_session(
@@ -1022,7 +1022,7 @@ async def test_invalid_conversion_and_base_exception_paths_agree(
 ) -> None:
     """F5 gap: the structural-rejection (invalid conversion) and BaseException
     terminal records carry their reply's (or envelope's) verdict and counts."""
-    from computer_use_mcp.models import ActionSpec
+    from computer_use_mcp.core.models import ActionSpec
     import weakref
 
     # invalid conversion: each spec converts ONCE at submission; the STEP's own

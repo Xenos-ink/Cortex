@@ -24,7 +24,7 @@ from recording_engine import RecordingEngine
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp import server
-from computer_use_mcp.agent import ComputerUseAgent
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
 from computer_use_mcp.backend import (
     CoordinateSpaceError,
     FakeComputerBackend,
@@ -32,8 +32,8 @@ from computer_use_mcp.backend import (
     PyAutoGuiInputEngine,
     SendInputEngine,
 )
-from computer_use_mcp.grounding import GroundingRouter, UnsupportedGroundingError
-from computer_use_mcp.models import (
+from computer_use_mcp.pipeline.grounding import GroundingRouter, UnsupportedGroundingError
+from computer_use_mcp.core.models import (
     ActionSpec,
     ActionType,
     GroundedAction,
@@ -43,10 +43,10 @@ from computer_use_mcp.models import (
     SessionState,
     WindowInfo,
 )
-from computer_use_mcp.provider import ProviderParseError, parse_decision
-from computer_use_mcp.safety import RiskLevel, SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry, StopToken, TaskStopped
-from computer_use_mcp.validator import (
+from computer_use_mcp.pipeline.provider import ProviderParseError, parse_decision
+from computer_use_mcp.security.safety import RiskLevel, SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry, StopToken, TaskStopped
+from computer_use_mcp.pipeline.validator import (
     GroundingValidator,
     MissingObservationBindingError,
     StaleObservationError,
@@ -355,7 +355,7 @@ def test_grounding_right_click_scaled_space_validates_and_records_scale() -> Non
 
 def test_grounding_right_click_is_never_non_spatial() -> None:
     """right_click stays OFF the non-spatial set: without a point it cannot ground."""
-    from computer_use_mcp.grounding import NON_SPATIAL_ACTIONS
+    from computer_use_mcp.pipeline.grounding import NON_SPATIAL_ACTIONS
 
     assert ActionType.RIGHT_CLICK not in NON_SPATIAL_ACTIONS
 
@@ -407,7 +407,7 @@ def test_validator_right_click_bound_and_in_bounds_is_valid() -> None:
 
 
 def test_validator_right_click_is_a_coordinate_action() -> None:
-    from computer_use_mcp.validator import COORDINATE_ACTIONS
+    from computer_use_mcp.pipeline.validator import COORDINATE_ACTIONS
 
     assert ActionType.RIGHT_CLICK in COORDINATE_ACTIONS
 
@@ -511,7 +511,7 @@ def test_verification_right_click_stated_effect_requires_change_without_focus_fl
     intent = _intent_agent()._build_intent(right_click((50, 30)), None, "context menu opens")
     assert intent.kind == "visual_change"
     assert intent.expected_change is True
-    from computer_use_mcp.agent import FOCUS_CHANGE_INTENT_FLAG
+    from computer_use_mcp.pipeline.agent import FOCUS_CHANGE_INTENT_FLAG
 
     assert FOCUS_CHANGE_INTENT_FLAG not in (intent.metadata or {})
 

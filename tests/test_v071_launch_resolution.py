@@ -43,7 +43,7 @@ from computer_use_mcp.backend import (
     LocalComputerBackend,
     parse_launch_paths,
 )
-from computer_use_mcp.interference import LAUNCHED, NO_INSTANCE, format_no_instance
+from computer_use_mcp.desktop.interference import LAUNCHED, NO_INSTANCE, format_no_instance
 
 LAUNCH_PATHS_ENV = "CORTEX_LAUNCH_PATHS"
 

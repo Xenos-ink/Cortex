@@ -45,16 +45,16 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.models import (
+from computer_use_mcp.core.models import (
     MAX_FOLLOW_UPS,
     ActionSpec,
     AgentDecision,
     GroundedAction,
     WindowInfo,
 )
-from computer_use_mcp.observation import observation_text_summary
-from computer_use_mcp.state import SessionRegistry
-from computer_use_mcp.verification import VerificationIntent, VerificationKind
+from computer_use_mcp.vision.observation import observation_text_summary
+from computer_use_mcp.core.state import SessionRegistry
+from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
 
 def done() -> AgentDecision:
@@ -255,7 +255,7 @@ async def test_ladder_deterministic_tier_returns_before_the_judge(
 
     RETARGETED (loop removal): this is the old in-loop pin moved to the agent
     seam (``_verify_judge_ladder``), the exact method the loop used to call."""
-    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+    from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
     backend = ScriptedBackend(
         active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App Window")
@@ -325,7 +325,7 @@ async def test_judge_tier_runs_when_cheap_tiers_uncertain(
     RETARGETED (loop removal): the old in-loop pin, moved to the exact method
     (``_verify_judge_ladder``) the loop used to call. Pixels differ (ShiftingScreen),
     no deterministic criteria -> the judge runs ONCE and its verdict wins."""
-    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+    from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
     provider = JudgingProvider([], verdict="verified")
     session_id, _bundle, _backend, _ = make_session(
@@ -792,7 +792,7 @@ def test_text_summary_changed_note_on_screen_change(
 
 
 def test_text_summary_control_hint_and_graceful_omission() -> None:
-    from computer_use_mcp.models import Observation
+    from computer_use_mcp.core.models import Observation
 
     base = {"image_base64": _png(), "width": 64, "height": 48}
     with_hint = Observation(
@@ -866,7 +866,7 @@ async def test_starved_after_capture_routes_past_the_diff_tier(
     agent = server._get_bundle(session_id).agent
     backend = ScriptedBackend(flip=False)
     frozen = backend.observe()  # the SAME observation object: starved self-comparison
-    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+    from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
     intent = VerificationIntent(
         kind=VerificationKind.MODEL_JUDGE,

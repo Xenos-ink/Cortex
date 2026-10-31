@@ -20,10 +20,10 @@ from types import SimpleNamespace
 from typing import Any
 
 from computer_use_mcp.backend import FakeComputerBackend, FocusDriftError
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import FOCUS_DRIFTED, parse_interference
-from computer_use_mcp.models import FailureClass, GroundedAction, WindowInfo
-from computer_use_mcp.state import StopToken
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import FOCUS_DRIFTED, parse_interference
+from computer_use_mcp.core.models import FailureClass, GroundedAction, WindowInfo
+from computer_use_mcp.core.state import StopToken
 
 TARGET = WindowInfo(
     hwnd=1, pid=100, process_name="EXCEL.EXE", window_class="XLMAIN", title="Book1 - Excel",
@@ -160,7 +160,7 @@ def test_mid_type_drift_aborts_remaining_chunks_and_preserves_stop_precedence() 
     engine2 = RecordingEngine()
     backend._engine = engine2
     real._engine = engine2
-    from computer_use_mcp.state import TaskStopped
+    from computer_use_mcp.core.state import TaskStopped
 
     try:
         real.execute(TYPE_ACTION, stopped, focus_hook=_hook)
@@ -171,11 +171,11 @@ def test_mid_type_drift_aborts_remaining_chunks_and_preserves_stop_precedence() 
 
 
 def test_controller_maps_mid_type_drift_to_rejection_without_retype() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     class DriftMidType(FakeComputerBackend):
         def __init__(self, **kwargs: Any) -> None:
@@ -205,11 +205,11 @@ def test_controller_maps_mid_type_drift_to_rejection_without_retype() -> None:
 
 
 def test_post_type_drift_reported_and_terminal_key_never_resent() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     class DriftAfterType(FakeComputerBackend):
         def __init__(self, **kwargs: Any) -> None:

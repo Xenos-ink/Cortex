@@ -38,18 +38,18 @@ from computer_use_mcp.backend import (
     PyAutoGuiInputEngine,
     SendInputEngine,
 )
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import parse_interference
-from computer_use_mcp.limits import LimitEnforcer, Limits
-from computer_use_mcp.models import (
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import parse_interference
+from computer_use_mcp.core.limits import LimitEnforcer, Limits
+from computer_use_mcp.core.models import (
     MAX_FOLLOW_UPS,
     ActionSpec,
     GroundedAction,
     WindowInfo,
 )
-from computer_use_mcp.redaction import redact_text
-from computer_use_mcp.safety import SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.security.redaction import redact_text
+from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry
 
 TARGET = WindowInfo(
     hwnd=1, pid=100, process_name="excel.exe", window_class="XLMAIN", title="Book1 - Excel",

@@ -26,7 +26,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .models import MAX_SUBTASKS, Subtask, SubtaskFailureInfo, SubtaskStatus
+from ..core.models import MAX_SUBTASKS, Subtask, SubtaskFailureInfo, SubtaskStatus
 from .plan_validator import find_cycle
 
 __all__ = [

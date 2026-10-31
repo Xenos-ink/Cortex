@@ -41,8 +41,8 @@ from typing import NamedTuple
 
 from PIL import Image, ImageFilter
 
-from .models import TextRegion
-from .textnorm import canonical_views
+from ..core.models import TextRegion
+from ..core.textnorm import canonical_views
 
 REDACTED_TEMPLATE = "[REDACTED:{name}]"
 

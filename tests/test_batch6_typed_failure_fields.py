@@ -45,9 +45,9 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.models import GroundedAction, WindowInfo
-from computer_use_mcp.plan import PLAN_FAILURE_REASONS
-from computer_use_mcp.state import SessionRegistry, TaskStopped
+from computer_use_mcp.core.models import GroundedAction, WindowInfo
+from computer_use_mcp.planning.plan import PLAN_FAILURE_REASONS
+from computer_use_mcp.core.state import SessionRegistry, TaskStopped
 
 
 def wire_plan(plan):

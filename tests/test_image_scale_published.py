@@ -24,7 +24,7 @@ from reply_contract import validate_reply
 from test_controller_integration import FAST_LIMITS, ScriptedBackend, make_session
 
 from computer_use_mcp import server
-from computer_use_mcp.visual_views import (
+from computer_use_mcp.vision.visual_views import (
     DEFAULT_GRID_DENSITY,
     outbound_view_scale,
     resolve_view,
@@ -224,7 +224,7 @@ async def test_grid_path_visual_view_scale_is_unchanged(
 ) -> None:
     """``visual_view_scale`` still reports the scale of the DERIVED VIEW (AL-002), and
     the measured key rides beside it rather than replacing it."""
-    from computer_use_mcp.models import Observation
+    from computer_use_mcp.core.models import Observation
 
     monkeypatch.delenv("CORTEX_RESULT_IMAGE_MAX_KB", raising=False)
     png = _noise_png_b64(1920, 1080, seed=13)

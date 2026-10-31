@@ -21,7 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .redaction import redact_text
+from ..security.redaction import redact_text
 
 RECENT_HISTORY_MIN = 5
 RECENT_HISTORY_MAX = 10

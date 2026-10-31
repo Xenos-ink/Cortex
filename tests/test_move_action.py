@@ -21,14 +21,14 @@ from recording_engine import RecordingEngine
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp import server
-from computer_use_mcp.agent import ComputerUseAgent
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
 from computer_use_mcp.backend import (
     CoordinateSpaceError,
     FakeComputerBackend,
     InputBlockedError,
 )
-from computer_use_mcp.grounding import GroundingRouter, UnsupportedGroundingError
-from computer_use_mcp.models import (
+from computer_use_mcp.pipeline.grounding import GroundingRouter, UnsupportedGroundingError
+from computer_use_mcp.core.models import (
     ActionType,
     GroundedAction,
     MonitorInfo,
@@ -37,15 +37,15 @@ from computer_use_mcp.models import (
     SessionState,
     WindowInfo,
 )
-from computer_use_mcp.provider import ProviderParseError, parse_decision
-from computer_use_mcp.safety import RiskLevel, SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry, StopToken, TaskStopped
-from computer_use_mcp.validator import (
+from computer_use_mcp.pipeline.provider import ProviderParseError, parse_decision
+from computer_use_mcp.security.safety import RiskLevel, SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry, StopToken, TaskStopped
+from computer_use_mcp.pipeline.validator import (
     GroundingValidator,
     MissingObservationBindingError,
     StaleObservationError,
 )
-from computer_use_mcp.verification import VerificationEngine
+from computer_use_mcp.pipeline.verification import VerificationEngine
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 

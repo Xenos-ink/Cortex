@@ -34,13 +34,13 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from computer_use_mcp.agent import ComputerUseAgent
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
 from computer_use_mcp.backend import AppWindowCandidate, FakeComputerBackend
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.interference import parse_interference
-from computer_use_mcp.models import GroundedAction, WindowInfo
-from computer_use_mcp.safety import SafetyPolicy
-from computer_use_mcp.state import StopToken, TaskState
+from computer_use_mcp.core.limits import Limits
+from computer_use_mcp.desktop.interference import parse_interference
+from computer_use_mcp.core.models import GroundedAction, WindowInfo
+from computer_use_mcp.security.safety import SafetyPolicy
+from computer_use_mcp.core.state import StopToken, TaskState
 
 EXCEL = WindowInfo(
     hwnd=1, pid=100, process_name="EXCEL.EXE", window_class="XLMAIN", title="Book1 - Excel"
@@ -192,7 +192,7 @@ def test_an_ambiguous_match_is_uncertain_never_verified() -> None:
 def test_the_probe_failure_classifier_names_only_the_two_failure_values() -> None:
     """Unit pin on the parser: the two failure suffixes are the whole vocabulary, and a
     probe with no failure suffix is not a failure."""
-    from computer_use_mcp.agent import _ensure_app_probe_failure
+    from computer_use_mcp.pipeline.agent import _ensure_app_probe_failure
 
     assert _ensure_app_probe_failure("NO_INSTANCE target='a' launch=server") is None
     assert _ensure_app_probe_failure("AMBIGUOUS_INSTANCE candidates=[]") is None
@@ -223,7 +223,7 @@ def test_the_probe_failure_classifier_names_only_the_two_failure_values() -> Non
 def test_the_probe_shortcut_is_not_taken_for_a_launched_target() -> None:
     """``REATTACHED`` is not a probe outcome and never entered the shortcut before
     this fix either — the classifier is scoped to the probe prefixes."""
-    from computer_use_mcp.agent import ComputerUseAgent as Agent
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent as Agent
 
     assert Agent._ensure_app_probe_outcome("REATTACHED title='Book1' hwnd=1") is False
     assert Agent._ensure_app_probe_outcome("NO_INSTANCE target='a'") is True

@@ -40,7 +40,7 @@ from computer_use_mcp.backend import (
     SendInputEngine,
     _drag_segment_points,
 )
-from computer_use_mcp.models import GroundedAction
+from computer_use_mcp.core.models import GroundedAction
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 

@@ -41,7 +41,7 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.state import SessionRegistry
 from reply_contract import validate_reply
 
 #: Tests run with a SHORT idle timeout so the patched clock only ever advances a

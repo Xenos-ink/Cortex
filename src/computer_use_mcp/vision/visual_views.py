@@ -71,7 +71,7 @@ from typing import Any, Callable, NamedTuple, Protocol
 
 from PIL import Image, ImageDraw
 
-from .models import DEFAULT_VISUAL_VIEW, VISUAL_VIEWS, Observation
+from ..core.models import DEFAULT_VISUAL_VIEW, VISUAL_VIEWS, Observation
 from .text_substrates import substrate_pass
 
 #: Cap on the regions served in one spatial-text block (AL-002 I-9): the SAME

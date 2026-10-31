@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from computer_use_mcp.models import (
+from computer_use_mcp.core.models import (
     MAX_SUBTASKS,
     SUBTASK_RESULTS_CAP,
     ExecutionResult,
@@ -21,7 +21,7 @@ from computer_use_mcp.models import (
     Subtask,
     SubtaskStatus,
 )
-from computer_use_mcp.subtask_manager import (
+from computer_use_mcp.planning.subtask_manager import (
     DependencyCycleError,
     InvalidSubtaskError,
     SelfDependencyError,

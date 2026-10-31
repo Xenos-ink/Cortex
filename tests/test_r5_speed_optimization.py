@@ -50,10 +50,10 @@ from test_controller_integration import (
 
 from computer_use_mcp import server
 from computer_use_mcp.backend import ComputerBackend, FakeComputerBackend
-from computer_use_mcp.models import Observation, WindowInfo
-from computer_use_mcp.observation import digest_matches
-from computer_use_mcp.state import SessionRegistry
-from computer_use_mcp.verification import (
+from computer_use_mcp.core.models import Observation, WindowInfo
+from computer_use_mcp.vision.observation import digest_matches
+from computer_use_mcp.core.state import SessionRegistry
+from computer_use_mcp.pipeline.verification import (
     DEFAULT_DIFF_THRESHOLD,
     STRONG_CHANGE_MIN_PIXELS,
     STRONG_PIXEL_DELTA,
@@ -321,7 +321,7 @@ def test_w2_mismatched_stash_size_falls_back_to_decode() -> None:
 def test_w2_focus_change_corroboration_uses_fast_path() -> None:
     """FocusChangeStrategy's digest-corroboration magnitude is identical via the
     fast path (shared _frames/_diff_magnitude implementation)."""
-    from computer_use_mcp.verification import (
+    from computer_use_mcp.pipeline.verification import (
         FOCUS_CHANGE_INTENT_FLAG,
         FocusChangeStrategy,
     )

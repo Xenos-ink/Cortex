@@ -35,7 +35,7 @@ from computer_use_mcp.backend import (
     _text_to_key_units,
     find_window_by_title,
 )
-from computer_use_mcp.models import GroundedAction
+from computer_use_mcp.core.models import GroundedAction
 
 #: The exact incident payload shape: a raw single-backslash Windows path after a verb.
 BS = chr(92)  # immune to source-encoding/shell mangling
@@ -61,12 +61,12 @@ def test_follow_ups_chain_with_backslash_path_type_runs_to_completion() -> None:
 
     from PIL import Image as PILImage
 
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.models import ActionSpec
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import ActionSpec
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     backend = FakeComputerBackend()
 

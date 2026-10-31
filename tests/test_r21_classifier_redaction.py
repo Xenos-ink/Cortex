@@ -45,11 +45,11 @@ from test_controller_integration import (
 from test_provider_safety import capturing_transport, judge_response
 
 from computer_use_mcp import server
-from computer_use_mcp.models import GroundedAction, RiskLevel, SessionState
-from computer_use_mcp.provider import OpenAICompatibleVisionProvider
-from computer_use_mcp.redaction import contains_secret, redact_text
-from computer_use_mcp.safety import SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.models import GroundedAction, RiskLevel, SessionState
+from computer_use_mcp.pipeline.provider import OpenAICompatibleVisionProvider
+from computer_use_mcp.security.redaction import contains_secret, redact_text
+from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry
 
 LEGACY_GATE_REASON = "Text resembles a secret, credential, or destructive command."
 

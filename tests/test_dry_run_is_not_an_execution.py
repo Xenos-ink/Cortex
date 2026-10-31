@@ -59,11 +59,11 @@ def _state(**overrides: Any) -> SimpleNamespace:
 
 
 async def test_a_dry_run_reports_not_ok_and_carries_the_marker() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.models import GroundedAction, Point
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import GroundedAction, Point
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     backend = ScriptedBackend(flip=True)  # a live world: any dispatch WOULD change pixels
     agent = ComputerUseAgent(
@@ -97,11 +97,11 @@ async def test_a_dry_run_reports_not_ok_and_carries_the_marker() -> None:
 
 
 async def test_a_dry_run_performs_no_post_action_capture() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.models import GroundedAction, Point
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import GroundedAction, Point
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     backend = ScriptedBackend(flip=True)
     agent = ComputerUseAgent(
@@ -129,11 +129,11 @@ async def test_a_dry_run_performs_no_post_action_capture() -> None:
 
 async def test_a_real_execution_is_not_marked_as_a_dry_run() -> None:
     """The other direction: the marker is a marker, and it never rides a real run."""
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.models import GroundedAction, Point
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import GroundedAction, Point
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     backend = ScriptedBackend(flip=True)
     agent = ComputerUseAgent(
@@ -179,7 +179,7 @@ async def test_a_dry_run_through_computer_execute_is_not_ok(
 
 async def test_a_dry_run_executed_row_serialises_the_marker() -> None:
     """The marker must be on the wire, not only on the model: a host reads the JSON."""
-    from computer_use_mcp.models import ExecutionResult, GroundedAction, Point, VerificationResult
+    from computer_use_mcp.core.models import ExecutionResult, GroundedAction, Point, VerificationResult
 
     result = ExecutionResult(
         ok=False,

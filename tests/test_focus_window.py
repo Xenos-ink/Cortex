@@ -33,31 +33,31 @@ from pydantic import ValidationError
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp import server
-from computer_use_mcp.agent import ComputerUseAgent
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
 from computer_use_mcp.backend import (
     ComputerBackend,
     FakeComputerBackend,
     InputBlockedError,
     WindowFocusError,
 )
-from computer_use_mcp.grounding import GroundingRouter
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.models import (
+from computer_use_mcp.pipeline.grounding import GroundingRouter
+from computer_use_mcp.core.limits import Limits
+from computer_use_mcp.core.models import (
     ActionType,
     GroundedAction,
     Observation,
     SessionState,
     WindowInfo,
 )
-from computer_use_mcp.provider import (
+from computer_use_mcp.pipeline.provider import (
     RESPONSE_SCHEMA_TEXT,
     ProviderParseError,
     parse_decision,
 )
-from computer_use_mcp.safety import RiskLevel, SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry, StopToken, TaskStopped
-from computer_use_mcp.validator import GroundingValidator, WindowIdentityUnavailableError
-from computer_use_mcp.verification import VerificationEngine
+from computer_use_mcp.security.safety import RiskLevel, SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry, StopToken, TaskStopped
+from computer_use_mcp.pipeline.validator import GroundingValidator, WindowIdentityUnavailableError
+from computer_use_mcp.pipeline.verification import VerificationEngine
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 

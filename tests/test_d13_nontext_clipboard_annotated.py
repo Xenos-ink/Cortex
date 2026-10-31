@@ -32,7 +32,7 @@ from computer_use_mcp.backend import (
     _clipboard_read_text,
     _clipboard_read_verdict,
 )
-from computer_use_mcp.models import ActionType, GroundedAction
+from computer_use_mcp.core.models import ActionType, GroundedAction
 
 # --- in-memory clipboard doubles ------------------------------------------------------------------
 

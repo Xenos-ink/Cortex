@@ -39,8 +39,8 @@ from PIL import Image
 from computer_use_mcp import backend as backend_module
 from computer_use_mcp import server
 from computer_use_mcp.backend import FakeComputerBackend, LocalComputerBackend
-from computer_use_mcp.models import GroundedAction, Observation, WindowInfo
-from computer_use_mcp.verification import (
+from computer_use_mcp.core.models import GroundedAction, Observation, WindowInfo
+from computer_use_mcp.pipeline.verification import (
     ScreenshotDiffStrategy,
     VerificationEngine,
     VerificationIntent,
@@ -758,7 +758,7 @@ def _diff_magnitude_probe(before: Observation, after: Observation) -> tuple[floa
     """Direct probe of the diff tier's magnitudes (decoded frames, no stash)."""
     before_image = ScreenshotDiffStrategy._decode(before.image_base64)
     after_image = ScreenshotDiffStrategy._decode(after.image_base64)
-    from computer_use_mcp.verification import _diff_magnitude
+    from computer_use_mcp.pipeline.verification import _diff_magnitude
 
     return _diff_magnitude(before_image, after_image)
 

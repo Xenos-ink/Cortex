@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from computer_use_mcp.plan import (
+from computer_use_mcp.planning.plan import (
     DISPATCHED_ITEM_KINDS,
     PLAN_EVIDENCE_KEY,
     TERMINAL_PLAN_RESULTS,
@@ -47,7 +47,7 @@ from computer_use_mcp.plan import (
     redact_queue_entry,
     set_plan_step_remainder,
 )
-from computer_use_mcp.plan import WaypointPlan as _PlanModel
+from computer_use_mcp.planning.plan import WaypointPlan as _PlanModel
 
 
 def _lease(points: int = 2, **plan_kwargs: Any) -> PlanLease:

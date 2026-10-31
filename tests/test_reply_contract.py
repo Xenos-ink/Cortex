@@ -48,13 +48,13 @@ from test_controller_integration import (
 
 from computer_use_mcp import server
 from computer_use_mcp.backend import FakeComputerBackend, FocusDriftError
-from computer_use_mcp.models import WindowInfo
+from computer_use_mcp.core.models import WindowInfo
 
 
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    from computer_use_mcp.state import SessionRegistry
+    from computer_use_mcp.core.state import SessionRegistry
 
     monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
     monkeypatch.setattr(server, "_bundles", {})
@@ -229,7 +229,7 @@ def test_chunked_type_counts_delivered_chars_before_the_abort(real_backend: Any)
     if platform.system() != "Windows":
         pytest.skip("Real Win32 backend requires Windows.")
     from computer_use_mcp.backend import TYPE_CHUNK_CHARS
-    from computer_use_mcp.models import GroundedAction
+    from computer_use_mcp.core.models import GroundedAction
 
     backend = real_backend
     chunks_seen: list[str] = []
@@ -432,7 +432,7 @@ async def test_defensive_no_result_branch_is_failed_action_error(
     real pipeline path reaches it) is a ``failed`` action_error reply. Unit-level
     shape check: no verification block exists because nothing was dispatched, so the
     full validate_reply verification requirement does not apply here."""
-    from computer_use_mcp.agent import SingleActionOutcome
+    from computer_use_mcp.pipeline.agent import SingleActionOutcome
 
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
@@ -494,7 +494,7 @@ def test_chunked_type_counts_per_character_drift(real_backend: Any) -> None:
     if platform.system() != "Windows":
         pytest.skip("Real Win32 backend requires Windows.")
     from computer_use_mcp.backend import TYPE_CHUNK_CHARS, PyAutoGuiInputEngine
-    from computer_use_mcp.models import GroundedAction
+    from computer_use_mcp.core.models import GroundedAction
 
     backend = real_backend
 
@@ -530,7 +530,7 @@ def test_integrity_off_path_counts_engine_dispatched_prefix(real_backend: Any) -
         pytest.skip("Real Win32 backend requires Windows.")
     import computer_use_mcp.backend as backend_module
     from computer_use_mcp.backend import PyAutoGuiInputEngine
-    from computer_use_mcp.models import GroundedAction
+    from computer_use_mcp.core.models import GroundedAction
 
     backend = real_backend
 
@@ -565,7 +565,7 @@ def test_repair_retype_drift_counts_landed_prefix(real_backend: Any) -> None:
     landed prefix (the characters already in the field) — never zero."""
     if platform.system() != "Windows":
         pytest.skip("Real Win32 backend requires Windows.")
-    from computer_use_mcp.models import GroundedAction
+    from computer_use_mcp.core.models import GroundedAction
 
     backend = real_backend
     calls = {"n": 0}
@@ -693,7 +693,7 @@ async def test_operation_error_reply_is_failed_action_error(
     """A backend operation error is result ``failed`` (ok False); no verification
     block exists because nothing was dispatched — the §1 helper scopes verification
     to dispatched input actions."""
-    from computer_use_mcp.models import GroundedAction
+    from computer_use_mcp.core.models import GroundedAction
 
     class ExplodingScrollBackend(ScriptedBackend):
         def execute(
@@ -720,8 +720,8 @@ async def test_task_stopped_reply_carries_the_stopped_token(
 ) -> None:
     """A host-requested stop surfacing through ``computer_execute`` replies with the
     §1.2 ``stopped`` token (ok False by the shared ok-rule)."""
-    from computer_use_mcp.agent import SingleActionOutcome  # noqa: F401 - shape reference
-    from computer_use_mcp.state import TaskStopped
+    from computer_use_mcp.pipeline.agent import SingleActionOutcome  # noqa: F401 - shape reference
+    from computer_use_mcp.core.state import TaskStopped
 
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
@@ -926,7 +926,7 @@ def test_sendinput_paced_per_char_drift_counts_dispatched(real_backend: Any) -> 
     if platform.system() != "Windows":
         pytest.skip("Real Win32 backend requires Windows.")
     from computer_use_mcp.backend import SendInputEngine
-    from computer_use_mcp.models import GroundedAction
+    from computer_use_mcp.core.models import GroundedAction
 
     probes = {"n": 0}
 
@@ -1141,8 +1141,8 @@ async def test_invalid_follow_up_entry_field_set_parity(
     and ``ensure_app_outcome`` present (None: nothing dispatched, nothing to own a
     value). Pinned on the agent-level outcome (the boundary answers the same wire
     condition with the teaching rejection before the queue ever runs)."""
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.models import ActionSpec, ActionType, GroundedAction
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction
 
     backend = ScriptedBackend(flip=False)
     _session_id, bundle, backend, _ = make_session(
@@ -1261,7 +1261,7 @@ async def test_rejection_reply_carries_the_retained_interference_events(
     """WP3 §-node: a pre-dispatch guard refusal (foreign foreground steal) surfaces the
     retained event list on the reply — the same string as the first reason — and the
     rejection obeys the §1 envelope (reasons, never an ``error`` key)."""
-    from computer_use_mcp.interference import FOCUS_TAKEN_BY
+    from computer_use_mcp.desktop.interference import FOCUS_TAKEN_BY
 
     backend = ScriptedBackend(
         flip=True, active_window=WindowInfo(hwnd=1, pid=100, process_name="EXCEL.EXE",

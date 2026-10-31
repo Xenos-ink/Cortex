@@ -26,7 +26,7 @@ import pytest
 from test_controller_integration import FAST_LIMITS, make_session
 
 from computer_use_mcp import server
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.state import SessionRegistry
 
 TEST_SEGMENT_SECONDS = 0.2
 

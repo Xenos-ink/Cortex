@@ -43,8 +43,8 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp.models import Observation, TextRegion, WindowInfo
-from computer_use_mcp.verification import (
+from computer_use_mcp.core.models import Observation, TextRegion, WindowInfo
+from computer_use_mcp.pipeline.verification import (
     FOCUS_CHANGE_INTENT_FLAG,
     IDENTITY_ELEMENT_SCAN_LIMIT,
     IDENTITY_STOP_TOKENS,
@@ -771,12 +771,12 @@ def test_the_binding_costs_no_extra_capture_or_input() -> None:
     # change costs no extra capture and no extra input either way.
     from types import SimpleNamespace
 
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.models import GroundedAction
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
     from test_controller_integration import ScriptedBackend
 
     window = WindowInfo(hwnd=1, pid=7, process_name="mspaint.exe", title="Untitled - Paint")

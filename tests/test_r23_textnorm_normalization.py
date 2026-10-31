@@ -35,11 +35,11 @@ import pytest
 from test_controller_integration import FAST_LIMITS, execute_payload, make_session
 
 from computer_use_mcp import server
-from computer_use_mcp.models import GroundedAction
-from computer_use_mcp.redaction import contains_secret, redact_text
-from computer_use_mcp.safety import SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry
-from computer_use_mcp.textnorm import canonical_views
+from computer_use_mcp.core.models import GroundedAction
+from computer_use_mcp.security.redaction import contains_secret, redact_text
+from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry
+from computer_use_mcp.core.textnorm import canonical_views
 
 # invisible/confusable characters (the R-23 strip set and space family)
 ZWSP = "\u200b"  # zero width space

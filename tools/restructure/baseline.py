@@ -37,11 +37,11 @@ NORMALIZATION (exact rules):
   4. Line/column info is DROPPED (ast.dump with include_attributes=False).
   5. Module-qualified references are normalized: any Name/Attribute chain
      whose dotted path names the package itself ("computer_use_mcp"), one of
-     its modules/subpackages ("computer_use_mcp.limits"), or an import alias
+     its modules/subpackages ("computer_use_mcp.core.limits"), or an import alias
      bound to such a module ("import computer_use_mcp.server as srv" binds
      "srv"; "from computer_use_mcp import server" binds "server") is replaced
      by the remainder of the chain after the module prefix is stripped —
-     "computer_use_mcp.limits.Limits" and "srv._f" become "Limits" / "_f".
+     "computer_use_mcp.core.limits.Limits" and "srv._f" become "Limits" / "_f".
      Chains that do not resolve to a src module are left untouched.
   6. The normalized subtree is serialized with ast.dump and hashed with
      sha256 (hex digest).
@@ -277,7 +277,7 @@ VOCAB_FALLBACK = {
 def audit_vocabulary() -> set[str]:
     try:
         from typing import get_args
-        from computer_use_mcp.audit import AuditEventType
+        from computer_use_mcp.security.audit import AuditEventType
         vocab = set(get_args(AuditEventType))
         if vocab:
             return vocab
@@ -288,7 +288,7 @@ def audit_vocabulary() -> set[str]:
 
 def _static_top_level_keys() -> list[str]:
     try:
-        from computer_use_mcp.audit import AuditEvent
+        from computer_use_mcp.security.audit import AuditEvent
         return sorted(AuditEvent.model_fields.keys())
     except Exception:
         return sorted(["timestamp", "session_id", "task_id", "observation_id",
@@ -388,14 +388,14 @@ def dynamic_audit_shapes() -> tuple[dict[str, dict], list[str]]:
 
     from PIL import Image
 
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.audit import AuditLogger, Metrics
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.security.audit import AuditLogger, Metrics
     from computer_use_mcp.backend import FakeComputerBackend
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.models import GroundedAction, WindowInfo
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import GroundedAction, WindowInfo
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     recorded: dict[str, dict] = {}
     orig_emit = AuditLogger.emit
@@ -820,9 +820,181 @@ def cmd_inventory(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# capture driver
-# ---------------------------------------------------------------------------
+def cmd_diff(args: argparse.Namespace) -> int:
+    """Diff two inventory files (BEFORE vs AFTER) by (name, kind) across modules.
+
+    Matching, in order:
+      UNCHANGED  same (module, name, kind, hash) on both sides
+      MOVED      same (name, kind, hash), module changed (a pure file move)
+      CHANGED    same (module, name, kind) but different hash
+      MISSING    in BEFORE only (no hash-equal match anywhere)
+      ADDED      in AFTER only (no hash-equal match, not a CHANGED partner)
+    With --move-table FILE (JSON: old module dotted name -> new module dotted
+    name), a BEFORE symbol whose module is in the table is paired ONLY inside
+    the module the table names (same leaf name, kind, hash); if it is found
+    anywhere else the pair is reported in moved_mismatch and the command exits 1.
+    Exit code 1 if any MISSING, CHANGED or moved_mismatch entry exists.
+    """
+    before_blob = json.loads(Path(args.before).resolve().read_text(encoding="utf-8"))
+    after_blob = json.loads(Path(args.after).resolve().read_text(encoding="utf-8"))
+    before: list[dict] = before_blob["symbols"]
+    after: list[dict] = after_blob["symbols"]
+    table: dict[str, str] | None = None
+    if getattr(args, "move_table", None):
+        table = json.loads(Path(args.move_table).resolve().read_text(encoding="utf-8"))
+
+    def key(e: dict) -> tuple:  # (module, name, kind, hash)
+        return (e["module"], e["name"], e["kind"], e["hash"])
+
+    def nk(e: dict) -> tuple:  # (name, kind, hash)
+        return (e["name"], e["kind"], e["hash"])
+
+    def mnk(e: dict) -> tuple:  # (module, name, kind)
+        return (e["module"], e["name"], e["kind"])
+
+    from collections import Counter
+
+    b_counts, a_counts = Counter(map(key, before)), Counter(map(key, after))
+    unchanged_multiset = b_counts & a_counts
+    unchanged: set[tuple] = set()
+    remaining_b, remaining_a = [], []
+    used_b: Counter = Counter()
+    used_a: Counter = Counter()
+    for e in before:
+        if used_b[key(e)] < unchanged_multiset[key(e)]:
+            used_b[key(e)] += 1
+            unchanged.add(key(e))
+        else:
+            remaining_b.append(e)
+    for e in after:
+        if used_a[key(e)] < unchanged_multiset[key(e)]:
+            used_a[key(e)] += 1
+        else:
+            remaining_a.append(e)
+
+    moved_pairs: list[dict] = []
+    moved_mismatch: list[dict] = []
+    moved_verified = 0
+    # pass 2a (with a move table): pair each mapped BEFORE symbol ONLY inside
+    # the module the table names (identical hash, same leaf name + kind).
+    if table is not None:
+        pool_a: dict[tuple, list[dict]] = {}
+        for e in remaining_a:
+            pool_a.setdefault((e["module"],) + nk(e), []).append(e)
+        fallback_b: list[dict] = []
+        matched_after: list[dict] = []
+        for e in remaining_b:
+            expected = table.get(e["module"])
+            cands = pool_a.get((expected,) + nk(e)) if expected else None
+            if cands:
+                cand = cands.pop(0)
+                matched_after.append(cand)
+                pair = {"name": e["name"], "kind": e["kind"], "hash": e["hash"],
+                        "from_module": e["module"], "to_module": cand["module"],
+                        "verified_by_table": True}
+                moved_pairs.append(pair)
+                moved_verified += 1
+            else:
+                fallback_b.append(e)
+        matched_ids = {id(m) for m in matched_after}
+        leftover_a = [e for e in remaining_a if id(e) not in matched_ids]
+    else:
+        fallback_b = list(remaining_b)
+        leftover_a = list(remaining_a)
+
+    # pass 2b: global multiset match on (name, kind, hash) for the leftovers
+    b_by_nk: Counter = Counter(nk(e) for e in fallback_b)
+    a_by_nk: Counter = Counter(nk(e) for e in leftover_a)
+    matched_nk = b_by_nk & a_by_nk
+    used_moved: Counter = Counter()
+    still_b: list[dict] = []
+    moved_b: list[dict] = []
+    for e in fallback_b:
+        if used_moved[nk(e)] < matched_nk[nk(e)]:
+            used_moved[nk(e)] += 1
+            moved_b.append(e)
+        else:
+            still_b.append(e)
+    still_a: list[dict] = []
+    used_after_moved: Counter = Counter()
+    for e in leftover_a:
+        if used_after_moved[nk(e)] < matched_nk[nk(e)]:
+            used_after_moved[nk(e)] += 1
+        else:
+            still_a.append(e)
+
+    # pair the fallback MOVED old->new per (name, kind, hash)
+    a_pool: dict[tuple, list[str]] = {}
+    for e in leftover_a:
+        a_pool.setdefault(nk(e), []).append(e["module"])
+    for e in moved_b:
+        to_mod = a_pool[nk(e)].pop(0)
+        pair = {"name": e["name"], "kind": e["kind"], "hash": e["hash"],
+                "from_module": e["module"], "to_module": to_mod}
+        moved_pairs.append(pair)
+    if table is not None:
+        for pair in moved_pairs:
+            expected = table.get(pair["from_module"])
+            if expected is not None and pair["to_module"] != expected:
+                pair["expected_module"] = expected
+                moved_mismatch.append(pair)
+
+    # CHANGED: same (module, name, kind), different hash; the rest of still_b is MISSING
+    a_by_mnk: dict[tuple, list[dict]] = {}
+    for e in still_a:
+        a_by_mnk.setdefault(mnk(e), []).append(e)
+    changed: list[dict] = []
+    missing: list[dict] = []
+    for e in still_b:
+        partners = a_by_mnk.get(mnk(e))
+        if partners:
+            changed.append({"before": e, "after": partners.pop(0)})
+        else:
+            missing.append(e)
+    changed_after_ids = {id(c["after"]) for c in changed}
+    added = [e for e in still_a if id(e) not in changed_after_ids]
+
+    report = {
+        "before": str(Path(args.before)),
+        "after": str(Path(args.after)),
+        "before_symbol_count": len(before),
+        "after_symbol_count": len(after),
+        "unchanged_count": len(unchanged),
+        "moved": moved_pairs,
+        "missing": missing,
+        "added": added,
+        "changed": changed,
+        "move_table": str(Path(args.move_table).resolve()) if table is not None else None,
+        "moved_verified_by_table": moved_verified,
+        "moved_mismatch": moved_mismatch,
+    }
+    report["moved_count"] = len(moved_pairs)
+    report["moved_mismatch_count"] = len(moved_mismatch)
+    summary = (f"missing={len(missing)} changed={len(changed)} added={len(added)} "
+               f"moved={len(moved_pairs)} unchanged={len(unchanged)} "
+               f"table_mismatch={len(moved_mismatch)}")
+    print(f"inventory diff: {summary}")
+    if missing:
+        for e in missing[:50]:
+            print(f"  MISSING {e['module']} {e['kind']} {e['name']}")
+    if changed:
+        for c in changed[:50]:
+            print(f"  CHANGED {c['before']['module']} {c['before']['kind']} {c['before']['name']}")
+    if added:
+        for e in added[:50]:
+            print(f"  ADDED {e['module']} {e['kind']} {e['name']}")
+    if moved_mismatch:
+        for pair in moved_mismatch[:50]:
+            print(f"  MOVE-MISMATCH {pair['from_module']} {pair['kind']} {pair['name']}"
+                  f" -> {pair['to_module']} (expected {pair['expected_module']})")
+    if args.out:
+        out_path = Path(args.out).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"diff report -> {out_path}")
+    return 1 if (missing or changed or moved_mismatch) else 0
+
+
 
 STAGES = ("nodeids", "counts", "tools", "probe", "audit", "perf", "wheel")
 
@@ -885,6 +1057,14 @@ def main(argv: list[str] | None = None) -> int:
     p_inv = sub.add_parser("inventory", help="write the symbol inventory to FILE")
     p_inv.add_argument("--out", required=True)
     p_inv.set_defaults(func=cmd_inventory)
+    p_diff = sub.add_parser("diff", help="diff two inventory files (BEFORE AFTER)")
+    p_diff.add_argument("before")
+    p_diff.add_argument("after")
+    p_diff.add_argument("--out", default=None, help="write the full diff report JSON here")
+    p_diff.add_argument("--move-table", default=None, dest="move_table",
+                        help="JSON file mapping old module -> new module; MOVED symbols "
+                             "must land in the named module or the diff fails")
+    p_diff.set_defaults(func=cmd_diff)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

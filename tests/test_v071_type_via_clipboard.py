@@ -39,11 +39,11 @@ from computer_use_mcp.backend import (
     _clipboard_read_text,
     _clipboard_write_text,
 )
-from computer_use_mcp.models import ActionSpec, ActionType, GroundedAction, SessionState
-from computer_use_mcp.safety import SafetyContext, SafetyPolicy
+from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction, SessionState
+from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
 from computer_use_mcp.server import _grounded_shape_hint
-from computer_use_mcp.state import StopToken, TaskStopped
-from computer_use_mcp.validator import GroundingValidator
+from computer_use_mcp.core.state import StopToken, TaskStopped
+from computer_use_mcp.pipeline.validator import GroundingValidator
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 

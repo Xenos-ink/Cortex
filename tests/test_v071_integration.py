@@ -31,12 +31,12 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp.agent import CAPTURE_SOURCE_SUSPECTED, ComputerUseAgent
+from computer_use_mcp.pipeline.agent import CAPTURE_SOURCE_SUSPECTED, ComputerUseAgent
 from computer_use_mcp.backend import TYPE_UNCONFIRMED_MARKER, FakeComputerBackend
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.models import GroundedAction
-from computer_use_mcp.safety import SafetyPolicy
-from computer_use_mcp.state import StopToken, TaskState
+from computer_use_mcp.core.limits import Limits
+from computer_use_mcp.core.models import GroundedAction
+from computer_use_mcp.security.safety import SafetyPolicy
+from computer_use_mcp.core.state import StopToken, TaskState
 
 # =====================================================================================
 # Helpers (same proven shapes as test_capture_source_integrity.py — self-contained)
@@ -274,8 +274,8 @@ def test_clipboard_transport_feeds_the_detector_reset_discipline(
     # late-repaint re-capture (one per identical-frame stated-effect action: 5 here),
     # never to the detector.
     parity_backend = _FrozenOrFlippedBackend(flip_script=[False, False, True, False, False, False])
-    import computer_use_mcp.verification as verification_module
-    import computer_use_mcp.agent as agent_module
+    import computer_use_mcp.pipeline.verification as verification_module
+    import computer_use_mcp.pipeline.agent as agent_module
 
     monkeypatch.setattr(
         verification_module, "_capture_provenance", lambda before, after: None

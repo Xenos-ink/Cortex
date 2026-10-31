@@ -30,7 +30,7 @@ from recording_engine import RecordingEngine
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp.backend import LocalComputerBackend
-from computer_use_mcp.models import ActionSpec, GroundedAction
+from computer_use_mcp.core.models import ActionSpec, GroundedAction
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 

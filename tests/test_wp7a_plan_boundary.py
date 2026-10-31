@@ -36,8 +36,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-import computer_use_mcp.plan as plan_module
-from computer_use_mcp.plan import (
+import computer_use_mcp.planning.plan as plan_module
+from computer_use_mcp.planning.plan import (
     MAX_PLAN_ACTIONS_PER_POINT,
     MAX_PLAN_POINTS,
     PLAN_EXPLICIT_PLAN_KEYS,
@@ -252,7 +252,7 @@ def test_an_oversized_plan_string_is_typed_rejected_at_the_cap() -> None:
     """VAL-WP7a-01 #7: the string arm is parsed behind a stated boundary cap
     (PLAN_STRING_MAX_CHARS) — an oversized string is a typed rejection, never an
     unbounded parse."""
-    from computer_use_mcp.plan import PLAN_STRING_MAX_CHARS
+    from computer_use_mcp.planning.plan import PLAN_STRING_MAX_CHARS
 
     oversized = json.dumps(COMPLETE_PLAN) + " " * (PLAN_STRING_MAX_CHARS + 1)
     with pytest.raises(ValueError, match="boundary"):
@@ -646,7 +646,7 @@ def test_the_advertised_plan_schema_bounds_match_the_models() -> None:
     """Every bound in the schema is read from the SAME place the models read theirs —
     the test derives its expectations from the models' OWN field metadata
     (VAL-WP7a-01 #8), so a drift fails here, never silently on the wire."""
-    from computer_use_mcp.models import ActionSpec
+    from computer_use_mcp.core.models import ActionSpec
 
     def _model_bounds(field: Any) -> tuple[Any, Any]:
         ge = le = None
@@ -706,7 +706,7 @@ def test_the_advertised_plan_schema_bounds_match_the_models() -> None:
 def test_the_advertised_plan_schema_key_sets_match_the_models() -> None:
     """The schema's property names are exactly the model field names — a field added
     to a model without its schema counterpart (or vice versa) fails here."""
-    from computer_use_mcp.models import ActionSpec
+    from computer_use_mcp.core.models import ActionSpec
 
     plan_fields = set(WaypointPlan.model_fields) - {"points"}
     plan_props = PLAN_PARAM_PLAIN_SCHEMA["properties"]
@@ -719,7 +719,7 @@ def test_the_advertised_plan_schema_key_sets_match_the_models() -> None:
 
 
 def test_the_advertised_action_enum_is_the_exact_action_vocabulary() -> None:
-    from computer_use_mcp.models import ActionType
+    from computer_use_mcp.core.models import ActionType
 
     enum = (
         PLAN_PARAM_PLAIN_SCHEMA["properties"]["points"]["items"]["properties"]["actions"][
@@ -772,4 +772,4 @@ def test_plan_py_imports_stay_in_the_declared_data_layer_set() -> None:
             for alias in node.names:
                 if alias.name.startswith("computer_use_mcp"):
                     local_modules.add(alias.name)
-    assert local_modules == {"models", "backend", "redaction"}
+    assert local_modules == {"backend", "core.models", "security.redaction"}

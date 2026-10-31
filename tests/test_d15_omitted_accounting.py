@@ -44,8 +44,8 @@ from computer_use_mcp.backend import (
     _empty_drops,
     _uia_snapshot_to_text_regions,
 )
-from computer_use_mcp.models import TextRegion
-from computer_use_mcp.visual_views import SPATIAL_TEXT_CAP, spatial_text_of
+from computer_use_mcp.core.models import TextRegion
+from computer_use_mcp.vision.visual_views import SPATIAL_TEXT_CAP, spatial_text_of
 
 # --- the scripted semantic reader (the UiaSemanticReader / Win32TextReader contract) ---------
 

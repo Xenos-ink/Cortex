@@ -94,17 +94,17 @@ from mcp.types import ImageContent, TextContent
 from PIL import Image
 from pydantic import BeforeValidator
 
-from .agent import ComputerUseAgent, execute_result_token, rejection_reasons
-from .audit import AuditLogger, Metrics
+from .pipeline.agent import ComputerUseAgent, execute_result_token, rejection_reasons
+from .security.audit import AuditLogger, Metrics
 from .backend import ComputerBackend, LocalComputerBackend
-from .checkpoint_manager import (
+from .planning.checkpoint_manager import (
     CheckpointError,
     CheckpointManager,
     CheckpointTrigger,
     CheckpointValidationError,
 )
-from .context_manager import ContextManager
-from .evidence import (
+from .planning.context_manager import ContextManager
+from .vision.evidence import (
     EVIDENCE_REFUSE_DISPOSED,
     EVIDENCE_STORE_KEY,
     FETCH_FRESHNESS_NOTE,
@@ -118,10 +118,10 @@ from .evidence import (
     new_store,
     register_frame,
 )
-from .interference import parse_interference
-from .limits import LimitEnforcer, LimitExceeded, Limits
-from .long_running import LongRunningRuntime
-from .models import (
+from .desktop.interference import parse_interference
+from .core.limits import LimitEnforcer, LimitExceeded, Limits
+from .planning.long_running import LongRunningRuntime
+from .core.models import (
     MAX_FOLLOW_UPS,
     ActionSpec,
     CoordinateSpace,
@@ -129,21 +129,21 @@ from .models import (
     SessionState,
     ok_from_result,
 )
-from .observation import observation_text_summary
-from . import plan as plan_layer
-from .plan import (
+from .vision.observation import observation_text_summary
+from .planning import plan as plan_layer
+from .planning.plan import (
     PLAN_EVIDENCE_KEY,
     PLAN_FAILURE_REASONS,
     PlanLease,
     PlanLeaseGuard,
     plan_failure_reason,
 )
-from .provider import OpenAICompatibleVisionProvider
-from .redaction import redact_text
-from .resume_manager import ResumeBundle, ResumeManager, ResumeRefusalError
-from .safety import SafetyPolicy
-from .state import SessionContext, SessionLimitExceeded, SessionRegistry, TaskStopped
-from .visual_views import (
+from .pipeline.provider import OpenAICompatibleVisionProvider
+from .security.redaction import redact_text
+from .planning.resume_manager import ResumeBundle, ResumeManager, ResumeRefusalError
+from .security.safety import SafetyPolicy
+from .core.state import SessionContext, SessionLimitExceeded, SessionRegistry, TaskStopped
+from .vision.visual_views import (
     DEFAULT_GRID_DENSITY,
     InvalidVisualViewError,
     VisualViewError,

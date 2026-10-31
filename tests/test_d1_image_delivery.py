@@ -39,7 +39,7 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.state import SessionRegistry
 
 
 @pytest.fixture
@@ -415,8 +415,8 @@ async def test_resume_governed_by_fresh_param(
     seam (``_build_runtime``) instead of a subtask TOOL — the removed loop family is
     removed by R-2 and this wave must not build on it.
     """
-    from computer_use_mcp.checkpoint_manager import CheckpointManager
-    from computer_use_mcp.resume_manager import ResumeManager
+    from computer_use_mcp.planning.checkpoint_manager import CheckpointManager
+    from computer_use_mcp.planning.resume_manager import ResumeManager
 
     checkpoint_manager = CheckpointManager(tmp_path / "checkpoints")
     monkeypatch.setattr(server, "_checkpoint_manager", checkpoint_manager)

@@ -34,9 +34,9 @@ from pathlib import Path
 from typing import Any
 
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import REANCHOR_REFUSED, parse_interference
-from computer_use_mcp.models import GroundedAction, WindowInfo
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import REANCHOR_REFUSED, parse_interference
+from computer_use_mcp.core.models import GroundedAction, WindowInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

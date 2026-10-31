@@ -24,8 +24,8 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.models import VerificationResult
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.models import VerificationResult
+from computer_use_mcp.core.state import SessionRegistry
 
 #: The plan-handshake evidence key (D-8a rename) — ABSENT from every non-plan reply.
 PLAN_EVIDENCE_KEY = "evidence_by_backend"

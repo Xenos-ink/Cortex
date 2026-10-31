@@ -38,8 +38,8 @@ from computer_use_mcp.backend import (
     SendInputEngine,
     UnsupportedActionError,
 )
-from computer_use_mcp.models import GroundedAction
-from computer_use_mcp.state import StopToken
+from computer_use_mcp.core.models import GroundedAction
+from computer_use_mcp.core.state import StopToken
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 
@@ -432,7 +432,7 @@ def test_engine_without_the_key_pair_fails_a_held_keypress_honestly(
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Per-module session isolation (the shared server-level fixture pattern)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    from computer_use_mcp.state import SessionRegistry
+    from computer_use_mcp.core.state import SessionRegistry
 
     monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
     monkeypatch.setattr(server, "_bundles", {})

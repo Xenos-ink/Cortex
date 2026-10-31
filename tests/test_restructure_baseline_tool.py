@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -47,19 +48,19 @@ def _hash_source(tool, source: str, module_ids: set[str] | None = None) -> str:
 def test_same_function_in_two_modules_same_hash(tool) -> None:
     """Same function body referencing two src modules via different paths."""
     src_a = (
-        "import computer_use_mcp.limits\n"
-        "from computer_use_mcp import observation\n"
-        "from computer_use_mcp.models import Observation\n"
+        "import computer_use_mcp.core.limits\n"
+        "from computer_use_mcp.vision import observation\n"
+        "from computer_use_mcp.core.models import Observation\n"
         "def helper():\n"
-        "    lim = computer_use_mcp.limits.Limits()\n"
+        "    lim = computer_use_mcp.core.limits.Limits()\n"
         "    eng = observation.ObservationEngine(None)\n"
         "    return lim, eng, Observation\n"
     )
     # "another module": aliased differently, but the same resolved references
     src_b = (
-        "import computer_use_mcp.limits as limmod\n"
-        "from computer_use_mcp import observation as obsmod\n"
-        "from computer_use_mcp.models import Observation\n"
+        "import computer_use_mcp.core.limits as limmod\n"
+        "from computer_use_mcp.vision import observation as obsmod\n"
+        "from computer_use_mcp.core.models import Observation\n"
         "def helper():\n"
         "    lim = limmod.Limits()\n"
         "    eng = obsmod.ObservationEngine(None)\n"
@@ -70,25 +71,25 @@ def test_same_function_in_two_modules_same_hash(tool) -> None:
 
 def test_changed_body_changes_hash(tool) -> None:
     src_a = (
-        "import computer_use_mcp.limits\n"
+        "import computer_use_mcp.core.limits\n"
         "def helper():\n"
-        "    return computer_use_mcp.limits.Limits()\n"
+        "    return computer_use_mcp.core.limits.Limits()\n"
     )
     src_b = (
-        "import computer_use_mcp.limits\n"
+        "import computer_use_mcp.core.limits\n"
         "def helper():\n"
-        "    return computer_use_mcp.limits.Limits(min_screenshot_interval_ms=1)\n"
+        "    return computer_use_mcp.core.limits.Limits(min_screenshot_interval_ms=1)\n"
     )
     assert _hash_source(tool, src_a) != _hash_source(tool, src_b)
 
 
 def test_import_line_only_change_same_hash(tool) -> None:
     body = "def helper():\n    return Limits()\n"
-    src_a = "import computer_use_mcp.limits\n" + body
+    src_a = "import computer_use_mcp.core.limits\n" + body
     src_b = (
         "import os\n"
-        "import computer_use_mcp.limits as lm\n"
-        "from computer_use_mcp.state import TaskState\n"
+        "import computer_use_mcp.core.limits as lm\n"
+        "from computer_use_mcp.core.state import TaskState\n"
         + body
     )
     assert _hash_source(tool, src_a) == _hash_source(tool, src_b)
@@ -111,3 +112,69 @@ def test_lineno_change_same_hash(tool) -> None:
     src_a = "X = 0\n\n\ndef helper():\n    return 1\n"
     src_b = "\n\n\n\nX = 0\n\n\n\n\ndef helper():\n    return 1\n"
     assert _hash_source(tool, src_a) == _hash_source(tool, src_b)
+
+
+# --- inventory diff + move-table verification (WP-R1 DELTA 1 / F2) ----------
+
+
+def _sym(module: str, name: str, kind: str = "def", h: str = "h1") -> dict:
+    return {"module": module, "name": name, "kind": kind, "hash": h}
+
+
+def _write_inventory(tmp_path: Path, fname: str, symbols: list[dict]) -> str:
+    path = tmp_path / fname
+    path.write_text(json.dumps({"symbols": symbols}), encoding="utf-8")
+    return str(path)
+
+
+def _run_diff(tool, before: str, after: str, out: str, move_table: str | None = None) -> dict:
+    argv = ["diff", before, after, "--out", out]
+    if move_table:
+        argv += ["--move-table", move_table]
+    tool.main(argv)
+    return json.loads(Path(out).read_text(encoding="utf-8"))
+
+
+def test_diff_verifies_moved_symbols_against_the_move_table(tool, tmp_path) -> None:
+    before = _write_inventory(tmp_path, "before.json", [_sym("pkg.old", "f")])
+    after = _write_inventory(tmp_path, "after.json", [_sym("pkg.new", "f")])
+    table = tmp_path / "table.json"
+    table.write_text(json.dumps({"pkg.old": "pkg.new"}), encoding="utf-8")
+    report = _run_diff(tool, before, after, str(tmp_path / "report.json"), str(table))
+    assert report["missing"] == []
+    assert report["moved_count"] == 1
+    assert report["moved_mismatch_count"] == 0
+    assert report["moved_verified_by_table"] == 1
+    assert report["moved"][0]["to_module"] == "pkg.new"
+
+
+def test_diff_reports_a_swapped_pair_against_the_move_table(tool, tmp_path) -> None:
+    """Two symbols whose actual landing modules are swapped vs the table must
+    be reported as MOVE-MISMATCH (exit 1) — identical-hash pairing may not be
+    matched first-in-first-out across unrelated modules."""
+    before = _write_inventory(
+        tmp_path, "before.json",
+        [_sym("pkg.m1", "f", h="hA"), _sym("pkg.m2", "g", h="hB")],
+    )
+    # swapped landings: f goes where the table sends g, and vice versa
+    after = _write_inventory(
+        tmp_path, "after.json",
+        [_sym("pkg.n2", "f", h="hA"), _sym("pkg.n1", "g", h="hB")],
+    )
+    table = tmp_path / "table.json"
+    table.write_text(json.dumps({"pkg.m1": "pkg.n1", "pkg.m2": "pkg.n2"}), encoding="utf-8")
+    report = _run_diff(tool, before, after, str(tmp_path / "report.json"), str(table))
+    assert report["moved_mismatch_count"] == 2
+    expected = {("pkg.m1", "pkg.n1"), ("pkg.m2", "pkg.n2")}
+    got = {(p["from_module"], p["expected_module"]) for p in report["moved_mismatch"]}
+    assert got == expected
+    assert all(p["to_module"] != p["expected_module"] for p in report["moved_mismatch"])
+
+
+def test_diff_without_table_still_reports_moves(tool, tmp_path) -> None:
+    before = _write_inventory(tmp_path, "before.json", [_sym("a.x", "f")])
+    after = _write_inventory(tmp_path, "after.json", [_sym("b.y", "f")])
+    report = _run_diff(tool, before, after, str(tmp_path / "report.json"))
+    assert report["moved_count"] == 1
+    assert report["moved_mismatch_count"] == 0
+    assert report["missing"] == []

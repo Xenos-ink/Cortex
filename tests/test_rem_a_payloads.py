@@ -29,7 +29,7 @@ import pytest
 from PIL import Image
 
 from computer_use_mcp import server
-from computer_use_mcp.models import Observation, TextRegion
+from computer_use_mcp.core.models import Observation, TextRegion
 
 from test_controller_integration import (
     FAST_LIMITS,
@@ -45,7 +45,7 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same as controller suite)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
     monkeypatch.setattr(server, "_registry", __import__(
-        "computer_use_mcp.state", fromlist=["SessionRegistry"]
+        "computer_use_mcp.core.state", fromlist=["SessionRegistry"]
     ).SessionRegistry(max_sessions=8))
     monkeypatch.setattr(server, "_bundles", {})
     return server
@@ -302,7 +302,7 @@ async def test_outbound_reencode_never_touches_internal_png(
 
 
 def _click_action() -> Any:
-    from computer_use_mcp.models import GroundedAction
+    from computer_use_mcp.core.models import GroundedAction
 
     return GroundedAction(
         action="click", point={"x": 30, "y": 30}, confidence=1.0, reason="REM-A test"
@@ -442,7 +442,7 @@ async def test_provider_judge_reuses_encoded_base64(
     agent.provider = ProbeJudgeProvider([])
     before = agent._observe("direct_request")
     after = agent._observe("post_action")
-    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+    from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
     intent = VerificationIntent(
         kind=VerificationKind.MODEL_JUDGE, expected_change=True, expected_effect="something"

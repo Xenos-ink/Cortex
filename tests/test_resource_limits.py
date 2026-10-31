@@ -25,8 +25,8 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.limits import LimitEnforcer, LimitExceeded, Limits
-from computer_use_mcp.state import SessionRegistry, TaskState
+from computer_use_mcp.core.limits import LimitEnforcer, LimitExceeded, Limits
+from computer_use_mcp.core.state import SessionRegistry, TaskState
 
 
 @pytest.fixture

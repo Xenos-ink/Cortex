@@ -39,10 +39,10 @@ import pytest
 from PIL import Image, ImageDraw
 
 from computer_use_mcp import server
-from computer_use_mcp.models import CoordinateSpace, MonitorInfo, Observation, TextRegion
-from computer_use_mcp.observation import observation_digest
-from computer_use_mcp.state import SessionRegistry
-from computer_use_mcp.visual_views import (
+from computer_use_mcp.core.models import CoordinateSpace, MonitorInfo, Observation, TextRegion
+from computer_use_mcp.vision.observation import observation_digest
+from computer_use_mcp.core.state import SessionRegistry
+from computer_use_mcp.vision.visual_views import (
     DEFAULT_GRID_DENSITY,
     GRID_DENSITIES,
     LABEL_COLOR,
@@ -64,7 +64,7 @@ from computer_use_mcp.visual_views import (
     resolve_view,
     spatial_text_of,
 )
-from computer_use_mcp.visual_views import SPATIAL_TEXT_CAP
+from computer_use_mcp.vision.visual_views import SPATIAL_TEXT_CAP
 import test_controller_integration as tci
 
 FAST_LIMITS = {"min_screenshot_interval_ms": 0}
@@ -747,7 +747,7 @@ async def test_item11_execute_path_derive_failure_keeps_executed_result(
 ) -> None:
     """Execute-path backstop: a derive failure NEVER hides the executed result and
     NEVER substitutes raw — the typed marker rides, no image block ships."""
-    from computer_use_mcp.visual_views import ViewDeriveError
+    from computer_use_mcp.vision.visual_views import ViewDeriveError
 
     session_id, _bundle, backend = make_session(monkeypatch)
 
@@ -806,7 +806,7 @@ async def test_item13_grounding_noninterference_text_anchor_fail_closed_holds(
     """The spatial_text block NEVER makes grounding strategies fire: with a grid view
     (and its attached text) in flight, a point action still grounds via the coordinate
     strategy, and text-anchor's fail-closed contract is untouched."""
-    from computer_use_mcp.grounding import TextAnchorGroundingStrategy, UnsupportedGroundingError
+    from computer_use_mcp.pipeline.grounding import TextAnchorGroundingStrategy, UnsupportedGroundingError
 
     # ocr_text ABSENT: the observe response ships spatial_text: null + the marker
     session_id, _bundle, _ = make_session(monkeypatch)
@@ -842,7 +842,7 @@ async def test_item13_grounding_noninterference_text_anchor_fail_closed_holds(
 
 
 def _grounded_click() -> Any:
-    from computer_use_mcp.models import ActionType, GroundedAction
+    from computer_use_mcp.core.models import ActionType, GroundedAction
 
     return GroundedAction(action=ActionType.CLICK, confidence=1.0)
 
@@ -1029,7 +1029,7 @@ def test_spatial_text_cap_reports_omitted_count() -> None:
 
 def test_registry_matches_models_constant() -> None:
     """The registry keys and models.VISUAL_VIEWS agree (R2 extensibility contract)."""
-    from computer_use_mcp.models import VISUAL_VIEWS
+    from computer_use_mcp.core.models import VISUAL_VIEWS
 
     assert sorted(VISUAL_VIEWS) == ["grid", "raw"]
     assert isinstance(resolve_view("raw"), RawPassThroughProvider)
@@ -1225,7 +1225,7 @@ def test_a1_pixel_evidence_one_decode_per_block_build(monkeypatch: pytest.Monkey
     """A1.1 decode discipline (A2 opt-in form): with evidence ON and absent ``_frame``
     -> the payload is decoded EXACTLY once per block build and reused for every region;
     the OCR-once cache never rebuilds."""
-    from computer_use_mcp import visual_views as vv
+    from computer_use_mcp.vision import visual_views as vv
 
     regions = [TextRegion(text=f"r{i}", x=2 + i, y=2, width=8, height=6) for i in range(4)]
     observation = Observation(image_base64=_png_b64(), width=1280, height=720, ocr_text=regions)
@@ -1761,7 +1761,7 @@ def test_w24_default_evidence_off_field_absent_mode_off_no_sigma_work(
     entirely (absent, never null-fabricated), the block records
     ``"pixel_evidence_mode": "off"``, and NO sigma computation runs — the A1.1 formula
     is never invoked (the canary would explode if it were), on observe AND zoom."""
-    from computer_use_mcp import visual_views as vv
+    from computer_use_mcp.vision import visual_views as vv
 
     def _must_not_compute(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("pixel_evidence computation ran while the flag is OFF")

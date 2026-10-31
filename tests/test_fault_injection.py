@@ -46,19 +46,19 @@ from test_controller_integration import (
 
 from computer_use_mcp import server
 from computer_use_mcp.backend import DisplayUnavailableError
-from computer_use_mcp.models import (
+from computer_use_mcp.core.models import (
     ActionType,
     GroundedAction,
     MonitorInfo,
     WindowInfo,
 )
-from computer_use_mcp.observation import ObservationEngine
-from computer_use_mcp.provider import (
+from computer_use_mcp.vision.observation import ObservationEngine
+from computer_use_mcp.pipeline.provider import (
     ProviderParseError,
     parse_decision,
 )
-from computer_use_mcp.safety import SafetyDecision, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry, TaskStopped
+from computer_use_mcp.security.safety import SafetyDecision, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry, TaskStopped
 
 # --- fault backends -------------------------------------------------------------------------
 

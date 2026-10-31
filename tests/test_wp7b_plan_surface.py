@@ -51,8 +51,8 @@ from test_controller_integration import (
 
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp import server
-from computer_use_mcp.plan import PLAN_EVIDENCE_KEY, PlanLeaseGuard
-from computer_use_mcp.models import WindowInfo
+from computer_use_mcp.planning.plan import PLAN_EVIDENCE_KEY, PlanLeaseGuard
+from computer_use_mcp.core.models import WindowInfo
 
 SERVER_PATH = Path(server.__file__)
 
@@ -273,7 +273,7 @@ async def test_legacy_flat_call_without_plan_stays_byte_identical(
     (``ExecutionResult.model_fields`` minus the popped image blob, plus the additive
     keys the flat path itself sets), not a hand list — so ANY leaked plan-only key
     (failure_reason, not_executed, evidence_by_backend, blocked, plan_id, ...) fails."""
-    from computer_use_mcp.models import ExecutionResult
+    from computer_use_mcp.core.models import ExecutionResult
 
     backend = ScriptedBackend(flip=True)
     session_id, _bundle, backend, _ = make_session(
@@ -1644,7 +1644,7 @@ async def test_plan_step_reply_carries_real_evidence_by_backend(
     # backend.executed payloads, no observation dumps
     assert "image_id" in evidence["captures"][0]
     assert "backend.executed" not in evidence and "backend.observed" not in evidence
-    from computer_use_mcp.evidence import evidence_store as _store
+    from computer_use_mcp.vision.evidence import evidence_store as _store
 
     store = _store(bundle.extra)
     assert store is not None and evidence["captures"] == store.captures()[-32:]
@@ -1703,7 +1703,7 @@ async def test_modal_dialog_event_is_carried_across_stepwise_plan_calls(
     """D-3, post-action side: the SAME event string the host got on call 1 is the one
     the aggregate reports on call 2 and the terminal reply on call 3 (value identity,
     retained on the lease, deduped + bounded)."""
-    from computer_use_mcp.interference import MODAL_DIALOG
+    from computer_use_mcp.desktop.interference import MODAL_DIALOG
 
     backend = ModalOnFirstDispatch(flip=True, active_window=TARGET)
     session_id, bundle, backend, _ = make_session(
@@ -1744,7 +1744,7 @@ async def test_pre_dispatch_focus_steal_event_reaches_the_plan_aggregate(
 ) -> None:
     """D-3b: a blocking PRE-dispatch verdict publishes its event on the step reply
     AND the aggregate; the refused step dispatched nothing."""
-    from computer_use_mcp.interference import FOCUS_TAKEN_BY
+    from computer_use_mcp.desktop.interference import FOCUS_TAKEN_BY
 
     backend = ScriptedBackend(flip=True, active_window=TARGET)
     session_id, bundle, backend, _ = make_session(
@@ -1864,7 +1864,7 @@ async def test_modal_on_the_action_item_reaches_the_step_and_lease(
     1) is published on the step reply (top level + aggregate) and retained on the
     lease, then carried by the terminal reply — even though the first outcome (the
     transition move) saw nothing."""
-    from computer_use_mcp.interference import MODAL_DIALOG
+    from computer_use_mcp.desktop.interference import MODAL_DIALOG
 
     backend = ModalOnSecondDispatch(flip=True, active_window=TARGET)
     session_id, bundle, backend, _ = make_session(
@@ -1942,7 +1942,7 @@ class StopOnSecondDispatch(ScriptedBackend):
     def execute(self, action: Any, stop: Any = None, **kwargs: Any) -> str:
         self.dispatches += 1
         if self.dispatches == 2:
-            from computer_use_mcp.state import TaskStopped
+            from computer_use_mcp.core.state import TaskStopped
 
             raise TaskStopped("host stopped the session mid-step")
         return super().execute(action, stop)
@@ -2188,7 +2188,7 @@ async def test_modal_on_the_last_point_reaches_the_parked_and_terminal_replies(
     """DELTA 2 N1: the modal fires on the LAST (only) point's ACTION item — the
     parked last-step reply carries the event (top level + aggregate), and the
     later terminal reply still carries the retained event (value identity)."""
-    from computer_use_mcp.interference import MODAL_DIALOG
+    from computer_use_mcp.desktop.interference import MODAL_DIALOG
 
     backend = ModalOnSecondDispatch(flip=True)
     session_id, bundle, backend, _ = make_session(
@@ -2235,9 +2235,9 @@ async def test_walk_ending_reply_carries_the_final_step_event_frame_and_disclosu
     the step's registered frame (image_id, fetchable) and its per-item
     disclosure — while the VERDICT is the whole-plan aggregate (the earlier
     uncertain point caps it at ``unknown``, ok false)."""
-    from computer_use_mcp.interference import MODAL_DIALOG
+    from computer_use_mcp.desktop.interference import MODAL_DIALOG
 
-    from computer_use_mcp.models import WindowInfo
+    from computer_use_mcp.core.models import WindowInfo
 
     target = WindowInfo(hwnd=1, pid=100, process_name="EXCEL.EXE", window_class="XLMAIN", title="Book1 - Excel")
     backend = ModalOnFinalDispatch(fire_on=3, flip=True, active_window=target, width=1024, height=800)
@@ -2339,7 +2339,7 @@ def test_the_exception_builder_names_any_limit_and_agrees() -> None:
     non-raising) gets the agreeing error / limit / cutoff / failure_reason."""
     from types import SimpleNamespace
 
-    from computer_use_mcp.plan import (
+    from computer_use_mcp.planning.plan import (
         PlanLease,
         coerce_tolerant_plan,
         normalize_plan,

@@ -34,9 +34,9 @@ from recording_engine import RecordingEngine
 import computer_use_mcp.backend as backend_module
 from computer_use_mcp import backend as backend_pkg
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.models import ActionSpec, ActionType, GroundedAction, Point
-from computer_use_mcp.state import StopToken, TaskStopped
-from computer_use_mcp.validator import GroundingValidator
+from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction, Point
+from computer_use_mcp.core.state import StopToken, TaskStopped
+from computer_use_mcp.pipeline.validator import GroundingValidator
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 

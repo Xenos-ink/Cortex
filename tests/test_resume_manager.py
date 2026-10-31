@@ -17,16 +17,16 @@ from typing import Any
 import pytest
 from test_checkpoint_manager import build_state, make_limits, make_subtask_manager
 
-from computer_use_mcp.checkpoint_manager import (
+from computer_use_mcp.planning.checkpoint_manager import (
     CHECKPOINT_FILENAME,
     CheckpointManager,
     CheckpointTrigger,
     CheckpointValidationError,
     EnvironmentExpectations,
 )
-from computer_use_mcp.context_manager import ContextManager
-from computer_use_mcp.limits import SessionBudgetTracker
-from computer_use_mcp.resume_manager import (
+from computer_use_mcp.planning.context_manager import ContextManager
+from computer_use_mcp.core.limits import SessionBudgetTracker
+from computer_use_mcp.planning.resume_manager import (
     STATIC_CHECK_NAMES,
     ResumeManager,
     ResumeRefusalError,
@@ -240,7 +240,7 @@ def test_resume_manager_uses_injected_checkpoint_manager(tmp_path: Path) -> None
 
 
 def test_allowlist_matcher_semantics() -> None:
-    from computer_use_mcp.resume_manager import matches_allowlist
+    from computer_use_mcp.planning.resume_manager import matches_allowlist
 
     assert matches_allowlist("Notepad.exe", ["notepad.exe"])  # case-insensitive exact
     assert matches_allowlist("Calculator.exe", ["calc*"])  # trailing-wildcard prefix

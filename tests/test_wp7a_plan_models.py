@@ -21,8 +21,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from computer_use_mcp.models import ActionSpec, GroundedAction
-from computer_use_mcp.plan import (
+from computer_use_mcp.core.models import ActionSpec, GroundedAction
+from computer_use_mcp.planning.plan import (
     MAX_PLAN_ACTIONS_PER_POINT,
     MAX_PLAN_POINTS,
     Waypoint,

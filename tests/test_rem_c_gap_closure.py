@@ -39,8 +39,8 @@ from unittest.mock import patch
 import pytest
 from PIL import Image
 
-from computer_use_mcp.models import Observation, WindowInfo
-from computer_use_mcp.verification import (
+from computer_use_mcp.core.models import Observation, WindowInfo
+from computer_use_mcp.pipeline.verification import (
     FOCUS_CHANGE_INTENT_FLAG,
     STRONG_CHANGE_MIN_PIXELS,
     FocusChangeStrategy,
@@ -589,7 +589,7 @@ def test_f4_env_knob_docstrings_are_truthful(monkeypatch: pytest.MonkeyPatch) ->
     ``driver``" — parsing is case-insensitive and whitespace-trimmed, and the docs
     must say so. The BEHAVIOR was already case/whitespace-tolerant (direction of
     the discrepancy is safe); only the claim was wrong."""
-    from computer_use_mcp import interference
+    from computer_use_mcp.desktop import interference
 
     source = interference.__doc__ or ""
     source += "\n" + interference.ATTACH_OR_LAUNCH_ENV

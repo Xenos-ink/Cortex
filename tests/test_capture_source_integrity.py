@@ -31,23 +31,23 @@ from typing import Any
 import pytest
 from PIL import Image
 
-import computer_use_mcp.verification as verification_module
-from computer_use_mcp.agent import (
+import computer_use_mcp.pipeline.verification as verification_module
+from computer_use_mcp.pipeline.agent import (
     CAPTURE_SOURCE_SUSPECTED,
     ComputerUseAgent,
 )
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.models import (
+from computer_use_mcp.core.limits import Limits
+from computer_use_mcp.core.models import (
     CaptureProvenance,
     ExecutionResult,
     GroundedAction,
     Observation,
     VerificationResult,
 )
-from computer_use_mcp.safety import SafetyPolicy
-from computer_use_mcp.state import StopToken, TaskState
-from computer_use_mcp.verification import (
+from computer_use_mcp.security.safety import SafetyPolicy
+from computer_use_mcp.core.state import StopToken, TaskState
+from computer_use_mcp.pipeline.verification import (
     ScreenshotDiffStrategy,
     VerificationEngine,
     VerificationIntent,
@@ -479,7 +479,7 @@ def test_detector_and_provenance_perform_zero_new_captures(
     disabled_backend = _CaptureCountingBackend()
     agent_without = _agent(disabled_backend)
     monkeypatch.setattr(verification_module, "_capture_provenance", lambda before, after: None)
-    import computer_use_mcp.agent as agent_module
+    import computer_use_mcp.pipeline.agent as agent_module
 
     monkeypatch.setattr(agent_module, "_is_identical_frame_uncertain", lambda result: False)
     _run_actions(agent_without, [_keypress() for _ in range(4)])

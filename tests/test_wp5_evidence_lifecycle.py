@@ -38,7 +38,7 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import evidence as evidence_module
+from computer_use_mcp.vision import evidence as evidence_module
 from computer_use_mcp import server
 
 

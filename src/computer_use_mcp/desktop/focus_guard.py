@@ -49,7 +49,7 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
-from .backend import ComputerBackend, WindowFocusError
+from ..backend import ComputerBackend, WindowFocusError
 from .interference import (
     FOCUS_DRIFTED,
     FOCUS_TAKEN_BY,
@@ -67,7 +67,7 @@ from .interference import (
     format_stuck_modifier,
     format_target_gone,
 )
-from .models import ActionType, FailureClass, GroundedAction, Observation, WindowInfo
+from ..core.models import ActionType, FailureClass, GroundedAction, Observation, WindowInfo
 
 logger = logging.getLogger(__name__)
 
@@ -860,7 +860,7 @@ class InterferenceGuard:
             return  # B10 (a): same-process / dialog-hosted / launcher surface
         payload = format_focus_drifted(_describe_target(bound), _describe_focus_target(target))
         self._audit("focus_drifted_mid_type", payload, action=action)
-        from .backend import FocusDriftError
+        from ..backend import FocusDriftError
 
         raise FocusDriftError(payload)
 

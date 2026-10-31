@@ -39,8 +39,8 @@ from computer_use_mcp.backend import (
     SendInputEngine,
     _motion_path_points,
 )
-from computer_use_mcp.models import GroundedAction
-from computer_use_mcp.state import StopToken, TaskStopped
+from computer_use_mcp.core.models import GroundedAction
+from computer_use_mcp.core.state import StopToken, TaskStopped
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 

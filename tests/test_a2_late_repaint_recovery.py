@@ -39,16 +39,16 @@ from typing import Any
 from PIL import Image, ImageDraw
 import pytest
 
-from computer_use_mcp.agent import (
+from computer_use_mcp.pipeline.agent import (
     _IDENTICAL_FRAME_RECHECK_LIMIT,
     _IDENTICAL_FRAME_RECHECK_SETTLE_SECONDS,
     ComputerUseAgent,
 )
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.models import GroundedAction, Observation, WindowInfo
-from computer_use_mcp.safety import SafetyPolicy
-from computer_use_mcp.state import StopToken, TaskState
+from computer_use_mcp.core.limits import Limits
+from computer_use_mcp.core.models import GroundedAction, Observation, WindowInfo
+from computer_use_mcp.security.safety import SafetyPolicy
+from computer_use_mcp.core.state import StopToken, TaskState
 
 WIDTH = 1280
 HEIGHT = 720
@@ -168,7 +168,7 @@ def _run(backend: FakeComputerBackend, action: GroundedAction, **kwargs: Any) ->
 
 
 def _click() -> GroundedAction:
-    from computer_use_mcp.models import Point
+    from computer_use_mcp.core.models import Point
 
     return GroundedAction(action="click", point=Point(x=400, y=300), confidence=1.0)
 
@@ -183,8 +183,8 @@ def _type(text: str = "castle move") -> GroundedAction:
 def test_the_recovery_is_bounded_to_one_and_conditioned_by_the_e02_spec() -> None:
     """The knobs are real: a non-zero settle, a hard limit of exactly ONE re-capture,
     and the repaint-prone classes are exactly type/scroll (E-02 spec)."""
-    from computer_use_mcp.agent import _INTRA_STEP_EXEMPT_PHASES, _REPAINT_PRONE_ACTIONS
-    from computer_use_mcp.models import ActionType
+    from computer_use_mcp.pipeline.agent import _INTRA_STEP_EXEMPT_PHASES, _REPAINT_PRONE_ACTIONS
+    from computer_use_mcp.core.models import ActionType
 
     assert _IDENTICAL_FRAME_RECHECK_SETTLE_SECONDS > 0.0
     assert _IDENTICAL_FRAME_RECHECK_LIMIT == 1

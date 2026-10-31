@@ -27,9 +27,9 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.models import GroundedAction, WindowInfo
-from computer_use_mcp.plan import PLAN_FAILURE_REASONS, plan_failure_reason
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.models import GroundedAction, WindowInfo
+from computer_use_mcp.planning.plan import PLAN_FAILURE_REASONS, plan_failure_reason
+from computer_use_mcp.core.state import SessionRegistry
 
 
 def wire_plan(plan):
@@ -238,7 +238,7 @@ async def test_mid_drag_fault_in_a_step_is_classified_not_unclassified(
 
 
 def test_error_stop_reason_maps_to_execution_error_in_one_table() -> None:
-    from computer_use_mcp import plan as plan_module
+    from computer_use_mcp.planning import plan as plan_module
 
     tables = (
         plan_module._PLAN_SPECIFIC_STOP_REASON_TO_FAILURE_REASON,
@@ -264,7 +264,7 @@ def test_unclassified_stays_the_documented_fallback() -> None:
 
 
 def test_every_classification_token_is_inside_the_closed_vocabulary() -> None:
-    from computer_use_mcp import plan as plan_module
+    from computer_use_mcp.planning import plan as plan_module
 
     for table in (
         plan_module._PLAN_ERROR_TO_FAILURE_REASON,
@@ -278,7 +278,7 @@ def test_every_classification_token_is_inside_the_closed_vocabulary() -> None:
 
 def test_the_same_error_literal_agrees_in_both_places_it_appears() -> None:
     """``"error"`` as an outcome kind and as a stop reason mean the same thing."""
-    from computer_use_mcp import plan as plan_module
+    from computer_use_mcp.planning import plan as plan_module
 
     assert plan_module._PLAN_OUTCOME_KIND_TO_FAILURE_REASON["error"] == "execution_error"
 
@@ -305,7 +305,7 @@ def test_verified_step_still_reports_no_failure() -> None:
 
 def test_pre_existing_classifications_are_unchanged() -> None:
     """The dev Batch-6/7 entries keep their exact tokens (stable table frozen)."""
-    from computer_use_mcp import plan as plan_module
+    from computer_use_mcp.planning import plan as plan_module
 
     # F8: the error table carries ONLY keys the classifier actually receives
     # (``cancelled``/``invalid_action`` are passed explicitly by the exception

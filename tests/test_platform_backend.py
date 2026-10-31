@@ -33,8 +33,8 @@ from computer_use_mcp.backend import (
     interruptible_wait,
     query_foreground_window,
 )
-from computer_use_mcp.models import GroundedAction, MonitorInfo, Observation, WindowInfo
-from computer_use_mcp.state import StopToken, TaskStopped
+from computer_use_mcp.core.models import GroundedAction, MonitorInfo, Observation, WindowInfo
+from computer_use_mcp.core.state import StopToken, TaskStopped
 
 if backend_module.IS_WINDOWS:
     import ctypes.wintypes

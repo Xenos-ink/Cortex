@@ -27,13 +27,13 @@ from test_controller_integration import (
 )
 
 from computer_use_mcp import server
-from computer_use_mcp.models import WindowInfo
+from computer_use_mcp.core.models import WindowInfo
 
 
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    from computer_use_mcp.state import SessionRegistry
+    from computer_use_mcp.core.state import SessionRegistry
 
     monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
     monkeypatch.setattr(server, "_bundles", {})

@@ -30,8 +30,8 @@ fresh_server = _shared_fresh_server_fixture
 
 from computer_use_mcp import server
 from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import (
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import (
     AMBIGUOUS_INSTANCE,
     DEFAULT_DIALOG_TITLE_TABLE,
     DEFAULT_TRANSIENT_LAUNCH_PROCESSES,
@@ -53,7 +53,7 @@ from computer_use_mcp.interference import (
     format_stuck_modifier,
     parse_interference,
 )
-from computer_use_mcp.models import GroundedAction, WindowInfo
+from computer_use_mcp.core.models import GroundedAction, WindowInfo
 
 # --- defaults (A12 section 4 policy surface) -------------------------------------------------
 
@@ -245,7 +245,7 @@ def test_event_payload_formatters() -> None:
 
 
 def test_ensure_app_probe_outcomes_are_recognized_by_the_agent_helper() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
 
     assert ComputerUseAgent._ensure_app_probe_outcome("NO_INSTANCE target='excel.exe' launch=driver")
     assert ComputerUseAgent._ensure_app_probe_outcome("AMBIGUOUS_INSTANCE candidates=[...]")
@@ -253,7 +253,7 @@ def test_ensure_app_probe_outcomes_are_recognized_by_the_agent_helper() -> None:
 
 
 def test_guard_rejection_maps_to_named_queue_stop_reasons() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent, SingleActionOutcome
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent, SingleActionOutcome
 
     def _rejected(reasons: list[str]) -> SingleActionOutcome:
         return SingleActionOutcome(kind="rejected", reasons=reasons)
@@ -283,12 +283,12 @@ def test_full_queue_with_a_focus_steal_between_items_stops_named() -> None:
 
     from PIL import Image as PILImage
 
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.models import ActionSpec, WindowInfo
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import ActionSpec, WindowInfo
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     class StealAfterFirstClick(FakeComputerBackend):
         """The screen flips once after the first execute (so item 0 verifies) and a
