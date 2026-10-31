@@ -121,7 +121,8 @@ def test_tripwire_blocks_every_user32_effect_entry_point() -> None:
         trap = getattr(user32, name)
         assert isinstance(trap, _EffectTrap), f"{name} is not a trap; refusing to call"
         with expect_trips():
-            with pytest.raises(RealDesktopEffectInOfflineSuite, match=f"'{name}'"):
+            # the trip label is the qualified "<module>.<dll>.<member>" (WP-R2a)
+            with pytest.raises(RealDesktopEffectInOfflineSuite, match=rf"_user32\.{name}'"):
                 trap()
 
 
@@ -136,7 +137,7 @@ def test_trap_members_accept_prototype_binding_m1() -> None:
     trap.argtypes = [ctypes.c_void_p]  # must be accepted silently
     trap.restype = ctypes.c_int
     with expect_trips():
-        with pytest.raises(RealDesktopEffectInOfflineSuite, match="'OpenClipboard'"):
+        with pytest.raises(RealDesktopEffectInOfflineSuite, match=r"_user32\.OpenClipboard'"):
             trap(None)
 
 
@@ -374,7 +375,7 @@ def test_fresh_module_user32_is_trapped_when_the_tripwire_is_armed() -> None:
     trap = getattr(user32, "SetCursorPos")
     assert isinstance(trap, _EffectTrap), "refusing to touch a non-trap member"
     with expect_trips():
-        with pytest.raises(RealDesktopEffectInOfflineSuite, match="'SetCursorPos'"):
+        with pytest.raises(RealDesktopEffectInOfflineSuite, match=r"_user32\.SetCursorPos'"):
             trap(10, 10)
 
 

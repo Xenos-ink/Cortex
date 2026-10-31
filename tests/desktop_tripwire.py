@@ -4,10 +4,14 @@ The offline suite must NEVER touch the user's desktop. The autouse fixture in
 ``tests/conftest.py`` arms this tripwire for every test whenever
 ``CUMCP_RUN_E2E != "1"``:
 
-- ``backend._user32`` effect members become :class:`_EffectTrap` callables that
-  raise :class:`RealDesktopEffectInOfflineSuite` on call (they ACCEPT attribute
+- EVERY module-level effect-DLL binding of every loaded ``computer_use_mcp.*``
+  module (``_user32``/``_kernel32``/``_ole32``/``_oleaut32`` — see
+  :data:`EFFECT_DLL_BINDINGS`) is wrapped in :class:`_TripwireDll`: user32's
+  effect members become :class:`_EffectTrap` callables that raise
+  :class:`RealDesktopEffectInOfflineSuite` on call (they ACCEPT attribute
   assignment, so ``_clipboard_bind``'s ``argtypes``/``restype`` writes trip
-  instead of raising ``AttributeError``); read-only members pass through.
+  instead of raising ``AttributeError``); read-only members pass through, and
+  kernel32/ole32/oleaut32 are pure read-only passthrough.
 - ``subprocess.Popen`` becomes :class:`_TripwirePopen`: a strict validator
   (:func:`check_launch`) allows ONLY the spawns the suite actually needs —
   ``sys.executable`` children without ``-c``, and the stdlib ``platform``
@@ -36,6 +40,7 @@ stubs at or above these points override the tripwire unchanged.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import importlib.abc
 import importlib.util
 import os
@@ -43,6 +48,7 @@ import subprocess
 import sys
 import threading
 import traceback
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -86,6 +92,24 @@ EFFECT_USER32_NAMES = frozenset(
         "SetClipboardData",
     }
 )
+
+#: The module-level binding NAMES any desktop module may bind an effect DLL
+#: through. ``install_tripwire`` wraps EVERY ``computer_use_mcp.*`` module
+#: attribute carrying one of these names (WP-R2a: the tripwire must be
+#: independent of how backend.py is split). ``_shcore`` is deliberately NOT
+#: here: it only carries read-only DPI queries (see the reviewed binding
+#: allow-list in tests/test_tripwire_bindings_guard.py).
+_TRIPWIRE_DLL_EFFECTS: dict[str, frozenset[str]] = {
+    "_user32": EFFECT_USER32_NAMES,
+    # kernel32/ole32/oleaut32 are read-only passthrough: their members are
+    # process-local memory / COM plumbing; every desktop-reaching effect rides
+    # user32. Attribute assignment (prototype argtypes/restype writes) is
+    # accepted and trips on USE exactly like on the user32 traps.
+    "_kernel32": frozenset(),
+    "_ole32": frozenset(),
+    "_oleaut32": frozenset(),
+}
+EFFECT_DLL_BINDINGS = frozenset(_TRIPWIRE_DLL_EFFECTS)
 
 #: pyautogui members that act on the desktop (12). Reads (size/position/...) stay.
 EFFECT_PYAUTOGUI_NAMES = frozenset(
@@ -217,15 +241,25 @@ class _EffectTrap:
         _trip_raise(self._name)
 
 
-class _TripwireUser32:
-    """Read-only passthrough for ``backend._user32``; effect members are traps."""
+class _TripwireDll:
+    """Read-only passthrough for ANY module-level effect-DLL binding.
 
-    def __init__(self, real: Any, node_id: str) -> None:
+    Effect members of the wrapped DLL (user32's pinned 11; none yet for
+    kernel32/ole32/oleaut32) are :class:`_EffectTrap` callables whose trip
+    label is ``"<module>.<dll>.<member>"`` so the log names the binding
+    module. Read-only members pass through, and the resolved attribute is
+    cached as an instance attribute so ctypes prototypes bound on the real
+    DLL keep applying.
+    """
+
+    def __init__(self, real: Any, dll_name: str, node_id: str, module_name: str) -> None:
         self.__dict__["_real"] = real
         self.__dict__["_cortex_tripwire"] = True
+        self.__dict__["_cortex_tripwire_dll"] = dll_name
+        self.__dict__["_cortex_tripwire_module"] = module_name
         self.__dict__["_node_id"] = node_id
-        for name in EFFECT_USER32_NAMES:
-            self.__dict__[name] = _EffectTrap(name)
+        for name in _TRIPWIRE_DLL_EFFECTS.get(dll_name, frozenset()):
+            self.__dict__[name] = _EffectTrap(f"{module_name}.{dll_name}.{name}")
 
     def __getattr__(self, name: str) -> Any:
         # Read-only passthrough; the resolved attribute is cached as an instance
@@ -233,6 +267,11 @@ class _TripwireUser32:
         value = getattr(self.__dict__["_real"], name)
         self.__dict__[name] = value
         return value
+
+
+#: Backward-compat alias: the arming-proof tests isinstance against the
+#: original user32-only wrapper name.
+_TripwireUser32 = _TripwireDll
 
 
 # --- launch validation (pure; the Popen subclass delegates) ---------------------------
@@ -469,6 +508,108 @@ class _PyautoguiTripwireFinder(importlib.abc.MetaPathFinder):
 # --- install --------------------------------------------------------------------------
 
 
+def effect_binding_wrappers(
+    module: Any, node_id: str, cache: dict[tuple[int, str], "_TripwireDll"] | None = None
+) -> list[tuple[str, "_TripwireDll"]]:
+    """Tripwire wrappers for ONE module's effect-DLL bindings (the shared helper).
+
+    Every module attribute named in :data:`EFFECT_DLL_BINDINGS` whose current
+    value is a real ctypes DLL instance (``ctypes.CDLL`` — covers WinDLL and
+    OleDLL) gets a :class:`_TripwireDll` wrapper; ``None`` bindings and
+    already-wrapped bindings (idempotent re-install) are skipped. With a
+    shared ``cache`` (keyed by ``(id(real), binding name)``) the SAME wrapper
+    object is returned for every module binding of the same real DLL — F6a
+    (VAL-WP-R2a-0-01): a member patch through any one binding must be seen by
+    every module, exactly like production where all bindings share one DLL
+    object. The CALLER applies them — through ``monkeypatch.setattr``
+    (restored per test) or a plain setattr (the throwaway fresh-exec probe
+    module).
+    """
+    if cache is None:
+        cache = {}
+    module_name = getattr(module, "__name__", "<unknown>")
+    out: list[tuple[str, _TripwireDll]] = []
+    for name in sorted(EFFECT_DLL_BINDINGS):
+        current = getattr(module, name, None)
+        if current is None or isinstance(current, _TripwireDll):
+            continue
+        if not isinstance(current, ctypes.CDLL):
+            continue
+        key = (id(current), name)
+        if key not in cache:
+            cache[key] = _TripwireDll(current, name, node_id, module_name)
+        out.append((name, cache[key]))
+    return out
+
+
+def wrap_loaded_effect_bindings(
+    monkeypatch: pytest.MonkeyPatch, node_id: str, cache: dict[tuple[int, str], "_TripwireDll"] | None = None
+) -> list[str]:
+    """Wrap the effect-DLL bindings of EVERY loaded ``computer_use_mcp.*`` module.
+
+    Iterates ``sys.modules`` so the tripwire is independent of how backend.py
+    is split (WP-R2a): after the split this traps every ``_user32`` /
+    ``_kernel32`` / ``_ole32`` / ``_oleaut32`` binding in every desktop
+    module — ONE shared wrapper per real DLL (F6a) — and nothing can reach a
+    real effect through any module. Returns the wrapped ``<module>.<binding>``
+    names and REGISTERS them in :data:`_WRAPPED_THIS_INSTALL` (F13: the
+    teardown re-scan exempts bindings the install itself wrapped — a test's
+    own ``monkeypatch.undo()`` removes the fixture's wrappers too, which is
+    the pre-existing undo semantics, not a late-import escape)."""
+    if cache is None:
+        cache = {}
+    wrapped: list[str] = []
+    for module_name, module in sorted(sys.modules.items()):
+        if not module_name.startswith("computer_use_mcp"):
+            continue
+        if not isinstance(module, ModuleType):
+            continue
+        for name, wrapper in effect_binding_wrappers(module, node_id, cache):
+            monkeypatch.setattr(module, name, wrapper)
+            wrapped.append(f"{module_name}.{name}")
+            _WRAPPED_THIS_INSTALL.add((module_name, name))
+    return wrapped
+
+
+#: (module, binding) pairs the CURRENT install wrapped — see F13 above.
+_WRAPPED_THIS_INSTALL: set[tuple[str, str]] = set()
+
+
+def find_unwrapped_effect_bindings() -> list[str]:
+    """Every loaded ``computer_use_mcp.*`` module binding that holds a REAL,
+    UNWRAPPED ctypes DLL under an EFFECT_DLL_BINDINGS name and was NOT wrapped
+    by the current install (F13, VAL-WP-R2a-0-01).
+
+    The teardown re-scan: the install-time wrap only sees modules loaded at
+    that moment; a module FIRST imported mid-test (after install) binds real
+    DLLs no trap covers, and a fixture wrapper on it would never be undone.
+    The autouse fixture calls this at teardown, BEFORE the monkeypatch undo,
+    and fails the test on any violation. Bindings the install itself wrapped
+    are exempt: a test's own ``monkeypatch.undo()`` legitimately removes the
+    fixture's wrappers (the fixture's own undo restores the originals after
+    the test, exactly as before this guard existed)."""
+    violations: list[str] = []
+    for module_name, module in sorted(sys.modules.items()):
+        if not module_name.startswith("computer_use_mcp"):
+            continue
+        if not isinstance(module, ModuleType):
+            continue
+        for name in sorted(EFFECT_DLL_BINDINGS):
+            value = getattr(module, name, None)
+            if value is None or isinstance(value, _TripwireDll):
+                continue
+            if not isinstance(value, ctypes.CDLL):
+                continue
+            if (module_name, name) in _WRAPPED_THIS_INSTALL:
+                continue  # undone by the test itself — not a late-import escape
+            violations.append(
+                f"{module_name}.{name}: UNWRAPPED real DLL bound at module level "
+                "(module first imported after the tripwire was installed, or the "
+                "install-time wrap missed this binding)"
+            )
+    return violations
+
+
 def _runtime_os_trap(name: str) -> Any:
     """Build a trip-raising stand-in for an ``os``/``asyncio`` spawn entry point."""
 
@@ -490,9 +631,12 @@ def install_tripwire(monkeypatch: pytest.MonkeyPatch, node_id: str) -> None:
     _CURRENT_NODE = node_id
     clear_trip_log()
 
-    real_user32 = backend_module._user32
-    if real_user32 is not None:
-        monkeypatch.setattr(backend_module, "_user32", _TripwireUser32(real_user32, node_id))
+    # WP-R2a: EVERY module-level effect-DLL binding of EVERY loaded
+    # computer_use_mcp.* module is wrapped (previously only
+    # backend_module._user32); on the unsplit tree this wraps exactly the
+    # bindings it wrapped before, plus the passthrough kernel32/ole32/oleaut32.
+    _WRAPPED_THIS_INSTALL.clear()  # F13: the registry is per-install
+    wrap_loaded_effect_bindings(monkeypatch, node_id)
 
     monkeypatch.setattr(subprocess, "Popen", _TripwirePopen)
     monkeypatch.setattr(os, "startfile", _startfile_trap, raising=False)

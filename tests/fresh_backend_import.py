@@ -25,9 +25,9 @@ import os
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Any
 
 import computer_use_mcp.backend as _installed_backend
+from desktop_tripwire import EFFECT_DLL_BINDINGS
 
 _BACKEND_PATH = Path(_installed_backend.__file__).resolve()
 #: A submodule name INSIDE the real package so backend.py's relative imports
@@ -115,34 +115,36 @@ def fresh_backend(env_overrides: dict[str, str | None] | None = None) -> ModuleT
                 spec.loader.exec_module(module)
         finally:
             sys.modules.pop(_PROBE_ALIAS, None)
-    _trap_fresh_module_user32(module)
+    _trap_fresh_module_bindings(module)
     return module
 
 
-def _tripwire_user32() -> Any:
-    """The installed backend's ``_user32`` WHEN the desktop tripwire is armed."""
-    installed = getattr(_installed_backend, "_user32", None)
-    if getattr(installed, "_cortex_tripwire", False):
-        return installed
+def _armed_tripwire_node_id() -> str | None:
+    """The desktop tripwire's node id WHEN armed (via any installed binding wrapper)."""
+    for name in sorted(EFFECT_DLL_BINDINGS):
+        installed = getattr(_installed_backend, name, None)
+        if getattr(installed, "_cortex_tripwire", False):
+            return str(getattr(installed, "_node_id", "fresh_backend_import"))
     return None
 
 
-def _trap_fresh_module_user32(module: ModuleType) -> None:
-    """WP-H N2 (VAL-WP-H-02): the fresh module's PRIVATE ``_user32`` is untrapped.
+def _trap_fresh_module_bindings(module: ModuleType) -> None:
+    """WP-H N2, generalized (WP-R2a): the fresh module's PRIVATE effect-DLL
+    bindings are untrapped.
 
-    The exec binds its own ``WinDLL("user32")`` instances; the tripwire only
-    patches the INSTALLED ``backend_module._user32``. While today's fresh-exec
-    consumers only evaluate module-level CONSTANTS, any future expression that
-    called an effect function through the fresh module would act untrapped.
-    When the tripwire is armed, replace the fresh module's ``_user32`` with a
-    tripwire wrapper over it (fresh trap instances, same node id).
+    The exec binds its own ``WinDLL`` instances; the tripwire only wraps the
+    INSTALLED modules' bindings. While today's fresh-exec consumers only
+    evaluate module-level CONSTANTS, any future expression that called an
+    effect function through the fresh module would act untrapped. When the
+    tripwire is armed, replace EVERY binding named in
+    ``desktop_tripwire.EFFECT_DLL_BINDINGS`` that the fresh exec bound with a
+    tripwire wrapper over it (fresh trap instances, same node id) — the same
+    shared helper the fixture uses, applied to one module.
     """
-    armed = _tripwire_user32()
-    if armed is None:
+    node_id = _armed_tripwire_node_id()
+    if node_id is None:
         return
-    fresh_user32 = getattr(module, "_user32", None)
-    if fresh_user32 is None:
-        return
-    from desktop_tripwire import _TripwireUser32
+    from desktop_tripwire import effect_binding_wrappers
 
-    module._user32 = _TripwireUser32(fresh_user32, str(getattr(armed, "_node_id", "fresh_backend_import")))
+    for name, wrapper in effect_binding_wrappers(module, node_id):
+        setattr(module, name, wrapper)

@@ -71,16 +71,40 @@ def resolve_target(owner: str, node: ast.Import | ast.ImportFrom) -> list[str]:
 
 
 def _string_import_targets(tree: ast.Module) -> list[str]:
-    """computer_use_mcp dotted paths passed to importlib.import_module/__import__."""
+    """computer_use_mcp dotted paths passed to importlib.import_module/__import__.
+
+    Covers the direct forms AND the alias forms (VAL-WP-R1-02 nit):
+    ``import importlib`` / ``import importlib as il`` /
+    ``from importlib import import_module`` /
+    ``from importlib import import_module as im``.
+    """
+    importlib_aliases: set[str] = {"importlib"}
+    import_module_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "importlib":
+                    importlib_aliases.add(alias.asname or "importlib")
+        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    import_module_names.add(alias.asname or "import_module")
     targets: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        is_import_module = (isinstance(func, ast.Attribute) and func.attr == "import_module"
-                            and isinstance(func.value, ast.Name) and func.value.id == "importlib")
+        is_import_module = (
+            isinstance(func, ast.Attribute)
+            and func.attr == "import_module"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in importlib_aliases
+        )
+        is_bound_import_module = (
+            isinstance(func, ast.Name) and func.id in import_module_names
+        )
         is_dunder_import = isinstance(func, ast.Name) and func.id == "__import__"
-        if not (is_import_module or is_dunder_import):
+        if not (is_import_module or is_bound_import_module or is_dunder_import):
             continue
         if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
             name = node.args[0].value
@@ -194,15 +218,26 @@ MOVED_MODULE_FILES = (
 ROOT_MODULE_FILES = ("__init__.py", "backend.py", "server.py", "cli.py")
 
 
+def all_package_module_relpaths() -> set[str]:
+    """The RECURSIVE package module-file listing (package-relative posix paths).
+
+    F1 (VAL-WP-R1-02): the SHARED scan listing — every source-tree scan in the
+    suite must derive its file set from this helper (or prove equality with
+    it), so a root-only ``glob("*.py")`` regression cannot hide moved modules.
+    """
+    return {path.relative_to(PKG).as_posix() for path in PKG.rglob("*.py")}
+
+
 def test_recursive_walk_sees_every_module_file() -> None:
     """F1 regression guard (VAL-WP-R1-01): source-tree scans must be
     RECURSIVE — none of the 26 moved modules lives at the package root, so a
     root-level ``glob("*.py")`` (as test_w1_cancellable_wait.py used) is blind
     to them. Any scan of the source tree must see all 29 module files."""
-    seen = {path.relative_to(PKG).as_posix() for path in PKG.rglob("*.py")}
+    seen = all_package_module_relpaths()
     expected = set(MOVED_MODULE_FILES) | set(ROOT_MODULE_FILES)
     missing = sorted(expected - seen)
     assert missing == [], f"recursive walk missed module files: {missing}"
+    assert "pipeline/agent.py" in seen, "the shared listing itself went blind"
     root_only = {path.name for path in PKG.glob("*.py")}
     assert not (root_only & {Path(f).name for f in MOVED_MODULE_FILES}), (
         "moved modules reappeared at the package root — recheck the F1 scan pins"
@@ -222,12 +257,39 @@ def test_checker_catches_an_upward_import() -> None:
         "computer_use_mcp.core.synthetic",
         "def f():\n    import computer_use_mcp.pipeline.validator\n",
     )
-    # ...and the string-import forms (F4)
+    # ...and the string-import forms (F4), including the alias forms
+    # (VAL-WP-R1-02 nit): `import importlib as il` and
+    # `from importlib import import_module [as im]`
     assert layer_violations(
         "computer_use_mcp.core.synthetic",
         "import importlib\n\n\ndef f():\n"
         "    importlib.import_module('computer_use_mcp.pipeline.validator')\n",
     )
+    assert layer_violations(
+        "computer_use_mcp.core.synthetic",
+        "import importlib as il\n\n\ndef f():\n"
+        "    il.import_module('computer_use_mcp.pipeline.validator')\n",
+    )
+    assert layer_violations(
+        "computer_use_mcp.core.synthetic",
+        "from importlib import import_module\n\n\ndef f():\n"
+        "    import_module('computer_use_mcp.pipeline.validator')\n",
+    )
+    assert layer_violations(
+        "computer_use_mcp.core.synthetic",
+        "from importlib import import_module as im\n\n\ndef f():\n"
+        "    im('computer_use_mcp.pipeline.validator')\n",
+    )
+    # a non-importlib `il.import_module` stays unflagged (no false positive)
+    assert layer_violations(
+        "computer_use_mcp.core.synthetic",
+        "class il:\n"
+        "    @staticmethod\n"
+        "    def import_module(name):\n"
+        "        return None\n\n\n"
+        "def f():\n"
+        "    il.import_module('computer_use_mcp.pipeline.validator')\n",
+    ) == []
     assert layer_violations(
         "computer_use_mcp.security.synthetic",
         "from ..vision.observation import ObservationEngine\n"

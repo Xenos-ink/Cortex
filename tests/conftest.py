@@ -21,9 +21,10 @@ def hermetic_desktop_tripwire(request: Any, monkeypatch: pytest.MonkeyPatch) -> 
     """WP-H: the offline suite must never touch the user's desktop.
 
     Whenever ``CUMCP_RUN_E2E != "1"`` (i.e. in EVERY offline gate run), every real
-    desktop EFFECT entry point — the backend's ``_user32`` effect functions,
-    GUI-app ``subprocess.Popen``/``os.startfile`` launches, and every importable
-    ``pyautogui`` effect function — raises
+    desktop EFFECT entry point — every loaded ``computer_use_mcp.*`` module's
+    effect-DLL bindings (``_user32``/``_kernel32``/``_ole32``/``_oleaut32``; the
+    user32 effect functions), GUI-app ``subprocess.Popen``/``os.startfile``
+    launches, and every importable ``pyautogui`` effect function — raises
     :class:`desktop_tripwire.RealDesktopEffectInOfflineSuite` naming the call and
     this test node, instead of acting. Read-only Win32 calls stay allowed.
 
@@ -38,15 +39,24 @@ def hermetic_desktop_tripwire(request: Any, monkeypatch: pytest.MonkeyPatch) -> 
     if os.environ.get("CUMCP_RUN_E2E") == "1":
         yield
         return
-    from desktop_tripwire import assert_no_unexpected_trips, install_tripwire
+    from desktop_tripwire import assert_no_unexpected_trips, find_unwrapped_effect_bindings, install_tripwire
 
     install_tripwire(monkeypatch, request.node.nodeid)
     yield
+    # F13 (VAL-WP-R2a-0-01), BEFORE the monkeypatch undo: a module first
+    # imported DURING this test binds real DLLs the install-time wrap never
+    # saw (and a fixture wrapper on it would never be undone) — fail here.
+    unwrapped = find_unwrapped_effect_bindings()
     # DELTA 1 (M1): a trip whose exception was swallowed (backend._launch's
     # degraded outcome, agent.run_single error kinds, focus_guard refocus errors,
     # worker threads) still fails THIS test here — the trip was recorded even
     # though the error never surfaced.
     assert_no_unexpected_trips(request.node.nodeid)
+    assert unwrapped == [], (
+        "TRIPWIRE ESCAPE: a computer_use_mcp module binds an UNWRAPPED real "
+        "effect DLL after this test ran (module first imported mid-test?):\n"
+        + "\n".join(f"  - {v}" for v in unwrapped)
+    )
 
 
 def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:

@@ -28,7 +28,12 @@ capture stages (default all):
                 tree (build/, src/*.egg-info) is removed and recorded.
 
 inventory: for every top-level def/class/assignment in every module under
-src/computer_use_mcp/: module, qualname, kind, and a normalized AST hash.
+src/computer_use_mcp/: module, qualname, kind, and a normalized AST hash;
+PLUS every top-level statement that is not a def/class/import/simple assign
+(If/Try/With/For/While/Expr/AugAssign/tuple-target Assign/__all__) with its
+module, ordinal among that module's top-level statements, kind, and the same
+normalized hash — so a dropped, duplicated or reordered import-time statement
+is visible in the diff (WP-R3 method change 2).
 
 NORMALIZATION (exact rules):
   1. Only the node's own AST subtree is hashed.
@@ -784,11 +789,77 @@ def top_level_symbols(tree: ast.Module) -> list[tuple[str, str, ast.AST]]:
     return out
 
 
+def _is_docstring_stmt(node: ast.stmt) -> bool:
+    return (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str))
+
+
+def _safe_unparse(node: ast.AST) -> str:
+    try:
+        return ast.unparse(node)
+    except Exception:  # pragma: no cover - exotic target shapes
+        return "?"
+
+
+def top_level_statements(tree: ast.Module) -> list[tuple[int, str, str, ast.AST]]:
+    """(ordinal, kind, name, node) for every top-level statement that is NOT a
+    def/class/Import/simple single-Name assign and NOT the module docstring —
+    If/Try/With/For/While/Expr/AugAssign/tuple-or-multi-target Assign and the
+    ``__all__`` assign (WP-R3 method change 2: a dropped, duplicated or
+    reordered import-time statement must be VISIBLE in the inventory diff).
+    The ordinal is the statement's index among ALL of the module's top-level
+    statements (defs and simple assigns included), so relative order to the
+    surrounding definitions is checked too."""
+    out: list[tuple[int, str, str, ast.AST]] = []
+    for ordinal, node in enumerate(tree.body):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                             ast.Import, ast.ImportFrom)):
+            continue
+        if _is_docstring_stmt(node):
+            continue
+        kind = type(node).__name__
+        name = ""
+        if isinstance(node, ast.Assign):
+            single = (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name))
+            if single and node.targets[0].id != "__all__":
+                continue  # a simple assign — covered by the symbol inventory
+            name = "__all__" if single else (
+                "assign:" + "+".join(sorted(_safe_unparse(t) for t in node.targets))
+            )
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                continue
+            name = "ann:" + _safe_unparse(node.target)
+        out.append((ordinal, kind, name, node))
+    return out
+
+
+def statement_entries(tree: ast.Module, module_ids: set[str], aliases: dict[str, str]) -> list[dict]:
+    """Hash-normalized inventory entries for a module's non-simple statements.
+
+    F4 (VAL-WP-R2a-0-01): every statement gets a stable, ADDRESSABLE name
+    ``stmt@<hash8>`` (the first 8 hex of its normalized hash) so a symbol-map
+    can route individual statements — e.g. backend's ``if IS_WINDOWS:`` block
+    to win32 and the three ``_VK_NAMED_KEYS.update(...)`` calls to
+    input_engine — instead of one destination for all of a module's If/Expr
+    statements. The name is stable under module moves (the hash is
+    location-independent)."""
+    entries: list[dict] = []
+    for ordinal, kind, _label, node in top_level_statements(tree):
+        digest = normalized_hash(node, module_ids, aliases)
+        entries.append({
+            "ordinal": ordinal, "kind": kind, "name": f"stmt@{digest[:8]}",
+            "hash": digest,
+        })
+    return entries
+
+
 def cmd_inventory(args: argparse.Namespace) -> int:
     out_path = Path(args.out).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     module_ids = collect_module_ids()
     entries = []
+    statements = []
     for path in sorted(PKG.rglob("*.py")):
         if path.name == "__init__.py":
             mod = _dotted(path.parent.relative_to(SRC))
@@ -804,6 +875,8 @@ def cmd_inventory(args: argparse.Namespace) -> int:
                 "kind": kind,
                 "hash": normalized_hash(node, module_ids, aliases),
             })
+        for entry in statement_entries(tree, module_ids, aliases):
+            statements.append({"module": mod, **entry})
     blob = {
         "normalization": ("sha256 of ast.dump(include_attributes=False) of the symbol's own "
                           "subtree; Import/ImportFrom nodes removed; docstrings kept; every "
@@ -813,10 +886,19 @@ def cmd_inventory(args: argparse.Namespace) -> int:
         "module_count": len({e["module"] for e in entries}),
         "symbol_count": len(entries),
         "symbols": entries,
+        "statements_note": ("every top-level statement that is not a def/class/import/"
+                            "simple single-Name assign (If/Try/With/For/While/Expr/"
+                            "AugAssign/tuple-target Assign/__all__), same normalized hash; "
+                            "ordinal = index among ALL top-level statements of its module; "
+                            "name = 'stmt@<hash8>' — a stable, addressable key for "
+                            "--symbol-map routing (F4)"),
+        "statement_count": len(statements),
+        "statements": statements,
         **meta([sys.executable] + sys.argv[1:]),
     }
     out_path.write_text(json.dumps(blob, indent=2) + "\n", encoding="utf-8")
-    print(f"inventory: {len(entries)} symbols in {blob['module_count']} modules -> {out_path}")
+    print(f"inventory: {len(entries)} symbols + {len(statements)} statements "
+          f"in {blob['module_count']} modules -> {out_path}")
     return 0
 
 
@@ -833,7 +915,14 @@ def cmd_diff(args: argparse.Namespace) -> int:
     name), a BEFORE symbol whose module is in the table is paired ONLY inside
     the module the table names (same leaf name, kind, hash); if it is found
     anywhere else the pair is reported in moved_mismatch and the command exits 1.
-    Exit code 1 if any MISSING, CHANGED or moved_mismatch entry exists.
+    With --symbol-map FILE (WP-R3 method change 2; JSON: "old.module" or
+    "old.module:name" -> "new.module", or {"symbol_map": {...}}), every mapped
+    BEFORE symbol AND every mapped BEFORE top-level statement must land in its
+    mapped module (symbol_map_mismatch otherwise); additionally every top-level
+    statement that stays in a module keeps its RELATIVE order
+    (statement_order_violations otherwise); both fail the command (exit 1).
+    Exit code 1 if any MISSING, CHANGED, moved_mismatch, symbol_map_mismatch,
+    statement_missing or statement_order_violations entry exists.
     """
     before_blob = json.loads(Path(args.before).resolve().read_text(encoding="utf-8"))
     after_blob = json.loads(Path(args.after).resolve().read_text(encoding="utf-8"))
@@ -954,6 +1043,188 @@ def cmd_diff(args: argparse.Namespace) -> int:
     changed_after_ids = {id(c["after"]) for c in changed}
     added = [e for e in still_a if id(e) not in changed_after_ids]
 
+    # --- --symbol-map (WP-R3 method change 2): symbol-level old->new module map.
+    # Accepted shapes: a flat JSON object mapping "old.module" (module-level:
+    # every symbol AND top-level statement of that module moves there) or
+    # "old.module:name" (symbol-level) to "new.module"; or a plan.json-style
+    # wrapper {"symbol_map": {...same flat shape...}}.
+    symbol_map: dict[str, str] | None = None
+    if getattr(args, "symbol_map", None):
+        raw = json.loads(Path(args.symbol_map).resolve().read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and isinstance(raw.get("symbol_map"), dict):
+            raw = raw["symbol_map"]
+        if not isinstance(raw, dict):
+            raise SystemExit("--symbol-map must be a JSON object "
+                             "({'old.module[:name]': 'new.module'} or {'symbol_map': ...})")
+        symbol_map = {str(k): str(v) for k, v in raw.items()}
+
+    def mapped_module(module: str, name: str) -> str | None:
+        if symbol_map is None:
+            return None
+        if f"{module}:{name}" in symbol_map:
+            return symbol_map[f"{module}:{name}"]
+        return symbol_map.get(module)
+
+    symbol_map_verified = 0
+    symbol_map_mismatch: list[dict] = []
+    if symbol_map is not None:
+        a_sym_pool: Counter = Counter(
+            (e["module"], e["name"], e["kind"], e["hash"]) for e in after
+        )
+        used: Counter = Counter()
+        for e in before:
+            expected = mapped_module(e["module"], e["name"])
+            if expected is None or expected == e["module"]:
+                continue  # unmapped or explicitly staying put
+            k = (expected, e["name"], e["kind"], e["hash"])
+            if used[k] < a_sym_pool.get(k, 0):
+                used[k] += 1
+                symbol_map_verified += 1
+            else:
+                symbol_map_mismatch.append({
+                    "name": e["name"], "kind": e["kind"], "hash": e["hash"],
+                    "from_module": e["module"], "expected_module": expected,
+                    "reason": "symbol not found in its mapped module (or exhausted)",
+                })
+
+    # --- top-level statement checks (both inventories must carry "statements")
+    statement_missing: list[dict] = []
+    statement_added: list[dict] = []
+    statement_moved = 0
+    statement_order_violations: list[dict] = []
+    if "statements" in before_blob and "statements" in after_blob:
+        before_stmts: list[dict] = before_blob["statements"]
+        after_stmts: list[dict] = after_blob["statements"]
+
+        # every BEFORE statement must land in its mapped module (or stay put)
+        a_stmt_pool: Counter = Counter(
+            (s["module"], s["kind"], s["hash"]) for s in after_stmts
+        )
+        stmt_used: Counter = Counter()
+        for s in before_stmts:
+            expected = mapped_module(s["module"], s["name"]) or s["module"]
+            k = (expected, s["kind"], s["hash"])
+            if stmt_used[k] < a_stmt_pool.get(k, 0):
+                stmt_used[k] += 1
+                if expected != s["module"]:
+                    statement_moved += 1
+            else:
+                statement_missing.append({
+                    "module": s["module"], "kind": s["kind"], "name": s["name"],
+                    "hash": s["hash"], "ordinal": s["ordinal"],
+                    "expected_module": expected,
+                })
+        # F3: duplicated statements — any (DESTINATION module, kind, hash) MORE
+        # often in AFTER than in BEFORE (a copy-instead-of-move or a duplicated
+        # .update(...) call must fail, not pass silently). Destination-aware:
+        # statements MOVED per the symbol map land in their new module and are
+        # not counted as additions.
+        b_dest_pool: Counter = Counter(
+            ((mapped_module(s["module"], s["name"]) or s["module"]), s["kind"], s["hash"])
+            for s in before_stmts
+        )
+        for (module, kind, digest), count in sorted(a_stmt_pool.items()):
+            extra = count - b_dest_pool.get((module, kind, digest), 0)
+            if extra > 0:
+                statement_added.append({
+                    "module": module, "kind": kind, "hash": digest,
+                    "name": next((s["name"] for s in after_stmts
+                                  if s["module"] == module and s["kind"] == kind
+                                  and s["hash"] == digest), ""),
+                    "extra_count": extra,
+                })
+
+        # F3: duplicated SYMBOLS — per (DESTINATION module, name, kind, hash) more
+    # often in AFTER than in BEFORE (destination-aware: symbols MOVED per the
+    # symbol map land in their new module and are not counted as duplicates).
+    symbol_duplicated: list[dict] = []
+    a_sym_counts: Counter = Counter(
+        (e["module"], e["name"], e["kind"], e["hash"]) for e in after
+    )
+    b_sym_counts: Counter = Counter(
+        ((mapped_module(e["module"], e["name"]) or e["module"]),
+         e["name"], e["kind"], e["hash"])
+        for e in before
+    )
+    for (module, name, kind, digest), count in sorted(a_sym_counts.items()):
+        extra = count - b_sym_counts.get((module, name, kind, digest), 0)
+        if extra > 0:
+            symbol_duplicated.append({
+                "module": module, "name": name, "kind": kind, "hash": digest,
+                "extra_count": extra,
+            })
+
+    # F5: ORDER check ACROSS the symbol map — group BEFORE statements by their
+    # mapped DESTINATION module and compare the relative order of the common
+    # (kind, hash) statements with AFTER. Covers NEW modules (the three
+    # _VK_NAMED_KEYS.update calls move into a module absent from BEFORE — a
+    # swap there is still caught).
+    if "statements" in before_blob and "statements" in after_blob:
+        before_stmts = before_blob["statements"]
+        after_stmts = after_blob["statements"]
+
+        def dest_of(s: dict) -> str:
+            return mapped_module(s["module"], s["name"]) or s["module"]
+
+        by_dest_b: dict[str, list[dict]] = {}
+        by_dest_a: dict[str, list[dict]] = {}
+        for s in before_stmts:
+            by_dest_b.setdefault(dest_of(s), []).append(s)
+        for s in after_stmts:
+            by_dest_a.setdefault(s["module"], []).append(s)
+        for module in sorted(by_dest_b):
+            b_mod = sorted(by_dest_b[module], key=lambda s: s["ordinal"])
+            a_mod = sorted(by_dest_a.get(module, []), key=lambda s: s["ordinal"])
+            common = (Counter((s["kind"], s["hash"]) for s in b_mod)
+                      & Counter((s["kind"], s["hash"]) for s in a_mod))
+            if not common:
+                continue
+
+            def ordered(seq: list[dict]) -> list[tuple]:
+                remaining = Counter(common)
+                out_seq = []
+                for s in seq:
+                    k = (s["kind"], s["hash"])
+                    if remaining.get(k, 0) > 0:
+                        remaining[k] -= 1
+                        out_seq.append(k)
+                return out_seq
+
+            b_seq, a_seq = ordered(b_mod), ordered(a_mod)
+            if b_seq != a_seq:
+                first_diverge = next(
+                    (i for i, (x, y) in enumerate(zip(b_seq, a_seq)) if x != y),
+                    min(len(b_seq), len(a_seq)),
+                )
+                statement_order_violations.append({
+                    "module": module,
+                    "note": "relative order of the module's unchanged top-level "
+                            "statements changed",
+                    "before_at_divergence": (b_seq[first_diverge]
+                                             if first_diverge < len(b_seq) else None),
+                    "after_at_divergence": (a_seq[first_diverge]
+                                            if first_diverge < len(a_seq) else None),
+                })
+
+    # F14: --symbol-map keys that match NOTHING in BEFORE fail the diff (a
+    # typo'd key would otherwise be silently ignored)
+    symbol_map_unknown_keys: list[str] = []
+    if symbol_map is not None:
+        before_modules = {e["module"] for e in before}
+        before_stmt_modules = {s["module"] for s in before_blob.get("statements", [])}
+        before_names = {(e["module"], e["name"]) for e in before}
+        before_stmt_names = {(s["module"], s["name"])
+                             for s in before_blob.get("statements", [])}
+        for key in sorted(symbol_map):
+            module, _sep, name = key.partition(":")
+            if name:
+                matched = ((module, name) in before_names
+                           or (module, name) in before_stmt_names)
+            else:
+                matched = module in before_modules or module in before_stmt_modules
+            if not matched:
+                symbol_map_unknown_keys.append(key)
+
     report = {
         "before": str(Path(args.before)),
         "after": str(Path(args.after)),
@@ -967,12 +1238,34 @@ def cmd_diff(args: argparse.Namespace) -> int:
         "move_table": str(Path(args.move_table).resolve()) if table is not None else None,
         "moved_verified_by_table": moved_verified,
         "moved_mismatch": moved_mismatch,
+        "symbol_map": str(Path(args.symbol_map).resolve()) if symbol_map is not None else None,
+        "symbol_map_verified": symbol_map_verified,
+        "symbol_map_mismatch": symbol_map_mismatch,
+        "symbol_map_unknown_keys": symbol_map_unknown_keys,
+        "statement_missing": statement_missing,
+        "statement_added": statement_added,
+        "statement_moved_per_map": statement_moved,
+        "statement_order_violations": statement_order_violations,
+        "symbol_duplicated": symbol_duplicated,
     }
     report["moved_count"] = len(moved_pairs)
     report["moved_mismatch_count"] = len(moved_mismatch)
+    report["symbol_map_mismatch_count"] = len(symbol_map_mismatch)
+    report["symbol_map_unknown_key_count"] = len(symbol_map_unknown_keys)
+    report["statement_missing_count"] = len(statement_missing)
+    report["statement_added_count"] = len(statement_added)
+    report["statement_order_violation_count"] = len(statement_order_violations)
+    report["symbol_duplicated_count"] = len(symbol_duplicated)
     summary = (f"missing={len(missing)} changed={len(changed)} added={len(added)} "
                f"moved={len(moved_pairs)} unchanged={len(unchanged)} "
-               f"table_mismatch={len(moved_mismatch)}")
+               f"table_mismatch={len(moved_mismatch)} "
+               f"symmap_verified={symbol_map_verified} "
+               f"symmap_mismatch={len(symbol_map_mismatch)} "
+               f"symmap_unknown={len(symbol_map_unknown_keys)} "
+               f"stmt_missing={len(statement_missing)} "
+               f"stmt_added={len(statement_added)} "
+               f"stmt_order={len(statement_order_violations)} "
+               f"symbol_dup={len(symbol_duplicated)}")
     print(f"inventory diff: {summary}")
     if missing:
         for e in missing[:50]:
@@ -987,12 +1280,36 @@ def cmd_diff(args: argparse.Namespace) -> int:
         for pair in moved_mismatch[:50]:
             print(f"  MOVE-MISMATCH {pair['from_module']} {pair['kind']} {pair['name']}"
                   f" -> {pair['to_module']} (expected {pair['expected_module']})")
+    if symbol_map_mismatch:
+        for pair in symbol_map_mismatch[:50]:
+            print(f"  SYMBOL-MAP-MISMATCH {pair['from_module']} {pair['kind']} {pair['name']}"
+                  f" (expected in {pair['expected_module']})")
+    if symbol_map_unknown_keys:
+        for key in symbol_map_unknown_keys[:50]:
+            print(f"  SYMBOL-MAP-UNKNOWN-KEY {key!r} matches nothing in BEFORE")
+    if statement_missing:
+        for s in statement_missing[:50]:
+            print(f"  STATEMENT-MISSING {s['module']}:{s['ordinal']} {s['kind']} {s['name']}"
+                  f" (expected in {s['expected_module']})")
+    if statement_added:
+        for s in statement_added[:50]:
+            print(f"  STATEMENT-ADDED {s['module']} {s['kind']} {s['name']}"
+                  f" (x{s['extra_count']} in AFTER only)")
+    if statement_order_violations:
+        for v in statement_order_violations[:50]:
+            print(f"  STATEMENT-ORDER {v['module']} — {v['note']}")
+    if symbol_duplicated:
+        for s in symbol_duplicated[:50]:
+            print(f"  SYMBOL-DUPLICATED {s['module']} {s['kind']} {s['name']}"
+                  f" (x{s['extra_count']} in AFTER only)")
     if args.out:
         out_path = Path(args.out).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(f"diff report -> {out_path}")
-    return 1 if (missing or changed or moved_mismatch) else 0
+    return 1 if (missing or changed or moved_mismatch or symbol_map_mismatch
+                 or symbol_map_unknown_keys or statement_missing or statement_added
+                 or statement_order_violations or symbol_duplicated) else 0
 
 
 
@@ -1064,6 +1381,12 @@ def main(argv: list[str] | None = None) -> int:
     p_diff.add_argument("--move-table", default=None, dest="move_table",
                         help="JSON file mapping old module -> new module; MOVED symbols "
                              "must land in the named module or the diff fails")
+    p_diff.add_argument("--symbol-map", default=None, dest="symbol_map",
+                        help="JSON file mapping 'old.module' or 'old.module:name' -> "
+                             "'new.module' (or {'symbol_map': {...}}); every mapped "
+                             "symbol AND top-level statement must land in its mapped "
+                             "module, and statements that stay in a module keep their "
+                             "relative order, or the diff fails")
     p_diff.set_defaults(func=cmd_diff)
     args = parser.parse_args(argv)
     return int(args.func(args))

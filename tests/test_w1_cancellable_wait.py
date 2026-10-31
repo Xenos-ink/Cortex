@@ -1055,10 +1055,21 @@ def test_max_task_seconds_is_not_newly_enforced() -> None:
     sites.  WP6 documents the gap; it does not close it."""
     import pathlib
 
+    from test_architecture_layers import all_package_module_relpaths
+
     src = pathlib.Path(server.__file__).parent
+    # F7 (VAL-WP-R2a-0-01): the file list is built ONCE and feeds BOTH the
+    # call-site scan below AND the coverage equality assertion — swapping the
+    # scan's rglob for a root-only glob would now fail the assertion too,
+    # because the same list is what the assertion checks.
+    paths = sorted(src.rglob("*.py"))
+    walked = {path.relative_to(src).as_posix() for path in paths}
+    assert walked == all_package_module_relpaths(), (
+        "the check_task_duration scan does not see every module file (F1/F7)"
+    )
     call_sites = [
         path.name
-        for path in sorted(src.rglob("*.py"))
+        for path in paths
         if path.name != "limits.py" and ".check_task_duration(" in path.read_text(encoding="utf-8")
     ]
     assert call_sites == []
