@@ -264,6 +264,14 @@ def test_check_launch_restricts_dash_m_to_pytest() -> None:
     bare ``-`` (stdin code) is rejected."""
     check_launch([sys.executable, "-m", "pytest", "-q", "tests/x.py"])
     check_launch([sys.executable, "-mpytest", "-q", "tests/x.py"])  # glued, still pytest
+    # R3 (VAL-WP8-03): 'm' ANYWHERE in the cluster — mid-cluster glued modules
+    # are caught, the isolated -I -m form stays allowed, -X values are exempt
+    check_launch([sys.executable, "-I", "somedir", "-m", "pytest", "-q", "tests/x.py"])
+    _rejected([sys.executable, "-Imwebbrowser", "http://example.invalid"])
+    _rejected([sys.executable, "-Bmwebbrowser", "http://example.invalid"])
+    _rejected([sys.executable, "-Im", "webbrowser"])
+    check_launch([sys.executable, "-X", "frozen_modules=off", "-m", "pytest", "-q", "tests/x.py"])
+    check_launch([sys.executable, "-Xfrozen_modules=off", "-m", "pytest", "-q", "tests/x.py"])
     _rejected([sys.executable, "-m", "code"])
     _rejected([sys.executable, "-mwebbrowser", "http://example.invalid"])
     _rejected([sys.executable, "-Im", "webbrowser"])
@@ -468,6 +476,15 @@ _REGARDLESS_BASE = frozenset(
         "ShellExecuteW",
         "create_subprocess_exec",
         "create_subprocess_shell",
+        # F12 residual (VAL-WP8-02): native process creation the runtime traps
+        # cannot cover. ``multiprocessing.Process(...)`` spawns a sys.executable
+        # child via _winapi.CreateProcess; ``_winapi.CreateProcess`` IS that
+        # transport — trapping it at runtime would break the ALLOWED
+        # sys.executable children (subprocess.Popen's Windows path), so these
+        # are guarded STATICALLY: any call so named is a violation, wherever it
+        # appears in ungated test code.
+        "CreateProcess",
+        "Process",
     }
 )
 #: generic names flagged ONLY when the base resolves to a process-spawning module
@@ -477,7 +494,6 @@ _REGARDLESS_BASE = frozenset(
 #: `startfile` and the exotic spawners stay regardless-of-base.
 _RESOLVED_ONLY = frozenset({"run", "call", "check_call", "check_output", "system"})
 _SPAWNING_MODULES = frozenset({"subprocess", "os", "asyncio.subprocess"})
-
 #: helpers only consumed by e2e-MARKED tests (D6 fail-closed live gate — the same
 #: gate as LIVE_DESKTOP); their spawn helpers take dynamic argv by design.
 _E2E_PROXY_GATED_FILES = frozenset({"e2e/helpers_win32.py"})
@@ -706,6 +722,10 @@ def test_ast_guard_catches_evasion_forms() -> None:
         "import subprocess\nsubprocess.Popen(['notepad'], executable='notepad.exe')\n",
         "import subprocess\nsubprocess.Popen(['notepad'], shell=True)\n",
         'import ctypes\n_windll = ctypes\n_windll.ShellExecuteW(0, "open", "notepad")\n',
+        # F12 residual (VAL-WP8-02): multiprocessing / _winapi native creation
+        "import multiprocessing\nmultiprocessing.Process(target=f).start()\n",
+        "import multiprocessing as mp\nmp.Process(target=f)\n",
+        "import _winapi\n_winapi.CreateProcess(None, 'notepad', None, None, 0, 0, None, None, b'')\n",
     ]
     for snippet in caught:
         violations = _scan_source(snippet)

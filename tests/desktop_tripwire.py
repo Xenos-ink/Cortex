@@ -330,23 +330,32 @@ def check_launch(args: Any, *, shell: bool = False, executable: Any = None) -> N
                 )
             if text.startswith("-") and not text.startswith("--"):
                 flags = text[1:]
-                if "c" in flags:
-                    _record_trip("subprocess spawn (python -c option cluster)")
-                    raise RealDesktopEffectInOfflineSuite(
-                        f"python child argument {text!r} carries 'c' as an option "
-                        f"cluster (a banned ``python -c`` in disguise) ({where})."
-                    )
-                if "m" in flags:
-                    tail = flags.split("m", 1)[1]
-                    module = tail if tail else (
-                        str(args[position + 2]) if position + 2 < len(args) else ""
-                    )
-                    if module != "pytest":
-                        _record_trip("subprocess spawn (python -m outside pytest)")
+                # DELTA 3 R3 (VAL-WP8-03): 'm' is found ANYWHERE in the cluster —
+                # ``-Imwebbrowser`` parses as -I -m webbrowser. The glued tail
+                # after the 'm' (or the next argv when the tail is empty) is the
+                # module and must be pytest. EXCEPTION: a cluster whose FIRST
+                # letter is ``X`` is ``-X<value>`` — the whole tail is the
+                # option's VALUE, never a flag list (``-Xfrozen_modules=off``
+                # stays allowed).
+                if flags[:1] != "X":
+                    if "c" in flags:
+                        _record_trip("subprocess spawn (python -c option cluster)")
                         raise RealDesktopEffectInOfflineSuite(
-                            f"python -m child {module!r} attempted in the OFFLINE "
-                            f"suite ({where}): '-m' is restricted to 'pytest'."
+                            f"python child argument {text!r} carries 'c' as an option "
+                            f"cluster (a banned ``python -c`` in disguise) ({where})."
                         )
+                    index = flags.find("m")
+                    if index != -1:
+                        tail = flags[index + 1 :]
+                        module = tail if tail else (
+                            str(args[position + 2]) if position + 2 < len(args) else ""
+                        )
+                        if module != "pytest":
+                            _record_trip("subprocess spawn (python -m outside pytest)")
+                            raise RealDesktopEffectInOfflineSuite(
+                                f"python -m child {module!r} attempted in the OFFLINE "
+                                f"suite ({where}): '-m' is restricted to 'pytest'."
+                            )
         return
     if basename in SHELL_ONLY_ALLOWLIST:
         _record_trip("subprocess spawn (ver without shell)")

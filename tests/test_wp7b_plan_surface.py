@@ -2026,14 +2026,28 @@ async def test_stop_session_racing_a_step_reports_stopped_and_releases_once(
     # F3 (VAL-WP8-01): the funnel and the in-step TaskStopped handler raced —
     # the idempotent terminal emission yields EXACTLY ONE terminal event for the
     # plan, carrying the reply's own result token and failure_reason.
+    # N4 (VAL-WP8-02): the funnel DEFERRED to the in-flight step — the record
+    # order is the step's plan_point BEFORE the terminal, and both records carry
+    # the FINAL prefix counts (equal to the reply's executed prefix).
     plan_events = [
         event for event in audit_events(bundle, session_id)
-        if event["event_type"] in ("plan_complete", "plan_stopped")
+        if event["event_type"].startswith("plan_")
     ]
-    assert len(plan_events) == 1, plan_events
-    assert plan_events[0]["event_type"] == "plan_stopped"
-    assert plan_events[0]["result"] == "stopped"
-    assert plan_events[0]["metadata"]["reason"] == "cancelled"
+    assert [event["event_type"] for event in plan_events] == [
+        "plan_start", "plan_point", "plan_stopped",
+    ], plan_events
+    point, terminal = plan_events[1], plan_events[2]
+    assert point["result"] == reply["result"]
+    assert point["metadata"].get("failure_reason") == reply["failure_reason"]
+    assert point["metadata"]["step_index"] == reply["step_index"]
+    assert terminal["event_type"] == "plan_stopped"
+    assert terminal["result"] == "stopped"
+    assert terminal["metadata"]["reason"] == "cancelled"
+    assert terminal["metadata"]["resolved_count"] == len(reply["executed_prefix"])
+    assert terminal["metadata"]["executed_count"] == sum(
+        entry.get("kind") in ("executed", "dispatched_unverified")
+        for entry in reply["executed_prefix"]
+    )
 
 
 # --- DELTA 1 #11: a whitespace-only action expected_effect is not a statement ---------------------

@@ -458,3 +458,65 @@ async def test_no_flip_backend_verification_failure_still_classifies(
     not_executed = payload["not_executed"]
     assert not_executed
     assert {entry["reason"] for entry in not_executed} == {"verification_failed"}
+
+
+# --- (e) N3 (VAL-WP8-02): never-dispatched terminal prefixes are classified -----
+
+
+def test_not_executed_and_dry_run_only_prefixes_are_classified() -> None:
+    """A terminal prefix of only never-dispatched work — a not_executed entry
+    WITHOUT an approval hold, or a dry_run entry — classifies as the cut token
+    ``cancelled`` (existing vocabulary; no token invented), never
+    ``unclassified``. An approval hold still wins (checked first)."""
+    _not_executed = {
+        "kind": "executed",
+        "result": "not_executed",
+        "requires_approval": False,
+    }
+    _dry_run = {"kind": "executed", "result": "dry_run", "requires_approval": False}
+    assert plan_failure_reason(None, [dict(_not_executed)], result="failed") == "cancelled"
+    # VAL-WP8-03 (Commander decision): a dry_run walk is DELIBERATE, not a
+    # cancellation — the same token the step level gives a dry-run step.
+    assert (
+        plan_failure_reason(None, [dict(_dry_run)], result="failed")
+        == "no_post_action_observation"
+    )
+    held = dict(_not_executed, requires_approval=True)
+    assert plan_failure_reason(None, [held], result="failed") == "approval_required"
+
+
+async def test_a_dry_run_walk_terminal_is_classified_not_unclassified(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: a plan walked in a dry-run session (every entry validated,
+    deliberately not dispatched) reaches a terminal reply whose failure_reason
+    is the cut token, never ``unclassified``."""
+    backend = ScriptedBackend(flip=True)
+    session_id, _bundle, _backend, _provider = make_session(
+        monkeypatch, backend=backend, dry_run=True, require_approval=False, limits=FAST_LIMITS
+    )
+    first = execute_payload(
+        await server.computer_execute(
+            session_id,
+            "done",
+            plan=wire_plan(
+                {
+                    "points": [
+                        {"id": "only", "x": 10, "y": 20, "actions": [{"action": "click"}]}
+                    ]
+                }
+            ),
+            approved=True,
+            include_screenshot_after=False,
+        )
+    )
+    assert first["failure_reason"] in (PLAN_FAILURE_REASONS | {None})
+    terminal = execute_payload(
+        await server.computer_execute(
+            session_id, "done", plan_action="continue", include_screenshot_after=False
+        )
+    )
+    # VAL-WP8-03 (Commander decision): a dry-run walk is DELIBERATE — the same
+    # token the step level gives a dry-run step, not "cancelled".
+    assert terminal["failure_reason"] == "no_post_action_observation", terminal["failure_reason"]
+    assert terminal["failure_reason"] in PLAN_FAILURE_REASONS

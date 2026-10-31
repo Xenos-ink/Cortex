@@ -175,35 +175,58 @@ def _reply_error_literals() -> set[str]:
 
 
 def _failure_reason_literals() -> set[str]:
-    """F9 (VAL-WP8-01): the failure/stop literals OUTSIDE agent.py.
+    """F9/N2 (VAL-WP8-01/02): the failure/stop literals OUTSIDE agent.py.
 
-    Every string constant the server and plan modules assign to a
-    ``failure_reason`` variable or pass as ``failure_reason=`` /
-    ``stopped_reason=`` is part of the classification universe: a literal the
-    tables and the closed vocabulary do not name must fail here, not only new
-    ``agent.py`` queue literals.
+    Every string constant the server and plan modules bind to a failure_reason
+    — by NAME assignment, SUBSCRIPT assignment (``response["failure_reason"] =
+    "..."``), DICT-LITERAL entry (``{"failure_reason": "..."}``), the
+    ``failure_reason=`` keyword, or the branches of an IfExp in any of those
+    positions — is part of the classification universe: a literal
+    the closed vocabulary does not name must fail here, not only new ``agent.py``
+    queue literals.
     """
     found: set[str] = set()
+
+    def _harvest(node: ast.expr) -> None:
+        """Collect the str constants an assigned/passed expression can yield."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            found.add(node.value)
+        elif isinstance(node, ast.IfExp):
+            _harvest(node.body)
+            _harvest(node.orelse)
+
     for module_name in ("server.py", "plan.py"):
         for node in ast.walk(_parse(module_name)):
-            if (
-                isinstance(node, ast.Assign)
-                and isinstance(node.value, ast.Constant)
-                and isinstance(node.value.value, str)
-                and any(
-                    isinstance(t, ast.Name) and t.id == "failure_reason"
+            if isinstance(node, ast.Assign):
+                is_failure_target = any(
+                    (isinstance(t, ast.Name) and t.id == "failure_reason")
+                    or (
+                        isinstance(t, ast.Subscript)
+                        and isinstance(t.slice, ast.Constant)
+                        and t.slice.value == "failure_reason"
+                    )
                     for t in node.targets
                 )
-            ):
-                found.add(node.value.value)
-            if isinstance(node, ast.Call):
+                if is_failure_target:
+                    _harvest(node.value)
+                if isinstance(node.value, ast.Dict):
+                    for key, value in zip(node.value.keys, node.value.values):
+                        if (
+                            isinstance(key, ast.Constant)
+                            and key.value == "failure_reason"
+                        ):
+                            _harvest(value)
+            elif isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if isinstance(key, ast.Constant) and key.value == "failure_reason":
+                        _harvest(value)
+            elif isinstance(node, ast.Call):
                 for kw in node.keywords:
-                    if (
-                        kw.arg in ("failure_reason", "stopped_reason")
-                        and isinstance(kw.value, ast.Constant)
-                        and isinstance(kw.value.value, str)
-                    ):
-                        found.add(kw.value.value)
+                    # ``stopped_reason=`` kwargs carry the AGGREGATE status
+                    # vocabulary ("stopped"/"awaiting_plan_action"/...), not the
+                    # failure_reason classes — only failure_reason is harvested.
+                    if kw.arg == "failure_reason":
+                        _harvest(kw.value)
     return found
 
 
@@ -341,7 +364,7 @@ def _entry(**overrides: Any) -> dict[str, Any]:
 
 async def _run_step_with_grounding_fault(
     monkeypatch: pytest.MonkeyPatch, fault_message: str
-) -> dict[str, Any]:
+) -> tuple[str, Any, dict[str, Any]]:
     """One plan step whose SECOND queue item is refused by the real grounding gate."""
     real_ground = agent_module.ComputerUseAgent._ground
     calls = {"n": 0}
@@ -357,10 +380,10 @@ async def _run_step_with_grounding_fault(
     backend = ScriptedBackend(
         flip=True, active_window=WindowInfo(hwnd=1, pid=1, process_name="app.exe", title="App")
     )
-    session_id, _bundle, _backend, _provider = make_session(
+    session_id, bundle, _backend, _provider = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    return session_id, execute_payload(
+    return session_id, bundle, execute_payload(
         await server.computer_execute(
             session_id, "done", plan=wire_plan(TWO_ITEM_PLAN), approved=True, include_screenshot_after=False
         )
@@ -475,20 +498,26 @@ def test_every_classification_token_is_inside_the_closed_vocabulary() -> None:
 def test_no_table_key_is_unreachable() -> None:
     """A table must not accumulate keys the product can never produce.
 
-    F8 (VAL-WP8-01): NO whitelist — every key of every table must be in the
-    extracted reachable universe (queue stop reasons + outcome kinds + reply
-    error values + the stop/failure literals server.py and plan.py assign, F9),
-    so the guard cannot pass vacuously.
+    N2 (VAL-WP8-02): each table is checked against its OWN emission source —
+    the error table against the builders' ``error`` literals, the kind table
+    against the constructible outcome kinds, the stop tables against the queue's
+    stop-reason universe — so no cross-source union can let a dead key pass by
+    coincidence.
     """
-    reachable = CODE_STOP_REASONS | CODE_ERROR_KEYS | set(CODE_KINDS) | CODE_OTHER_SITE_LITERALS
-    for name, table in (
-        ("_PLAN_ERROR_TO_FAILURE_REASON", plan_module._PLAN_ERROR_TO_FAILURE_REASON),
-        ("_PLAN_OUTCOME_KIND_TO_FAILURE_REASON", plan_module._PLAN_OUTCOME_KIND_TO_FAILURE_REASON),
-        ("_PLAN_SPECIFIC_STOP_REASON_TO_FAILURE_REASON", STOP_TABLES[0]),
-        ("_PLAN_STOP_REASON_TO_FAILURE_REASON", STOP_TABLES[1]),
-    ):
-        dead = sorted(set(table) - reachable)
-        assert not dead, f"{name} carries keys the product cannot produce: {dead}"
+    sources: tuple[tuple[str, dict[str, str], set[str]], ...] = (
+        ("_PLAN_ERROR_TO_FAILURE_REASON", plan_module._PLAN_ERROR_TO_FAILURE_REASON, CODE_ERROR_KEYS),
+        ("_PLAN_OUTCOME_KIND_TO_FAILURE_REASON", plan_module._PLAN_OUTCOME_KIND_TO_FAILURE_REASON, CODE_KINDS),
+        ("_PLAN_SPECIFIC_STOP_REASON_TO_FAILURE_REASON", STOP_TABLES[0], CODE_STOP_REASONS),
+        ("_PLAN_STOP_REASON_TO_FAILURE_REASON", STOP_TABLES[1], CODE_STOP_REASONS),
+    )
+    for name, table, universe in sources:
+        dead = sorted(set(table) - universe)
+        assert not dead, f"{name} carries keys its emission source cannot produce: {dead}"
+    # and the cross-site literals stay inside the closed vocabulary, each one
+    # actually classifiable by SOME table (value-side, not key-side coincidence)
+    assert CODE_OTHER_SITE_LITERALS, "the extraction found nothing — fix the test"
+    uncovered = sorted(CODE_OTHER_SITE_LITERALS - PLAN_FAILURE_REASONS)
+    assert not uncovered, f"failure literals outside the closed vocabulary: {uncovered}"
 
 
 # --- (B) a follow-up refused WITHOUT a named interference stop -------------------------------
@@ -498,7 +527,7 @@ async def test_rejected_follow_up_is_not_unclassified(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A queue item refused by a gate that names no interference stop."""
-    _session_id, payload = await _run_step_with_grounding_fault(
+    _session_id, _bundle, payload = await _run_step_with_grounding_fault(
         monkeypatch, "synthetic gate refusal with no named interference stop"
     )
     assert payload["follow_ups_stopped_reason"] == "rejected", payload
@@ -647,7 +676,7 @@ async def test_terminal_walk_over_a_rejected_prefix_is_not_unclassified(
 ) -> None:
     """F1: a terminal reply (``continue`` past the end) classifies a REJECTED
     follow-up from the entries alone — never ``unclassified``."""
-    session_id, payload = await _run_step_with_grounding_fault(
+    session_id, bundle, payload = await _run_step_with_grounding_fault(
         monkeypatch, "synthetic gate refusal with no named interference stop"
     )
     assert payload["failure_reason"] == "rejected"
@@ -664,6 +693,14 @@ async def test_terminal_walk_over_a_rejected_prefix_is_not_unclassified(
     assert terminal["result"] == "failed"  # a rejected entry FAILS the plan (§1.2)
     assert terminal["failure_reason"] == "rejected", terminal["failure_reason"]
     assert terminal["failure_reason"] in PLAN_FAILURE_REASONS
+    # F5 (VAL-WP8-02): the FAILED terminal-walk record agrees with the reply
+    from test_audit_compliance import _plan_events
+
+    events = _plan_events(bundle, session_id)
+    assert events[-1]["event_type"] == "plan_stopped"
+    assert events[-1]["result"] == terminal["result"]
+    assert events[-1]["metadata"].get("failure_reason") == terminal["failure_reason"]
+    assert events[-1]["metadata"]["resolved_count"] == len(terminal["executed_prefix"])
 
 
 async def test_terminal_walk_over_an_approval_held_prefix_is_not_unclassified(

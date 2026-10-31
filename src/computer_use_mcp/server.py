@@ -401,17 +401,31 @@ def _close_stopped_bundle(
         # WP8: a killed session (stop_session / idle reap / internal kill path)
         # ends any active plan as cancelled — audited OUTSIDE the lock, after the
         # reply-shaped teardown decided the stop, with the kill source named.
-        # F3/F4: idempotent per lease (an in-step TaskStopped racing this funnel
-        # emits first and wins); the reason is the reply's own failure_reason
-        # ("cancelled"), the kill source rides the metadata.
-        _audit_plan_terminal(
-            bundle,
-            active_plan_lease,
-            reply_result="stopped",
-            reason="cancelled",
-            failure_reason="cancelled",
-            source=source,
-        )
+        # F3/F4: idempotent per lease; the reason is the reply's own
+        # failure_reason ("cancelled"), the kill source rides the metadata.
+        # DELTA 4 (VAL-WP8-04): when a step is IN FLIGHT the funnel does NOT
+        # emit — it records the kill on the lease (under the SAME lock the step's
+        # finally uses) and returns; the step's single try/finally closes the
+        # lifecycle on every exit, with the step's plan_point already emitted and
+        # the final prefix counts.
+        # DELTA 5 (Commander review): the defer DECISION is made INSIDE the lock
+        # — a check-then-act across it could race the step's finally (funnel
+        # reads True, finally clears + sees no kill, funnel then sets
+        # kill_deferred on a finished step = zero terminals). The emit itself
+        # stays outside the lock (it is fallible and never holds it).
+        with _plan_terminal_audit_lock:
+            defer = active_plan_lease.step_in_flight
+            if defer:
+                active_plan_lease.kill_deferred = True
+        if not defer:
+            _audit_plan_terminal(
+                bundle,
+                active_plan_lease,
+                reply_result="stopped",
+                reason="cancelled",
+                failure_reason="cancelled",
+                source=source,
+            )
     return cancelled_wait_handles
 
 
@@ -3629,6 +3643,11 @@ def computer_zoom(
 _plan_guard = PlanLeaseGuard()
 
 
+#: N1 (VAL-WP8-02): serializes the terminal-audit check-and-set across the
+#: stop-session thread and the event loop (one terminal event per plan, always).
+_plan_terminal_audit_lock = threading.Lock()
+
+
 def _plan_counts(lease: PlanLease) -> dict[str, int]:
     """The ONE bounded count pair for every plan audit event (F4/VAL-WP8-01).
 
@@ -3696,9 +3715,13 @@ def _audit_plan_terminal(
     ``completed`` for a verified plan, or the lifecycle cause no reply names
     (stop / replaced / exception).
     """
-    if lease.terminal_audited:
-        return
-    lease.terminal_audited = True
+    # N1 (VAL-WP8-02): the check-and-set is ATOMIC under a dedicated lock — the
+    # session-end funnel runs on a stop-session thread while the in-step
+    # emitters run on the event loop, so a bare flag could double-emit.
+    with _plan_terminal_audit_lock:
+        if lease.terminal_audited:
+            return
+        lease.terminal_audited = True
     _audit_plan_event(
         bundle,
         "plan_complete" if reply_result == "verified" else "plan_stopped",
@@ -4435,6 +4458,17 @@ def _plan_response(
         failure_reason=response.get("failure_reason"),
         **_plan_counts(lease),
     )
+    if session_killed:
+        # N4 (VAL-WP8-02): the funnel deferred to this in-flight step — the killed
+        # step's own reply IS the terminal shape, so the lifecycle closes right
+        # after its plan_point record (point before terminal, final counts).
+        _audit_plan_terminal(
+            bundle,
+            lease,
+            reply_result=str(response["result"]),
+            reason=response.get("failure_reason") or "cancelled",
+            failure_reason=response.get("failure_reason"),
+        )
     if complete_walk:
         _audit_plan_terminal(
             bundle,
@@ -4685,9 +4719,16 @@ async def _execute_plan_step(
             blocked=False,
             failure_reason="invalid_action",
         )
+    # O-03: approval was evaluated ONCE on the FIRST plan call and is inherited
+    # by every step and by replace — ``continue`` never re-asks.
+    # DELTA 4 (VAL-WP8-04): ONE structure for the in-flight marker. The funnel
+    # records ``kill_deferred`` (under the terminal-audit lock) instead of
+    # emitting; the step's plan_point records are emitted INSIDE the guarded
+    # region; the SINGLE ``finally`` clears the marker and closes the lifecycle
+    # when a kill was deferred — on EVERY exit (including a raise in the merge),
+    # after the merge and after the point, with the final prefix counts.
+    lease.step_in_flight = True
     try:
-        # O-03: approval was evaluated ONCE on the FIRST plan call and is inherited
-        # by every step and by replace — ``continue`` never re-asks.
         outcome = await bundle.agent.run_single(
             bundle.state,
             grounded,
@@ -4714,6 +4755,19 @@ async def _execute_plan_step(
         # finish; the lifecycle ends cancelled.  F3/F4: idempotent per lease (the
         # session-end funnel may have raced us here); the reason is the reply's
         # own failure_reason ("cancelled"), the result token is the reply's.
+        # DELTA 4: the step's OWN plan_point record comes FIRST, with the final
+        # prefix counts; the kill-deferred terminal (if any) is emitted by the
+        # single finally AFTER this point.
+        _audit_plan_event(
+            bundle,
+            "plan_point",
+            lease=lease,
+            result="stopped",
+            step_index=step_index,
+            step_number=step_index + 1,
+            failure_reason="cancelled",
+            **_plan_counts(lease),
+        )
         _audit_plan_terminal(
             bundle, lease, reply_result="stopped", reason="cancelled",
             failure_reason="cancelled",
@@ -4742,7 +4796,10 @@ async def _execute_plan_step(
         if plan_layer.plan_step_attempted(step_entries):
             lease.cursor = plan_layer.plan_cursor_after(lease.cursor, step_index, step_entries)
         # WP8: the limit cut parks the lease (the plan continues on the host's
-        # ``continue``) — this step still gets its own plan_point event.
+        # ``continue``) — this step still gets its own plan_point event. If the
+        # session was killed mid-step (funnel deferred), the SINGLE finally below
+        # closes the lifecycle — N-A (VAL-WP8-04) is structural now, not a
+        # per-handler special case.
         _audit_plan_event(
             bundle,
             "plan_point",
@@ -4781,57 +4838,69 @@ async def _execute_plan_step(
             bundle, lease, reply_result="failed", reason="exception",
         )
         raise
-    step_entries = list(outcome.follow_up_results or step_context.get("partial_results") or [])
-    plan_layer.merge_plan_step_prefix(
-        lease,
-        step_entries,
-        source_offset=int(lease.context["points"][step_index]["first_item"]),
-    )
-    plan_layer.set_plan_step_remainder(lease, step_index, step_specs, step_entries)
-    # K-53: the cursor advances iff >= 1 item of the step dispatched input; a
-    # pre-dispatch refusal (rejected/approval/safety) keeps the cursor so
-    # ``continue`` re-executes the same step.
-    lease.cursor = plan_layer.plan_cursor_after(lease.cursor, step_index, step_entries)
-    if outcome.kind == "error":
-        # A backend/agent error is a structural failure, not a repairable step
-        # verdict: release the lease in the guaranteed path so no caller is
-        # stranded behind it.
-        _plan_guard.release(session_id, bundle)
-        # WP8: the lifecycle ends failed with the SAME reason the reply reports.
-        _audit_plan_terminal(
-            bundle, lease, reply_result="failed", reason="execution_error",
-            failure_reason="execution_error",
-        )
-        return _plan_exception_response(
-            bundle,
+    else:
+        step_entries = list(outcome.follow_up_results or step_context.get("partial_results") or [])
+        plan_layer.merge_plan_step_prefix(
             lease,
-            step_index=step_index,
-            result="failed",
-            reason=outcome.message or "action_error",
-            blocked=False,
-            failure_reason="execution_error",
+            step_entries,
+            source_offset=int(lease.context["points"][step_index]["first_item"]),
         )
-    # DELTA 1 #1 + DELTA 2 N3 (§1.3 "retry = replace"): the walk ends in THIS call
-    # only when the LAST STEP ITSELF verified — and then the reply is the terminal
-    # reply whose verdict comes from the whole-plan aggregate over the retained
-    # prefix (an earlier uncertain/failed point still caps the verdict at
-    # ``unknown``/``failed`` with ``ok:false`` — the #1 fix stays). A last step
-    # that did NOT itself verify (uncertain / failed / rejected / partial) PARKS
-    # the lease: the host may ``replace`` to retry or ``continue`` to receive the
-    # terminal reply (built by the same aggregate over the whole prefix).
-    session_killed = bool(getattr(bundle.state, "stopped", False)) or bool(
-        getattr(getattr(bundle.context, "stop", None), "stopped", False)
-    )
-    if (
-        lease.cursor >= len(lease.steps)
-        and not session_killed
-        and outcome.kind == "executed"
-        and _plan_step_result(step_entries) == "verified"
-    ):
-        # N1 (VAL-WP7b-02): the terminal reply is the STEP reply (image registered
-        # and attached, per-item disclosure kept, the step's events retained on the
-        # lease and in the aggregate) with the verdict overridden by the whole-plan
-        # aggregate — the completing step loses nothing.
+        plan_layer.set_plan_step_remainder(lease, step_index, step_specs, step_entries)
+        # K-53: the cursor advances iff >= 1 item of the step dispatched input; a
+        # pre-dispatch refusal (rejected/approval/safety) keeps the cursor so
+        # ``continue`` re-executes the same step.
+        lease.cursor = plan_layer.plan_cursor_after(lease.cursor, step_index, step_entries)
+        if outcome.kind == "error":
+            # A backend/agent error is a structural failure, not a repairable step
+            # verdict: release the lease in the guaranteed path so no caller is
+            # stranded behind it.
+            _plan_guard.release(session_id, bundle)
+            # WP8: the lifecycle ends failed with the SAME reason the reply reports.
+            _audit_plan_terminal(
+                bundle, lease, reply_result="failed", reason="execution_error",
+                failure_reason="execution_error",
+            )
+            return _plan_exception_response(
+                bundle,
+                lease,
+                step_index=step_index,
+                result="failed",
+                reason=outcome.message or "action_error",
+                blocked=False,
+                failure_reason="execution_error",
+            )
+        # DELTA 1 #1 + DELTA 2 N3 (§1.3 "retry = replace"): the walk ends in THIS call
+        # only when the LAST STEP ITSELF verified — and then the reply is the terminal
+        # reply whose verdict comes from the whole-plan aggregate over the retained
+        # prefix (an earlier uncertain/failed point still caps the verdict at
+        # ``unknown``/``failed`` with ``ok:false`` — the #1 fix stays). A last step
+        # that did NOT itself verify (uncertain / failed / rejected / partial) PARKS
+        # the lease: the host may ``replace`` to retry or ``continue`` to receive the
+        # terminal reply (built by the same aggregate over the whole prefix).
+        session_killed = bool(getattr(bundle.state, "stopped", False)) or bool(
+            getattr(getattr(bundle.context, "stop", None), "stopped", False)
+        )
+        if (
+            lease.cursor >= len(lease.steps)
+            and not session_killed
+            and outcome.kind == "executed"
+            and _plan_step_result(step_entries) == "verified"
+        ):
+            # N1 (VAL-WP7b-02): the terminal reply is the STEP reply (image registered
+            # and attached, per-item disclosure kept, the step's events retained on the
+            # lease and in the aggregate) with the verdict overridden by the whole-plan
+            # aggregate — the completing step loses nothing.
+            return _plan_response(
+                bundle,
+                lease,
+                outcome,
+                step_index=step_index,
+                step_entries=step_entries,
+                include_screenshot_after=include_screenshot_after,
+                image_mode=image_mode,
+                view_provider=view_provider,
+                complete_walk=True,
+            )
         return _plan_response(
             bundle,
             lease,
@@ -4841,18 +4910,27 @@ async def _execute_plan_step(
             include_screenshot_after=include_screenshot_after,
             image_mode=image_mode,
             view_provider=view_provider,
-            complete_walk=True,
         )
-    return _plan_response(
-        bundle,
-        lease,
-        outcome,
-        step_index=step_index,
-        step_entries=step_entries,
-        include_screenshot_after=include_screenshot_after,
-        image_mode=image_mode,
-        view_provider=view_provider,
-    )
+    finally:
+        # DELTA 4 (VAL-WP8-04): the ONE clear + deferred-kill close, on EVERY exit
+        # (handlers, else-tail, a raise in the merge — N-B). Under the SAME lock
+        # the funnel uses: the marker clears first, so a later funnel emits its
+        # own (idempotent) terminal instead of re-deferring; a kill recorded
+        # while the step ran closes the lifecycle HERE — after this step's
+        # plan_point records (which are inside the guarded region) and with the
+        # final prefix counts.
+        with _plan_terminal_audit_lock:
+            lease.step_in_flight = False
+            deferred = lease.kill_deferred
+            lease.kill_deferred = False
+        if deferred:
+            _audit_plan_terminal(
+                bundle,
+                lease,
+                reply_result="stopped",
+                reason="cancelled",
+                failure_reason="cancelled",
+            )
 
 
 async def _handle_plan_action(

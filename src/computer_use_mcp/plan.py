@@ -924,6 +924,19 @@ class PlanLease:
     # session-end funnel racing it) sets this and the loser stays silent, so a
     # killed session mid-step produces exactly ONE terminal event for the plan.
     terminal_audited: bool = False
+    # N4 (VAL-WP8-02): True while a step's dispatch is in flight. The session-end
+    # funnel DEFERS to an in-flight step (it skips its own terminal emission) so
+    # the record order is plan_point BEFORE the terminal and the terminal counts
+    # are read from the FINAL prefix. Every step path that runs while this is set
+    # emits the terminal itself (TaskStopped handler, the killed-step reply, the
+    # BaseException handler); the armed stop token guarantees the in-flight step
+    # wakes, so the defer cannot lose the terminal event.
+    step_in_flight: bool = False
+    # DELTA 4 (VAL-WP8-04): set by the funnel (under the terminal-audit lock)
+    # when it found the step in flight — the step's SINGLE try/finally closes
+    # the lifecycle on every exit (the step's own plan_point is emitted before
+    # the finally runs, so the funnel can never emit terminal-before-point).
+    kill_deferred: bool = False
 
 
 def merge_plan_step_prefix(
@@ -1363,6 +1376,18 @@ def plan_failure_reason(
         # a failed entry with NO failed verification outcome is an operation
         # error (kind "error"); the verification-failed case returned above
         return "execution_error"
+    if any(entry.get("result") == "not_executed" for entry in step_entries):
+        # N3 (VAL-WP8-02/03): a not_executed step WITHOUT an approval hold (that
+        # case returned above) never dispatched and was never refused — the cut
+        # token "cancelled" is the honest class.
+        return "cancelled"
+    if any(entry.get("result") == "dry_run" for entry in step_entries):
+        # VAL-WP8-03 (Commander decision): a dry_run step was VALIDATED and
+        # DELIBERATELY not dispatched — a cut, not a cancellation. The step
+        # level already gives a dry-run step "no_post_action_observation" (no
+        # post-action observation can exist for a dispatch that never ran), so
+        # the terminal aggregate uses the SAME existing token.
+        return "no_post_action_observation"
     if any(
         entry.get("verification_outcome") == "uncertain"
         or entry.get("result") == "uncertain"

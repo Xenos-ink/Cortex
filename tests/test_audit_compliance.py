@@ -32,6 +32,7 @@ from test_controller_integration import (
 from computer_use_mcp import server
 from computer_use_mcp.audit import AuditEventType, AuditLogger, Metrics
 from computer_use_mcp.backend import DisplayUnavailableError
+from computer_use_mcp.limits import LimitExceeded
 from computer_use_mcp.models import WindowInfo
 from computer_use_mcp.state import SessionRegistry
 
@@ -473,9 +474,11 @@ async def test_task_stopped_and_error_terminals_agree_exactly_once(
     )
     assert reply["result"] == "stopped" and reply["failure_reason"] == "cancelled"
     events = _plan_events(bundle, sid)
-    assert [e["event_type"] for e in events] == ["plan_start", "plan_stopped"]
+    # N4: the killed step emits its own plan_point BEFORE the terminal record
+    assert [e["event_type"] for e in events] == ["plan_start", "plan_point", "plan_stopped"]
     _assert_agrees(events[1], reply)
-    assert events[1]["metadata"]["reason"] == "cancelled"
+    _assert_agrees(events[2], reply)
+    assert events[2]["metadata"]["reason"] == "cancelled"
 
     backend = _BrokenBackend(flip=True)
     sid, bundle, _, _ = make_session(
@@ -534,6 +537,317 @@ async def test_limit_cut_parks_and_the_records_agree(
     ) == 1
 
 
+class _LimitCutThenKill(ScriptedBackend):
+    """R1/R2 (VAL-WP8-03): the session kill lands while a step that will end in
+    a LimitExceeded cut is in flight — the funnel DEFERS, the flag clears after
+    the merge, and the lifecycle still closes EXACTLY once."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.kill_started = False
+
+    def execute(self, action: Any, stop: Any = None, **kwargs: Any) -> str:
+        if not self.kill_started:
+            import asyncio as _asyncio
+            import threading as _threading
+
+            from computer_use_mcp import server as _server
+
+            self.kill_started = True
+            session_ids = list(_server._bundles.keys())
+            assert session_ids, "no live session to stop"
+            thread = _threading.Thread(
+                target=lambda: _asyncio.run(_server.stop_session(session_ids[0]))
+            )
+            thread.start()
+            thread.join()  # the funnel already ran (deferred) BEFORE the cut
+        message = super().execute(action, stop)
+        raise LimitExceeded("max_actions", "synthetic cut after the kill")
+
+
+async def test_limit_cut_then_stop_session_emits_exactly_one_terminal(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 (VAL-WP8-03): a plan parked after a limit cut, then stop_session-killed,
+    emits EXACTLY ONE terminal event with the final reply's counts — the stale
+    step_in_flight flag (DELTA 2 regression) would have emitted ZERO."""
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch,
+        backend=backend,
+        dry_run=False,
+        require_approval=False,
+        limits={**FAST_LIMITS, "max_actions": 2},
+    )
+    await server.computer_execute(
+        sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+    )
+    cut = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan_action="continue", include_screenshot_after=False
+        )
+    )
+    assert cut["failure_reason"] == "limit_exceeded" and cut["blocked"] is True
+    # the LimitExceeded handler cleared the in-flight marker (R1 invariant)
+    lease = server._plan_guard.active_lease(bundle)
+    assert lease is not None and lease.step_in_flight is False
+    import asyncio as _asyncio
+
+    await _asyncio.wait_for(server.stop_session(sid), 5)
+    terminals = [
+        event for event in _plan_events(bundle, sid)
+        if event["event_type"] in ("plan_complete", "plan_stopped")
+    ]
+    assert len(terminals) == 1, terminals
+    assert terminals[0]["event_type"] == "plan_stopped"
+    assert terminals[0]["result"] == "stopped"
+    assert terminals[0]["metadata"]["reason"] == "cancelled"
+    assert terminals[0]["metadata"]["resolved_count"] == len(cut["executed_prefix"])
+    assert terminals[0]["metadata"]["executed_count"] == sum(
+        entry.get("kind") in ("executed", "dispatched_unverified")
+        for entry in cut["executed_prefix"]
+    )
+
+
+async def test_the_funnel_defer_decision_is_atomic_with_the_step_finally(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELTA 5 (Commander review): the funnel's defer DECISION happens INSIDE the
+    terminal-audit lock. The interleaving that used to lose the terminal — the
+    funnel reads step_in_flight True, the step's finally clears it, the funnel
+    then sets kill_deferred on a FINISHED step — is forced deterministically by
+    letting the step's finally complete inside the funnel's decision window:
+    with the fix the funnel reads the CLEARED flag and emits its own terminal,
+    so exactly ONE plan_stopped exists."""
+    import asyncio as _asyncio
+    import threading as _threading
+
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    await server.computer_execute(
+        sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+    )
+    lease = server._plan_guard.active_lease(bundle)
+    assert lease is not None
+    # simulate the in-flight step: the funnel must consult the flag under the lock
+    lease.step_in_flight = True
+
+    real_lock = server._plan_terminal_audit_lock
+
+    class _StepFinishesInsideTheFunnelDecision:
+        """A lock whose acquisition completes the step's lifecycle FIRST — the
+        exact interleaving the pre-DELTA-5 check-then-act lost."""
+
+        def __enter__(self) -> Any:
+            real_lock.acquire()
+            # the step's finally, racing the funnel's decision:
+            lease.step_in_flight = False
+            return self
+
+        def __exit__(self, *exc_info: Any) -> bool:
+            real_lock.release()
+            return False
+
+    monkeypatch.setattr(server, "_plan_terminal_audit_lock", _StepFinishesInsideTheFunnelDecision())
+    await _asyncio.wait_for(server.stop_session(sid), 5)
+    terminals = [
+        event for event in _plan_events(bundle, sid)
+        if event["event_type"] in ("plan_complete", "plan_stopped")
+    ]
+    assert len(terminals) == 1, terminals
+    assert terminals[0]["event_type"] == "plan_stopped"
+    assert terminals[0]["result"] == "stopped"
+    assert terminals[0]["metadata"]["reason"] == "cancelled"
+    assert lease.step_in_flight is False
+    assert lease.kill_deferred is False
+
+
+async def test_limit_cut_then_idle_reap_emits_exactly_one_terminal(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 (VAL-WP8-03): the same invariant through the WP-S idle reaper."""
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch,
+        backend=backend,
+        dry_run=False,
+        require_approval=False,
+        limits={**FAST_LIMITS, "max_actions": 2},
+    )
+    await server.computer_execute(
+        sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+    )
+    cut = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan_action="continue", include_screenshot_after=False
+        )
+    )
+    assert cut["failure_reason"] == "limit_exceeded"
+    monkeypatch.setattr(server, "_session_idle_timeout", lambda: 0.05)
+    import asyncio as _asyncio
+
+    await _asyncio.sleep(0.08)
+    assert sid in server._sweep_idle_sessions()
+    terminals = [
+        event for event in _plan_events(bundle, sid)
+        if event["event_type"] in ("plan_complete", "plan_stopped")
+    ]
+    assert len(terminals) == 1, terminals
+    assert terminals[0]["metadata"]["reason"] == "cancelled"
+    assert terminals[0]["metadata"]["source"] == "idle_timeout"
+    assert terminals[0]["metadata"]["resolved_count"] == len(cut["executed_prefix"])
+
+
+async def _kill_lands_mid_step(
+    bundle: Any, sid: str
+) -> None:
+    """The kill lands WHILE the step is in flight: stop_session runs to
+    completion on a side thread — the funnel finds ``step_in_flight`` set and
+    records ``kill_deferred`` (no terminal of its own)."""
+    import asyncio as _asyncio
+    import threading as _threading
+
+    done = _threading.Event()
+
+    def _kill() -> None:
+        _asyncio.run(server.stop_session(sid))
+        done.set()
+
+    thread = _threading.Thread(target=_kill)
+    thread.start()
+    thread.join()
+    assert done.is_set()
+    assert bundle is not None
+
+
+async def _assert_one_terminal_after_kill(
+    bundle: Any,
+    sid: str,
+    lease: Any,
+    reply: dict[str, Any] | None,
+    *,
+    result: str = "stopped",
+    reason: str = "cancelled",
+) -> None:
+    """Sequence plan_start → plan_point → plan_stopped, ONE terminal, counts
+    equal to the (reply's) final prefix, step_in_flight cleared (N-B)."""
+    assert lease.step_in_flight is False
+    events = _plan_events(bundle, sid)
+    terminals = [
+        event for event in events
+        if event["event_type"] in ("plan_complete", "plan_stopped")
+    ]
+    assert len(terminals) == 1, events
+    assert terminals[0]["event_type"] == "plan_stopped"
+    assert terminals[0]["result"] == result
+    assert terminals[0]["metadata"]["reason"] == reason
+    point_events = [event for event in events if event["event_type"] == "plan_point"]
+    assert point_events, events
+    assert events.index(point_events[-1]) < events.index(terminals[0]), events
+    if reply is not None:
+        assert terminals[0]["metadata"]["resolved_count"] == len(reply["executed_prefix"])
+
+
+# DELTA 4 (VAL-WP8-04): the kill matrix — run_single itself is driven, not
+# backend.execute wrapping. Parametrized over how the step ends after the kill
+# landed mid-flight (funnel deferred).
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_reply_result"),
+    [
+        ("limit", "failed"),  # N-A: LimitExceeded propagating out of run_single
+        ("task", "stopped"),
+        ("base", None),  # no reply: the exception reaches the caller
+        ("normal", "stopped"),  # DELTA 1 #5: the killed step reply says stopped
+        ("merge", None),  # N-B (VAL-WP8-05): the MERGE itself raises post-kill
+    ],
+)
+async def test_kill_then_step_exit_always_closes_the_lifecycle(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch, case: str, expected_reply_result: str | None
+) -> None:
+    """DELTA 4: with the kill DEFERRED by the funnel, every step exit — a
+    LimitExceeded out of run_single (N-A), a TaskStopped, a BaseException, and a
+    normal return — ends with EXACTLY ONE terminal event, AFTER the plan_point,
+    with the final prefix counts and the in-flight marker cleared."""
+    from computer_use_mcp.agent import SingleActionOutcome
+    from computer_use_mcp.models import ExecutionResult, GroundedAction
+    from computer_use_mcp.state import TaskStopped
+
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    await server.computer_execute(
+        sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+    )
+    lease = server._plan_guard.active_lease(bundle)
+    assert lease is not None and lease.step_in_flight is False
+    real_run_single = bundle.agent.run_single
+    merge_fault = {"v": False}
+
+    async def wrapped_run_single(state: Any, action: Any, **kwargs: Any) -> Any:
+        # the kill lands WHILE this step is in flight (the flag is already set)
+        await _kill_lands_mid_step(bundle, sid)
+        if case == "limit":
+            raise LimitExceeded("max_actions", "synthetic cut after the kill")
+        if case == "task":
+            raise TaskStopped("synthetic kill-then-stop")
+        if case == "base":
+            raise RuntimeError("synthetic kill-then-base")
+        if case == "merge":
+            merge_fault["v"] = True
+            return await real_run_single(state, action, **kwargs)
+        # normal return: a hand-built executed outcome (the armed stop token
+        # would make a REAL pipeline run raise TaskStopped — the point of this
+        # case is the finally on the SUCCESS path)
+        return SingleActionOutcome(
+            kind="executed",
+            result=ExecutionResult(
+                ok=True,
+                action=GroundedAction(action="move", point={"x": 30, "y": 40}, confidence=1.0),
+                message="synthetic post-kill normal return",
+            ),
+        )
+
+    monkeypatch.setattr(bundle.agent, "run_single", wrapped_run_single)
+    reply: dict[str, Any] | None = None
+    if case == "base":
+        # the BaseException handler re-raises: no reply reaches the caller
+        with pytest.raises(RuntimeError, match="synthetic kill-then-base"):
+            await server.computer_execute(
+                sid, "done", plan_action="continue", include_screenshot_after=False
+            )
+    elif case == "merge":
+        real_merge = server.plan_layer.merge_plan_step_prefix
+
+        def faulting_merge(lease_arg: Any, entries: Any, **kwargs: Any) -> None:
+            if merge_fault["v"]:
+                raise ValueError("synthetic merge failure")
+            real_merge(lease_arg, entries, **kwargs)
+
+        monkeypatch.setattr(server.plan_layer, "merge_plan_step_prefix", faulting_merge)
+        with pytest.raises(ValueError, match="synthetic merge failure"):
+            await server.computer_execute(
+                sid, "done", plan_action="continue", include_screenshot_after=False
+            )
+    else:
+        reply = execute_payload(
+            await server.computer_execute(
+                sid, "done", plan_action="continue", include_screenshot_after=False
+            )
+        )
+        assert reply["result"] == expected_reply_result, sorted(reply)
+    # N-B: the flag is cleared even when the merge itself raised; exactly one
+    # terminal, after the point, with the final counts
+    await _assert_one_terminal_after_kill(
+        bundle, sid, lease, reply,
+        **({"result": "failed", "reason": "exception"} if case == "base" else {}),
+    )
+
+
 async def test_idle_reap_funnel_emits_one_terminal_with_the_kill_source(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -585,6 +899,203 @@ async def test_a_raising_audit_writer_leaves_the_reply_unchanged(
     assert reply["result"] == "verified"
     assert reply["failure_reason"] is None
     assert "failure_reason" in reply and "not_executed" in reply
+
+
+# --- DELTA 2 (VAL-WP8-02): N1 atomicity, N3 non-verified records, F5 gaps -------
+
+
+async def test_concurrent_terminal_emitters_produce_exactly_one_event(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N1 (VAL-WP8-02): two terminal emitters racing on DIFFERENT threads (the
+    stop-session thread and the event loop) produce exactly ONE terminal event —
+    the check-and-set is atomic under the terminal-audit lock."""
+    import threading
+
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    await server.computer_execute(
+        sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+    )
+    lease = server._plan_guard.active_lease(bundle)
+    assert lease is not None
+    start = threading.Barrier(2)
+
+    def _emit() -> None:
+        start.wait()
+        server._audit_plan_terminal(
+            bundle, lease, reply_result="stopped", reason="cancelled",
+            failure_reason="cancelled",
+        )
+
+    threads = [threading.Thread(target=_emit), threading.Thread(target=_emit)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    terminals = [
+        event for event in _plan_events(bundle, sid)
+        if event["event_type"] in ("plan_complete", "plan_stopped")
+    ]
+    assert len(terminals) == 1, terminals
+    assert terminals[0]["event_type"] == "plan_stopped"
+    assert terminals[0]["result"] == "stopped"
+
+
+async def test_non_verified_walk_ending_and_terminal_walk_records_agree(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F5 gap: the walk-ending (unknown) and terminal-walk (failed) records carry
+    the replies' own result tokens — not only the verified shape."""
+    # unknown: an uncertain first point caps the walk-ending aggregate
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    plan = {
+        "transition_duration_ms": 0,
+        "points": [
+            {"x": 10, "y": 10, "actions": [{"action": "click", "expected_effect": "the click landed"}]},
+            {"x": 30, "y": 40, "actions": []},
+        ],
+    }
+    await server.computer_execute(
+        sid, "done", plan=wire_plan(plan), approved=True, include_screenshot_after=False
+    )
+    walk_end = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan_action="continue", include_screenshot_after=False
+        )
+    )
+    assert walk_end["result"] == "unknown" and walk_end["ok"] is False
+    events = _plan_events(bundle, sid)
+    # the walk-ending aggregate of an UNKNOWN plan is still a plan_stopped
+    # record (plan_complete iff the plan verified) — but it carries the reply's
+    # own result token and failure_reason (F5: agreement, not just type)
+    assert events[-1]["event_type"] == "plan_stopped"
+    _assert_agrees(events[-1], walk_end)
+    assert events[-1]["metadata"]["reason"] == "verification_uncertain"
+
+    # failed: stated WINDOW expectations on a no-flip backend are DEFINITIVELY
+    # failed (the deterministic tier) -> the terminal walk reads the aggregate
+    # over the prefix (result failed)
+    backend = ScriptedBackend(flip=False)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    failed_plan = {
+        "transition_duration_ms": 0,
+        "points": [
+            {"x": 10, "y": 20, "actions": [{"action": "keypress", "keys": ["enter"], "expected_effect": "open Calculator"}]},
+            {"x": 30, "y": 40, "actions": [{"action": "click"}]},
+        ],
+    }
+    step0 = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan=wire_plan(failed_plan), approved=True, include_screenshot_after=False
+        )
+    )
+    assert step0["result"] in ("failed", "uncertain"), step0.get("result")
+    await server.computer_execute(
+        sid, "done", plan_action="continue", include_screenshot_after=False
+    )
+    terminal = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan_action="continue", include_screenshot_after=False
+        )
+    )
+    # NON-verified terminal walk (whatever honest verdict the prefix earns):
+    # the terminal record carries the reply's own token (F5)
+    assert terminal["result"] != "verified"
+    events = _plan_events(bundle, sid)
+    assert events[-1]["event_type"] == "plan_stopped"
+    _assert_agrees(events[-1], terminal)
+    assert sum(
+        event["event_type"] in ("plan_complete", "plan_stopped") for event in events
+    ) == 1
+
+
+async def test_invalid_conversion_and_base_exception_paths_agree(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F5 gap: the structural-rejection (invalid conversion) and BaseException
+    terminal records carry their reply's (or envelope's) verdict and counts."""
+    from computer_use_mcp.models import ActionSpec
+    import weakref
+
+    # invalid conversion: each spec converts ONCE at submission; the STEP's own
+    # re-conversion is what fails (the structural gate in _execute_plan_step)
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    real_to_grounded = ActionSpec.to_grounded
+    real_install = server._plan_guard.install
+    seen_specs: "list[weakref.ref]" = []
+    started = {"v": False}
+
+    def wrapped_install(bundle: Any, lease: Any, **kwargs: Any) -> None:
+        started["v"] = True
+        real_install(bundle, lease, **kwargs)
+
+    monkeypatch.setattr(server._plan_guard, "install", wrapped_install)
+
+    def exploding_to_grounded(self: Any, **kwargs: Any) -> Any:
+        # only the STEP's own re-conversion (after the lease is installed) fails;
+        # every submission-time conversion passes (ActionSpec is unhashable, so
+        # identity is tracked via weak references)
+        already = any(ref() is self for ref in seen_specs)
+        if started["v"] and already:
+            raise ValueError("synthetic structural conversion failure")
+        if not already:
+            seen_specs.append(weakref.ref(self))
+        return real_to_grounded(self, **kwargs)
+
+    monkeypatch.setattr(ActionSpec, "to_grounded", exploding_to_grounded)
+    reply = execute_payload(
+        await server.computer_execute(
+            sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+        )
+    )
+    assert reply["result"] == "failed" and reply["failure_reason"] == "invalid_action"
+    events = _plan_events(bundle, sid)
+    assert [event["event_type"] for event in events] == ["plan_start", "plan_stopped"]
+    _assert_agrees(events[1], reply)
+    assert events[1]["metadata"]["reason"] == "invalid_action"
+    assert events[1]["metadata"]["resolved_count"] == 0
+    # (the BaseException leg lives in its own test below — the conversion
+    # fault's monkeypatch persists to the end of this test)
+
+
+async def test_base_exception_terminal_record_agrees(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F5 gap: the BaseException path — no step reply exists; the terminal
+    record names the exception cause and the exception reaches the caller."""
+    backend = ScriptedBackend(flip=True)
+    sid, bundle, _, _ = make_session(
+        monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+
+    async def exploding_run_single(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("synthetic base exception")
+
+    monkeypatch.setattr(bundle.agent, "run_single", exploding_run_single)
+    # the BaseException handler re-raises; the exception reaches the caller (no
+    # step reply exists for this step)
+    import pytest as _pytest
+
+    with _pytest.raises(RuntimeError, match="synthetic base exception"):
+        await server.computer_execute(
+            sid, "done", plan=wire_plan(_STAT_TWO), approved=True, include_screenshot_after=False
+        )
+    events = _plan_events(bundle, sid)
+    assert [event["event_type"] for event in events] == ["plan_start", "plan_stopped"]
+    assert events[1]["result"] == "failed"
+    assert events[1]["metadata"]["reason"] == "exception"
+    assert "failure_reason" not in events[1]["metadata"]  # no reply: null ≡ absent
 
 
 # --- redaction enforced at the sink ------------------------------------------------------------

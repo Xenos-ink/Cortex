@@ -615,6 +615,7 @@ def test_a_lease_carries_every_retained_field() -> None:
         "model", "specs", "context", "steps", "cursor", "prefix", "source_indices",
         "approved", "repositions", "remainder",
         "replaced_plan_id", "replaced_prefix", "interference_events", "terminal_audited",
+        "step_in_flight", "kill_deferred",
     ):
         assert hasattr(lease, name), name
     assert lease.cursor == 0 and lease.approved is False
