@@ -663,7 +663,7 @@ async def computer_execute(
         ]
         response["follow_ups_stopped_reason"] = outcome.follow_ups_stopped_reason
     # T8: additive Interference Guard events on every response shape (structured event
-    # payloads the driver parses per DRIVER-PROTOCOL.md).
+    # payloads the driver parses per benchmarks/tasks_hard/DRIVER-PROTOCOL.md).
     if outcome.interference_events:
         response["interference_events"] = list(outcome.interference_events)
     # REM-A H3 (master-mission Phase 2): EXECUTED responses return MCP content blocks

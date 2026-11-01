@@ -1,10 +1,10 @@
 # VERSIONS
 
 A per-release ledger for Cortex (`computer-use-mcp`). Newest first. Reconstructed
-from the repository's git history (`git log --oneline`) and the
-`docs/ARCHITECTURE.md` header. Internal engineering-process designations are omitted
-on purpose — releases are described by content only. The version in `pyproject.toml`
-is the authoritative released version.
+from the repository's git history (`git log --oneline`) and the release
+documentation (README.md, docs/). Internal engineering-process designations are
+omitted on purpose — releases are described by content only. The version in
+`pyproject.toml` is the authoritative released version.
 
 **Convention for future entries:** while work is in flight, land its notes under the
 topmost `## Unreleased` heading; at release time they are folded into a new
@@ -83,6 +83,15 @@ taught value from the code. Full offline suite at release: 3319 passed +
   (plan-protocol, reply-contract, glossary, examples), accurate triggers, and
   `tests/test_skill_truth.py` deriving every taught value (bounds, token sets,
   tool count) from the code at test time.
+- **Docs restructure** — README rewritten as a concise current entry point
+  (≤ 250 lines: what Cortex is, install/update, quick start, the ten tools,
+  the reply contract in brief, the skill, safety summary, configuration
+  pointers); docs/ reorganized into current-truth references (ARCHITECTURE,
+  SAFETY, TOOLS, REPLY-CONTRACT, CONFIGURATION, INSTALL) with superseded and
+  removed-feature records moved to docs/history/ under explicit HISTORICAL
+  headers; the facts a test can check (tools, limits, result/failure tokens,
+  env vars, bounds, links, versions) pinned by the new
+  `tests/test_docs_truth.py` against the code.
 
 ### Changed
 

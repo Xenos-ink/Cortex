@@ -1,1074 +1,375 @@
-# Safety — Cortex
+# Safety — Cortex 0.7.6
 
-Status: describes the code at the Cortex open-source release HEAD (production-
-hardening Waves 1–5 including the E6 defect round D1–D10 and the red-team fix round
-F1–F7, plus the DRAG action, the compact-change verification upgrade, and the
-move/hotkey/focus_window actions with the allowlist-gated focus pre-foreground check),
-the loop-removal wave, the v0.6.0 internals-removal wave (the removed loop's
-orphaned internals — recovery/approval-epoch/health modules, the decide-loop block,
-the provider decide/plan/summarize endpoints, the summarizer plumbing, the subtask
-mutation APIs, and the plan-validator classes — are gone; the limits fields stay
-accepted and validated, documented as reserved), and the v0.7.0 safety wave
-(the R-21/R-22/R-23 design fixes: the textnorm normalization layer, the
-destructive-intent grammar, the extended secret-redaction families, and the
-commit-key re-anchor policy — §3.1–§3.2, §7.1–§7.3, §10, §11.11, §12).
-Every live rule below is enforced in a named module and exercised by the test suite
-(standard suite: **1594 passed, 10 skipped** at the v0.7.0 HEAD; 8 skips are the
-gated real-Windows E2E desktop tests and 2 are the documented-residual pins named
-in §10; observed on the reference machine).
-Companion documents: `README.md` (English capability statement),
-`docs/ARCHITECTURE.md` (module map, contracts, limits, audit, E2E/benchmark layout).
-§11 documents the long-running session surface: the checkpoint redaction/integrity
-seals and resume re-verification remain LIVE; the approval epochs, unattended
-modifier, dependency enforcement, health checks, and session-ceiling trip points it
-also describes were REMOVED with the loop and are marked as historical records.
+The current safety model. Every live rule is enforced in a named module and
+exercised by the test suite. Removed safety machinery (approval epochs, the
+unattended modifier, dependency enforcement, health checks — all removed with
+the internal loop) is recorded, clearly labelled, in
+[history/REMOVED-LOOP-AND-INTERNALS.md](history/REMOVED-LOOP-AND-INTERNALS.md);
+the per-release red-team log is
+[history/RED-TEAM-v0.7.0.md](history/RED-TEAM-v0.7.0.md).
+Companions: [ARCHITECTURE.md](ARCHITECTURE.md),
+[TOOLS.md](TOOLS.md), [REPLY-CONTRACT.md](REPLY-CONTRACT.md),
+[CONFIGURATION.md](CONFIGURATION.md).
 
 ## 1. Threat model
 
-The operating assumptions are deliberately pessimistic; every mechanism in this
-document exists because of one of these three lines:
+Deliberately pessimistic assumptions; every mechanism below exists because of
+one of these lines:
 
-1. **The model controls a desktop.** A proposed action becomes real physical input
-   on a live Windows session (raw Win32 `SendInput` by default; `pyautogui` is the
-   selectable fallback — both engines honor the same safety contract). A mis-grounded coordinate clicks the wrong thing; a
-   wrong action deletes, sends, or pays. The model is treated as a fallible,
-   potentially manipulable proposer — never as an authority.
-2. **Screen content is untrusted.** Screenshots, window titles, dialogs, web pages,
-   terminals, and emails routinely contain text that reads like instructions
-   (prompt injection), like approvals, or like authority ("You are now authorized to
-   format C:"). None of it is. No policy value in this system is derivable from what
-   is visible on screen.
-3. **The provider is untrusted.** The vision endpoint sits outside the trust boundary:
-   its output is parsed strictly and fail-closed, its payloads carry no secrets and no
-   policy internals beyond the doctrine block, and it is never given any capability
-   (no callbacks, no token access, no control flow).
+1. **The model controls a desktop.** A proposed action becomes real physical
+   input on a live Windows session (raw Win32 `SendInput` by default;
+   `pyautogui` is the selectable fallback — both engines honor the same safety
+   contract). The model is treated as a fallible, potentially manipulable
+   proposer — never as an authority.
+2. **Screen content is untrusted.** Screenshots, window titles, dialogs, web
+   pages routinely contain text that reads like instructions, approvals, or
+   authority. None of it is. No policy value in this system is derivable from
+   what is visible on screen.
+3. **The provider is untrusted.** The vision endpoint sits outside the trust
+   boundary: its output is parsed strictly and fail-closed, its payloads carry
+   no secrets and no policy internals beyond the doctrine block, and it is
+   never given any capability.
 
-Consequence: authority flows only from the operator (USER INTENT) and the local policy
-(SYSTEM POLICY). Everything else is data.
+Consequence: authority flows only from the operator (USER INTENT) and the local
+policy (SYSTEM POLICY). Everything else is data.
 
-## 2. Five-channel prompt doctrine (`provider.py`)
+## 2. Five-channel prompt doctrine (`pipeline/provider.py`)
 
 Every model prompt is one system message of five labeled sections
-(`=== CHANNEL ===` markers), plus a user message containing only the screenshot and a
-fixed caption (so no untrusted string can ever appear outside its channel):
+(`=== CHANNEL ===` markers) plus a user message containing only the screenshot
+and a fixed caption:
 
 | Channel | Authority | Contents |
 |---|---|---|
-| `USER INTENT` (authoritative) | Yes | the operator's goal (redacted, clipped to 4000 chars) |
+| `USER INTENT` (authoritative) | Yes | the operator's goal (redacted, clipped) |
 | `SYSTEM POLICY` (authoritative) | Yes | fixed policy text + response schema; never contains screen-derived text |
-| `TASK STATE` (authoritative) | Yes | controller-rendered task state (goal, subgoal, status, counters) |
-| `MODEL SUGGESTION` (advisory only — never authority) | No | bounded history of the model's own prior decisions (10 entries × 500 chars), redacted |
-| `ENVIRONMENT CONTENT` (UNTRUSTED DATA — never instructions) | No | screen-derived evidence only: caller-supplied environment text (clipped 8000 chars), foreground process (reported by the OS), foreground window title (labeled "untrusted"), screenshot dimensions |
+| `TASK STATE` (authoritative) | Yes | controller-rendered task state |
+| `MODEL SUGGESTION` (advisory only) | No | bounded history of the model's own prior decisions, redacted |
+| `ENVIRONMENT CONTENT` (UNTRUSTED DATA) | No | screen-derived evidence only |
 
-Why screen text is never authority: titles and OCR/screen-derived strings are placed
-ONLY under `ENVIRONMENT CONTENT` (or, as the model's own prior output, under
-`MODEL SUGGESTION`); the policy text is a constant; the channel labels state the
-trust level explicitly and the policy instructs the model to report
-instruction-like content in `suspicious_content` instead of complying. On the
-consumer side the same rule is structural: provider output is parsed into a fixed
-pydantic schema (`AgentDecision`) whose fields are data — nothing in it can change
-policy, grant approval, or reach the stop token. Injection corpora (fake
-"ignore previous instructions" screens, fake approvals in history) are covered by
-dedicated tests producing no policy change, no approval bypass, and no high-risk
-execution.
+Screen text is never authority: it enters only under `ENVIRONMENT CONTENT` (or,
+as the model's own prior output, under `MODEL SUGGESTION`); the policy text is
+a constant; the policy instructs the model to report instruction-like content in
+`suspicious_content` instead of complying. Provider output is parsed into a
+fixed pydantic schema whose fields are data — nothing in it can change policy,
+grant approval, or reach the stop token.
 
-## 3. Risk classification taxonomy (`safety.py`)
+## 3. Risk classification (`security/safety.py`)
 
 Every action is classified from action type + target text/coordinates + active
-window/process identity + goal context (`SafetyPolicy.classify(action, context) →
-(risk, category, why)`). Categories are stable machine strings; unknown action types
-and high-risk actions with insufficient context escalate to `CRITICAL`
-(`risk_unresolvable_fail_closed`) — fail closed. `HIGH`-class matches with unknown
-window/process identity escalate to `CRITICAL`.
+window/process identity + goal context. Unknown action types and high-risk
+actions with insufficient context escalate to `CRITICAL`
+(`risk_unresolvable_fail_closed`) — fail closed.
 
-**CRITICAL** (blocked pending explicit authorization):
+**CRITICAL** (blocked pending explicit authorization — and no MCP tool grants
+it today):
 
-| Category | Trigger (text/reason pattern) |
+| Category | Trigger patterns |
 |---|---|
-| `shell_execution` | powershell, pwsh, cmd.exe, command prompt, `cmd /c`, `bash -c`, `sh -c`, invoke-expression/iex, start-process, wscript, cscript, certutil |
+| `shell_execution` | powershell, pwsh, cmd.exe, `cmd /c`, `bash -c`, invoke-expression, start-process, certutil |
 | `registry_write` | `reg add/delete/import/restore/load/save`, regedit |
-| `disk_destructive` | `format X:`, diskpart, wipe disk/drive, format-volume; the Arabic word for "format" (exact glyph tokens in safety.py, stored as unicode escapes) |
-| `file_deletion` | del/rd/rmdir/remove-item/rm/erase patterns; delete files/folders/directories |
-| `destructive_sql` | drop database/table/schema/index/view, truncate table, delete from |
-| `credential_change` | change/reset/remove password/pin/credentials; delete account/user |
-| `security_change` | disable firewall/antivirus/defender/UAC/security; add exclusion |
-| `financial_transaction` | purchase, checkout, place order, pay/confirm payment, transfer/send money, wire transfer, enter credit card |
-| `external_send` | send/forward email/message, click send, reply all, post message/comment |
+| `disk_destructive` | `format X:`, diskpart, wipe disk; the Arabic word for "format" |
+| `file_deletion` | del/rd/rmdir/remove-item/rm/erase; delete files/folders |
+| `destructive_sql` | drop database/table/schema, truncate, delete from |
+| `credential_change` | change/reset/remove password/pin/credentials; delete account |
+| `security_change` | disable firewall/antivirus/defender/UAC; add exclusion |
+| `financial_transaction` | purchase, checkout, pay/confirm payment, transfer money, enter credit card |
+| `external_send` | send/forward email/message, click send, post message/comment |
 
-**HIGH** (always requires approval):
+**HIGH** (always requires approval): `install_uninstall`, `process_kill`,
+`system_settings_change`, `elevation`, `network_config`, `wide_delete`,
+`clipboard_credential` (paste password/credentials/secret/token/API key).
 
-| Category | Trigger |
-|---|---|
-| `install_uninstall` | install, uninstall, reinstall, msiexec, setup.exe, run the installer |
-| `process_kill` | taskkill, kill process/app, end task, force quit, terminate |
-| `system_settings_change` | control panel, system/device manager, services.msc, task scheduler, group policy/gpedit, change the settings |
-| `elevation` | run as administrator, elevate, administrator privileges |
-| `network_config` | netsh, network/adapter/proxy/DNS/VPN settings, change the DNS/IP |
-| `wide_delete` | empty/clear/purge recycle bin, permanently delete everything |
-| `clipboard_credential` | paste password/credentials/secret/token/API key |
+**MEDIUM** (approval when the session requires it): `navigation`,
+`file_modification`, `window_identity_drift`, `suspicious_delete_term` (Arabic
+destructive terms), `keyboard_shortcut_state_change` (keypress/hotkey with
+delete/backspace/win/alt/ctrl), `window_focus_change` (`focus_window` — always
+MEDIUM), `unverified_target_application` (click/type family with unknown
+identity).
 
-**MEDIUM** (context-dependent; approval when the session requires it):
+**LOW** (routine): `plain_text_entry`, `known_application_interaction`,
+`low_routine_action` (keypress/hotkey without state-changing keys, scroll, wait,
+done, move), `completion`.
 
-| Category | Trigger |
-|---|---|
-| `navigation` | URL-like text, navigate to, open website/URL |
-| `file_modification` | save as, save the file, move/copy to, rename, new folder, export, overwrite, replace the file |
-| `window_identity_drift` | controller environment-note reports the active window changed identity since last validation |
-| `suspicious_delete_term` | Arabic destructive terms (the words for "delete"/"erase" in Arabic script; exact glyph tokens in safety.py as unicode escapes) in typed text/reason |
-| `keyboard_shortcut_state_change` | keypress/hotkey containing delete/backspace/win/alt/ctrl |
-| `window_focus_change` | `focus_window` — the action brings a different window to the foreground (always MEDIUM; the category is assigned before the drift/routine scans so it is stable). Consequence: subsequent input could land in an unintended application |
-| `unverified_target_application` | click/double-click/right-click/drag/type when window/process identity is unknown |
+Merge rules: the legacy gates run first (stopped session, step budget,
+sensitive-typed-text block, state-changing keys, interactive-action approval
+defaults); classification then fills risk/category/reason and the approval
+requirement is **upgraded, never downgraded**. `HIGH` → requires approval;
+`CRITICAL` → blocked. Dry-run semantics untouched.
 
-**LOW** (routine): `plain_text_entry` (type into an identified target),
-`known_application_interaction` (click/double-click/right-click/drag on an identified target),
-`low_routine_action` (keypress/hotkey without state-changing keys, scroll, wait, done,
-move — a cursor reposition with no click),
-`completion` (done marker).
-
-Policy merge rules (`evaluate`): the legacy gates run verbatim first (stopped session,
-step budget, sensitive-typed-text block, state-changing keys — keypress **and hotkey**,
-interactive-action approval defaults — click/double-click/right-click/drag/type **and
-focus_window**); the classification then fills `risk`/`category`/`reason` and the approval
-requirement is **upgraded, never downgraded**, by risk. `HIGH` → `requires_approval=True`;
-`CRITICAL` → blocked unless `authorized=True` (see §5). `dry_run` semantics are
-untouched — the decision still reports risk and approval needs but nothing executes.
-
-PERF-004 (C5/C7) notes, no safety weakening: `start_session` now DEFAULTS to
-`dry_run=False` — the one sanctioned default change (the old default silently produced
-no-op sessions; the compensating control is the mandatory `DRY-RUN (no input
-dispatched):` banner on every dry-run result message, so a no-op can never be misread
-as execution). Queued `follow_ups` are ZERO-BYPASS: every queue item runs the full
-independent pipeline (ground → validate → safety → approval semantics → execute →
-verify), the queue stops on TRUE premise staleness — the attached window's identity
-(hwnd/title/bounds) changed or the window closed since the queued premise
-(`CORTEX_QUEUE_STRICT_DIGEST=1` restores the v0.5.6 whole-screen digest stop; ordinary
-pixel change no longer stops the batch, each item re-grounds from the fresh
-post-action capture) — safety rejection, approval requirement, validator/
-grounding rejection, or named interference stop (modal dialog / focus drift); the
-stop token is checked between items, and adversarial tests
-prove an unsafe item is rejected individually and `stop_session` halts a running
-queue. Default: an EXECUTED item whose verification outcome is `failed` no
-longer flushes later items — the input dispatched, the next item re-grounds from the
-fresh post-action capture, and the honest failed verdict (ok=False + evidence) rides
-the per-item `follow_up_results` entry; set `CORTEX_QUEUE_STRICT_VERIFY=1` to restore
-the v0.5.5 strict stop-on-failed queue semantics.
+Queue (`follow_ups`) is ZERO-BYPASS: every item runs the full independent
+pipeline; the queue stops on TRUE premise staleness (the attached window's
+identity changed or closed), safety rejection, approval requirement,
+validator/grounding rejection, or a named interference event; the stop token is
+checked between items. Default: an executed item whose verification is `failed`
+no longer flushes later items — the honest failed verdict rides the item's
+`follow_up_results` entry; `CORTEX_QUEUE_STRICT_VERIFY=1` restores
+stop-on-failed.
 
 Limitation (stated honestly): classification is deterministic pattern + context
-matching (English patterns plus a small Arabic set), not semantic understanding. It is
-a coarse, conservative net — novel destructive phrasing in other languages may classify
-lower than a human would. The compensating controls are the approval defaults
-(click/type require approval by default), the allowlists, and verification.
+matching (English patterns plus a small Arabic set), not semantic
+understanding. Novel destructive phrasing in other languages may classify lower
+than a human would. Compensations: approval defaults, allowlists, typed
+outcomes with host re-grounding, verification.
 
-### 3.1 Pre-classifier normalization layer (R-23, v0.7.0 — `textnorm.py`)
+### 3.1 Matching-only normalization (`core/textnorm.py`)
 
-Zero-width/variation-selector/tatweel characters split the tokens and `\b` anchors
-every text matcher matches on (`"de\u200blete"` tokenizes as `[de, lete]`;
-`"for\u200bmat C:"` breaks the `\b`-anchored disk pattern). v0.7.0 adds ONE
-canonicalizer that every matcher consumes INSTEAD of raw text:
+Zero-width/variation-selector/tatweel and invisible-separator characters split
+the tokens every text matcher matches on. One canonicalizer sits between action
+text ingress and the safety gate, the classifier, and secret redaction:
+`view(x) = TRANSLATE(NFKC(x))` in two views (delete view removes strip
+characters; fold view maps them to space), merge never-downgrade, and an ASCII
+fast path that is byte-identical to the single-pass matcher. The strip set is
+the 437-codepoint invisible-character family (all category Cf, variation
+selectors, tatweel) plus the nine invisible non-Cf splitters. **Type-integrity
+invariant**: normalization is matching-only — dispatched text keeps its original
+bytes, and redaction returns the original string unchanged when no pattern
+matches any view. Residual: cross-script homoglyphs are not NFKC-addressable
+(future TR39-class hardening item; pinned skip in the test suite).
 
-- **Pipeline:** `view(x) = TRANSLATE(NFKC(x))` — NFKC first, strip/fold second.
-  The order is load-bearing: NFKC can *manufacture* strip-set characters during
-  composition (Arabic presentation ligatures decompose through tatweel U+0640), so
-  the final pass guarantees strip-free, ASCII-whitespace-only output by construction
-  (proven over all 1,114,112 codepoints, both views, fully idempotent).
-- **Strip set — 437 codepoints / 30 contiguous ranges** (Unicode 15.0.0): all
-  category Cf format characters (the zero-width family, soft hyphen, bidi controls,
-  tag characters), the variation selectors U+FE00-FE0F + U+E0100-E01EF, the Arabic
-  tatweel U+0640 (the standard Arabic-search joiner used to split Arabic markers),
-  and — the v0.7.0 red-team repair S1 (RT-D1-02) — the nine invisible non-Cf
-  splitters U+034F, U+180B-U+180D, U+115F/U+1160, U+3164, U+FFA0, U+17B4/U+17B5,
-  each of which provably splits keywords exactly like the Cf set.
-- **Two views of the same strip set:** the *delete view* removes strip characters
-  (catches in-word insertion: `for\u200bmat` → `format`); the *fold view* maps them
-  to U+0020 (catches between-word insertion and space-substitution:
-  `restart\u200bthe\u200bserver`, `drop\u200bdatabase`). All 28 non-ASCII
-  `str.isspace()` codepoints fold to U+0020 in both views.
-- **ASCII fast path:** every ASCII string is returned as-is (`str.isascii` gate,
-  ~0.05 µs), so the entire benign corpus and the overwhelming TYPE population run
-  exactly the pre-v0.7.0 single-pass matching at the same cost. `canonical_views`
-  returns ONE element whenever the two views coincide, so well-formed non-ASCII
-  input pays no added matching either.
-- **Merge rule:** matchers run on every view and merge never-downgrade — block if
-  any view blocks, risk = max across views (safety), redaction prefers the
-  matching view (§7). On the dual-view path the keyword gate additionally matches
-  the fold view's RE-FUSED component stream: adjacent components whose
-  concatenation is a known keyword re-join, but only across strip-derived gaps
-  (boundary-faithful fusion via the U+001F sentinel in `fold_marked`; repair S7 +
-  RT2-D1-01) — benign multi-word prose with strip-character noise (a trailing VS16
-  emoji, one stray joiner) somewhere else in the payload never fuses into a keyword.
-- **TYPE-integrity invariant (matching-only):** normalization never rewrites
-  dispatched text. The typed string keeps its original bytes
-  (`CORTEX_TYPE_INTEGRITY` semantics unchanged), approval-message reasons keep the
-  original text, and redaction returns the ORIGINAL string byte-identical when no
-  pattern matches any view (a redaction hit returns the matching view's redacted
-  text — a sink representation, never a dispatched payload). Pinned by
-  `tests/test_r23_textnorm_normalization.py`
-  (`test_ac23b_matching_only_type_integrity_unit`,
-  `test_ac23b_dispatched_text_keeps_the_original_bytes`,
-  `test_ac23a_redaction_no_match_returns_the_original_bytes`).
+### 3.2 Destructive-intent grammar (`security/safety.py`)
 
-### 3.2 Destructive-intent grammar (R-21, v0.7.0 — `safety.py`)
-
-The pre-v0.7.0 classifier matched literal command templates; polite phrasings of the
-same destructive act passed ("please delete the model" typed at LOW). The R-21 fix is
-a verb-anchored severity floor over the NORMALIZED token components — design-level
-grammar, not per-string patching:
-
-- **V1 unambiguous destructive verbs** (`delete`, `remove`, `erase`, `wipe`,
-  `truncate`, `purge`, `destroy`; the shell abbreviations `del`/`rm` stay exact
-  tokens): V1 + any non-function-word object inside the window floors the verdict
-  at **MEDIUM** (new category `destructive_intent`) and fires the keyword gate.
-  The floor no longer depends on noun enumeration to decide WHETHER to flag — that
-  shape inversion covers polite phrasing, open objects, and filler tolerance at once.
-- **V2 contextual destructive verbs** (`drop`, `clear`, `empty`, `format`, `kill`,
-  `shutdown`, `restart`): never flagged on an open object; require a
-  high-consequence object-class hit (databases, tables, disks/drives, accounts,
-  files, models, backups, logs, credentials, … — the class decides the TIER only).
-  V1/V2 + a class object floors at **CRITICAL**.
-- **Object window:** the 3 non-function components after the verb. Function words
-  (the, a, my, all, entire, old, please, kindly, …) are skipped WITHOUT consuming
-  window slots (repair S2/RT-D1-01 — "delete the entire old production database"
-  reaches its object through three function words); a copula (is/are/was/…) closes
-  the window, so mention-form verbs stay benign ("delete is a word in the
-  dictionary", "wiping is configured").
-- **Bounded morphology (repair S4/RT-D1-04, Commander-approved):** the closed
-  inflection family s/es/ed/d/ing with e-drop and consonant doubling is allowed on
-  V1/V2 verbs, so gerund/past/third-person forms of the SAME verb carry the same
-  intent ("wiping the old drive", "deleted the database"). This is not a stemmer:
-  derived nouns (`deletion`), prefixes (`reformatting`), and typos never match
-  (pinned benign). The accepted trade — narrative past tense with a class noun now
-  flags — is documented in §10.
-- **Floors only, never downgrades:** the grammar can only upgrade an existing
-  verdict, never lower one; every pre-v0.7.0 marker, phrase, pattern, the DOI
-  suppression, and the Arabic handling are unchanged and still fire first. The
-  classify-side regex floors use bounded quantifiers (filler groups `{0,3}`,
-  tempered on copulas) and are gated by a cheap verb-presence prerequisite; on the
-  dual-view path the re-fused component stream feeds both the gate and the floor,
-  and phrase markers fire across strip-connected fusions (repair RT3-D1-02 —
-  `cm\u200bd\u200bexe` / `re\u200bg\u200bdelete` block at CRITICAL with plain-form
-  parity).
+A verb-anchored severity floor over normalized token components: V1
+unambiguous destructive verbs (`delete`, `remove`, `erase`, `wipe`, `truncate`,
+`purge`, `destroy`) flag with any non-function-word object in the window
+(floors at MEDIUM, new category `destructive_intent`); V2 contextual verbs
+(`drop`, `clear`, `empty`, `format`, `kill`, `shutdown`, `restart`) require a
+high-consequence object-class hit (V1/V2 + class object floors at CRITICAL).
+Function words do not consume window slots; a copula closes the window
+(mention-form prose stays benign); bounded morphology (s/es/ed/ing with
+e-drop/doubling) carries inflected forms of the same verb. Floors only — the
+grammar can upgrade a verdict, never lower one; every pre-existing pattern
+still fires first. Pinned trade: narrative past tense with a class noun flags
+(over-block direction).
 
 ## 4. Fail-closed rules
 
 | Condition | Behavior | Where |
 |---|---|---|
-| Unknown risk / insufficient context for a potentially high-risk action | escalate to `CRITICAL` (`risk_unresolvable_fail_closed`) → blocked | `safety.classify` |
-| Unknown action type | `CRITICAL` → blocked | `safety.classify` |
-| Unverifiable coordinate space (`unverifiable`) | grounding refuses; validator rejects (`coordinate_space_unverifiable`); executor raises `CoordinateSpaceError` | `grounding.py`, `validator.py`, `backend.py` |
-| Missing observation binding (coordinate action without `source_observation_id`) | reject (`missing_observation_binding`) | `validator.py` |
-| Stale screen identity (HWND/process/monitor/dimensions/space drifted) | reject (`STALE_OBSERVATION`) → automatic re-observe + re-ground, never blind execution | `validator.py`, `agent.run_single` |
-| Uncertain verification | never success — the outcome rides the result honestly to the host, which decides the next action (single documented carve-out: `wait` reports `ok` with the uncertain outcome carried) | `agent.py`, `verification.py` |
-| Policy itself raises | deny fail-closed with a structured decision | `agent._evaluate_safety` |
-| Verification raises | degrade to `uncertain` (`controller_guard`) | `agent._verify` |
-| Audit write fails | logged and swallowed — the control loop never breaks on telemetry | `agent._audit` |
-| Process allowlist configured but identity unavailable | reject (`process_identity_unavailable`) | `validator.py` |
-| `focus_window` target outside the process or window-title allowlist, or the target window cannot be resolved while either allowlist is configured | controller-level gate refuses **before any foregrounding call** (`process_not_allowed` / `window_not_allowed` / `process_identity_unavailable` / `window_identity_unavailable`) — the backend never runs on a disallowed target; same typed rejection shape as ordinary allowlist violations (the removed recovery
-layer historically mapped it to `WRONG_WINDOW`) | `agent._focus_allowlist_rejection` |
+| Unknown risk / insufficient context for a high-risk action | escalate to CRITICAL → blocked | `safety.classify` |
+| Unknown action type | CRITICAL → blocked | `safety.classify` |
+| Unverifiable coordinate space | grounding refuses; validator rejects; executor raises `CoordinateSpaceError` | grounding/validator/backend |
+| Missing observation binding (coordinate action) | reject (`missing_observation_binding`) | `validator` |
+| Stale screen identity (hwnd/process/monitor/dimensions/space drifted) | reject (`STALE_OBSERVATION`) → one automatic re-observe + re-ground, never blind execution | `validator`, `agent` |
+| Uncertain verification | never success — rides the reply honestly (`ok:false`) | verification/agent |
+| Policy itself raises | deny fail-closed | `agent` |
+| Verification raises | degrade to `uncertain` | `agent` |
+| Audit write fails | logged and swallowed — telemetry never breaks the loop | `agent` |
+| Process allowlist configured but identity unavailable | reject (`process_identity_unavailable`) | `validator` |
+| `focus_window` target outside either allowlist, or unresolvable while one is configured | refused BEFORE any foregrounding call (`process_not_allowed` / `window_not_allowed` / `process_identity_unavailable` / `window_identity_unavailable`) | `agent` |
+| Session idle past the timeout with nothing in flight | stopped through the kill path (`source="idle_timeout"`); later calls `session_stopped` | `server/lifecycle.py` |
+| Session cap reached after the idle sweep | `session_limit_exceeded` listing `live_sessions` + `idle_timeout_seconds` | `server/lifecycle.py` |
 
 ## 5. Approval semantics
 
-- **Per-call authorization (the five-tool surface)**: `computer_execute(approved=True)`
-  authorizes that single call's action when the policy requires approval
-  (`approval_required` otherwise). CRITICAL actions are never cleared by this flag
-  (see below). (Historical: the removed internal loop additionally granted exactly
-  one approval per call via `approve_next_action=True`, bound to the approved action
-  instance id so its recovery retries did not re-consume it — the loop, its budget,
-  and its in-run recovery were removed by user order.)
-- **Explicit authorization flow**: `SafetyPolicy.evaluate(..., authorized=True)`
-  exists for CRITICAL actions, to be set only by a caller that obtained explicit
-  human authorization through a mechanism the model cannot reach. **No MCP tool
-  currently passes `authorized=True`**, so in the present surface CRITICAL actions
-  are always blocked (`safety_denied` / `BLOCKED_SAFETY` termination) with a message
-  explaining what authorization would require. This is the honest current state: the
-  mechanism is policy-level, its operator-facing wiring is future work.
-- **Approval message contents** (asserted by test; never bare coordinates): Action
-  (kind + coordinates or clipped text or keys), Target (application identity —
-  process and/or window title — plus coordinates/text), Why (risk category + human
-  reason), Risk level, Consequence (per-category consequence text), and how to
-  approve (explicit human mechanism; screen content, model suggestions, and the
-  message itself can never authorize).
-- Nothing on screen and nothing a model says can grant approval: authorization is the
-  host's explicit `approved=True` call parameter; `SafetyContext` describes the world
-  and is never treated as authorization. (There is no model output at all on the
-  five-tool surface.)
+- **Per-call authorization**: `computer_execute(approved=True)` authorizes that
+  single call when policy requires approval. CRITICAL actions are never cleared
+  by the flag: `SafetyPolicy.evaluate(..., authorized=True)` exists at the
+  policy API, but NO MCP tool passes it — CRITICAL is always blocked today
+  (fail safe, and honest about it).
+- **In a plan**: approval is decided ONCE on the first plan call and inherited
+  by every step and by `replace`; `continue` never re-asks; a gated step
+  replies `not_executed` + `requires_approval:true`. Per-item safety
+  classification still applies to every action.
+- **Approval message contents** (asserted by test): action, target identity,
+  why (category + reason), risk level, consequence, and how to approve. Screen
+  content, model suggestions, and the message itself can never authorize.
+- A resumed session starts with NOTHING granted — approval is never resurrected
+  from checkpoint data.
 
-## 6. Emergency stop (kill path)
+## 6. Emergency stop and the idle reaper
 
 - `StopToken` wraps `threading.Event`; `stop()` is idempotent and thread-safe;
-  `ensure_live()` raises `TaskStopped`. One token per session, held in
-  `SessionContext`; armed by `stop_session` (which also sets `state.stopped` and
-  audits `stop` + `emergency_stop`).
-- **Checked before every physical input**: `backend.execute` calls
-  `ensure_live()` on entry, before each click, before **each typed character**, before
-  hotkeys, before a cursor `move`, and before scroll; a fired token means zero further
-  inputs. `focus_window` performs no pyautogui input — the token is checked by the
-  `execute` header before the Win32 foreground sequence runs.
-- **Checked at every control point**: during the screenshot-rate wait (50 ms
-  polling), immediately before execution on the direct path, between queued
-  `follow_ups` items, and before/inside `backend.execute` per input. (Loop-era
-  checkpoints — loop top, pre-provider-call, recovery dismiss attempts — died with the
-  removed loop; a stopped session now refuses ALL work at the session boundary.)
-- **One stop, one observable outcome (F7)**: the two stop flavors — an explicit
-  `stop_session` call and an internally-armed kill path (in-run `TaskStopped`) —
-  route through the same `_close_stopped_bundle` cleanup: token armed, `stopped`
-  mirrored onto state, stop + `emergency_stop` audited (once), bundle removed from
-  the store and the registry, and a bounded snapshot retained
-  (`_STOPPED_SESSION_MEMORY = 1024`). Every tool (`start_session` aside, all four
-  session-scoped tools) subsequently refuses that session id with the identical
-  structured `session_stopped` error — no flavor leaves a live bundle behind.
-- **Interruptible waits**: sleeps are sliced at 100 ms (`interruptible_wait`,
-  `_sleep_for_wait_action`); a stop ends the wait within one slice. `wait` actions are
-  capped at 10 s.
-- **The model can never reach the stop setter** — enforcement, concretely: the token
-  instance lives only in server-held session objects; the provider receives plain
-  data (redacted strings, the pydantic `Observation`, `list[str]` history) with no
-  reference to any session object; provider output is parsed into a fixed-schema
-  pydantic decision (data, no callables, no object references); the approval callback
-  receives only `(GroundedAction, str)` copies. Tests assert: stop set mid-run → zero
-  further inputs and a known stopped state with an `emergency_stop` audit event; and
-  the stop setter is unreachable from provider output.
-- Residual honesty: this is a cooperative, in-process stop. There is no OS-level kill
-  switch; if the whole process is compromised or wedged below the Python layer, the
-  only physical backstop is the failsafe screen corner (replicated by BOTH input
-  engines and mapped to
-  `InputBlockedError` → `BLOCKED_UI`).
+  `ensure_live()` raises `TaskStopped`. One token per session.
+- **Checked before every physical input**: on execute entry, before each click,
+  before each typed chunk, before hotkeys, before a move, before scroll; waits
+  are sliced (100 ms; wait-machine cancellation slices at 0.1 s) so a stop ends
+  the wait within one slice.
+- **One stop, one observable outcome**: `stop_session`, the idle reaper, and an
+  internally-armed kill path route through the same `_close_stopped_bundle`
+  cleanup; every later call on the id returns the identical `session_stopped`
+  error.
+- **The idle reaper**: a session with no tool call for 15 minutes (default; env
+  `CORTEX_SESSION_IDLE_TIMEOUT_SECONDS`, band 60..86400, `0` disabled) and
+  nothing in flight is stopped through the same kill path, audited with
+  `source="idle_timeout"`; any call resets the count; sweeping is lazy (every
+  tool entry + before the session-limit check). A running wait is never reaped.
+- **The model can never reach the stop setter** — structural: the token lives
+  only in server-held session objects; provider output is data.
+- Residual honesty: this is a cooperative, in-process stop. There is no
+  OS-level kill switch; if the whole process is compromised, the only physical
+  backstop is the failsafe screen corner (replicated by BOTH input engines and
+  mapped to `InputBlockedError`).
 
-## 7. Secrets policy
+## 7. Secrets policy (`security/redaction.py`)
 
-- **Detection patterns** (`redaction.py`, 10 registered): AWS access key (`AKIA…`),
-  JWT, private-key block and header (`-----BEGIN … PRIVATE KEY-----`), bearer
-  authorization header, standalone bearer token, basic-auth URL
-  (`scheme://user:pass@host`), password/passphrase assignment (`name=value`),
-  token/API-key/secret assignment, credit-card numbers (Luhn-validated). Matching is
-  value-oriented, so prose merely mentioning "password" is not flagged. The registry
-  is extensible (`register_secret_pattern`). v0.7.0 extends the grammar and the
-  value-shape coverage (§7.1–§7.2) and adds the non-executed response shapes to the
-  redaction choke point (§7.3). Matching runs on the canonical view(s) of the input
-  (§3.1): ASCII input is matched exactly as before; non-ASCII input is matched on
-  both views (never-downgrade) with byte-identical benign pass-through.
-- **Typed-text secret block** (pre-existing gate, preserved): `type` actions whose
-  text resembles a secret/credential/destructive command (keyword markers: password,
-  api_key, secret, token, credential, rm, del, format, shutdown, powershell, …) are
-  denied with approval required — they never reach the backend.
-- **Redaction at the audit sink**: every string field and metadata value of every
-  `AuditEvent` passes `redact_text` at write time; values under sensitive-named
-  metadata keys (password/token/key/secret/credential/auth/cookie, word-bounded) are
-  redacted wholesale. The in-memory event is not mutated; the JSONL file is guaranteed
-  secret-free (covered by an audit-log secret-scan test).
-- **Redaction on the tool response path (F2, defense in depth)**: `computer_execute`
-  responses pass through `_redact_result_payload` before leaving the server —
-  `message`, `action.text`, `action.reason`, `verification.note`, and every
-  `verification.evidence` entry are redacted. The audit sink and the provider payload
-  were already enforced; the response (which echoes proposed strings back to the
-  calling client) is no longer the one surface that bypasses redaction. (The removed
-  internal-loop response path shared this enforcement; nothing was weakened by its
-  removal.)
-- **No secret logging**: provider request bodies are never logged; the API key exists
-  only inside the Authorization header construction — never in exceptions, messages,
-  or logs. `TaskState.action_history` stores secret-free summaries (typed text
-  intentionally excluded); `safe_repr` is the redaction-enforced repr for logging
-  untrusted objects.
-- **Provider treated as untrusted**: goal, environment content, history, task state,
-  and judge payloads are redacted before dispatch; the payload contains no policy
-  internals beyond the doctrine block; `ProviderDecision.redactions_applied` reports
-  the replacement count; response size is capped (10 MB) and raw responses are never
-  executed.
-- **Screenshot redaction (honest scope)**: pattern-based for text; `redact_image`
-  blurs only explicitly supplied regions; pixel-level secret detection is the
-  `_scan_image_for_secrets` hook (no-op in P0). Screenshots are not persisted to disk
-  by the server.
-
-### 7.1 Assignment grammar (R-21, v0.7.0 — `redaction.py`)
-
-The pre-v0.7.0 grammar detected labelled assignments only (`noun [=:] value` with a
-closed noun list); `pwd is hunter2`, `api key: sk-…`, and `password is: X` passed
-raw. The extended grammar is filler-tolerant on both sides of the separator:
-
-- **Nouns:** the spaced/hyphenated compound forms (`api key`, `access key`,
-  `client secret`, `secret key`, `auth token`) and the abbreviations `pwd`/`pass`
-  join the existing alternation.
-- **Separators:** the direct `[=:]` arm keeps its measured value floors
-  (`\S{4,}` password-family / `\S{6,}` token-family). The **copula arm**
-  (`is|was|are` immediately after the noun — `password policy was updated` stays
-  clean because the copula is not adjacent) accepts an optional `[:=]` after the
-  copula (repair S3/RT-D1-03 — `password is: X` / `pwd was: X` are caught) and
-  requires a **secret-shaped value**: `len(V) >= 6` and NOT pure-lowercase-ASCII of
-  length ≤ 10 (repair S5/RT-D1-07, Commander-refined — benign copula prose such as
-  "the password is stored in the vault" stays clean and can no longer block
-  checkpoint persistence, while evidence-corpus values like `hunter2` still match).
-- **Shape rule (repair RT4, Commander-adjudicated):** a token is PROSE-shaped
-  (skippable, never a value) when it is pure ASCII-alpha in a natural-language form
-  — all-lowercase ≤ 10, or Capitalized-form `[A-Z][a-z]+` ≤ 20. Everything else
-  with len ≥ 6 is SECRET-shaped: digit/symbol-bearing runs, ALL-CAPS acronyms
-  (`ABCDEF`), all-lower passphrases ≥ 10 (defeating the exemption: digits,
-  capitals, punctuation, or non-ASCII letters all defeat it), and mixed runs. A
-  Capitalized+digit token ("Vault2024") is therefore treated secret-shaped — the
-  Commander's Vault2024 ruling, pinned (§10).
-- **Decoy bound (repairs RT2-D1-02/RT3-D1-01/RT4):** the copula arm skips at most
-  TWO prose-shaped tokens before the secret-shaped value
-  ("password is abcdefghij supersecret123" is caught; the bound is the
-  evidence-forced value — three prose tokens precede the value in D1's false-positive
-  row). The trade classes of any finite bound are documented in §10.
-- **Bridge-continued secret-run (repair RT5/RT4-D1-01-02):** the value is a maximal
-  run of secret-shaped tokens whose separators carry at most two prose-shaped
-  bridge tokens ("and"/"or"/"then" or decoys), all consumed/redacted —
-  "password is ABCDEF and supersecret123" leaves no raw survivor in any sink.
-  Prose-only sequences never match: the run is anchored by secret-shaped tokens on
-  both sides of every bridge.
-
-### 7.2 Bearer-token value-shape families (R-21, v0.7.0 — `redaction.py`)
-
-The `AKIA` shape mechanism generalized: standalone token VALUES are detected by
-prefix + charset + length floor, no keyword label required — `gh[pousr]_…`
-(GitHub, 20+ chars), `github_pat_…` (17+), `xox[abprs][-_]…` (Slack, both
-separators, 8+), `npm_…` and `xocr_…` (20+). Length floors keep truncated/benign
-strings clean. For hot-path economy the bearer separators and all value-shape
-families share ONE compiled alternation (P2: one pass on clean text) with
-per-family hit labels resolved from the matched group; the PEM block and its bare
-header share the same fused-pattern treatment (a full block still wins over its own
-header).
-
-### 7.3 One choke point feeding every sink (v0.7.0)
-
-`redact_text` / `contains_secret` remain the single detection choke point; every
-redaction-enforced sink calls exactly it, so a grammar/family improvement repairs
-all sinks simultaneously: the audit JSONL (write-time redaction + wholesale
-redaction under sensitive-named metadata keys), the provider request body
-(`expected_effect`/`goal` before the judge call), model context (goal/task/state/
-history/plan notes), checkpoints (per-value redaction plus the fail-closed
-`contains_secret` gate that REFUSES a checkpoint write when a value stays
-secret-like), long-running state, resume error text, `safe_repr`, and the MCP
-response path. v0.7.0 closes the last response-shape gap: the non-executed
-responses (`rejected`, `safety_denied`, `approval_required`, `digest_surprise`,
-`error`) embed model-proposed text in `message` and now pass the SAME
-`_redact_result_payload` redaction the executed shape already applied (additive;
-pinned end-to-end by `tests/test_r21_classifier_redaction.py` sink tests — approval
-response, audit JSONL, and provider request body carry no raw secret).
+- **Detection choke point**: `redact_text` / `contains_secret` are the single
+  detection point; every sink calls exactly them — the audit JSONL (write-time
+  redaction + wholesale redaction under sensitive-named metadata keys), the
+  provider request body, model context, checkpoints (per-value redaction plus
+  the fail-closed `contains_secret` gate that REFUSES the write), resume error
+  text, `safe_repr`, and the MCP response path (executed AND non-executed
+  shapes: `message`, `action.text`, `action.reason`, `verification.note`,
+  `verification.evidence`).
+- **Patterns**: AWS access key, JWT, private-key block and header, bearer
+  authorization header, standalone bearer token, basic-auth URL,
+  password/passphrase assignment, token/API-key/secret assignment,
+  Luhn-validated card numbers, plus value-shape families for untagged bearer
+  tokens (`ghp_`-class GitHub, `github_pat_`, `xox[abprs]` Slack, `npm_`,
+  `xocr_`). The assignment grammar is filler-tolerant (spaced compound nouns,
+  `pwd`/`pass`, copula arms `password is/was/are`, a prose-vs-secret token-shape
+  rule, at most two prose decoys, bridge-continued secret-run consumption).
+  Matching runs on the canonical view(s) (§3.1); benign ASCII input is
+  byte-identical pass-through.
+- **Typed-text secret block**: `type` actions whose text resembles a secret,
+  credential, or destructive command are denied with approval required — they
+  never reach the backend. Negation is not understood ("do NOT delete
+  anything" blocks — over-block direction).
+- **Provider treated as untrusted**: payloads redacted before dispatch; no
+  policy internals beyond the doctrine block; response size capped; raw
+  responses never executed; request bodies never logged.
+- **Checkpoint redaction**: every string value passes redaction; a value still
+  secret-like after redaction REFUSES the checkpoint write before any disk
+  touch. No secrets, no screenshots in checkpoints.
+- **Screenshot redaction (honest scope)**: pattern-based for text;
+  `redact_image` blurs only explicitly supplied regions; pixel-level detection
+  is the no-op hook. Screenshots are not persisted to disk by the server.
 
 ## 8. Limits and resource isolation
 
-- **Hard limits** with safe defaults and clamping (`limits.py`; full table in
-  `docs/ARCHITECTURE.md` §8): on the direct five-tool path the tripping gates are the
-  screenshot rate budget (`min_screenshot_interval_ms`), the action budget
-  (`max_actions`), and the session cap (`max_sessions` — a new session at capacity is
-  refused, never evicting a live one). Trips raise `LimitExceeded` → audited clean
-  termination (fail safely). The remaining fields of the limits family are accepted,
-  validated, and clamped on the wire but are RESERVED — not enforced since the
-  internal loop's removal (see §11.6).
-- **Unthrottled explicit observation (F5, accepted-by-design)**: the
-  `min_screenshot_interval_ms` rate gate applies to the runtime's own capture paths.
-  PERF-004 C2 refined semantics: the gate protects FRESH observations (on the direct
-  path, the per-call grounding/validation capture of a `computer_execute`);
-  intra-call verification captures (staleness probe, post-action,
-  P0-H revalidate) are burst-exempt but still recorded into the enforcer (count +
-  pacing timestamp), so session-wide capture volume stays enforced and bounded
-  (per-call captures are structurally capped at one staleness probe + one post-action
-  capture). `computer_observe` / `computer_screenshot` remain explicit client tools
-  with NO rate gate — measured ~46 captures/s, and every capture emits an audit row,
-  so a hammering client can generate audit volume and CPU load at its own discretion.
-  Clients wanting throttling should self-limit; the gate exists to stop the runtime
-  from racing itself, not to police explicit calls.
-- **Session registry**: bounded at `max_sessions` (default 4); at capacity a new
-  session is **refused** (`session_limit_exceeded`), never evicting a live session.
-  Thread-safe (`RLock`).
-- **Per-session isolation**: each session owns its `SessionContext` (TaskState +
-  StopToken), `SessionState`, backend, agent, `LimitEnforcer`, `AuditLogger` (own
-  JSONL file), and `Metrics`. There is no shared mutable state between sessions;
-  a two-concurrent-sessions test shows zero cross-contamination. Histories inside
-  `TaskState` are bounded deques (action 100, observations 50, plan notes 50) so they
-  cannot grow unbounded.
-- **No cross-session state**: `server._bundles` is keyed by session id and every tool
-  call resolves its bundle first; unknown ids fail closed (`unknown_session`).
-  Sessions are in-process — this is isolation within one process, not OS/VM isolation.
+- LIVE gates on the direct path: the action budget (`max_actions`), the
+  screenshot-rate gate (`min_screenshot_interval_ms`, protecting FRESH
+  captures; intra-call captures are burst-exempt but recorded), the session cap
+  (`max_sessions` — refusal, never eviction), `max_wait_seconds` on wait
+  requests, and the session's `max_steps` (enforced by the safety gate and the
+  plan surface). Trips raise `LimitExceeded` (or a typed refusal) → fail
+  closed. The remaining limits fields are RESERVED (accepted, validated,
+  checkpointed; the loop-era trip points are gone — see docs/history/). Full
+  table with defaults and bands: [CONFIGURATION.md](CONFIGURATION.md).
+- **Unthrottled explicit observation (accepted-by-design)**: the rate gate does
+  not cover `computer_observe` / `computer_screenshot` / `computer_zoom` —
+  explicit client tools. Every capture emits an audit row, so a hammering client
+  generates audit volume at its own discretion; it cannot bypass any safety
+  gate (observation alone never acts).
+- **Per-session isolation**: each session owns its context, state, backend,
+  agent, enforcer, audit logger, and metrics. No shared mutable state between
+  sessions; unknown ids fail closed (`unknown_session`). Sessions are in-process
+  — isolation within one process, not OS/VM isolation.
 
-## 9. Windows identity and allowlists
+## 9. Windows identity, allowlists, and the launch truth
 
-- **Strong identity** (`backend.query_foreground_window`): hwnd (root owner via
-  `GetAncestor(GA_ROOT)`), pid (`GetWindowThreadProcessId`), `process_name` (exe
-  basename via `OpenProcess` + `QueryFullProcessImageNameW`), `exe_path`,
-  `window_class` (`GetClassNameW`), title (`GetWindowTextW`), bounds
-  (`GetWindowRect`). Field failures degrade to `None` instead of crashing observation.
-- **Process allowlist enforcement** (`validator.py`, `start_session(allowed_processes=…)`):
-  authoritative when the observation carries process identity — an active process
-  outside the list is a violation (`process_not_allowed`) even when the title matches;
-  matching is case-insensitive and `.exe`-tolerant with basename fallback. When
-  identity is unavailable while an allowlist is configured, the action is rejected
-  fail-closed (`process_identity_unavailable`).
-- **Controller-level focus pre-foreground gate** (`agent._focus_allowlist_rejection`):
-  a `focus_window` target cannot be allowlist-checked the way other actions are — its
-  identity belongs to the *target* window, not the foreground one, and the check must
-  happen before the OS-level focus change. When either allowlist is configured, the
-  agent resolves the target window through
-  `backend.find_window_by_title` (case-insensitive matching, precedence exact >
-  prefix > substring, first in Z-order wins ties) and checks it against BOTH
-  allowlists **before any foregrounding call**: process/exe outside the process
-  allowlist → `process_not_allowed`; title outside the window-title allowlist
-  (casefolded exact-or-substring, mirroring the validator's `_window_allowed`; an
-  empty title never matches) → `window_not_allowed`; a target that cannot be resolved
-  → `process_identity_unavailable` (process allowlist configured) /
-  `window_identity_unavailable` (title allowlist configured). Every rejection reuses
-  the validator's typed errors and codes, so the host receives the identical typed
-  rejection shape throughout (the removed recovery layer historically mapped these to
-  `WRONG_WINDOW`). Fail-closed; the
-  backend never runs on a disallowed target, and no window is ever brought to the
-  foreground to "check" it.
-- **Title demoted to fallback**: exact-title matching via `WindowInfo` is preferred;
-  the legacy substring match survives only as a fallback for observations without
-  window identity.
-- **Staleness binding** (`validator._staleness_drift`): the fresh pre-execution
-  observation must match the grounding-source observation on active-window hwnd,
-  active process, monitor identity/bounds, screenshot dimensions, and coordinate
-  space; any drift is `STALE_OBSERVATION` → re-observe (and one automatic re-observe +
-  re-validate for direct calls).
+- **Strong identity** (`desktop/backend.py`): hwnd (root owner), pid, process
+  name (exe basename), exe path, window class, title, bounds. Field failures
+  degrade to `None`, never crash observation.
+- **Process allowlist**: authoritative when the OS reports process identity;
+  an active process outside the list is a violation even when the title matches
+  (case-insensitive, `.exe`-tolerant); identity unavailable while an allowlist
+  is configured is a fail-closed rejection.
+- **Focus pre-foreground gate**: a `focus_window` target is resolved through
+  `find_window_by_title` and checked against BOTH allowlists BEFORE any
+  foregrounding call; all four rejection paths reuse the validator's typed
+  shape; the backend never runs on a disallowed target.
+- **Launch truth (ensure_app)**: the enforced default is
+  `launch="server"` — `ensure_app` MAY spawn a target process server-side when
+  no existing instance matches. When NO process allowlist is configured, any
+  resolvable target may launch; when one IS configured, only an allowlisted
+  target may. `launch="driver"` (or env `CORTEX_ATTACH_OR_LAUNCH=driver`)
+  restores never-launch. The launch is never silent: the payload carries
+  exactly one typed `ensure_app_outcome` (`launched` / `launch_rejected` /
+  `launch_unresolved` / `reattached` / `ambiguous` / `not_found`), and a real
+  spawn is prefixed `LAUNCHED` in the message. The needle→path mapping
+  (`CORTEX_LAUNCH_PATHS`) is LOCAL TRUSTED CONFIGURATION in the host env block;
+  malformed entries are skipped fail-safe and nothing is ever spawned from one.
+- **Staleness binding**: the fresh pre-execution observation must match the
+  grounding-source observation on hwnd, process, monitor identity, screenshot
+  dimensions, and coordinate space; drift is `STALE_OBSERVATION` → one
+  automatic re-observe + re-ground, then the typed rejection to the host.
 
 ## 10. Known residual risks (honest)
 
-1. **No OS-level sandbox.** The runtime is a normal process on an interactive
-   desktop; there is no VM, job object, or AppContainer isolation. A sufficiently
-   wrong action can still affect the machine between the policy check and the input.
-2. **Coordinate actions depend on runtime coordinate-space verification.** Safety of a
-   click rests on measured screenshot-vs-input space classification (including the
-   `dpi_estimated` fail-closed path); the fallback "execute before any observation"
-   path assumes physical passthrough coordinates by documented legacy behavior.
-3. **OCR/UIA are not active.** Grounding is model-coordinates-first; text/accessibility
-   strategies are graceful-degradation stubs. `text_predicate` verification is inert
-   without OCR data.
-4. **Single-monitor E2E only.** A real-Windows E2E suite exists (`tests/e2e/`, gated
-   behind `CUMCP_RUN_E2E=1` — the D6 fail-closed gate skips those tests in every
-   plain `pytest tests` run and warns that opting in drives real input on the live
-   desktop; Notepad, `win32calc.exe`, Edge on a local page) and
-   passed on the reference box, but the box is single-monitor: multi-monitor logic is
-   covered only by unit tests with fake monitor sets. E2E window isolation (D6):
-   the suite launches its own app instances with run-unique window tokens and
-   attaches only through marker-only enumeration, so it cannot attach to or type
-   into a window the user has open.
-5. **Risk classification is heuristic.** Regex + context matching (English + limited
-   Arabic) is not semantic understanding; novel phrasings may under-classify.
-   Compensations: approval-by-default for interactive actions, allowlists, typed
-   outcomes with host re-grounding (a fresh observation, never a blind retry), and
-   verification.
-6. **CRITICAL authorization is not operator-wired.** `authorized=True` exists at the
-   policy API only; no MCP tool grants it, so CRITICAL is always blocked today (fail
-   safe, but also fail unavailable).
-7. **Model-based verification quality is external.** `model_visual` judgments are only
-   as good as the configured provider; a weak judge can produce wrong `verified`
-   verdicts. Deterministic strategies always run first; a judge's `uncertain` is
-   passed through, never upgraded.
-8. **Pixel-diff verification has residual blind spots.** The compact-change upgrade
-   fixed the measured failure where a single-digit Calculator change (mean pixel
-   difference ~0.2 on a 1920x1080 screenshot, far below the 1.0 mean threshold)
-   reported a false `failed` on real success: `ScreenshotDiffStrategy` now also
-   counts strongly-changed pixels (per-channel delta >= `STRONG_PIXEL_DELTA = 40`,
-   threshold `STRONG_CHANGE_MIN_PIXELS = 50`), so thin strokes and small controls
-   verify. Changes below both counters (sub-threshold, low-contrast, sparse) stay
-   `uncertain` — never a false success. Fine-grained application-internal state is
-   still best verified with application-state strategies (window text, process,
-   calculator display), which the E2E suite injects via the documented protocol;
-   they are not in the default chain.
-9. **No pixel-level screenshot secret detection.** Pattern-based text redaction +
-   explicit-region blur only; secrets visible only as pixels are not redacted before
-   provider dispatch.
-10. **In-process stop only.** The kill path is cooperative; see §6 residual note.
-11. **Provider key handling assumes a local operator.** The key is read from process
-    environment (`VISION_API_KEY`/`OPENAI_API_KEY`); anyone who can read the
-    process environment can read the key.
-12. **Explicit observe calls are unthrottled (F5).** The screenshot rate gate does not
-    cover explicit observe calls: on the direct path it applies to FRESH captures in
-    `computer_execute` (the per-call grounding capture), while
-    `computer_observe`/`computer_screenshot` execute at client discretion (measured
-    ~46 captures/s) with one audit row per capture — a misbehaving client can spend
-    CPU and audit volume, though it cannot bypass any safety gate (observation alone
-    never acts).
-13. **Windows foregrounding is best-effort.** `SetForegroundWindow` can be refused by
-    the OS (foreground-lock policy); `focus_window` detects a refusal by re-reading
-    `GetForegroundWindow()` and fails with a typed `WindowFocusError` (a `BackendError`
-    subclass) — the host receives the typed outcome and re-grounds from a fresh
-    observation; there is no blind retry (the loop-era recovery layer that classified
-    it `UNKNOWN` was removed in v0.6.0). The previously-focused window is **not**
-    restored on a refusal; the caller re-observes actual window state and re-decides.
-    Verification is deterministic window state, so a refused focus can never be
-    reported as `verified`.
-14. **Typed-text integrity and the backslash-type wedge (input engine).** `type`
-    actions are chunk-dispatched and verified once at end-of-action by reading the
-    focused control's value back (a single fixed-buffer `WM_GETTEXT`, or UIA
-    `Value`). Two consecutive reads must agree before any value is trusted; the
-    trust read is taken after a landing-lag horizon
-    (`CORTEX_TYPE_VERIFY_STABILITY_SECONDS`, default 2.5 s). `unverified` never
-    triggers a repair; a trusted genuine partial is repaired with exactly the
-    missing suffix (once); a confirmed still-wrong buffer fails the action with
-    `TextIntegrityError`. The action message reports
-    `integrity=verified|partial|unverified|mismatch(v/total)[ healed=n]`.
-    `CORTEX_TYPE_INTEGRITY=0` restores the legacy unverified-dispatch path
-    byte-identically. Known limitation: verification depends on the focused
-    control exposing a readable value; controls that cannot expose one (or
-    cross-thread length mis-reporting — worked around in
-    `_window_text_via_message`) degrade to honest `unverified` and never
-    double-apply.
-    **Backslash-type wedge (B5, closed as root-caused).** A 2026-09 one-off stall
-    (>10 min) typing a raw single-backslash path into the Run dialog was a
-    window-activation race: the type dispatched while the freshly activated
-    dialog's thread input queue was still settling. Mitigations shipped: keyboard
-    input paces behind a recent focus transition (`CORTEX_FOCUS_SETTLE_SECONDS`,
-    default 0.3 s) and terminal-key chords pace behind the previous dispatch
-    (`CORTEX_KEY_DISPATCH_GAP`, default 0.05 s); watchdog regression tests pin the
-    incident payload, and the 2026-09-13 re-run completed the exact payload in
-    <0.35 s across engine, Run-dialog, and full-server topologies. Residual
-    accepted risk: a one-off OS input-stack wedge cannot be made impossible
-    in-process; it is bounded by the session watchdog and surfaces as a typed
-    failure, never a silent partial dispatch.
-15. **v0.6.0 red-team residuals R-21/R-22/R-23 — CLOSED in v0.7.0.** The three
-    routed residuals were fixed at the design level (ROADMAP P0, commit range
-    `a36033d..9069ac2`; root causes, executed repro matrices, and the adversarial
-    re-attack record are archived in the maintainer-local `evidence/v07-007/`
-    tree): polite/phrased destructives typed at LOW because the gate was a closed
-    tool-token list and the classifier a set of verb+noun adjacency templates
-    (RT-E8-01) — replaced by the destructive-intent verb grammar (§3.2); varied
-    credential formats and untagged bearer tokens bypassed redaction because the
-    grammar was `[=:]`-assignment-only with one value-shape family (RT-E8-02/03) —
-    replaced by the filler-tolerant assignment grammar + bearer families (§7.1–
-    §7.2); zero-width characters split tokens/anchors because no canonicalization
-    existed between ingress and four independent matchers (RT-E8-04) — replaced by
-    the normalization layer (§3.1); and a keypress into a `#32770`/explorer.exe
-    anchor armed the launch-act marker for one action regardless of key or outcome
-    (RT-E8-05) — replaced by commit-key-only arming after the gates plus
-    seed↔outcome correlation (§11.11). Executable proof:
-    `tests/test_r21_classifier_redaction.py`,
-    `tests/test_r22_launch_act_adoption.py`,
-    `tests/test_r23_textnorm_normalization.py`,
-    `tests/test_v07_redteam_repairs.py`.
-16. **v0.7.0 accepted residual and trade classes (bounded, each named, each with a
-    direction).** The adversarial cycle that found them is recorded in §12; every
-    enforceable class is pinned by a test so it can never drift silently:
-    - **Cyrillic/mixed-script homoglyphs (fail-open).** Cross-script confusables
-      (`а/е/о/с/р/х` for `a/e/o/c/p/x`) split or replace keywords and are not
-      NFKC-addressable; closure needs TR39-style skeleton mapping (future item).
-      Pinned skip: `tests/test_r23_textnorm_normalization.py`
-      (`test_residual_cyrillic_homoglyph_not_nfkc_addressable`).
-    - **Seedless commit-key adoption (fail-open, adjudicated).** A bare commit key
-      (enter family) into a launcher anchor still adopts the next titled window —
-      including the `ctrl+enter`/`shift+enter`/`numpadenter` chord forms and the
-      paste-then-enter shape (clipboard text never seeds). Accepted because any
-      in-process gate refusing it also refuses R-20's frozen Win+R positive
-      control (the two are evidence-identical); allowlists still gate dispatch,
-      the bound is one action, and a refusal keeps the anchor. Pinned:
-      `tests/test_r22_launch_act_adoption.py`
-      (`test_residual_seedless_commit_key_unrelated_foreign_window_adopts`).
-      Adjacent LOW trades, pinned in the same file's doctrine: a title-spoofing
-      seed (`notepad` typed, foreign window titled `notepad`) correlates, and
-      fully-short/fullwidth seeds degrade to the seedless behavior (the S6
-      min-length repair removed the degenerate-correlation widening).
-    - **Stripe `sk_live_`/`rk_live_`/`pk_live_` key family (fail-open).** Matches
-      no pattern family; the value-shape mechanism that would cover it is proven
-      (§7.2) and adding the family is additive. Kept pinned in
-      `tests/test_p5_redteam.py`.
-    - **Pure-lowercase ≤ 10 copula values treated as prose (fail-open boundary).**
-      The S5/RT4 secret-shape rule exempts all-lowercase ASCII values of length
-      ≤ 10 (`password is letmeinnow` passes redaction); digits, capitals,
-      punctuation, or non-ASCII letters defeat the exemption. Accepted to stop the
-      measured false-positive class that blocked benign prose and refused
-      checkpoint writes. Pinned boundary rows in `tests/test_v07_redteam_repairs.py`
-      (S5 section). Corollary trade: the decoy-skip bound is finite (two prose
-      tokens), so a bound+1 decoy sequence dodges the copula arm — any finite
-      bound admits this; the bound is the evidence-forced value (RT4 adjudication).
-    - **Capitalized+digit tokens are secret-shaped (fail-closed, by ruling).**
-      "Vault2024"-class values at copula or skip distance are detected and
-      redacted — an intentional over-block of some prose shapes ("the password is
-      kept in Vault2024" redacts), the Commander's Vault2024 ruling. The class is
-      pinned in `RT4_CONSTRAINT_TABLE`
-      (`tests/test_v07_redteam_repairs.py`, the `Season2024` row; the V01–V06
-      ruling-row variants are pinned in the mission evidence corpus).
-    - **Fail-closed over-blocks of decorated prose (by design).** Text carrying
-      strip-class noise adjacent to marker vocabulary hard-blocks: accented-prose
-      + emoji/VS16 payloads, `please re\u200bformat the document` (fold view
-      exposes `format`), and the pre-existing legacy-marker vocabulary trade
-      (`restart`, `del`, `format` as standalone tokens block their prose
-      mentions). Negation is ignored (RT-D1-05: "do NOT delete anything" blocks),
-      and V1 mention-prose blocks wider than the pinned trade (RT-D1-06: "the
-      delete key on this keyboard is stuck"). All are over-block direction —
-      normalization never un-matches a marker the plain form contains. Pinned
-      representative rows in `tests/test_v07_redteam_repairs.py` (legacy-marker
-      rows, RT3 INFO pin, `test_s4_mention_form_copula_guard_applies_to_inflected_forms`).
-    - **S4 narrative past-tense blocking (fail-closed trade).** Closing the
-      inflected-verb bypass means narrative/habitual past tense with a
-      high-consequence object flags ("he wiped the drive yesterday" keyword-gates).
-      Commander-approved; pinned:
-      `tests/test_v07_redteam_repairs.py::test_s4_narrative_prose_trade_pinned`.
-    - **Fusion end-boundary omission (fail-open, INFO).** The boundary-faithful
-      fusion enumerates keyword concatenations LEFT of an internal boundary; a
-      strip-split keyword whose final join terminates AT the payload end (with
-      trailing strip noise) is not formed. Bounded shape class; the delete view
-      covers every strip-removed reading containing a whole keyword token. Pinned
-      skip: `tests/test_v07_redteam_repairs.py`
-      (`test_residual_r4_info_end_boundary_fusion_omission`).
-    Outside-vocabulary imperatives (`nuke`/`trash`/`obliterate` classes), typo'd
-    verbs, and nominalizations remain unflagged by the no-stemming closed-vocabulary
-    design (typed honestly in §3's limitation; benign-safe, pinned in
-    `tests/test_v07_redteam_repairs.py`).
+1. **No OS-level sandbox.** No VM, job object, or AppContainer isolation; a
+   sufficiently wrong action can still affect the machine between the policy
+   check and the input.
+2. **Coordinate safety rests on measured coordinate-space verification**,
+   including the fail-closed `dpi_estimated` path.
+3. **Text-level verification needs text data**: `text_predicate` is opt-in and
+   inert without OCR regions; the UIA read covers control text where the box
+   exposes it.
+4. **Single-monitor e2e only.** The live-desktop suite passed on a
+   single-monitor reference box; multi-monitor logic is covered by unit tests
+   with fake monitor sets.
+5. **Risk classification is heuristic** (regex + context, English + limited
+   Arabic); novel phrasings may under-classify. Compensations listed in §3.
+6. **CRITICAL authorization is not operator-wired** — always blocked, never
+   approvable.
+7. **Model-judge quality is external**; deterministic strategies always run
+   first; a judge's `uncertain` is passed through, never upgraded.
+8. **Pixel-diff blind spots below both counters** (sub-threshold, low-contrast,
+   sparse changes) stay `uncertain` — never a false success. Fine-grained
+   application-internal state is best verified with application-state
+   strategies (injectable via the documented protocol).
+9. **No pixel-level screenshot secret detection** (text patterns + explicit
+   region blur only).
+10. **In-process stop only** (§6 residual note).
+11. **Provider key handling assumes a local operator** (process environment).
+12. **Explicit observe calls are unthrottled** (§8).
+13. **Windows foregrounding is best-effort.** `SetForegroundWindow` can be
+    refused; `focus_window` detects the refusal and fails with a typed
+    `WindowFocusError`; the previously-focused window is NOT restored on a
+    refusal — the host re-observes and re-decides. Deterministic verification
+    means a refused focus can never be reported `verified`.
+14. **Type-integrity degradation**: controls that cannot expose a readable
+    value degrade to honest `unverified` and never double-apply; a confirmed
+    still-wrong buffer fails with `TextIntegrityError`. The one-off OS
+    input-stack wedge class is bounded by the pacing knobs
+    (`CORTEX_FOCUS_SETTLE_SECONDS`, `CORTEX_KEY_DISPATCH_GAP`) and surfaces as
+    a typed failure, never a silent partial dispatch.
+15. **Accepted red-team trade classes (bounded, named, test-pinned)**:
+    Cyrillic/mixed-script homoglyphs (fail-open; needs TR39-class mapping);
+    seedless commit-key adoption of the next titled window (fail-open,
+    adjudicated — allowlists still gate dispatch, the bound is one action);
+    the `sk_live_`/`rk_live_`/`pk_live_` stripe family matches no pattern yet
+    (adding it is additive); pure-lowercase ≤ 10 copula values treated as
+    prose (fail-open boundary, digits/capitals/symbols defeat it); capitalized
+    +digit tokens are secret-shaped (fail-closed by ruling — some prose
+    over-blocks); decorated prose near marker vocabulary hard-blocks
+    (over-block by design); narrative past tense with a class noun flags;
+    the fusion end-boundary omission (INFO; the delete view covers every
+    whole-token reading). Outside-vocabulary imperatives and typo'd verbs
+    remain unflagged by the no-stemming closed-vocabulary design. The
+    adversarial cycle that adjudicated these is recorded in
+    [history/RED-TEAM-v0.7.0.md](history/RED-TEAM-v0.7.0.md).
+16. **Clipboard abort path**: when an abort (failsafe, stop token, blocked
+    input) lands between the clipboard set and the paste chord, the prior text
+    is restored (best effort) but a destroyed non-text payload is not disclosed
+    and a failed restore is not annotated. Recorded in VERSIONS.md; fixing it
+    needs an annotation channel on the abort path.
 
-## 11. Long-running sessions: checkpoint/resume surface (same fail-closed doctrine)
+## 11. Interference Guard
 
-**(v0.6.0 internals-removal wave): of the orchestration layer described here, the
-LIVE surface is the sealed checkpoint/resume machinery (§11.3) and resume
-re-verification (§11.4) — plus allowlist re-checks on resume (§11.7, resume half).
-The approval epochs (§11.1), the unattended modifier (§11.2), dependency enforcement
-(§11.5), the health checks (§11.8), and the session-ceiling trip points (§11.6
-enforcement half) were REMOVED with the internal loop; their subsections are kept as
-historical records of the removed machinery.** The doctrine is unchanged: whatever
-remains executes nothing itself, and every failure path stops fail-closed. The
-session-budget family of `limits` fields stays accepted and validated on the wire and
-is documented as RESERVED — not enforced on the direct five-tool path since the
-internal loop's removal (the sealed-overshoot budget gate on resume remains live).
-
-### 11.1 Approval epochs — REMOVED (historical record; `approval.py` deleted in v0.6.0)
-
-The live approval semantics are §5 (per-call `approved=True` + `safety.py
-requires_approval`). Historical design, for the record:
-
-Every approval in a long-running session lives inside an approval epoch that expires on
-TWO independent axes — wall-clock age (`approval_epoch_seconds`, default 1800 s = 30
-minutes, clamp 60..86400) and the count of interactive actions
-(`approval_epoch_actions`, default 50, clamp 1..1000) — whichever comes first
-(inclusive boundaries).
-
-- **`require_approval=false` is not an unlimited pass.** It is modeled as a full-scope
-  epoch: the standing grant covers interactive actions without the per-action flow, but
-  it STILL expires on both axes and dies on invalidation exactly like any other epoch.
-- **Expiry is fail-closed.** After expiry, every approval-requiring action is refused
-  with `requires_fresh_approval=True` regardless of any per-action approval; a
-  per-action approval can never resurrect a dead epoch. The caller must stop and
-  request fresh approval.
-- **Fresh approval is a NEW epoch**, issued only by an explicit human grant — in the
-  current surface, an MCP call with `approve_next_action=True`. Nothing auto-renews;
-  there is no accumulation of old grants.
-- **Material change invalidates immediately** (typed reasons): application/process
-  changed, risk escalated, goal changed, policy changed, expected environment changed.
-  A health check that turns UNSAFE also invalidates the epoch (the environment changed
-  materially) before stopping execution.
-
-### 11.2 Prolonged unattended execution (raise-only) — REMOVED (historical record)
-
-Once a session has run without human interaction for at least one hour
-(`PROLONGED_UNATTENDED_SECONDS = 3600`, inclusive boundary), a pure runtime policy
-modifier activates:
-
-- It can only **raise** protection: `LOW` is treated as `MEDIUM`, `MEDIUM` as `HIGH`,
-  `HIGH` stays `HIGH`, `CRITICAL` stays `CRITICAL`. There is **no fifth RiskLevel** —
-  the enum is untouched — and no risk level is ever lowered for any input.
-- While active, non-routine actions (original risk `MEDIUM` and above) require a fresh
-  approval epoch, and a full-scope standing grant may not START new subtasks: the
-  boundary epoch gate holds execution with an explicit `unattended_hold` reason.
-- The only clear path is an explicit human approval call (`approve_next_action=True`),
-  which issues a fresh epoch and restarts the unattended clock. The modifier is
-  consulted at every orchestration boundary.
-
-### 11.3 Checkpoint redaction and integrity seal
-
-- Every string **value** in the checkpoint payload passes `redact_text`; if any value
-  still trips `contains_secret` after redaction, the write is **refused**
-  (`CheckpointRedactionError`) — fail-closed, before any filesystem mutation. The gate
-  runs per value rather than on the serialized JSON, so an inert
-  `[REDACTED:*]` placeholder does not falsely trip while any surviving secret-bearing
-  value blocks the write.
-- Checkpoints therefore store **no secrets**: identity fields carry session ids only;
-  screenshot payloads are never persisted (a persisted result carrying
-  `screenshot_after_base64` is rejected at validation); error text is redacted and
-  bounded; the serialized file is capped at 8 MB.
-
-**Integrity seal (tamper-evidence).** Every checkpoint is sealed with HMAC-SHA256 over a
-canonical serialization of the tamper-sensitive fields — session id, continuation chain
-(`continuation_of`), goal, current subtask id, budget counters, limits, and the subtask
-states — keyed by a per-installation random key stored at
-`<checkpoint-base>/.integrity_key` (created exclusively on first write, `O_CREAT|O_EXCL`,
-mode 0600 where the OS honors it; never inside a session directory, never logged).
-
-- **Load verifies the seal BEFORE anything restores**: a tampered or unsigned checkpoint
-  raises `CheckpointValidationError` (MCP surface: `invalid_checkpoint`) and is never
-  deleted, repaired, or partially loaded.
-- **Key loss is fail-closed, never a re-key**: a missing or replaced key file refuses
-  the load — the load path NEVER recreates the key, so a checkpoint that can no longer
-  be authenticated is refused instead of silently accepted.
-- **Deterministic ceiling cross-checks** (defense in depth behind the seal): at load,
-  `budget.subtasks ≤ limits.max_subtasks` and `budget.steps ≤ limits.max_session_steps`
-  must hold against the checkpoint's own ceilings — counter forgeries past them are
-  refused even when sealed.
-- **Honest threat model**: the seal defends the checkpoint FILE against out-of-band
-  tampering (e.g., zeroing budget counters to refill a session budget on resume). A
-  same-user/full-disk attacker who can also read or replace the key file can re-seal
-  forged state and is OUT OF SCOPE — the OS user boundary, not this mechanism, is the
-  control for that adversary. Checkpoints written before the seal existed are refused
-  by design (fail-closed).
-
-### 11.4 Resume safety
-
-`start_session(resume_from_checkpoint=…)` resumes a session as a continuation only
-after every gate below passes; any failure is a typed refusal (`invalid_checkpoint` /
-`resume_refused`) and the freshly created session is discarded — nothing partially
-restores.
-
-- **Schema/version/integrity validation**: unknown or newer schema versions are
-  rejected; structural, type, and self-consistency checks run on load (counters numeric,
-  limits **canonical** — exactly the current clamping mechanism's output, subtask graph
-  valid with no self/unknown dependencies or cycles, current subtask present in the
-  graph, bounded sizes, no screenshot payloads). A corrupt checkpoint is never deleted,
-  repaired, or partially loaded.
-- **No counter reset**: restored counters are SET to checkpoint values and are
-  monotonic (a counter already higher is never lowered); the elapsed-time anchor is
-  re-based so wall-clock gaps cannot refill the duration budget. The bundle verifies
-  restored counters EQUAL the checkpoint values before continuing.
-- **No limit enlargement**: the resumed session runs under the checkpoint's own
-  (re-clamped) limits, adopted by the enforcer and executor; canonical equality is
-  enforced at load, refusing any checkpoint whose limits the clamp would change.
-- **Environment re-verification**: the checkpoint records the expected foreground
-  process/window and the allowlists; the CURRENT environment is re-read from a real
-  backend observation and compared (casefold) before continuation. Missing current
-  identity is a mismatch, never a pass; a mismatch raises a typed refusal.
-- **Approval is never resurrected**: no approval state has any restore path — on the
-  five-tool surface every call carries its own per-call `approved` authorization, so a
-  resumed session starts with NOTHING granted.
-
-### 11.5 Dependency enforcement — REMOVED (historical record)
-
-The subtask start/fail/blocked transition machinery died with the loop; the restored
-graph is validated fail-closed at resume (`SubtaskManager.restore` refuses
-unknown/self dependencies and cycles), but nothing executes it. Historical design:
-
-- A subtask cannot start until **all** of its dependencies are `completed`:
-  `SubtaskManager.start` re-checks and raises with the unmet dependency ids (MCP surface:
-  `subtask_not_ready` + `unmet_dependencies`); the orchestrator selects work only from
-  the ready set (pending with all dependencies completed), in deterministic creation
-  order.
-- A failed subtask moves its transitive dependents (`pending`/`paused`) to `blocked`
-  automatically. A terminal-failed prerequisite can never complete, so that branch is
-  permanently unrunnable — requeueing cannot revive it. When only dead work remains and
-  the bounded replan (at most 3 planner consultations per session, replacement work
-  never depending on dead ids, deterministically validated) cannot replace it, the
-  session terminates `UNRECOVERABLE` — it never continues when correctness is unknown.
-
-### 11.6 Resource ceilings
-
-**RESERVED, NOT ENFORCED (v0.6.0 internals-removal wave): the session-ceiling fields
-below are still accepted and validated (clamped exactly as before, persisted in
-checkpoints, re-clamped on resume) but their enforcement trip points died with the
-removed loop.** The live remainder: the sealed-overshoot gate — a SEALED checkpoint
-whose inflated counters pass load still fails closed with the typed
-`SessionBudgetExceeded` at the budget seam when anything tries to consume work
-(pinned in tests/test_checkpoint_integrity.py) — and the loop-free per-task limits
-(screenshot rate, action budget) that still gate the direct path (§8).
-
-Historical enforcement design:
-
-- All existing per-task limits still gated every run unchanged; the long-running layer
-  added shared session ceilings — duration (default 4 h, max configurable 24 h), 2000
-  actions, 500 model calls, 500 steps, 50 subtasks — enforced at every subtask start and
-  orchestration boundary. Exhaustion raised a typed `SessionBudgetExceeded` (a
-  `LimitExceeded` subclass) → the existing audited, fail-closed termination.
-- Counters are **shared and monotonic**: each subtask consumes from its own fresh
-  per-task scope AND mirrors its consumption onto the session tracker, which only ever
-  grows — no subtask can reset, shrink, or refill a session counter. A run's step budget
-  is additionally capped to the REMAINING session steps, so one subtask cannot overspend
-  the shared budget.
-- Ceilings survive resume: counters are restored from the checkpoint (never zeroed or
-  refilled) and limits are the checkpoint's own re-clamped limits (never enlarged).
-- **Dry-run counter semantics (per-phase attribution)**: a completed DRY-RUN subtask
-  records `model_calls ≥ 1` but `steps == 0` and `actions == 0` — the executor's
-  dry-run short-circuit returns a stub result BEFORE `record_action()`/`step_count += 1`,
-  while every decision still consumes a model call. This is per-phase attribution, not
-  an overspend (nothing executed, so there is nothing to count); the run-state step cap
-  (`max_steps` capped to the remaining session steps) still bounds loop iterations.
-
-### 11.7 Allowlist enforcement
-
-- **No new path bypasses the existing validator.** The orchestrator performs no input
-  itself; every action of every subtask flows through the same grounding, staleness
-  validation, process/window allowlist checks (§9), risk classification, approval, and
-  verification as a direct call.
-- **`focus_window` process-binding is preserved**: a target window is resolved and
-  checked against BOTH allowlists before any foregrounding call, exactly as before;
-  the backend never runs on a disallowed target.
-- **Resume re-checks allowlists**: the checkpoint records the session's
-  `allowed_processes`/`allowed_windows`, and the current foreground process/window must
-  satisfy them before continuation (missing current identity = refusal). The resume-side
-  matcher is deliberately conservative (case-insensitive exact or trailing-`*` prefix)
-  and is a re-verification hook only — the live executor keeps its own stricter
-  machinery unchanged.
-
-### 11.8 Health checks — REMOVED (historical record; `health.py` deleted in v0.6.0)
-
-- **Boundary-evaluated only**: no background thread, no scheduler, not a second
-  execution loop. A check runs at an orchestration boundary only when one is due
-  (default every 600 s, clamp 60..3600); the world is read exclusively through injected
-  probes bound to the real session backend, and probe failure is fail-closed data
-  (worst-case reading). A monitor without bound probes can never report `healthy`.
-- **Verdicts are routing data, never actions**: `healthy` → continue; `degraded` → one
-  bounded re-evaluation, then pause; `UNSAFE` (unexpected foreground application, or its
-  identity unavailable) → the approval epoch is invalidated and execution stops
-  (`blocked_safety` termination). The monitor holds no action executor and **never
-  auto-executes** unsafe actions; window-title drift, stale observations, or hung
-  indicators degrade rather than pass.
-
-### 11.9 Fail-closed behavior summary for the new surface
-
-| Condition | Behavior | Where |
-|---|---|---|
-| Approval epoch dead (time / actions / invalidated) — REMOVED | (historical) refused every approval-requiring action with `requires_fresh_approval=True` | `approval.authorize_action` (deleted) |
-| ≥ 1 h unattended + full-scope grant — REMOVED | (historical) new subtasks blocked (`unattended_hold`) until a fresh explicit approval epoch | `long_running._epoch_gate` (removed) |
-| Checkpoint value still secret-like after redaction | write REFUSED before any disk touch; previous checkpoint intact | `checkpoint_manager._serialize` |
-| Corrupt / wrong-version / non-canonical-limits checkpoint | typed `CheckpointValidationError`; never loaded, repaired, or deleted | `checkpoint_manager.load` |
-| Checkpoint seal missing/malformed/mismatching, or integrity key missing/replaced | typed `CheckpointValidationError` → `invalid_checkpoint`; refused before any restore; file intact | `checkpoint_manager.load` |
-| Resume environment mismatch or missing current identity | typed `resume_refused`; new session discarded; nothing restored | `resume_manager.prepare`, `server.start_session` |
-| Subtask with unmet dependencies — REMOVED | (historical) `subtask_not_ready` (+ unmet list); never started | `subtask_manager.start` (removed) |
-| Dead dependency branch, replan exhausted — REMOVED | (historical) `UNRECOVERABLE` termination — no continuation with unknown correctness | `long_running.run_pending_subtasks` (removed) |
-| Sealed checkpoint with inflated counters | restored EXACT, then typed `SessionBudgetExceeded` at the budget seam when work is attempted (live fail-closed gate) | `limits.SessionBudgetTracker` |
-| Session budget trip points (duration/actions/model calls/steps/subtasks) — RESERVED, NOT ENFORCED | (loop-era enforcement removed with the loop; fields still accepted + validated, see §11.6) | `limits.SessionBudgetTracker` |
-| Health check UNSAFE — REMOVED | (historical) epoch invalidated + run stops (`blocked_safety`); never auto-executes | `long_running._boundary_health` (removed) |
-| Planner unavailable or plan rejected — REMOVED | (historical) typed `planner_unavailable` / `plan_rejected` (+ codes); nothing created | `long_running.plan_from_llm` (removed) |
-
-
-### 11.10 Interference Guard (T8): protection upgrades, same doctrine
-
-The Interference Guard only ADDS fail-closed behavior; no existing gate, allowlist,
-approval, or limit is weakened and no new bypass exists:
+The Interference Guard only ADDS fail-closed behavior; no existing gate,
+allowlist, approval, or limit is weakened and no new bypass exists.
 
 | Concern | Behavior |
 |---|---|
-| Foreign foreground at dispatch | REJECTION (`FOCUS_TAKEN_BY`) — the guard cannot click, type, or focus the foreign window; `refocus_then_abort` reuses the verified foreground switch aimed ONLY at the bound title; `observe_only` merely annotates |
-| Foreign process at dispatch | unchanged P0-G allowlist rejection (the guard runs in addition, never instead) |
-| Bound window closed | `TARGET_GONE` + binding cleared (default) — no infinite reject loop against a dead identity; driver doctrine: ensure_app before any launch |
-| Modal dialog after an action | reported with its control list; queued batches HALT (`modal_dialog`); auto-handling ships DISABLED (`auto_handle=[]`) and, when a host explicitly configures it, resolves only the exact configured identity with an audit event per resolution |
-| Keyboard focus outside the target | `FOCUS_DRIFTED` rejection before dispatch; mid-type drift aborts the in-flight type (no text into foreign fields); terminal keys are never auto-resent (double-submit risk) |
-| Stuck modifiers before a chord | `STUCK_MODIFIER` rejection; opt-in `release` mode touches ONLY modifiers this session dispatched (a foreign modifier is never released) |
-| ensure_app launches | server-side launch requires the `attach_or_launch.launch="server"` policy (the DEFAULT; `CORTEX_ATTACH_OR_LAUNCH=driver` or `launch="driver"` restores never-launch) AND the process-allowlist gate — an allowlisted `ensure_app` target IS server-launched by default when no instance matches |
-| Launch target not on PATH | the authorized launch resolves the needle in a fixed order — `CORTEX_LAUNCH_PATHS` mapped path FIRST (v0.7.1), then `PATH` (`shutil.which`), then the Microsoft Store execution alias, then the raw-name spawn — so GUI apps installed under `C:\Program Files\...` launch through the mapping instead of silently spawning nothing; the mapping is LOCAL TRUSTED CONFIGURATION (host `env` block), its needle side passes the same charset gate as the launch itself, and its path side must exist as a FILE |
-| Launch outcome honesty | an authorized (`launch=server`) `NO_INSTANCE` is never silent (v0.7.1): the payload carries exactly one launch status — `launched=<exe>` (a process was REALLY spawned, named by its actual basename), `launch_rejected=LaunchTargetError` (charset-invalid needle, nothing spawned), `launch_unresolved=path-lookup-missed` (valid needle, every resolution step missed — the former silent degrade), or `launch_unresolved=spawn-failed (<Error>: <bounded message>)` (resolved but the OS refused the spawn). `launch=driver` payloads carry no launch status and never spawn. The suffixes add no driver-controlled injection surface: `path-lookup-missed` is fully static text, and `spawn-failed` carries bounded OS-error text (which may echo the LOCAL operator-configured spawn target — never the driver-supplied needle) |
-| Malformed launch mapping | a malformed `CORTEX_LAUNCH_PATHS` entry (missing `=`, charset-invalid needle, path that is not an existing file, including a directory) is skipped fail-safe: never fatal, and nothing is ever spawned FROM a malformed entry |
-| Policy parsing | fail-closed (`invalid_interference` on unknown/invalid fields) — a malformed policy can never silently disable protection |
+| Foreign foreground at dispatch | REJECTION (`FOCUS_TAKEN_BY`); `refocus_then_abort` reuses the verified foreground switch aimed only at the bound title; `observe_only` annotates |
+| Bound window closed | `TARGET_GONE` + binding cleared (default) — no infinite reject loop against a dead identity |
+| Modal dialog after an action | reported with its control list; queued batches HALT (`modal_dialog`); auto-handling ships DISABLED and resolves only the exact configured identity with an audit event per resolution |
+| Keyboard focus outside the target | `FOCUS_DRIFTED` rejection before dispatch; mid-type drift aborts the in-flight type (carrying `partial_delivery`); terminal keys are never auto-resent (double-submit risk) |
+| Stuck modifiers before a chord | `STUCK_MODIFIER` rejection; opt-in `release` touches ONLY modifiers this session dispatched |
+| ensure_app launches | server-side launch requires the `launch="server"` policy (the DEFAULT) — the allowlist restricts ONLY when one is configured (see §9 launch truth); `CORTEX_ATTACH_OR_LAUNCH=driver` or `launch="driver"` restores never-launch |
+| Launch outcome honesty | the payload carries exactly one typed outcome (`launched` / `launch_rejected` / `launch_unresolved=path-lookup-missed` / `launch_unresolved=spawn-failed (<error>)`); `launch=driver` payloads carry no launch status and never spawn |
+| Malformed launch mapping | skipped fail-safe: never fatal, nothing spawned FROM a malformed entry |
+| Policy parsing | fail-closed (`invalid_interference`) — a malformed policy can never silently disable protection |
 
-New pacing policies are protection, not performance tuning: `CORTEX_KEY_DISPATCH_GAP`
-(default 0.05 s) paces terminal-key chords and `CORTEX_FOCUS_SETTLE_SECONDS`
-(default 0.3 s) paces keyboard input behind a recent window activation — both reduce
-dropped/misdelivered-input windows (B3/B5/B8); both accept `0` to disable.
-
-### 11.11 Launch-act / re-anchor policy (R-22, v0.7.0 — `focus_guard.py`)
-
-R-20's adoption lattice is unchanged — a verified action's foreground is adopted as
-the new anchor only when it is a session surface (hwnd membership), a same-pid
-descendant, or an owner-chained dialog of one; everything else is refused with the
-named `REANCHOR_REFUSED` payload, anchor kept. v0.7.0 tightens the ONE remaining
-path (the keyboard launch act), whose pre-v0.7.0 form armed on ANY keypress into a
-launcher-looking anchor regardless of key or outcome:
-
-- **Commit-key-only arming, AFTER the gates (D-1).** The launch-act marker arms
-  only for a chord carrying the launcher-commit key family (`enter`/`return`/
-  `numpadenter` — the Win+R doctrine's act) dispatched into a launcher/dialog
-  anchor (`#32770` class or a configured transient launcher process), and the
-  arming decision runs after the pre-dispatch gates: a REJECTED chord
-  (`FOCUS_TAKEN_BY` / `STUCK_MODIFIER` / `FOCUS_DRIFTED`) never dispatches and is
-  never a launch act. Letters, arrows, modifier-only hotkeys, and enter-free chords
-  never arm.
-- **Seed↔outcome correlation (D-2).** A TYPE dispatched into the launcher surface
-  records a bounded casefolded token set of the typed text (the "seed" — path and
-  URL separators split too; tokens below 3 alphanumerics are dropped per the S6
-  repair so degenerate seeds cannot widen correlation, and a fully-short seed is
-  treated as seedless). When a seed exists, a seeded launch act adopts only a
-  candidate whose process name/exe basename or title contains a seed token ("we
-  typed `notepad`, enter; a surface matching `notepad` appeared"); an unrelated
-  surface is refused with `REANCHOR_REFUSED`. A seedless pure commit key keeps the
-  legacy R-20 adoption shape — the adjudicated residual in §10. The seed is cleared
-  when the anchor moves or the marker is consumed; the one-action consumption bound
-  and the intervening-non-keyboard-dispatch break are unchanged.
-- **Dead-anchor path unchanged.** `TARGET_GONE` → (default) unbind-and-report —
-  the guard returns to DORMANT and reattachment happens only by explicit identity
-  (`ensure_app`/`focus_window`), never by adopting an arbitrary successor. R-20's
-  suite stays green unmodified (`tests/test_r20_reanchor_causality.py`, pinned
-  cross-file by `tests/test_r22_launch_act_adoption.py::
-  test_ac22b_r20_reanchor_causality_suite_green_unmodified`).
-
-## 12. v0.7.0 adversarial red-team cycle (record)
-
-After the R-21/R-22/R-23 fixes landed, an independent adversarial review re-attacked
-all three fixed layers (classifier/redaction, normalization, re-anchor state
-machine) in the same classes the v0.6.0 red team had revealed, followed by four
-differential re-verification rounds, each round re-attacking the previous round's
-repairs. Every attack row is an executed in-process probe against the real
-functions; **661+ attack-row instances were executed across the rounds** (initial
-round: 261 new rows + the 65-row historical vector corpus re-run; re-verification
-rounds: 241, 181, and 199 rows including 35 novel attack-surface probes, plus an
-aggregate 377-row prior-round sweep). Full per-row results, repro drivers, and the
-round reports are archived in the maintainer-local mission workspace
-(`evidence/v07-007/redteam/`); they are not part of this repository. Every finding
-was either fixed-and-retested in-mission or dispositioned into §10's residual
-classes. No open HIGH/CRITICAL finding remains.
-
-**Initial round findings (RT-D1-01…08).** Four bypass-class findings against the
-fresh fixes: RT-D1-01 window-overflow (3+ function words defeated the intent
-window); RT-D1-02 (HIGH) nine invisible non-Cf codepoints outside the strip set
-flipped blocked payloads to allowed/LOW on both layers; RT-D1-03 copula-then-colon
-(`password is: X`) defeated the assignment grammar; RT-D1-04 inflected destructive
-verbs stayed unflagged. Three false-positive findings: RT-D1-05 negation ignored,
-RT-D1-06 V1 mention-prose blocked wider than pinned, RT-D1-07 copula arm redacted
-benign prose (checkpoint availability side-effect). RT-D1-08 graded the new-family
-residuals (basic-auth header MEDIUM; stripe/OpenAI/Google/Slack-webhook INFO) and
-confirmed the R-22 joints held (no bypass in the fixed path; seedless-commit-key
-residual boundary extended). Layer-3 perf probing found nothing (no ReDoS; worst
-adversarial 2000-char payload 8.5 ms).
-
-**Repair rounds R1–R5** (commit chain `a36033d` → `fa03828` → `e59f1ea` →
-`c4624da` → `e88cec4` → `d433a5b` → `9069ac2`):
-
-- **R1 (`fa03828`)** — strip set +9 invisible non-Cf splitters (S1), intent-window
-  filler no longer consumes slots (S2), copula-then-colon (S3), bounded verb
-  morphology (S4), copula value floor (S5), seed min-length (S6), mixed-position
-  fusion scan (S7), plus hot-path restoration (gate-first per-view, fused bearer
-  alternation, guard check ordering).
-- **R2 (`e59f1ea` + `c4624da`)** — S5 floor refined to the secret-shape rule
-  (evidence corpus intact, prose rows clean); boundary-faithful fusion (RT2-D1-01
-  — joins span strip-derived gaps only, never a real space); copula-arm decoy-token
-  continuation (RT2-D1-02); accented-prose residual documented (RT2-D1-03).
-- **R3 (`e88cec4`)** — decoy continuation bounded to one prose-token skip
-  (RT3-D1-01); fused-stream phrase windows (RT3-D1-02 — `cm\u200bd\u200bexe`/
-  `re\u200bg\u200bdelete` block at CRITICAL with plain-form parity); secret-run
-  value redaction (RT3-D1-03).
-- **R4 (`d433a5b`)** — shape-sharpened decoy/value classification (prose-shaped =
-  all-lowercase ≤ 10 or Capitalized-form; secret-shaped = everything else
-  len ≥ 6), skip bound raised to two, bridge words covered, evidence pin restored
-  (B01 back to must-catch).
-- **R5 (`9069ac2`)** — bridge-continued secret-run redaction: the maximal
-  secret-shaped run continues across at most two prose-shaped bridge tokens, so
-  the r4 X01–X03 leak rows ("password is ABCDEF and supersecret123") leave no raw
-  survivor in any sink; constraint table extended.
-
-**Re-verification verdicts (rounds r2–r5).** Every round's closures were
-re-verified differential (both-heads execution where applicable), with zero
-unexpected regressions in every round: r2 closed all first-pass findings (241
-row-instances; one NEW fail-closed FP found — RT2-D1-01, fixed by R2/R3); r3
-verified R2's closures real (181 rows) but found the unbounded decoy skip
-(RT3-D1-01, fixed by R3); r4 verified R3's closures (199 rows, 35 novel probes)
-but found the two-decoy dodge (RT4-D1-01, fixed by R4 and confirmed by r5) and the
-bridge-word
-member (RT4-D1-02, closed by R5); r5 verified R4's claims (constraint table 22/22
-strict, B01 differential-proven, Vault2024 ruling pinned) with the aggregate sweep
-showing 368/377 rows no-diff and 9 adjudicated closures, zero unexpected drift —
-its single forced finding (RT5-D1-01, the fail-open X01–X03 bridge class) is the
-one R5 closed. **Final status: all rounds' closures verified, zero unexpected
-regressions across the whole cycle; MISSION-GRADE STABLE is pending the final r6
-re-verification of the R5 commit** (the pre-adjudicated stop rule — any
-raw-secret-persists row forces FINDINGS — was satisfied by closing X01–X03; the
-confirming r6 pass had not run at documentation time). The pinned regression corpus
-for everything above lives in `tests/test_v07_redteam_repairs.py`.
-
-**Performance adjudication (honest).** The user-facing speed gate PASSED at every
-official measurement: end-to-end per-action latency within noise of the `439a043`
-baseline (paired adjacent deltas −3.6%…+1.8% across type/keypress/hotkey proxies),
-full-suite wall time 100.2–101.9 s against the 100.26 s baseline while the suite
-grew by +218 tests (1594 passed + 10 skipped at `9069ac2` vs 1376 + 8 at baseline),
-and captures identical (9 per 3-action flow, zero increase). The STRICT
-pre-registered per-function rule (×1.10 gate) FAILED at the release-candidate
-measurement on 13 of 36 gated functions: the dominant cluster is the dual-view
-obfuscated-input path (`classify.type_obfuscated` ×1.85, `evaluate.type_obfuscated`
-×1.76 — µs-scale absolutes, 20–63 µs), the security-mandated cost of the R2–R4
-fusion-scan repairs; removing the dual-view scan is prohibited (it is what catches
-zero-width obfuscation the baseline missed). The remaining rows are long-text
-redaction scans (×1.12–1.17 on 2 KB inputs) and µs-scale guard rows — all
-invisible at the ~300 ms end-to-end action floor, and disclosed with raw numbers
-in the maintainer-local `perf-release-verdict.md` artifact of the mission
-workspace.
+**Launch-act / re-anchor policy**: the session anchor is adopted only from
+session surfaces (hwnd membership, same-pid descendant, owner-chained dialog);
+everything else is refused with `REANCHOR_REFUSED` (annotation-only, anchor
+kept). The keyboard launch-act marker arms ONLY for a commit-key chord
+(`enter`/`return`/`numpadenter`) into a launcher/dialog anchor and only after
+the pre-dispatch gates pass — a REJECTED chord never dispatches and is never a
+launch act. A TYPE into the launcher records bounded seed tokens; a seeded
+launch act adopts only a candidate whose process/title correlates with the
+seed. A seedless pure commit key keeps the documented adoption shape (the
+adjudicated residual in §10). A dead anchor unbinds via `TARGET_GONE`;
+reattachment happens only by explicit identity (`ensure_app`/`focus_window`).
