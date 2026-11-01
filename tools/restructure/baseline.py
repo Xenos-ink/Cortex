@@ -632,7 +632,9 @@ def stage_wheel(out: Path) -> dict:
     wheel_dir.mkdir(parents=True, exist_ok=True)
     for old in wheel_dir.glob("*.whl"):
         old.unlink()
-    cmd = ["uv", "build", "--wheel", "--out-dir", str(wheel_dir)]
+    # n3: --offline guarantees no network; it requires the build dependencies
+    # to already be in the local uv/build cache (they are, from WP-R0 onward)
+    cmd = ["uv", "build", "--wheel", "--offline", "--out-dir", str(wheel_dir)]
     proc = subprocess.run(cmd, cwd=str(REPO), capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=1200)
     if proc.returncode != 0:
