@@ -142,13 +142,9 @@ def run_transport(
     instance._apply_key_dispatch_gap = lambda keys: None  # type: ignore[method-assign]
 
     saved = (
-        clipboard_module._clipboard_read_text,
         B._clipboard_write_text,
         B._clipboard_read_verdict,
     )
-    # F10: the dead ``_clipboard_read_text`` binding is retargeted to the clipboard
-    # module (its HOME); the patch stays a documented no-op (WP10a deletes it).
-    clipboard_module._clipboard_read_text = clipboard.read_text  # type: ignore[assignment]
     B._clipboard_write_text = clipboard.write_text  # type: ignore[assignment]
     # F3 fix 3.3: production saves through the three-way verdict, so the double does too.
     B._clipboard_read_verdict = clipboard.verdict  # type: ignore[assignment]
@@ -160,7 +156,6 @@ def run_transport(
         raised = exc
     finally:
         (
-            clipboard_module._clipboard_read_text,
             B._clipboard_write_text,
             B._clipboard_read_verdict,
         ) = saved  # type: ignore[assignment]

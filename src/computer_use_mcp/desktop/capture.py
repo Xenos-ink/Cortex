@@ -34,8 +34,7 @@ _DXGI_ACQUIRE_TIMEOUT_MS = 8  # AcquireNextFrame wait when the desktop is idle
 # and compared for staleness — a deterministic raw-pixel key serves both cheaper).
 # CORTEX_TEXT_PNG=1 is the kill-switch: text sessions keep encoding real PNGs.
 TEXT_PNG_ENV = "CORTEX_TEXT_PNG"  # "1" forces PNG payloads even in text sessions
-# R-6 (dxgi): payload-dedupe key over the duplicated frame's packed BGRA bytes.
-_DXGI_PAYLOAD_CACHE: tuple[tuple[int, int], bytes, str] | None = None  # per-backend, see __init__
+
 
 @dataclass(frozen=True)
 class _CaptureContext:

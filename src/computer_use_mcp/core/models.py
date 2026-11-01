@@ -54,8 +54,11 @@ class ActionType(StrEnum):
     HOTKEY = "hotkey"
     FOCUS_WINDOW = "focus_window"
     # T8 mechanism ii (additive sibling of focus_window): attach-or-launch probe.
-    # Target = ``process[|doc-token]``; focuses an EXISTING instance and never spawns
-    # one by default (REATTACHED / AMBIGUOUS_INSTANCE / NO_INSTANCE payloads).
+    # Target = ``process[|doc-token]``; focuses an EXISTING instance (REATTACHED /
+    # AMBIGUOUS_INSTANCE / NO_INSTANCE payloads). Spawning is decided by the
+    # pipeline's launch policy: launch="server" (the default) may spawn — restricted
+    # to allowlisted targets only when an allowlist is configured;
+    # CORTEX_ATTACH_OR_LAUNCH=driver restores never-launch.
     ENSURE_APP = "ensure_app"
 
 

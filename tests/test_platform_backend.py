@@ -5,8 +5,9 @@ Two layers are covered:
   monitor sets at 100/125/150% DPI, window moves/focus swaps, coordinate transforms
   (including negative-origin secondary monitors), stop-token interrupts.
 - ``LocalComputerBackend`` + module Win32 helpers — window/process identity via mocked
-  user32/kernel32 (no real app needed), per-monitor DPI fallback paths, and read-only
-  real-desktop smoke tests on this box (Windows only).
+  user32/kernel32 (no real app needed), per-monitor DPI fallback paths; every offline
+  node is hermetic: the former real-desktop smoke nodes are LIVE_DESKTOP-gated with
+  stubbed-seam offline twins carrying the same shape assertions (WP10a delta).
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from computer_use_mcp.desktop.motion import interruptible_wait
 from computer_use_mcp.desktop.windows import enumerate_monitors, query_foreground_window
 from computer_use_mcp.core.models import GroundedAction, MonitorInfo, Observation, WindowInfo
 from computer_use_mcp.core.state import StopToken, TaskStopped
+from desktop_tripwire import LIVE_DESKTOP
 
 if backend_module.IS_WINDOWS:
     import ctypes.wintypes
@@ -617,11 +619,16 @@ def test_real_backend_find_window_by_title_populates_identity(
     assert real_backend.find_window_by_title("Ghost Window") is None
 
 
-# --- real-desktop read-only smoke (this box: 1920x1080 @ 125%) -------------------------------
+# --- observation completeness: LIVE confirmation + stubbed-seam offline twins -----------------
 
 
 @WINDOWS_ONLY
+@LIVE_DESKTOP
 def test_real_observe_populates_full_observation(real_backend: LocalComputerBackend) -> None:
+    """LIVE confirmation on the 125% reference box: a real observe() populates a
+    complete observation. The ``dpi_scale_x == 1.25`` bound makes this a THIS-BOX
+    pin, so it runs only under the shared LIVE_DESKTOP gate; the offline twin below
+    drives observe() through the SAME shape assertions with the DPI from the stub."""
     observation = real_backend.observe()
     assert observation.observation_id
     assert observation.timestamp.tzinfo is not None
@@ -642,8 +649,66 @@ def test_real_observe_populates_full_observation(real_backend: LocalComputerBack
     assert observation.redactions_applied is False
 
 
+def test_observe_populates_full_observation_through_stubbed_seams(
+    real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Offline twin of the live observation pin: the SAME shape assertions, with the
+    capture/monitor/DPI/window seams stubbed at what ``observe()`` actually reads —
+    the module-level ``get_cursor_position`` / ``query_foreground_window`` and the
+    instance methods ``_refresh_monitors`` / ``_grab_png`` / ``_uia_semantic_fields``.
+    No real capture, no real foreground-window read."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    stub_monitor = MonitorInfo(
+        id="m", index=0, bounds=(0, 0, 1920, 1080), is_primary=True, dpi_scale_x=1.25, dpi_scale_y=1.25
+    )
+    stub_window = WindowInfo(
+        hwnd=4242,
+        pid=1000,
+        process_name="stub.exe",
+        title="Stub Foreground",
+        bounds=(0, 0, 800, 600),
+    )
+    buffer = io.BytesIO()
+    Image.new("RGB", (1920, 1080), (255, 255, 255)).save(buffer, format="PNG")
+    payload = base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    monkeypatch.setattr(real_backend, "_refresh_monitors", lambda: None)
+    monkeypatch.setattr(real_backend, "_monitors", [stub_monitor])
+    monkeypatch.setattr(real_backend, "_grab_png", lambda left, top, width, height: (payload, 1920, 1080, None))
+    monkeypatch.setattr(real_backend, "_uia_semantic_fields", lambda monitor, verdict: ([], [], 0))
+    monkeypatch.setattr(backend_module, "get_cursor_position", lambda: (100, 100))
+    monkeypatch.setattr(backend_module, "query_foreground_window", lambda: stub_window)
+
+    observation = real_backend.observe()
+    assert observation.observation_id
+    assert observation.timestamp.tzinfo is not None
+    assert observation.width > 0 and observation.height > 0
+    assert observation.monitor is not None
+    assert observation.monitor.bounds[2] > 0
+    assert (observation.width, observation.height) == (
+        observation.monitor.bounds[2],
+        observation.monitor.bounds[3],
+    )
+    # 1920x1080 captured at the stubbed monitor's 1920x1080 bounds: verified passthrough.
+    assert observation.coordinate_space is CoordinateSpace.VERIFIED_PASSTHROUGH
+    assert observation.monitor.dpi_scale_x == pytest.approx(1.25)  # DPI from the stub
+    assert observation.active_window_info is not None
+    assert observation.active_window_info.pid == 1000
+    assert observation.active_window_info.process_name == "stub.exe"
+    assert observation.active_window_info.bounds == (0, 0, 800, 600)
+    # cursor (100, 100) physical maps 1:1 through the passthrough transform.
+    assert (observation.cursor_x, observation.cursor_y) == (100, 100)
+    assert observation.redactions_applied is False
+
+
 @WINDOWS_ONLY
+@LIVE_DESKTOP
 def test_real_enumerate_monitors_lists_this_box(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LIVE confirmation: the real box lists at least one well-formed monitor."""
     import mss
 
     with mss.MSS() as capture:
@@ -655,6 +720,30 @@ def test_real_enumerate_monitors_lists_this_box(monkeypatch: pytest.MonkeyPatch)
         _left, _top, width, height = monitor.bounds
         assert width > 0 and height > 0
         assert monitor.dpi_scale_x >= 1.0
+
+
+def test_enumerate_monitors_mss_fallback_lists_a_well_formed_stub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Offline twin: the SAME shape assertions over the mss-list FALLBACK path —
+    the EnumDisplayMonitors seam is stubbed empty, so ``enumerate_monitors``
+    consumes the supplied stub list exactly as it would mss's real one (index 0
+    skipped as the virtual-desktop union, DPI estimated from the system)."""
+    mss_monitors = [
+        {"left": 0, "top": 0, "width": 3840, "height": 1080},  # virtual-desktop union (skipped)
+        {"left": 0, "top": 0, "width": 1920, "height": 1080},
+    ]
+    monkeypatch.setattr(
+        windows_module, "_monitors_via_enum_display_monitors", lambda per_monitor_dpi: ([], False)
+    )
+    monitors, dpi_estimated = enumerate_monitors(mss_monitors)
+    assert len(monitors) >= 1
+    assert any(monitor.is_primary for monitor in monitors)
+    for monitor in monitors:
+        _left, _top, width, height = monitor.bounds
+        assert width > 0 and height > 0
+        assert monitor.dpi_scale_x >= 1.0
+    assert dpi_estimated is True
 
 
 # --- observation field completeness ----------------------------------------------------------
@@ -710,31 +799,51 @@ def test_coordinate_verdict_dataclass_shape() -> None:
 
 @pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="Real Win32 backend requires Windows.")
 def test_focus_window_on_already_foreground_window_is_idempotent_success(
-    real_backend: LocalComputerBackend,
+    real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """B7: focusing the CURRENT foreground window succeeds as a no-op, never errors."""
-    info = query_foreground_window()
-    if info is None or not (info.title or "").strip():
-        pytest.skip("No foreground window with a title available.")
-    # WP2 environment adaptation (recorded in gates/wp2-notes.md): a live desktop can
-    # carry a foreground title longer than the model's pre-existing 200-char target
-    # bound (observed: a browser tab title), which fails GroundedAction CONSTRUCTION
-    # — a test-setup artifact, not the behavior under test. Build the action from the
-    # declared-bound prefix; find_window_by_title's exact > prefix > substring
-    # precedence still resolves the same window, and the B7 idempotency assertion is
-    # untouched (the model bound itself is unchanged).
+    """B7: focusing the CURRENT foreground window succeeds as a no-op, never errors.
+
+    Hermetic (WP10a): the window identity and the user32 surface are stubbed at the
+    module globals ``_execute_focus_window`` actually reads, so the idempotent branch
+    (``GetForegroundWindow() == hwnd``) is exercised deterministically — no real
+    foreground-window read and no real ``ShowWindow``/``SetForegroundWindow`` call.
+    The B7 assertion is unchanged.
+    """
+    stub = WindowInfo(
+        hwnd=4242,
+        pid=1000,
+        process_name="stub.exe",
+        title="Stub Foreground",
+        bounds=(0, 0, 100, 100),
+    )
+    monkeypatch.setattr(backend_module, "find_window_by_title", lambda target: stub)
+    fake_user32 = SimpleNamespace(
+        IsIconic=lambda hwnd: 0,  # not minimized: the restore arm stays unreachable
+        GetForegroundWindow=lambda: 4242,  # == the stub hwnd: the idempotent no-op arm
+    )
+    monkeypatch.setattr(backend_module, "_user32", fake_user32)
     message = real_backend._execute_focus_window(
-        GroundedAction(action="focus_window", target=info.title[:200], confidence=1.0)
+        GroundedAction(action="focus_window", target=stub.title, confidence=1.0)
     )
     assert message.startswith("Focused window")
 
 
 @pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="Real Win32 backend requires Windows.")
-def test_is_window_alive_reflects_real_windows(real_backend: LocalComputerBackend) -> None:
-    """B6 probe contract: a real hwnd is alive; a bogus hwnd is not."""
-    info = query_foreground_window()
-    if info is None or info.hwnd is None:
-        pytest.skip("No foreground window identity available.")
-    assert real_backend.is_window_alive(int(info.hwnd)) is True
+def test_is_window_alive_reflects_real_windows(
+    real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B6 probe contract: a live hwnd is alive; a bogus hwnd is not.
+
+    Hermetic (WP10a): liveness is decided by a stubbed ``IsWindow`` (the only OS call
+    ``is_window_alive`` makes), so the True/False/None arms are deterministic — no real
+    foreground-window read.
+    """
+
+    def _is_window(handle: Any) -> int:
+        value = getattr(handle, "value", handle)
+        return 1 if int(value or 0) == 4242 else 0
+
+    monkeypatch.setattr(backend_module, "_user32", SimpleNamespace(IsWindow=_is_window))
+    assert real_backend.is_window_alive(4242) is True
     assert real_backend.is_window_alive(0xDEADBEEF) is False
     assert real_backend.is_window_alive(None) is False

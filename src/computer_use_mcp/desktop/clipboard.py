@@ -144,21 +144,6 @@ def _clipboard_read_verdict() -> tuple[str | None, str]:
             pass
 
 
-def _clipboard_read_text() -> str | None:
-    """Best-effort CF_UNICODETEXT read of the CURRENT clipboard; ``None`` on ANY failure.
-
-    Used ONLY for the save half of the clipboard transport's restore discipline: a
-    ``None`` here means "nothing restorable is known" (non-text content, open refused,
-    read failed) and the restore step is skipped silently — a failed SAVE must never
-    fail or even annotate the action.
-
-    D13 / repair 3.3: the transport now calls :func:`_clipboard_read_verdict` instead,
-    which splits the two ``None``s. This function keeps its EXACT contract (and is
-    what every non-transport caller uses) — it is a thin projection of the verdict.
-    """
-    return _clipboard_read_verdict()[0]
-
-
 def _clipboard_write_text(text: str) -> bool:
     """Replace the clipboard with ``text`` as CF_UNICODETEXT; ``True`` on success.
 

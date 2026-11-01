@@ -124,7 +124,10 @@ def test_the_env_restore_knob_is_the_exact_enforced_spelling() -> None:
 
 
 def test_the_vocabulary_states_the_enforced_delta_band() -> None:
-    assert "scroll (delta -20..20)" in ACTION_VOCABULARY
+    # WP10a (F3 fix): the scroll clause gained the sign convention and the cursor
+    # dependence, so the band pin is the new clause prefix — band AND sign together.
+    assert "scroll (delta -20..20; POSITIVE = UP" in ACTION_VOCABULARY
+    assert "CURRENT CURSOR POSITION" in ACTION_VOCABULARY
 
 
 def test_the_skill_states_both_scroll_facts() -> None:

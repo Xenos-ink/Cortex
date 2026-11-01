@@ -1,9 +1,10 @@
 """D·N1 / repair 3.3 — the action SAYS when a non-text clipboard was destroyed.
 
-``_clipboard_read_text`` answers ``None`` for a clipboard holding no ``CF_UNICODETEXT``
-(a copied image, a file drop, RTF-only) AND for a genuinely EMPTY or unreadable
-clipboard.  The transport's write path then calls ``EmptyClipboard()`` and the restore
-is skipped because ``prior is None`` — so the user's copied image is gone,
+``_clipboard_read_verdict`` reports ``non_text`` (with a ``None`` text) for a clipboard
+holding no ``CF_UNICODETEXT``
+(a copied image, a file drop, RTF-only) and ``unknown`` for a genuinely EMPTY or unreadable
+clipboard.  Before the fix the transport's write path called ``EmptyClipboard()`` and the restore
+was skipped because ``prior is None`` — so the user's copied image was gone,
 permanently, with a success-sounding message and no mention of it.  The repro (D13-7)
 read:
 
@@ -25,13 +26,11 @@ from typing import Any
 import pytest
 
 import computer_use_mcp.desktop.backend as backend_module
-import computer_use_mcp.desktop.clipboard as clipboard_module
 from computer_use_mcp.desktop import backend as B
 import computer_use_mcp.desktop.clipboard as clipboard_module
 from computer_use_mcp.desktop.clipboard import (
     CLIPBOARD_RESTORE_DESTROYED,
     CLIPBOARD_RESTORE_FAILED,
-    _clipboard_read_text,
     _clipboard_read_verdict,
 )
 from computer_use_mcp.core.models import ActionType, GroundedAction
@@ -119,13 +118,9 @@ def _run(
     instance._apply_focus_settle = lambda: None  # type: ignore[method-assign]
     instance._apply_key_dispatch_gap = lambda keys: None  # type: ignore[method-assign]
     saved = (
-        clipboard_module._clipboard_read_text,
         B._clipboard_write_text,
         B._clipboard_read_verdict,
     )
-    # F10: the dead ``_clipboard_read_text`` binding is retargeted to the clipboard
-    # module (its HOME); the patch stays a documented no-op (WP10a deletes it).
-    clipboard_module._clipboard_read_text = clipboard.read_text  # type: ignore[assignment]
     B._clipboard_write_text = clipboard.write_text  # type: ignore[assignment]
     B._clipboard_read_verdict = read_verdict or clipboard.verdict  # type: ignore[assignment]
     raised: Exception | None = None
@@ -140,7 +135,6 @@ def _run(
         raised = exc
     finally:
         (
-            clipboard_module._clipboard_read_text,
             B._clipboard_write_text,
             B._clipboard_read_verdict,
         ) = saved  # type: ignore[assignment]
@@ -223,12 +217,6 @@ def test_an_empty_string_is_still_a_restorable_clipboard(monkeypatch: pytest.Mon
     text, reason = _clipboard_read_verdict()
     assert reason == "restorable"
     assert text == ""
-
-
-def test_the_legacy_reader_keeps_its_exact_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``_clipboard_read_text`` still answers ``str | None``; nothing else changes."""
-    _patch_reader(monkeypatch, openable=True, available=False, handle=0, text=None)
-    assert _clipboard_read_text() is None
 
 
 def test_the_annotation_vocabulary_is_disjoint() -> None:

@@ -16,7 +16,7 @@ COLLECTED SITE FORMS (tests/ + benchmarks/, recursive):
   are registered, F1);
 - plain module-attribute assignments ``<cu-module alias>.<name> = ...`` and
   ``<cu-module alias>.<name> op= ...`` (form ``"assign"``, F2 — e.g.
-  ``B._clipboard_read_text = ...``, ``backend_module._user32 = fake``);
+  ``backend_module._user32 = fake``);
 - the string forms ``monkeypatch.setattr("computer_use_mcp.x.name", ...)``;
 - ``mock.patch("computer_use_mcp.x.name")`` / ``mock.patch.object(<module>,
   "name")``, including bare ``patch(...)``/``patch.object(...)`` imported from
@@ -55,10 +55,12 @@ driven-reader proof — it shows the module reads the name somewhere in a body,
 not that THE CODE THE TEST DRIVES reads it. Step 1 carries a per-site
 driven-reader table reviewed by the validator (plan §5).
 
-On the CURRENT tree the scan finds the module-never-reads sites recorded in
+On the CURRENT tree the scan finds ONE module-never-reads site, recorded in
 :data:`EXPECTED_NOOP_PATCH_SITES` (equality-checked — a new site fails, a
-pruned site must be removed from the list), including the dead
-``backend._clipboard_read_text`` binding patches reported to the Commander.
+pruned site must be removed from the list): the e2e harness's reviewed
+``stop_session`` spy, whose reader lives OUTSIDE the patched module. WP10a
+deleted the dead ``_clipboard_read_text`` binding patches together with the
+dead function itself, pruning those sites from the list.
 """
 
 from __future__ import annotations
@@ -726,25 +728,10 @@ EXPECTED_NOOP_PATCH_SITES: dict[tuple[str, str, str, int], str] = {
         "but benchmarks/runner.py calls ``server.stop_session(session_id)`` — an "
         "attribute lookup on the module at call time, so the spy patch IS "
         "effective for the harness run it drives.",
-    ("tests/test_v071_type_via_clipboard.py", "computer_use_mcp.desktop.clipboard", "_clipboard_read_text", 1):
-        "GENUINE SILENT NO-OP (Commander decision, VAL-WP-R2a-0-01/F10): the "
-        "binding is dead in src since the D13/repair-3.3 transport switch to "
-        "_clipboard_read_verdict (def backend.py:1703, zero call sites; "
-        "monkeypatch.setattr at v071:148). Step 1 retargets this patch to "
-        "computer_use_mcp.desktop.clipboard (the defining module — no "
-        "AttributeError, no bare re-export) and KEEPS it listed; WP10a deletes "
-        "the dead function and the patch together.",
-    ("tests/test_v071_type_via_clipboard.py", "computer_use_mcp.desktop.clipboard", "_clipboard_read_text", 6):
-        "GENUINE SILENT NO-OP (same decision; the _bomb_read tripwire never "
-        "arms because nothing reads the binding — v071:420; the "
-        "_bomb_verdict/_bomb_write companions cover the path). Same step-1 "
-        "retarget to desktop.clipboard.",
-    ("tests/test_d13_nontext_clipboard_annotated.py", "computer_use_mcp.desktop.clipboard", "_clipboard_read_text", 0):
-        "GENUINE SILENT NO-OP (F2 exposed this assign-form site): same dead "
-        "binding; same step-1 retarget to desktop.clipboard.",
-    ("tests/test_d13_clipboard_restore_after_settle.py", "computer_use_mcp.desktop.clipboard", "_clipboard_read_text", 0):
-        "GENUINE SILENT NO-OP (F2 exposed this assign-form site): same dead "
-        "binding; same step-1 retarget to desktop.clipboard.",
+    # WP10a: the four ``_clipboard_read_text`` no-op sites (test_v071_type_via_clipboard
+    # x2, test_d13_nontext_clipboard_annotated, test_d13_clipboard_restore_after_settle)
+    # were PRUNED per this list's own rule — the patches and the dead function were
+    # deleted together, so the sites no longer exist to be listed.
 }
 
 

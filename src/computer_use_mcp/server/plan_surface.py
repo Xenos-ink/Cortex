@@ -897,8 +897,9 @@ def _plan_response(
     if outcome.kind != "executed" or "screenshot_after_base64" not in response:
         return response
     if image_mode == "text":
-        # D1: text mode dominates — the attachment and bytes are removed, never the
-        # retained frame or its id (WP5 retention rule).
+        # D1: text mode dominates — the attachment and bytes are removed and NOTHING
+        # is retained for this call (no frame, no image_id: the retention site below
+        # is never reached, matching the skill's retention truth).
         response.pop("screenshot_after_base64", None)
         response["image_delivery"] = "text"
         response[IMAGE_OUTBOUND_SCALE_KEY] = None

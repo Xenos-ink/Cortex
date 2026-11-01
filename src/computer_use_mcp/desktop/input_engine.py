@@ -742,4 +742,8 @@ class SendInputEngine(InputEngine):
         self._send_release(events)
 
     def scroll(self, delta: int) -> None:
+        """Turn the wheel at the CURRENT CURSOR POSITION: POSITIVE = UP, away from
+        you (negative reads further down). The engine injects no pointer motion, so
+        the caller must ``move`` the pointer to the target region first.
+        """
         self._send([_mouse_flag_event(_MOUSEEVENTF_WHEEL, (delta * _WHEEL_DELTA) & 0xFFFFFFFF)])

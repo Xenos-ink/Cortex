@@ -1640,9 +1640,11 @@ class LocalComputerBackend(ComputerBackend):
             return self._execute_focus_window(action)
         elif action.action == "ensure_app":
             # T8 mechanism ii: attach-or-launch probe. Target format
-            # ``process[|doc-token]``; NEVER launches unless the host explicitly
-            # authorized server-side launches (policy + allow_launch) — the default
-            # outcome set is REATTACHED / AMBIGUOUS_INSTANCE / NO_INSTANCE.
+            # ``process[|doc-token]``; launches only when the caller grants
+            # ``allow_launch=True`` — the pipeline grants it under the
+            # launch="server" policy (the default), restricted to allowlisted
+            # targets only when an allowlist is configured. The outcome set without
+            # a launch is REATTACHED / AMBIGUOUS_INSTANCE / NO_INSTANCE.
             target = (action.target or "").strip()
             if not target:
                 raise ValueError("A target is required for ensure_app actions")

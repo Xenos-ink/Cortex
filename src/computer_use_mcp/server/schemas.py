@@ -366,15 +366,18 @@ ACTION_VOCABULARY = (
     "click (x,y required), double_click (x,y), right_click (x,y; opens a context menu), "
     "drag (x,y start + x2,y2 end, both required), "
     "move (x,y), type (text required), keypress (keys=[\"<one key name>\"]), "
-    "hotkey (keys=[2-12 key names], e.g. [\"ctrl\",\"a\"]), scroll (delta -20..20), "
+    "hotkey (keys=[2-12 key names], e.g. [\"ctrl\",\"a\"]), "
+    "scroll (delta -20..20; POSITIVE = UP, away from you — the wheel turns at the "
+    "CURRENT CURSOR POSITION, so move the pointer to the target region first), "
     "wait (delta seconds; this flat action is capped at 10 s and reports "
     "waited_seconds when the cap bites — for a LONG wait use the computer_wait tool, "
     "not a large delta), focus_window (target = window title), "
     "ensure_app (target = \"process\" or \"process|doc-token\"; attaches to an EXISTING "
     "instance — REATTACHED/AMBIGUOUS_INSTANCE/NO_INSTANCE — and may launch the target "
-    "server-side when no instance matches, the target is allowlisted, and the "
-    "launch=\"server\" policy holds (the default; CORTEX_ATTACH_OR_LAUNCH=driver "
-    "restores never-launch)), done. "
+    "server-side when no instance matches and the launch=\"server\" policy holds (the "
+    "default; the process allowlist restricts launches only when one is configured — "
+    "with NO process allowlist any resolvable target may launch; "
+    "CORTEX_ATTACH_OR_LAUNCH=driver restores never-launch)), done. "
     # WP2 (ORVEX-2026-107): the vocabulary must not disagree with the three production
     # guards, which all read "hold_ms is only valid on click/right_click/keypress/
     # hotkey actions" (models.py, backend.py, validator.py). Kept to the enforced

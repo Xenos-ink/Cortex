@@ -93,9 +93,11 @@ async def computer_execute(
     {"action": "type", "text": "..."}. "ensure_app" takes target="process" or
     "process|doc-token" (e.g. "excel|book1") and attaches to an EXISTING instance
     (REATTACHED / AMBIGUOUS_INSTANCE / NO_INSTANCE payloads; with the default
-    launch="server" policy a NO_INSTANCE for an allowlisted target launches the
-    process server-side — launch="driver" or CORTEX_ATTACH_OR_LAUNCH=driver keeps
-    the never-launch behavior).
+    launch="server" policy a NO_INSTANCE launches the process server-side — when a
+    process allowlist is configured only an allowlisted target may launch, and when
+    NO process allowlist is configured any resolvable target may (the pipeline's
+    ``_ensure_app_allow_launch`` gate); launch="driver" or
+    CORTEX_ATTACH_OR_LAUNCH=driver keeps the never-launch behavior).
 
     The hardcoded ``confidence=1.0`` is the client-asserted MODEL confidence; grounding,
     staleness, risk, approval, and verification run independently. ``expected_effect``
@@ -105,13 +107,20 @@ async def computer_execute(
     drag end (both required, screenshot coordinates). ``action="move"`` requires
     ``x``/``y``; ``action="hotkey"`` requires ``keys`` (2-12 key names);
     ``action="focus_window"`` requires ``target`` (a window title).
+    ``action="scroll"`` turns the wheel at the CURRENT CURSOR POSITION with
+    POSITIVE = UP, away from you (negative reads further down) — ``move`` the pointer
+    to the target region first; ``delta`` is bounded -20..20.
 
     Type transport selector (v0.7.1, type actions ONLY): ``via`` chooses HOW text is
     delivered. ``via="sendinput"`` (default; also ``via=null``) is per-character
     ``KEYEVENTF_UNICODE`` injection. ``via="clipboard"`` saves the current clipboard,
     sets ``CF_UNICODETEXT`` with the typed text, dispatches the ctrl+v chord through the
     existing hotkey path, then best-effort restores the previous clipboard content
-    (restore failure is typed-annotated, never fails the action). Use the clipboard
+    (on the executed path a restore failure is typed-annotated
+    ``clipboard_restore=failed`` and never fails the action; on an ABORT between the
+    clipboard set and the chord the prior text is restored when it was readable
+    (best effort) but the annotation is lost
+    with the exception — a known abort-path limitation). Use the clipboard
     transport for OpenGL/console apps that receive chords but drop per-character
     injection (field case: Blender's Python Console). GATE PARITY: the transport never
     bypasses anything — the SAME classification, redaction, and approval decision is
@@ -274,8 +283,8 @@ async def computer_execute(
     Plan replies (unified contract §1.3): every step and terminal reply carries
     ``result`` (step: verified/uncertain/failed/rejected/not_executed; terminal:
     verified/unknown/failed/stopped), ``failure_reason`` (ALWAYS; ``null`` when
-    nothing failed; ONE token of the typed vocabulary — the full B6-B8
-    classification tables land with the WP8 decomposition), ``not_executed`` (the
+    nothing failed; ONE token of the closed vocabulary ``plan.PLAN_FAILURE_REASONS``
+    — the full B6-B8 classification tables), ``not_executed`` (the
     bounded, explicit list of plan work that never ran, each entry carrying the
     reason), and ``evidence_by_backend`` (a DICT: ``captures`` from the session's
     evidence store — real on BOTH backends — plus ``repositions`` the plan's moves

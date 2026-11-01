@@ -12,6 +12,236 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
+## v0.7.6 (2026-11-01, ORVEX-2026-108 — the unified-contract port)
+
+0.7.6 re-implements the release's full feature set under a single unified reply
+contract: one definition of
+`ok` / `result` / `verification` that holds identically for every tool, every
+`follow_up_results` entry, every plan step and terminal reply, and the wait
+family — no compatibility flags, no per-tool variants. The served surface grows
+from six to ten tools; the code is restructured into a layered package
+(`core` / `security` / `desktop` / `vision` / `pipeline` / `planning` / `server`)
+with the public launch paths unchanged. The shipped `cortex-skill` is rewritten
+(core ≤ 250 lines + `references/`) and pinned by truth tests that derive every
+taught value from the code. Full offline suite at release: 3319 passed +
+19 skipped with `-W error::RuntimeWarning` (≈1.9× the v0.7.5 suite's
+1753+11; the live-desktop e2e is the final gate).
+
+### Added
+
+- **Unified reply contract** — every action-bearing reply carries a closed
+  `result` token (`verified` / `uncertain` / `failed` / `rejected` /
+  `not_executed` / `dry_run` / `marker` / `stopped` / `unknown`) and
+  `ok = (result ∈ {verified, marker})`; `verification` blocks name their tier via
+  `verification_method`; plan step/terminal replies always carry `failure_reason`
+  (a closed 16-token vocabulary, `unclassified` fallback) and `not_executed`;
+  rejections carry `reasons` (never an `error` key) and a mid-type focus drift
+  additionally carries `partial_delivery.delivered_chars`.
+- **`hold_ms`** (0..5000 ms) on `click` / `right_click` / `keypress` / `hotkey`
+  queue entries: press, hold, release (hotkeys go down together, release in
+  reverse order); **`duration_ms`** (0..5000 ms, `move` only) for timed motion,
+  and a plan point's `settle_ms` (0..200 ms) is really applied after the point's
+  last item.
+- **The wait family** — the new `computer_wait` tool blocks up to one segment (env
+  `CORTEX_WAIT_SEGMENT_SECONDS`, default 45 s, band 1..55, under the client's
+  60 s tool timeout) and answers `completed` / `running` itself;
+  `computer_wait_status` (new tool) blocks the next segment or peeks with
+  `block=false`; `computer_cancel_wait` cancels. Waits are tool-running time,
+  never idle time; caps 4 per session / 16 process-wide, last 8 tombstones.
+- **Evidence store + `computer_fetch_image`** — the 10th tool; reply-bearing
+  captures are retained (16 frames / 24 MB / 3600 s) and fetchable by `image_id`
+  at the fetch's own disclosed `image_outbound_scale`; fetch is allowed during a
+  plan lease.
+- **Waypoint plans** — `computer_execute` gains trailing optional `plan` /
+  `plan_action` (typed object schema, no anyOf/$ref, no string arm): one
+  waypoint step per call, a plan lease with typed `plan_lease` refusals for the
+  other mid-lease tools (`computer_wait_status` and `computer_fetch_image` stay
+  allowed), per-step `continue`/`stop`/`replace`, retained-prefix disclosure,
+  B6–B8 failure classification, and new `plan_start` / `plan_point` /
+  `plan_complete` / `plan_stopped` audit events.
+- **Session idle timeout** — a session with no tool call for 15 minutes (env
+  `CORTEX_SESSION_IDLE_TIMEOUT_SECONDS`, band 60..86400, `0` disabled,
+  fallback-not-clamp) and nothing in flight is stopped through the stop_session
+  kill path (audited, later calls get `session_stopped` with the inactivity
+  reason); sweeping is lazy (every tool entry + `start_session` before the
+  limit check), so a registry full of forgotten sessions frees itself.
+- **Clipboard honesty (D13)** — the save reads a three-way verdict
+  (`restorable` / `non_text` / `unknown`); the restore moved AFTER the verify
+  settle (a late-reading target pastes the intended text); a destroyed non-text
+  payload (copied image / file drop / RTF) is disclosed as
+  `clipboard_restore=non_text_destroyed`; a truly empty clipboard claims no loss.
+- **Dropped-element accounting (D15)** — semantic reads report their omissions:
+  `region_count + omitted_count` accounts for the whole read, clipped labels
+  carry `text_truncated`, and the reader's own offscreen/unavailable/cap/budget
+  drops are counted (not zeroed).
+- **Input honesty** — `ensure_app` launch failures (`not_found` /
+  `launch_rejected` / `launch_unresolved`) reply `failed`, never `verified`
+  (`ambiguous` is `uncertain`); every executed action emits exactly ONE
+  `verification` audit event carrying the FINAL verdict (markers and ensure_app
+  probes included).
+- **`cortex-skill` rewrite** — core ≤ 250 lines + `references/`
+  (plan-protocol, reply-contract, glossary, examples), accurate triggers, and
+  `tests/test_skill_truth.py` deriving every taught value (bounds, token sets,
+  tool count) from the code at test time.
+
+### Changed
+
+- **`ok` is the closed-token rule everywhere**: `ok = result ∈ {verified,
+  marker}`. `dry_run` replies are now `ok:false` (they dispatch nothing — a
+  deliberate no-op is not a success); `done`/`wait` carry `result:"marker"`
+  with `ok:true` (an acknowledgement, not a screen claim).
+- **A real server-side `ensure_app` launch is prefixed `LAUNCHED`** (was
+  `NO_INSTANCE ... launched=<exe>`); suffix vocabulary unchanged.
+  `AMBIGUOUS_INSTANCE` lists EVERY candidate (was: the unsaved subset only).
+- **One image-scale key**: `image_scale` is deleted; `image_outbound_scale` is
+  the only scale key on every image-bearing reply (the measured applied
+  downscale; `None` for raw pass-through).
+- **Plan honesty**: the terminal reply's `ok = (result == "verified")` —
+  `unknown` and `stopped` are never success, and a verified-but-partial prefix
+  is capped at `unknown`; a plan walk whose last step does not verify itself
+  parks the lease (retry = `replace`).
+- **Plan approval (O-03)** is decided ONCE on the first plan call and INHERITED
+  by every step and by `replace`; `continue` never re-asks; a gated step replies
+  `not_executed` + `requires_approval:true`.
+- **Stated-effect honesty (E-03)**: an action with a stated `expected_effect`
+  that only changed pixels stays `uncertain` (`ok:false`) — the deterministic
+  tiers (window state, process state, UI control text, focus identity) are the
+  verify path; the bounded late-repaint re-capture fires only when a stated
+  effect or a repaint-prone action class makes it plausible.
+- **Type-integrity mismatch veto**: a read-back `integrity=mismatch` demotes a
+  `verified` verdict to `uncertain` (a masked or transformed field may
+  legitimately hold something that differs); only mismatch confirms a drop.
+- **Cursor-reposition settle default 50 → 0 ms** (`CORTEX_MOVE_SETTLE_MS`,
+  band 0..200, fallback-not-clamp): outside plans a move is instant; an
+  operator who wants a settle sets the knob.
+- **Terminal `unknown` plans report nested `plan.status: "unknown"`** (was
+  `"blocked"`); the replace disclosure (`replaced_plan_id` / `replaced_prefix`)
+  rides only the replace call's own reply.
+- **The `session_limit_exceeded` reply now lists the live sessions**
+  (`live_sessions`, most-idle first, with idle/in-flight/age) plus
+  `idle_timeout_seconds`, so an agent that lost its session ids can recover by
+  stopping one.
+- **`package.json` (the `cortex-agent-skill` npm wrapper) version 0.6.0 →
+  0.7.6** — policy: the skill package tracks the server release.
+- **Layered package restructure** (reorganization only): `src/computer_use_mcp/`
+  is now `core/`, `security/`, `desktop/`, `vision/`, `pipeline/`,
+  `planning/`, `server/` with layering enforced by a test. The public launch
+  paths are unchanged (`computer_use_mcp.server:main`, `computer_use_mcp.cli:main`,
+  `python -m computer_use_mcp.server`, `python -m computer_use_mcp.cli`, and the
+  console scripts), but the module entry's logger name changed
+  `__main__` → `computer_use_mcp.server`.
+
+### Fixed
+
+- The `via="clipboard"` type transport's restore raced the queued chord: a
+  target reading the clipboard a few tens of milliseconds after the paste
+  received the OLD text. The restore now runs after the verify settle (a
+  late-reading target pastes the intended text), and a KNOWN non-text payload
+  destroyed by the set is disclosed (`clipboard_restore=non_text_destroyed`)
+  instead of being lost silently. (Present in v0.7.5 through the v0.7.1
+  clipboard transport.)
+
+- Hardened during the port (defects found in this release's own development
+  sources — never shipped in v0.7.5, so no 0.7.5 user could have hit them):
+  - Terminal plan replies could claim `ok:true` while the aggregate verdict
+    was `unknown` — the ok rule is the aggregate's by construction.
+  - A plan point's declared `settle_ms` was stamped as a flag but never
+    carried its millisecond value to the dispatch path — the producer stamps
+    both, and the backend sleeps exactly the declared duration.
+  - Semantic-read drop accounting was overwritten by a dict merge that zeroed
+    the counts a walk had already accumulated (a capped read could report
+    `offscreen: 0`) — the cap/budget split now accumulates.
+  - Audit verdicts could disagree with reply verdicts (drift- or
+    mismatch-demoted actions were audited `verified`; ensure_app probes
+    emitted no verification event at all) — every executed action now records
+    once, after all demotions.
+  - A refused wait could leave an empty per-session registry entry behind
+    (the cap check now precedes the insert).
+
+### Performance
+
+- Per-action: no regression demonstrated by the restructure equivalence run
+  (captures per action ratio exactly 1.0000; the latency metrics were
+  noise-dominated and unresolved, not shown to regress). Start-up import cost
+  ≈ +2% point estimate with a confidence interval that does not exclude ~5%
+  (not statistically established; a one-time cost per server start). Final
+  measured numbers against the +5% hot-path ceiling are the WP11 gate.
+
+### Known limitations
+
+- **Clipboard abort path**: when an abort (failsafe, stop token, blocked input)
+  lands between the clipboard set and the chord, the `finally` restores the
+  prior text but a destroyed non-text payload is NOT disclosed and a failed
+  restore is NOT annotated — the exception propagates and the annotation is
+  lost. Behaviour matches the pre-existing v0.7.1 design; fixing it needs an
+  annotation channel on the abort path (recorded, deliberately not changed in
+  this release).
+
+### Compatibility notes
+
+- **Closed result token set; the ok rule**: every action-bearing execute reply
+  (flat, follow-up item, plan step, terminal, wait family) carries `result`
+  from the closed set and `ok = (result ∈ {verified, marker})`. Consumers that
+  treated `ok:true` on a dry-run reply, or `result != "failed"` as success,
+  must re-read the contract: `dry_run`, `uncertain`, `rejected`,
+  `not_executed`, `stopped` and `unknown` are all `ok:false` now, and
+  `done`/`wait` markers are `ok:true` with `result:"marker"`.
+- **`image_scale` is gone**: the only scale key on any image-bearing reply is
+  `image_outbound_scale`. Readers of v0.7.5's constant-keyed `image_scale`
+  field must switch (the single measured key replaces it; `None` for raw
+  pass-through).
+- **Terminal plan ok rule**: `ok = (result == "verified")`; `unknown` (any
+  abstaining step, or a verified-but-partial prefix) and `stopped` are never
+  success. Plan STEP replies report `uncertain`; the `unknown` token is
+  reserved for the terminal aggregate.
+- **`LAUNCHED` prefix**: a real server-side `ensure_app` spawn message now
+  starts with `LAUNCHED` (was `NO_INSTANCE`); matchers on the leading token
+  must be updated. Launch gating truth: the process allowlist restricts
+  launches ONLY when one is configured — with no allowlist, `launch="server"`
+  (the default) may launch any resolvable target; `CORTEX_ATTACH_OR_LAUNCH=driver`
+  restores never-launch.
+- **Surface 6 → 10 tools**: the new `computer_wait` (blocks in segments under
+  the client's tool timeout), `computer_cancel_wait`, `computer_wait_status`,
+  and `computer_fetch_image` join the surface. A mid-plan lease refuses flat
+  execute / a second plan / wait / cancel / observe / zoom / screenshot with
+  the typed `plan_lease` error; `computer_wait_status` and
+  `computer_fetch_image` stay allowed.
+- **Mismatch veto + stated-effect uncertainty**: a stated-effect action whose
+  only evidence is a pixel change answers `uncertain` (E-03) where some paths
+  previously escalated to the pixel ladder and could answer `verified`; a
+  type-integrity `mismatch` demotes `verified` to `uncertain` instead of
+  reporting success beside a disagreeing read-back.
+- **Settle 50 → 0 ms**: the unconditional post-move settle is gone (default
+  `CORTEX_MOVE_SETTLE_MS=0`, band 0..200, fallback-not-clamp). The clipboard
+  transport's restore runs ~50 ms later (after the verify settle), so the
+  user's clipboard holds the agent's text slightly longer.
+- **Plan approval inheritance (O-03)**: approval is decided on the FIRST plan
+  call; `replace` inherits it and deliberately never reads the replace call's
+  own `approved` parameter — an approved plan can be replaced without
+  re-approval (per-item safety classification still applies to every action).
+- **Session idle timeout + recoverable session-limit reply**: sessions idle
+  > 15 min (configurable, `0` disables) with nothing in flight are stopped
+  automatically; `session_limit_exceeded` replies carry `live_sessions` and
+  `idle_timeout_seconds`; the `session_stopped` message for idle-reaped
+  sessions names the inactivity stop. Agents that poll slowly between calls
+  will find sessions stopped — call more often or raise the knob. A running
+  wait is never reaped; idle counting starts when it ends.
+- **Layered package restructure**: module paths moved (`computer_use_mcp.backend`
+  → `computer_use_mcp.desktop.backend`, `server.py` → the `server/` package,
+  etc.) with NO compatibility re-exports — importers of old paths must update.
+  The public launch paths are unchanged; `python -m computer_use_mcp.server`'s
+  logger name is now `computer_use_mcp.server` (was `__main__`), which matters
+  only to log-config filters keyed on logger names.
+- **Additive disclosure keys**: clipboard `non_text_destroyed` annotation,
+  semantic-read `ocr_dropped` / `text_truncated`, plan audit event types
+  (`plan_start` / `plan_point` / `plan_complete` / `plan_stopped`),
+  `partial_delivery`, `evidence_by_backend`, `ensure_app_outcome` (typed enum),
+  `replaced_plan_id` / `replaced_prefix`. All additive; no pre-existing key was
+  removed except `image_scale` (above).
+- **`package.json` policy**: the `cortex-agent-skill` npm wrapper previously
+  carried its own 0.6.0 version; it now tracks the server release (0.7.6), so
+  the npm version jumps to match and stays aligned going forward.
+
 ## v0.7.5 (2026-09-18, MISSION-CRF-AVR-010 — adaptive visual representations)
 
 The observation family becomes adaptive: per-call `visual_view` (raw/grid) with a

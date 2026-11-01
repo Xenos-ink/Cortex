@@ -1286,6 +1286,9 @@ _PLAN_STOP_REASON_TO_FAILURE_REASON: dict[str, str] = {
 }
 # The complete, closed set the reply surface may report.  A strict consumer can
 # validate against it; ``unclassified`` is the documented escalation fallback.
+# NOT dead code: this closed vocabulary is read by the plan-reply truth tests
+# (test_batch6/7/8) and the cortex-skill truth tests, which derive their taught
+# vocabulary from it.
 PLAN_FAILURE_REASONS = frozenset(
     {
         "verification_failed",
