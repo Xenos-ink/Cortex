@@ -169,12 +169,30 @@ taught value from the code. Full offline suite at release: 3319 passed +
 
 ### Performance
 
-- Per-action: no regression demonstrated by the restructure equivalence run
-  (captures per action ratio exactly 1.0000; the latency metrics were
-  noise-dominated and unresolved, not shown to regress). Start-up import cost
-  ≈ +2% point estimate with a confidence interval that does not exclude ~5%
-  (not statistically established; a one-time cost per server start). Final
-  measured numbers against the +5% hot-path ceiling are the WP11 gate.
+- Measured against v0.7.5 (2ae76b0) with a fresh interleaved same-interpreter
+  A/B on the fake backend (60 rounds/side hot path, 80 import pairs/side;
+  bootstrap 95% CI; gate artifacts `.orvex/mission/artifacts/gates/wp11-*`):
+  - Captures per action 3.0 -> 2.75 (ratio 0.9167) on the scripted
+    effect-less workload (the cause was not isolated in this measurement).
+  - Per-action verification time p50 29.15 -> 10.13 ms (ratio 0.35) on the
+    same workload: 0.7.6 performs less verification work there (fewer
+    verification calls); the screenshot-diff engine itself is unchanged
+    (its stage timings are ≈ 1.0).
+  - Per-action input dispatch +8.3 us p50 (22.4 -> 30.7 us) / +19.7 us p95
+    (59.8 -> 79.4 us), attributed to the two new per-action safety checks
+    (`_validate_action_defense`, `_mark_action_dispatched`; call counts
+    confirmed by profiling, their exact time share not isolated). Accepted by
+    ruling as their cost.
+  - Start-up import: cold 1354 -> 1414 ms (≈ +4.4%, 95% CI +0.6% .. +8.1%:
+    slower, but not shown to exceed +5%), warm 899 -> 941 ms (≈ +4.7%, CI
+    -0.8% .. +10.0%: not established); a one-time cost per server start, not
+    per action. Accepted by ruling.
+  - 17 of 37 measured metrics (hot path plus benchmark stages) straddle the
+    noise floor (CI contains 1.05 with median <= 1.05) and are reported
+    NOISE-UNRESOLVED; one stage "regression" (foreground-window query p95
+    0.0005 -> 0.0006 ms) is a single timer tick on identical code; nothing
+    was tuned. All numbers are on the fake backend — real capture cost, move
+    durations, and OS input latency are not modeled by it.
 
 ### Known limitations
 
