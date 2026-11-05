@@ -103,7 +103,7 @@ typo into a different meaning where the row says "fallback-not-clamp").
 |---|---|---|---|
 | `CORTEX_INPUT_BACKEND` | `sendinput` | `sendinput` \| `pyautogui` | physical-input engine (both honor the same stop/failsafe contract) |
 | `CORTEX_PYAUTOGUI_PAUSE` | 0.0 | seconds ≥ 0 | fallback-engine PAUSE |
-| `CORTEX_TYPE_INTERVAL` | 0.0 | seconds ≥ 0 | per-chunk typing pacing |
+| `CORTEX_TYPE_INTERVAL` | 0.02 | seconds ≥ 0 (`0` = unpaced burst) | per-character typing pacing on the real SendInput path |
 | `CORTEX_DRAG_INTERPOLATE` | on | `0` = off | segmented drag strokes (button always released, incl. mid-stroke stop) |
 | `CORTEX_DRAG_STEP_PAUSE` | 0.001 | seconds ≥ 0 | per-segment drag pacing (the SendInput factory's ~1 ms live default) |
 | `CORTEX_DRAG_STEP_PIXELS` | 8 | int ≥ 1 | drag stroke granularity (the SendInput factory's ~8 px live default) |
@@ -115,6 +115,48 @@ typo into a different meaning where the row says "fallback-not-clamp").
 | `CORTEX_TYPE_VERIFY_CONFIRM_GAP_SECONDS` | 0.04 | seconds ≥ 0 | spacing between quick confirm reads |
 | `CORTEX_TYPE_VERIFY_FAST_MAX_READS` | 4 | clamped 2..8 | quick reads the fast verify path may spend |
 | `CORTEX_TYPE_VERIFY_STABILITY_SECONDS` | 2.5 | seconds ≥ 0 | landing-lag horizon before repair decisions (escalation only) |
+
+Typing pace and integrity ladder (WP12a/WP12b, user ruling 2026-11-02 "pause by
+default + flag corruption"):
+
+- The REAL SendInput path paces typing BY DEFAULT at 0.02 s per character —
+  Windows 11 packaged Notepad (RichEditD2DPT) corrupts/drops fast unicode bursts
+  (live runs 4-7: the RAW one-burst leg truncated the text to `e2e-ty`; the
+  unpaced PRODUCT leg substituted the tail, `brown xxx` for `brown fox`; one
+  diagnostic trial each was exact — 15 ms raw, 20 ms product; the calibration
+  matrix has not run yet). `CORTEX_TYPE_INTERVAL` is
+  read ONCE PER SESSION when the backend is built (not per call) and still
+  overrides the default; `0` restores the old unpaced burst. The default applies
+  to the SendInput engine only — the pyautogui fallback keeps its unpaced
+  default. The standalone engine library default stays 0.0 (offline suite and
+  fake backend unaffected).
+- ONE wall-clock deadline per type action (45 s, `TYPE_ACTION_DEADLINE_SECONDS`),
+  comfortably inside the client's 60 s tool timeout. Pacing gets at most 36 s of
+  it (`PACING_BUDGET_SECONDS`), counted the way the engine actually sleeps —
+  since WP12c ONE sleep per CHARACTER (a surrogate pair travels in ONE SendInput
+  call with one sleep). For very long texts the EFFECTIVE interval therefore
+  drops below 20 ms above 1800 characters (BMP or astral alike): 2000 characters
+  pace at 18 ms (36 s / 2000 sleeps). The dispatch loop checks the deadline per
+  chunk; if the PACED rest would overrun it, the remaining text finishes UNPACED
+  and the reply message carries ` paced=partial` (the ladder still classifies
+  the burst honestly — the fast finish is the smaller hazard). A repair (the one
+  verified suffix retype) runs under the SAME capped interval
+  and ONLY if it fits the remaining deadline — otherwise the reply is
+  `unverified` with `branch=repair_over_budget` and nothing more is typed.
+- The repair is BASELINE-GATED: the focused control is read once BEFORE the first
+  chunk is dispatched (the same bounded read path as the verification reads; one
+  extra focused read per type action). A repair fires only when the stable buffer
+  equals that baseline plus a proper prefix of the typed text (the suffix
+  genuinely missing). POSITIVE divergence against the baseline (`tett` for
+  `test`, `brown xxx` for `brown fox`) is flagged `integrity=mismatch` — never
+  retyped. Everything else is `unverified` with a `branch=` suffix naming the
+  ladder branch inside the message (closed vocabulary, derived from the code by
+  a truth test): `blind_read`, `read_truncated`, `unstable_confirm`,
+  `agreed_empty`, `not_landed`,
+  `no_baseline`, `transformed_buffer`, `landed_not_at_tail`, `horizon_blind`,
+  `horizon_unconfirmed`, `fast_budget_exhausted`, `repair_read_blind`,
+  `repair_unconfirmed`, `repair_over_budget`, `tail_unproven`. A masked password buffer is
+  `transformed_buffer` (unverified), NOT a failure.
 
 ### Motion (timed moves and settles)
 

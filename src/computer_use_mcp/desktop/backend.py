@@ -140,6 +140,7 @@ from .text_readers import (
     UIA_READ_ENV,
     UiaSemanticReader,
     Win32TextReader,
+    _WINDOW_TEXT_MAX_CHARS,
     _uia_snapshot_to_text_regions,
     _uia_snapshot_to_ui_elements,
 )
@@ -313,6 +314,29 @@ TYPE_INTEGRITY_ENABLED = _env_bool("CORTEX_TYPE_INTEGRITY", True)
 #: can corrupt before it is detected. 64 chars ≈ one SendInput batch per chunk at the
 #: default event budget.
 TYPE_CHUNK_CHARS = _env_int_in_range("CORTEX_TYPE_CHUNK_CHARS", 64, 1, 4096)
+#: WP12a (user ruling 2026-11-02, "pause by default + flag corruption"): the REAL
+#: backend's DEFAULT per-character typing pace. Live runs 4-7 proved Windows 11
+#: packaged Notepad (RichEditD2DPT, Arabic layout) corrupts/drops fast unicode
+#: bursts even without the product (live runs 4-7: the RAW one-burst leg
+#: truncated the text to 'e2e-ty'; the unpaced PRODUCT leg substituted its tail).
+#: One diagnostic trial each was exact — 15 ms raw, 20 ms product — so the REAL
+#: SendInput path paces by default (WP12c: the paced engine sleeps once per
+#: CHARACTER; a surrogate pair travels in one SendInput call). The env
+#: override still wins and `0` restores the unpaced burst; the standalone
+#: SendInputEngine()/FakeComputerBackend library defaults stay 0.0 so the offline
+#: suite stays fast.
+DEFAULT_TYPE_INTERVAL_SECONDS = 0.02
+#: WP12b/c (VAL M1/M2 + C3): ONE wall-clock deadline per type action — pacing
+#: (counted per CHARACTER since the WP12c per-character pacing: a surrogate pair
+#: travels in ONE SendInput call with ONE sleep), the per-character probes,
+#: verification and a possible repair must together stay <= 45 s, comfortably
+#: inside the client's 60 s tool timeout. The paced-dispatch share of that
+#: deadline is PACING_BUDGET_SECONDS; the dispatch loop checks the deadline per
+#: chunk and finishes the rest UNPACED if the paced rest would overrun; a repair
+#: runs only if it fits the REMAINING deadline, else the reply is unverified
+#: with branch=repair_over_budget (never typed).
+TYPE_ACTION_DEADLINE_SECONDS = 45.0
+PACING_BUDGET_SECONDS = 36.0
 #: Settle before the post-dispatch integrity read-back: SendInput returns when events
 #: are ACCEPTED by the input stack, not when the target app has processed them —
 #: reading too early would mistake queue lag for a drop.
@@ -882,7 +906,13 @@ class LocalComputerBackend(ComputerBackend):
                 f"unknown input engine {name!r}: expected 'sendinput' or 'pyautogui'"
             )
         interval = (
-            _env_nonnegative_float(TYPE_INTERVAL_ENV, SENDINPUT_TYPE_INTERVAL)
+            _env_nonnegative_float(
+                TYPE_INTERVAL_ENV,
+                # WP12b MINOR: the paced default is a SendInput-path mitigation
+                # (Windows 11 Notepad burst corruption); the pyautogui fallback
+                # keeps its previous unpaced default.
+                DEFAULT_TYPE_INTERVAL_SECONDS if name == "sendinput" else SENDINPUT_TYPE_INTERVAL,
+            )
             if type_interval is None
             else max(0.0, type_interval)
         )
@@ -1167,6 +1197,10 @@ class LocalComputerBackend(ComputerBackend):
         legacy message byte-identical. Never consulted as typing evidence.
         """
         reader = getattr(self, "_semantic_reader", None)
+        # WP12e (VAL MINOR): remember WHICH reader produced the value — the raw-cap
+        # truncation rule (backend._read_landed_normalized) applies ONLY to the
+        # truncating Win32 WM_GETTEXT reader; UIA values are not truncated.
+        self._last_value_source = "none"
         if reader is None or not reader.available:
             self._last_read_had_target = False
             return None
@@ -1175,6 +1209,7 @@ class LocalComputerBackend(ComputerBackend):
         except Exception:  # noqa: BLE001 - a broken reader must never break typing
             self._last_read_had_target = False
             return None
+        self._last_value_source = getattr(reader, "value_source", "win32")
         focused = snapshot.get("focused") if isinstance(snapshot, dict) else None
         if not isinstance(focused, dict):
             self._last_read_had_target = False
@@ -1719,6 +1754,35 @@ class LocalComputerBackend(ComputerBackend):
             if release_error is not None and hold_error is None:
                 raise release_error
 
+    def _cap_type_interval(self, text: str) -> float:
+        """WP12b/c (VAL M1/M2 + C4): cap the paced budget by the sleep count.
+
+        Since WP12c the paced engine sleeps once per CHARACTER (a surrogate pair
+        travels in one SendInput call with one sleep — input_engine.py
+        ``_char_event_groups``), so the sleep count IS ``len(text)``. The effective
+        interval is ``min(configured, PACING_BUDGET_SECONDS / sleeps)`` and is
+        RETURNED so the repair can run under the same capped pace. The configured
+        interval is remembered and restored by :meth:`_restore_type_interval` (the
+        engine is per-session and actions run sequentially, so the temporary
+        override cannot interleave). Unpaced engines are a no-op (returns 0.0).
+        """
+        self._original_type_interval = getattr(self._engine, "type_interval", 0.0)
+        sleeps = len(text)
+        self._capped_type_interval = 0.0
+        if self._original_type_interval > 0 and sleeps > 0:
+            self._capped_type_interval = min(
+                self._original_type_interval, PACING_BUDGET_SECONDS / sleeps
+            )
+            self._engine.type_interval = self._capped_type_interval
+        return self._capped_type_interval
+
+    def _restore_type_interval(self) -> None:
+        """Restore the engine's configured typing interval after a capped call."""
+        interval = getattr(self, "_original_type_interval", None)
+        if interval is not None:
+            self._engine.type_interval = interval
+            self._original_type_interval = None
+
     def _execute_type(
         self,
         action: GroundedAction,
@@ -1733,7 +1797,15 @@ class LocalComputerBackend(ComputerBackend):
         ``TYPE_CHUNK_CHARS`` chunks and dispatched chunk-by-chunk (stop token and the
         T8 focus hook ride every engine dispatch, no added gaps), and verification
         runs ONCE after the FINAL chunk settles — read-backs are NEVER interleaved
-        mid-dispatch.
+        mid-dispatch. WP12b/c: the paced budget is capped per action
+        (``PACING_BUDGET_SECONDS`` inside ``TYPE_ACTION_DEADLINE_SECONDS`` = 45 s);
+        the dispatch loop checks the deadline per chunk and finishes the rest
+        UNPACED if the paced rest would overrun.
+
+        A PRE-DISPATCH BASELINE read of the focused control is taken once (WP12b B1)
+        — and WP12d N1 makes EVERY read blind when its RAW value sits at the
+        reader's 8192-char WM_GETTEXT truncation cap — every repair and every
+        ``mismatch`` verdict is GATED ON IT.
 
         FAST PATH (the happy case pays only quick reads and no horizon): read1 after
         ``TYPE_VERIFY_SETTLE_SECONDS``, then up to ``TYPE_VERIFY_FAST_MAX_READS`` total
@@ -1742,22 +1814,32 @@ class LocalComputerBackend(ComputerBackend):
         previous read was MID-DRAIN: the app had not yet appended the last keystrokes —
         the profiled live signature is 58 of 81 chars at +50 ms); a monotone extension
         of a real read is real evidence, not a disagreement. The moment a read ends
-        with the full expected text → ``verified``. Blind reads (``None``) or an
-        agreed EMPTY buffer → ``unverified`` (never repaired).
+        with the full expected text AND — WP12c C2 — the KNOWN baseline proves the
+        insertion form (buffer == baseline + typed text at one position) →
+        ``verified``; a tail match the baseline cannot prove → ``unverified``
+        branch=tail_unproven (the text may have been there already and the dispatch
+        dropped). A first STABLE read that already proves the caret-insertion form
+        against the baseline is accepted without the horizon (WP12c M3). Blind reads
+        (``None``) or an agreed EMPTY buffer → ``unverified`` (never repaired).
 
         SLOW PATH (escalation only — the rare-and-suspicious case pays): a pair that
-        SHRANK or DIVERGED, an agreed genuine PARTIAL (some expected prefix present,
-        suffix missing), or growth that outlives the fast budget is confirmed across
-        ``TYPE_VERIFY_STABILITY_SECONDS`` (the landing-lag horizon) with one more
-        agreeing read before anything else: drain-completed → ``verified`` (no repair
-        ever fired); trusted genuine partial → retype EXACTLY the missing suffix
-        (diffed from the real buffer, mapped back to typed coordinates) ONCE, then a
-        quick re-verify pair; success → ``verified`` with ``healed=<n>``; a confirmed
-        still-wrong buffer raises :class:`TextIntegrityError` (no second repair); an
-        unconfirmable repair reports ``unverified`` honestly. Agreed non-empty buffers
-        that share no expected-prefix suffix (masked fields, transforming apps)
-        resolve to ``mismatch`` — appending would double-apply, so no repair.
-        ``unverified`` NEVER triggers a retype (the anti-duplication gate).
+        SHRANK or DIVERGED, a stalled stable buffer, or growth that outlives the fast
+        budget is confirmed across ``TYPE_VERIFY_STABILITY_SECONDS`` (the landing-lag
+        horizon) with one more agreeing read before anything else, then resolved
+        AGAINST THE BASELINE (WP12b B1): buffer == baseline + a proper prefix of the
+        typed text (suffix genuinely missing) → retype EXACTLY the missing suffix
+        ONCE under the SAME capped interval and only if it fits the remaining
+        deadline (else unverified branch=repair_over_budget), then a quick re-verify
+        pair; success → ``verified`` with ``healed=<n>``; a buffer that began
+        correctly and then DIVERGED (positive corruption evidence — 'tett'/'test',
+        'brown xxx'/'brown fox') → ``mismatch``, never retyped; a confirmed
+        still-wrong buffer after a repair raises :class:`TextIntegrityError` (no
+        second repair); an unconfirmable repair reports ``unverified`` honestly. A
+        transformed/foreign buffer (shares nothing with the typed text) is honest
+        ``unverified`` branch=transformed_buffer — a masked field must NOT report a
+        failure. ``unverified`` NEVER triggers a retype (the anti-duplication gate),
+        and every ``unverified`` names its ladder branch as a ``branch=`` suffix
+        inside the message.
 
         The stop token is checked between chunks, before every read-back, and before
         the retype. The action message gains an additive ``integrity=...`` suffix —
@@ -1787,35 +1869,72 @@ class LocalComputerBackend(ComputerBackend):
             # intra-call dispatched count to the FocusDriftError; an engine that does
             # not report leaves the class default (None -> 0 -> no partial_delivery
             # key), which is the conservative "no completed dispatch known" answer.
+            self._cap_type_interval(text)
             try:
                 self._engine.type_text(text, before_chunk=before_chunk)
             except FocusDriftError as exc:
                 intra = exc.delivered_chars
                 exc.delivered_chars = intra if isinstance(intra, int) and intra > 0 else 0
                 raise
+            finally:
+                self._restore_type_interval()
             self._last_key_dispatch = time.monotonic()
             return "Executed type."
 
         total = len(text)
         delivered = 0
-        for chunk in _split_type_chunks(text, TYPE_CHUNK_CHARS):
-            if stop is not None:
-                stop.ensure_live()  # between chunks (existing discipline)
-            try:
-                self._engine.type_text(chunk, before_chunk=before_chunk)
-            except FocusDriftError as exc:
-                # §1.1 K-05 (ORVEX-2026-108): the abort happened INSIDE this engine
-                # call — every EARLIER chunk fully landed (`delivered`), and the
-                # engine reports the exact prefix it dispatched within its own call
-                # (per-character granularity on both shipped engines). The aborting
-                # unit contributed nothing. Compose, never undercount completed work.
-                intra = exc.delivered_chars
-                exc.delivered_chars = delivered + (
-                    intra if isinstance(intra, int) and intra > 0 else 0
-                )
-                raise
-            delivered += len(chunk)
-            self._last_key_dispatch = time.monotonic()
+        # WP12b (VAL M1/M2): ONE wall-clock deadline per type action.
+        deadline = time.monotonic() + TYPE_ACTION_DEADLINE_SECONDS
+        # WP12b (VAL B1a): one PRE-DISPATCH BASELINE read of the focused control
+        # (the same bounded read path the verification reads use; it dispatches
+        # nothing). None = unreadable: without a baseline the ladder can never
+        # repair, and mismatch requires positive evidence against the baseline.
+        # WP12d (VAL N1): _read_landed_normalized itself returns None for a RAW
+        # read at the reader's 8192-char truncation cap — on EVERY read, so a
+        # repair can never fire on a cap-truncated buffer.
+        if stop is not None:
+            stop.ensure_live()
+        baseline_n = self._read_landed_normalized()
+        # WP12c (VAL C1): the cap is applied AFTER the stop-check and the baseline
+        # read — anything that can raise between applying the cap and the dispatch
+        # try: would otherwise leave the CAPPED interval on the engine for the rest
+        # of the session.
+        effective_interval = self._cap_type_interval(text)
+        # WP12d (VAL R1 MINOR): " paced=partial" rides in the reply message when
+        # the deadline forced the remaining text to finish unpaced (documented in
+        # docs/CONFIGURATION.md and VERSIONS.md).
+        pace_token = ""
+        try:
+            for chunk in _split_type_chunks(text, TYPE_CHUNK_CHARS):
+                if stop is not None:
+                    stop.ensure_live()  # between chunks (existing discipline)
+                # WP12c (VAL C3): the deadline is checked per chunk. If the PACED
+                # rest would overrun it, the remaining text finishes UNPACED (a
+                # fast burst is a smaller hazard than an unbounded over-deadline
+                # hang; documented in docs/CONFIGURATION.md).
+                remaining = deadline - time.monotonic()
+                if effective_interval > 0:
+                    chars_left = total - delivered
+                    if remaining <= 0 or chars_left * effective_interval > remaining:
+                        self._engine.type_interval = 0.0
+                        pace_token = " paced=partial"
+                try:
+                    self._engine.type_text(chunk, before_chunk=before_chunk)
+                except FocusDriftError as exc:
+                    # §1.1 K-05 (ORVEX-2026-108): the abort happened INSIDE this engine
+                    # call — every EARLIER chunk fully landed (`delivered`), and the
+                    # engine reports the exact prefix it dispatched within its own call
+                    # (per-character granularity on both shipped engines). The aborting
+                    # unit contributed nothing. Compose, never undercount completed work.
+                    intra = exc.delivered_chars
+                    exc.delivered_chars = delivered + (
+                        intra if isinstance(intra, int) and intra > 0 else 0
+                    )
+                    raise
+                delivered += len(chunk)
+                self._last_key_dispatch = time.monotonic()
+        finally:
+            self._restore_type_interval()
 
         # --- end-of-action verification: FAST PATH FIRST (bounded drain poll) -----
         if stop is not None:
@@ -1840,8 +1959,15 @@ class LocalComputerBackend(ComputerBackend):
                 stop.ensure_live()
             return self._read_landed_normalized()
 
-        def _unverified() -> str:
-            base = f"Executed type. {_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+        def _unverified(branch: str) -> str:
+            """WP12a: the typed `branch=` token names WHICH ladder path gave up (it
+            rides INSIDE the message like integrity=/waited_seconds= — no new reply
+            key; docs/REPLY-CONTRACT.md sanctions key=value suffixes in messages)."""
+            base = (
+                "Executed type. "
+                f"{_format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)}"
+                f" branch={branch}{pace_token}"
+            )
             # v0.7.1 (Defect C) honest diagnostic: when the read-backs were blind because
             # there was NO readable focused target at all (OpenGL/console apps), say so in
             # typed vocabulary and teach the escape hatch. A valueless-but-present control
@@ -1851,11 +1977,56 @@ class LocalComputerBackend(ComputerBackend):
                 return f"{base} {TYPE_UNCONFIRMED_MARKER} ({TYPE_UNCONFIRMED_HINT_SENDINPUT})"
             return base
 
+        def _baseline_landing_proven(buffer: str) -> bool:
+            """WP12c (VAL C2): with a KNOWN baseline, 'verified' is accepted ONLY
+            when the buffer is the baseline with the typed text inserted at ONE
+            position (length check first, then the insertion form via common
+            prefix/suffix — linear). With no baseline, today's tail match governs
+            (returns True — nothing to prove against)."""
+            if baseline_n is None:
+                return True
+            if len(buffer) != len(baseline_n) + len(expected_n):
+                return False
+            p = 0
+            while p < len(baseline_n) and buffer[p] == baseline_n[p]:
+                p += 1
+            s = 0
+            while (
+                s < len(baseline_n)
+                and buffer[len(buffer) - 1 - s] == baseline_n[len(baseline_n) - 1 - s]
+            ):
+                s += 1
+            # WP12d: a single insertion is provable from EITHER side — the greedy
+            # prefix position overshoots when the insertion point sits inside the
+            # prefix match, and vice versa for the suffix. Try both candidates.
+            if buffer[p : p + len(expected_n)] == expected_n and buffer[p + len(expected_n):] == baseline_n[p:]:
+                return True
+            j = len(baseline_n) - s
+            if buffer[j : j + len(expected_n)] == expected_n and buffer[:j] == baseline_n[:j]:
+                return True
+            return False
+
         def _repair_and_recheck(matched: int) -> str:
-            """The ONE verified retype of the exact missing suffix + quick re-verify."""
+            """The ONE verified retype of the exact missing suffix + quick re-verify.
+
+            WP12b (VAL M1/M2): the repair is typed under the SAME capped interval
+            and ONLY if it fits the remaining wall-clock deadline — an over-budget
+            repair is never typed (unverified, branch=repair_over_budget)."""
             missing = text[_typed_index_for_norm_len(text, matched) :]
+            remaining = deadline - time.monotonic()
+            needed = len(missing) * max(effective_interval, 0.0) + (
+                TYPE_VERIFY_SETTLE_SECONDS + 2.0
+            )
+            if needed > remaining:
+                return _unverified("repair_over_budget")
             if stop is not None:
                 stop.ensure_live()  # before the verified retype
+            # WP12c (VAL recheck MAJOR): the dispatch loop's restore already ran, so
+            # the engine holds the CONFIGURED interval here — save it before
+            # overriding with the capped pace and restore it in this finally, or
+            # the capped value leaks into every later type of the session.
+            repair_original = getattr(self._engine, "type_interval", 0.0)
+            self._engine.type_interval = effective_interval  # the SAME capped pace
             try:
                 self._engine.type_text(missing, before_chunk=before_chunk)
             except FocusDriftError as exc:
@@ -1868,6 +2039,8 @@ class LocalComputerBackend(ComputerBackend):
                 # prefix.
                 exc.delivered_chars = len(text)
                 raise
+            finally:
+                self._engine.type_interval = repair_original
             self._last_key_dispatch = time.monotonic()
             if TYPE_VERIFY_SETTLE_SECONDS > 0:
                 time.sleep(TYPE_VERIFY_SETTLE_SECONDS)
@@ -1875,14 +2048,28 @@ class LocalComputerBackend(ComputerBackend):
                 stop.ensure_live()
             recheck1 = self._read_landed_normalized()
             if recheck1 is None:
-                return _unverified()
+                return _unverified("repair_read_blind")
             recheck2 = _quick_read()
             if recheck2 is None or recheck2 != recheck1:
                 # Repair landing UNCONFIRMED: honest "unknown", never a second retype.
-                return _unverified()
+                return _unverified("repair_unconfirmed")
             if recheck2.endswith(expected_n):
-                healed = len(missing)
-                return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=healed)}"
+                # WP12c (VAL C2): after a repair the expected buffer is exactly
+                # baseline + expected — with a KNOWN baseline the insertion form
+                # must hold; a buffer that merely ENDS with the typed text is
+                # still-wrong -> TextIntegrityError (never a false heal).
+                if baseline_n is None or _baseline_landing_proven(recheck2):
+                    healed = len(missing)
+                    return (
+                        "Executed type. "
+                        f"{_format_integrity_status(total, total, mismatch=0, unverified=0, healed=healed)}"
+                        f"{pace_token}"
+                    )
+                raise TextIntegrityError(
+                    "typed-text integrity verification failed after one verified retype "
+                    f"({len(missing)} retried characters still not landed correctly in the "
+                    "focused control); refusing further blind repair. Re-observe and decide."
+                )
             raise TextIntegrityError(
                 "typed-text integrity verification failed after one verified retype "
                 f"({len(missing)} retried characters still not landed correctly in the "
@@ -1890,28 +2077,100 @@ class LocalComputerBackend(ComputerBackend):
             )
 
         def _resolve_trusted(trusted_n: str) -> str:
-            """Verdict on a horizon-confirmed trusted buffer (escalation outcome)."""
+            """WP12b (VAL B1): BASELINE-GATED verdicts on the horizon-confirmed
+            trusted buffer. A suffix-append repair is sound ONLY when the trusted
+            buffer is exactly the pre-dispatch baseline plus a proper prefix of the
+            typed text (the suffix genuinely missing); corruption is flagged
+            ``mismatch`` ONLY on positive evidence against the baseline; everything
+            else is an honest ``unverified`` naming its branch."""
+
+            def _verified_full() -> str:
+                return (
+                    "Executed type. "
+                    f"{_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
+                    f"{pace_token}"
+                )
+
+            def _mismatch() -> str:
+                return (
+                    "Executed type. "
+                    f"{_format_integrity_status(0, total, mismatch=total, unverified=0, healed=0)}"
+                    f"{pace_token}"
+                )
+
             if trusted_n.endswith(expected_n):
-                # The drain completed during the horizon; no repair was ever needed.
-                return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
-            if trusted_n == "":
-                return _unverified()
-            matched = _landed_prefix_len(trusted_n, expected_n)
-            if matched == 0:
-                # Masked/transformed/foreign buffer: appending would double-apply.
-                return f"Executed type. {_format_integrity_status(0, total, mismatch=total, unverified=0, healed=0)}"
-            return _repair_and_recheck(matched)
+                # (e) The drain completed; the typed text is at the tail.
+                # WP12c (VAL C2): with a KNOWN baseline, accept ONLY the insertion
+                # form (baseline + typed text at one position) — a buffer that
+                # merely ends with the typed text (it was already there and the
+                # dispatch dropped entirely) is honest unknown.
+                if _baseline_landing_proven(trusted_n):
+                    return _verified_full()
+                return _unverified("tail_unproven")
+            if expected_n in trusted_n:
+                # Landed but NOT at the tail: caret mid-text, inline autocomplete,
+                # auto-closed brackets. With a baseline we can prove the exact
+                # caret insertion; otherwise honest unknown (never mismatch, never
+                # repair — VAL M3/Doubt B).
+                if baseline_n is not None:
+                    # WP12d (VAL R3 NIT): reuse the linear insertion-form check —
+                    # the old per-position loop was quadratic on long buffers.
+                    if _baseline_landing_proven(trusted_n):
+                        return _verified_full()  # landed at the caret
+                return _unverified("landed_not_at_tail")
+            if baseline_n is None:
+                # (d) No baseline: without it, no tail-shape can be attributed —
+                # never repair.
+                return _unverified("no_baseline")
+            if not trusted_n.startswith(baseline_n):
+                # The whole buffer changed from the baseline: transformed/foreign
+                # content replaced it.
+                return _unverified("transformed_buffer")
+            new_part = trusted_n[len(baseline_n):]
+            if new_part == "":
+                # The buffer still EQUALS the baseline: nothing of ours landed
+                # (drain lag or a full drop). k == 0 is excluded from the sound
+                # repair rule — honest unknown.
+                return _unverified("not_landed")
+            k = 0
+            while k < min(len(new_part), len(expected_n)) and new_part[k] == expected_n[k]:
+                k += 1
+            if k == len(new_part):
+                # (b) Buffer == baseline + a PROPER prefix of the typed text: the
+                # suffix is genuinely missing -> the one sound repair.
+                return _repair_and_recheck(k)
+            if k == 0:
+                # (d) The new characters share NOTHING with the typed text:
+                # password masks ('●●●●'), foreign input ('zzz'). A masked field
+                # must NOT report a failure — honest unverified, never repair.
+                return _unverified("transformed_buffer")
+            # (c) 0 < k < len(expected_n) and the new part DIVERGED after k correct
+            # characters (live: 'tett' vs 'test'; 'brown xxx' vs 'brown fox'):
+            # POSITIVE evidence our text landed and then was corrupted -> flagged,
+            # never retyped (appending would land after the corruption).
+            return _mismatch()
 
         prev = self._read_landed_normalized()
         if prev is None:
-            return _unverified()
+            # WP12e: a read at the Win32 WM_GETTEXT truncation cap gets its own
+            # branch (read_truncated); a plain blind read stays blind_read.
+            if getattr(self, "_last_read_truncated", False):
+                return _unverified("read_truncated")
+            return _unverified("blind_read")
         if prev.endswith(expected_n):
             # Rare (dispatch already drained during the settle): single-read match is
-            # accepted only after ONE quick confirming read agrees.
+            # accepted only after ONE quick confirming read agrees — and, WP12c
+            # (VAL C2), only when the KNOWN baseline proves the insertion form.
             confirm = _quick_read()
             if confirm is not None and confirm == prev:
-                return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
-            return _unverified()
+                if _baseline_landing_proven(prev):
+                    return (
+                        "Executed type. "
+                        f"{_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
+                        f"{pace_token}"
+                    )
+                return _unverified("tail_unproven")
+            return _unverified("unstable_confirm")
 
         reads_left = TYPE_VERIFY_FAST_MAX_READS - 1
         escalated = False
@@ -1919,23 +2178,46 @@ class LocalComputerBackend(ComputerBackend):
             reads_left -= 1
             current = _quick_read()
             if current is None:
-                return _unverified()
+                if getattr(self, "_last_read_truncated", False):
+                    return _unverified("read_truncated")
+                return _unverified("blind_read")
             if current.endswith(expected_n):
                 # read grew monotonically into the full expected text (mid-drain at
-                # first read) — verified, no horizon, no repair.
-                return f"Executed type. {_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
+                # first read) — verified, no horizon, no repair. WP12c (VAL C2):
+                # with a KNOWN baseline the insertion form must hold.
+                if _baseline_landing_proven(current):
+                    return (
+                        "Executed type. "
+                        f"{_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
+                        f"{pace_token}"
+                    )
+                return _unverified("tail_unproven")
             if not (current == prev or current.startswith(prev)):
                 escalated = True
                 break  # shrink/divergence: suspicious -> escalation
-            if current == prev and _landed_prefix_len(current, expected_n) > 0:
-                # TWO CONSECUTIVE EQUAL reads on a genuine partial: growth stalled on
-                # a missing suffix (the measured drop signature) — escalate: confirm
-                # across the landing-lag horizon, then the one verified retype.
+            if current == prev and current != "":
+                # TWO CONSECUTIVE EQUAL NON-EMPTY reads: growth STALLED on a stable
+                # buffer. WP12a: escalate regardless of the landed prefix — the
+                # horizon-confirmed pair then decides: a genuinely missing suffix
+                # (matched prefix > 0) gets the one sound retype; a substituted/
+                # foreign tail (matched == 0 — the live 'brown xxx' shape) is
+                # FLAGGED as mismatch and never retyped. Before WP12a the prefix==0
+                # stall silently burned the fast budget into an unverified.
+                # WP12c (VAL M3 residual): if the FIRST stable read ALREADY proves
+                # the caret-insertion form against the KNOWN baseline, accept it
+                # here — cheap and sound (two agreeing reads + the insertion
+                # proof), no 2.5 s horizon needed.
+                if baseline_n is not None and _baseline_landing_proven(current):
+                    return (
+                        "Executed type. "
+                        f"{_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
+                        f"{pace_token}"
+                    )
                 escalated = True
                 break
             prev = current
             if current == "":
-                return _unverified()
+                return _unverified("agreed_empty")
             # else: monotone growth or agreed non-matching buffer — keep polling
             # (pre-existing content may precede a still-pending drain).
         if escalated:
@@ -1945,12 +2227,12 @@ class LocalComputerBackend(ComputerBackend):
             # honest fast answer is unverified (never a repair).
             trusted_n = _horizon_read()
             if trusted_n is None:
-                return _unverified()
+                return _unverified("horizon_blind")
             confirm_n = _quick_read()
             if confirm_n is None or confirm_n != trusted_n:
-                return _unverified()
+                return _unverified("horizon_unconfirmed")
             return _resolve_trusted(trusted_n)
-        return _unverified()
+        return _unverified("fast_budget_exhausted")
 
     def _execute_type_via_clipboard(
         self,
@@ -2076,9 +2358,32 @@ class LocalComputerBackend(ComputerBackend):
         return base
 
     def _read_landed_normalized(self) -> str | None:
-        """One read-back, normalized; ``None`` when the value is unavailable."""
+        """One read-back, normalized; ``None`` when the value is unavailable.
+
+        WP12d (VAL-WP12-03 N1 BLOCKER): a RAW value at or above the reader's
+        ``_WINDOW_TEXT_MAX_CHARS`` cap (text_readers.py — the Win32 reader returns
+        at most the first 8192 characters) is TRUNCATED, so its tail proves
+        nothing: such reads are BLIND on every ladder path (baseline, verification,
+        horizon, repair recheck), which makes a repair on a truncated read
+        impossible (the old behavior could double-type the missing "suffix" that
+        was only cut off by the cap). Line-ending folding SHORTENS the text, so
+        this check must use the RAW length, never the normalized one.
+        """
         raw = self.read_focused_control_value()
-        return None if raw is None else _normalize_landed_text(raw)
+        if raw is None:
+            self._last_read_truncated = False
+            return None
+        # WP12e: the source attribute is set by read_focused_control_value; a test
+        # double that replaces that method leaves it unset — treat as non-truncating.
+        if getattr(self, "_last_value_source", "none") == "win32" and len(raw) >= _WINDOW_TEXT_MAX_CHARS:
+            # WP12e (VAL MINOR): only the Win32 WM_GETTEXT reader truncates at its
+            # cap — UIA values are not truncated and keep full verification. A
+            # capped Win32 read is BLIND and FLAGGED: the ladder answers
+            # branch=read_truncated (never repaired, never a false verify).
+            self._last_read_truncated = True
+            return None
+        self._last_read_truncated = False
+        return _normalize_landed_text(raw)
 
     def _drag_waypoints(self, start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
         """Stroke waypoints for one drag (engine-selected policy).

@@ -52,18 +52,43 @@ cause stays verbatim in `follow_ups_stopped_reason` and the entry's `reasons`.
 
 - `integrity=verified` — the focused control's read-back matched the text.
 - `integrity=partial` — read-back only partially confirmed; NOT a veto.
-- `integrity=unverified` — no read-back was possible (no accessibility tree); NOT a
-  veto — corroborate visually with a stated `expected_effect`.
-- `integrity=mismatch` — the focused control's read-back disagrees with the typed
-  text: a matching window title can no longer stand as proof, so the verdict is
-  demoted to `uncertain` — never silently `verified`, and never a confirmed failure
-  either.
+- `integrity=unverified` — the verification ladder could not decide. Since WP12b
+  the reply names WHICH ladder branch gave up as a `branch=` suffix inside the
+  message (closed vocabulary, derived from the code by a truth test):
+  `blind_read` (no readable focused target), `unstable_confirm`,
+  `agreed_empty`, `not_landed` (the buffer still equals the pre-dispatch
+  baseline), `no_baseline` (the baseline read was blind — never repaired),
+  `read_truncated` (the Win32 WM_GETTEXT read sat at its 8192-character
+  truncation cap, so the value's tail proves nothing — UIA reads are not
+  truncated and keep full verification; never repaired),
+  `transformed_buffer` (a masked or transformed field — password dots — shares
+  nothing with the typed text: it must NOT report a failure),
+  `landed_not_at_tail` (the text is in the buffer but not at its tail — caret
+  mid-text, autocomplete), `horizon_blind`, `horizon_unconfirmed`,
+  `fast_budget_exhausted`, `repair_read_blind`, `repair_unconfirmed`,
+  `repair_over_budget` (the repair did not fit the per-action deadline and was
+  never typed), `tail_unproven` (the buffer ends with the typed text but the
+  known baseline proves no insertion — e.g. the text was already there and the
+  dispatch dropped entirely). NOT a veto — corroborate visually with a stated
+  `expected_effect`.
+- `integrity=mismatch` — POSITIVE evidence the typed text landed and then
+  diverged: the read-back starts with the pre-dispatch baseline plus a non-empty
+  correct leading part of the typed text and then differs (e.g. `tett` for
+  `test`, `brown xxx` for `brown fox`). A matching window title can no longer
+  stand as proof, so the verdict is demoted to `uncertain` — never silently
+  `verified`, and never a confirmed failure either.
 
 `integrity=mismatch` means the drop is NOT proven good: the verdict is demoted to
-`uncertain`, and a masked or transformed field (password dots, formatted numbers) may
-legitimately hold something that differs from the typed text. A `TextIntegrityError`
-is different: the read-back itself raised, so the reply is `failed` with `error`
-`action_error` — an operation error, not an integrity verdict. Either way: re-observe
+`uncertain`. WP12d notes: typing that REPLACES a selection (address bar after
+Ctrl+L, rename fields) now reports `unverified` branch=`tail_unproven` — the
+baseline cannot prove an insertion, which is honest and NOT a veto. A
+`TextIntegrityError` is different from both: it fires only AFTER the one verified
+retype still did not produce the typed text at the control's tail — the reply is
+`failed` with `error` `action_error` — an operation error, not an integrity
+verdict, and the duplicate-typing hazard is why the repair is baseline-gated.
+Either way: re-observe
 the field and decide from evidence; never retype blind on the mismatch alone, and
-never conclude success from the title alone. `partial` and `unverified` are annotated
-absences of read-back, not vetoes.
+never conclude success from the title alone. `partial` is an annotated partial
+confirmation, and `unverified` is an annotated non-decision of the verification
+ladder (a blind read, a transformed buffer, a stall or an over-budget repair —
+see the `branch=` list above) — neither is a veto.

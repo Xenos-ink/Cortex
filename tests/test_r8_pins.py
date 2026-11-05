@@ -274,17 +274,29 @@ def test_close_window_polls_only_the_exact_hwnd(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_teardown_kills_only_the_launched_pid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """kill_process_tree is invoked with EXACTLY the Popen pid the test launched.
+    """Teardown never kills a pid that hosts anything but the suite's own windows.
 
-    Source-level pin over the e2e app-launch context managers: notepad/calculator
-    teardown must call w32.kill_process_tree(proc.pid) (the process WE started),
-    never a window found by name. Checked on source so no app is ever launched.
+    Source-level pin over the e2e app-launch context managers. WP12 live-run 2
+    tightened the doctrine: packaged Notepad hosts EVERY window in ONE shared
+    process, so notepad teardown must go through the D6-safe ownership-checked
+    ``w32.release_notepad`` — close the marker hwnd; in the SHARED topology close
+    only OUR TAB (one atomic Ctrl+W batch behind the marker/foreground guard
+    chain) and NEVER kill the shared host (its tabs are invisible to Win32);
+    only pids the test SPAWNED are ever killed. Calculator keeps the direct
+    kill: classic win32calc is spawned directly and hosts only the window the
+    test launched. Checked on source so no app is ever launched.
     """
     notepad_src = (E2E_DIR / "test_e2e_notepad.py").read_text(encoding="utf-8")
     calc_src = (E2E_DIR / "test_e2e_calculator.py").read_text(encoding="utf-8")
     browser_src = (E2E_DIR / "test_e2e_browser.py").read_text(encoding="utf-8")
-    for name, src in (("notepad", notepad_src), ("calculator", calc_src)):
-        assert "finally:" in src and "w32.kill_process_tree(proc.pid)" in src, name
+    # notepad: D6-safe release helper only (unit-pinned in
+    # tests/test_wp12_live_harness_guard.py); never a bare kill of a shared pid.
+    assert "finally:" in notepad_src and "w32.release_notepad(proc, hwnd" in notepad_src, "notepad"
+    assert "kill_process_tree" not in notepad_src, (
+        "notepad teardown must go through w32.release_notepad (shared-process safety)"
+    )
+    # calculator: kills exactly the Popen pid the test launched (classic binary).
+    assert "finally:" in calc_src and "w32.kill_process_tree(proc.pid)" in calc_src, "calculator"
     # browser: closes the exact found hwnd, then kills only the launcher tree.
     assert "w32.close_window(hwnd" in browser_src
     assert "w32.kill_process_tree(proc.pid)" in browser_src

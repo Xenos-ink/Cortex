@@ -132,12 +132,13 @@ def _integrity_status(message: str) -> str | None:
 
 
 def test_mismatch_read_back_with_a_mirroring_title_is_not_verified() -> None:
-    """THE REPRODUCED CASE. A masked PIN field (read-back ``mismatch``) plus a window
-    title that mirrors the typed account used to yield ``ok=True / verified`` at
-    confidence 0.9 from the title substring match."""
+    """THE REPRODUCED CASE. The focused control's read-back began correctly and then
+    diverged (WP12b B1(c): '12••' for the typed '1234' — the tail turned to mask
+    dots) plus a window title that mirrors the typed account used to yield
+    ``ok=True / verified`` at confidence 0.9 from the title substring match."""
     payload = _type(
         title=f"Sign in - account {TYPED}",
-        focused_control_value="••••",  # masked -> mismatch
+        focused_control_value="12••",  # correct prefix then diverged -> mismatch
     )
     assert _integrity_status(payload["message"]) == "mismatch", payload["message"]
     assert payload["verification"]["outcome"] != "verified", payload["verification"]
@@ -156,7 +157,7 @@ def test_mismatch_demotion_is_annotated_in_the_note_too() -> None:
     """The evidence line is the machine channel; the note names the blocker for a
     driver that only reads prose."""
     payload = _type(
-        title=f"Sign in - account {TYPED}", focused_control_value="••••"
+        title=f"Sign in - account {TYPED}", focused_control_value="12••"
     )
     note = payload["verification"]["note"]
     assert "integrity" in note and "mismatch" in note, note
@@ -220,10 +221,11 @@ def test_a_genuine_landing_with_a_quiet_title_is_not_claimed_by_the_weak_tier() 
 
 
 def test_a_mismatch_type_with_no_title_evidence_is_uncertain_not_failed() -> None:
-    """``mismatch`` is a disagreement about the FOCUSED CONTROL, not proof that nothing
+    """``mismatch`` (WP12b B1(c): '12••' for the typed '1234' — landed correctly
+    then diverged) is a disagreement about the FOCUSED CONTROL, not proof that nothing
     happened anywhere; with no title evidence the verdict is the ladder's honest
     abstention, not a hard failure."""
-    payload = _type(title="Sign in", focused_control_value="••••")
+    payload = _type(title="Sign in", focused_control_value="12••")
     assert _integrity_status(payload["message"]) == "mismatch", payload["message"]
     assert payload["verification"]["outcome"] == "uncertain", payload["verification"]
     assert payload["ok"] is False

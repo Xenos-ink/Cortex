@@ -591,8 +591,14 @@ def test_repair_retype_drift_counts_landed_prefix(real_backend: Any) -> None:
     try:
         patch.setattr(backend, "_engine", RepairDriftEngine())
         patch.setattr(backend, "_apply_focus_settle", lambda: None)
-        # the normalizer folds line endings only — the read must match the typed case
-        patch.setattr(backend, "_read_landed_normalized", lambda: "C" * 20)
+        # WP12b B1: the FIRST read is the pre-dispatch BASELINE (empty field); the
+        # verification reads then see 20 of the 30 'C's landed (suffix missing).
+        reads = ["", "C" * 20, "C" * 20, "C" * 20]
+
+        def _scripted_read() -> str:
+            return reads.pop(0) if len(reads) > 1 else reads[-1]
+
+        patch.setattr(backend, "_read_landed_normalized", _scripted_read)
         action = GroundedAction(action="type", text="C" * 30, confidence=1.0)
         with pytest.raises(FocusDriftError) as excinfo:
             backend._execute_type(action, None, None)
@@ -922,10 +928,11 @@ def test_sendinput_counts_code_points_not_utf16_units(real_backend: Any) -> None
     text = "😀" * 10  # ten astral emoji
     with pytest.raises(FocusDriftError) as excinfo:
         engine.type_text(text, before_chunk=focus_hook)
-    # paced path: one hook per 2 EVENTS = per surrogate HALF, so an emoji completes
-    # every 2 hooks. Drift at probe 7 -> 6 hooks returned = 3 full emoji = exactly
-    # 3 CODE POINTS (the old UTF-16-unit counting would have reported 6).
-    assert excinfo.value.delivered_chars == 3, excinfo.value.delivered_chars
+    # WP12c C4 paced path: one hook per CHARACTER — a surrogate pair travels in
+    # ONE SendInput call, so an emoji completes every hook. Drift at probe 7 ->
+    # 6 hooks returned = exactly 6 CODE POINTS (the old UTF-16-unit counting
+    # would have reported 12; the WP12b per-half pacing would have reported 3).
+    assert excinfo.value.delivered_chars == 6, excinfo.value.delivered_chars
 
 
 def test_sendinput_paced_per_char_drift_counts_dispatched(real_backend: Any) -> None:
@@ -1414,12 +1421,13 @@ class _MaskedPinWorld(ScriptedBackend):
 async def test_type_integrity_mismatch_vetoes_verified_and_audit_agrees(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """WP4a §-node (F2-1): a masked PIN field (read-back ``integrity=mismatch``) plus a
-    window title that mirrors the typed text never answers ``ok:true`` — the
+    """WP4a §-node (F2-1): a focused read-back that began correctly and then
+    diverged (``integrity=mismatch`` — WP12b B1(c): '12••' for the typed '1234')
+    plus a window title that mirrors the typed text never answers ``ok:true`` — the
     strong, target-scoped read-back vetoes the weak substring match, the reply is the
     honest ``uncertain`` token, and the audit 'verification' event (written AFTER the
     veto) carries the SAME verdict."""
-    backend = _MaskedPinWorld(title="Sign in - account 1234", focused_control_value="••••")
+    backend = _MaskedPinWorld(title="Sign in - account 1234", focused_control_value="12••")
     session_id, bundle, backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )

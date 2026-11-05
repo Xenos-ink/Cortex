@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -51,25 +50,31 @@ MENU_CLASS = "#32768"
 
 @contextmanager
 def notepad_app(deadline: w32.Deadline, file_path: Path):
-    """Launch Notepad with a marker-carrying scratch file; kill ONLY our process tree.
+    """Launch Notepad with a marker-carrying scratch file; D6-safe teardown.
 
     D6: ``file_path.name`` MUST embed the run-unique window token (the caller builds
-    it via ``w32.unique_window_token()``); the wait matches pid AND that unique
-    title needle, so it can never latch onto the user's own Notepad window.
+    it via ``w32.unique_window_token()``); the wait is marker-only
+    (:func:`w32.launch_marked_notepad`), so it can never latch onto the user's own
+    Notepad window. Teardown goes through :func:`w32.release_notepad`: close ONLY
+    the marker hwnd; kill a process only when the test spawned it or it hosts no
+    non-marker window (packaged Notepad shares ONE process with the user's windows).
+    Yields ``(proc, hwnd, real_pid)`` — ``real_pid`` is the window's REAL owning
+    pid (WP12 live-run-2: never compare a launcher-stub pid to a window pid).
     """
     token = file_path.stem
     assert "cumcp-e2e-" in token, (
         f"notepad scratch file must embed the run-unique window token: {file_path}"
     )
-    proc, hwnd = w32.launch_gui(
-        deadline, ["notepad.exe", str(file_path)], title_contains=file_path.name, timeout_s=30.0
-    )
-    assert w32.window_pid(hwnd) == proc.pid, (hwnd, proc.pid)
+    proc, hwnd = w32.launch_marked_notepad(deadline, file_path, timeout_s=30.0)
+    real_pid = w32.window_pid(hwnd)
+    assert real_pid == proc.pid or (w32.process_exe(real_pid) or "").casefold().endswith(
+        "notepad.exe"
+    ), (proc.pid, real_pid)
     assert token.casefold() in w32.window_text(hwnd).casefold(), w32.window_text(hwnd)
     try:
-        yield proc, hwnd
+        yield proc, hwnd, real_pid
     finally:
-        w32.kill_process_tree(proc.pid)
+        w32.release_notepad(proc, hwnd, token)
 
 
 def _visible_windows_for_pid(pid: int) -> list[dict[str, Any]]:
@@ -137,7 +142,7 @@ def test_right_click_opens_real_context_menu(
     token = w32.unique_window_token("cumcp-e2e-right-click")
     file_path = e2e_scratch / f"{token}.txt"
     file_path.write_text("", encoding="utf-8")
-    with notepad_app(deadline, file_path) as (proc, hwnd):
+    with notepad_app(deadline, file_path) as (proc, hwnd, real_pid):
         # The session allowlist is bound to OUR token: every dispatch in this session
         # validates the ACTIVE window title against it, so input can only ever land
         # in the window we launched (the user's own Notepad is invisible to it).
@@ -152,9 +157,11 @@ def test_right_click_opens_real_context_menu(
             before_observation = observe(evidence, session_id, "before")
 
             # Identity pin: the observed active window is OURS (token in the title).
+            # WP12 live-run-2: the pid is compared against the window's REAL owning
+            # pid — ``proc`` is the launcher stub and is never a window pid.
             info = before_observation.get("active_window_info")
             assert info, "observation carries no active_window_info"
-            assert info["pid"] == proc.pid, (info.get("pid"), proc.pid)
+            assert info["pid"] == real_pid, (info.get("pid"), real_pid)
             assert token.casefold() in str(info["title"]).casefold(), info["title"]
             assert before_observation["coordinate_space"] in {
                 "verified_passthrough",
@@ -169,10 +176,11 @@ def test_right_click_opens_real_context_menu(
             target_x = int(bounds[0] + bounds[2] / 2)
             target_y = int(bounds[1] + bounds[3] / 2)
 
-            # Baseline: no menu window of ours exists yet.
-            menus_before = _menu_windows(proc.pid)
+            # Baseline: no menu window of ours exists yet (scoped to the REAL owning
+            # pid — the launcher stub hosts no windows).
+            menus_before = _menu_windows(real_pid)
             assert menus_before == [], menus_before
-            visible_before = {window["hwnd"] for window in _visible_windows_for_pid(proc.pid)}
+            visible_before = {window["hwnd"] for window in _visible_windows_for_pid(real_pid)}
             if evidence is not None:
                 evidence.record("menu_baseline", menus_before=menus_before)
 
@@ -183,10 +191,9 @@ def test_right_click_opens_real_context_menu(
             # expectation, a small context menu is exactly the "sub-threshold visual
             # change" the doctrine reports as honest `uncertain` (never false success).
             # The CAPABILITY PROOF is the Win32 menu-window enumeration below.
-            response = asyncio.run(
+            response = rt.execute_payload(asyncio.run(
                 srv_server_execute.computer_execute(session_id, "right_click", x=target_x, y=target_y)
-            )
-            response = _payload(response)
+            ))
             assert response.get("error") is None, response
             assert "requires_approval" not in response, response
             if evidence is not None:
@@ -206,10 +213,10 @@ def test_right_click_opens_real_context_menu(
 
             def _menu_opened() -> bool:
                 nonlocal menus_after, new_windows
-                menus_after = _menu_windows(proc.pid)
+                menus_after = _menu_windows(real_pid)
                 new_windows = [
                     window
-                    for window in _visible_windows_for_pid(proc.pid)
+                    for window in _visible_windows_for_pid(real_pid)
                     if window["hwnd"] not in visible_before
                 ]
                 return bool(menus_after or new_windows)
@@ -238,23 +245,16 @@ def test_right_click_opens_real_context_menu(
 
             # Cleanup through our OWN session: ESC closes the menu (the menu of our
             # process holds foreground). The menu window must be gone afterwards.
-            esc_response = _payload(
+            esc_response = rt.execute_payload(
                 asyncio.run(srv_server_execute.computer_execute(session_id, "keypress", keys=["esc"]))
             )
             if evidence is not None:
                 evidence.record("computer_execute(keypress esc)", ok=esc_response.get("ok"))
             deadline.check("menu closed after ESC")
-            menus_left = _menu_windows(proc.pid)
+            menus_left = _menu_windows(real_pid)
             assert menus_left == [], menus_left
             if evidence is not None:
                 evidence.assert_that("menu closed after ESC", True)
         finally:
             with suppress(Exception):  # teardown never masks the test result
                 asyncio.run(srv_server_lifecycle.stop_session(session_id))
-
-
-def _payload(response: Any) -> dict[str, Any]:
-    """Unwrap an executed MCP content-block response to its dict payload."""
-    if isinstance(response, list):
-        return json.loads(response[0].text)
-    return response

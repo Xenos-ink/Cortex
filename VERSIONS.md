@@ -95,6 +95,28 @@ taught value from the code. Full offline suite at release: 3319 passed +
 
 ### Changed
 
+- **Default typing pace 0.02 s/char on the real SendInput path** (WP12a/WP12b,
+  user ruling 2026-11-02 "pause by default + flag corruption"): Windows 11
+  packaged Notepad corrupts/drops fast unicode bursts (live runs 4-7: the RAW
+  one-burst leg TRUNCATED the text to `e2e-ty`; the unpaced PRODUCT leg
+  substituted its tail, `brown xxx` for `brown fox`). The `CORTEX_TYPE_INTERVAL`
+  env is read ONCE PER SESSION (when the backend is built) and still overrides;
+  `0` restores the old unpaced burst; the default applies to the SendInput
+  engine only (the pyautogui fallback keeps its unpaced default). ONE wall-clock
+  deadline per type action (45 s, comfortably inside the client's 60 s tool
+  timeout): pacing gets at most 36 s counted per CHARACTER (WP12c: a surrogate
+  pair travels in ONE SendInput call with ONE sleep), so very long texts pace
+  below 20 ms above 1800 characters, BMP or astral alike — 2000 characters of
+  either kind at 18 ms. When the deadline would overrun, the dispatch loop
+  finishes the remaining text UNPACED and the reply carries ` paced=partial`.
+  The standalone engine / fake-backend defaults
+  stay 0.0 — the offline suite is not slowed. Every `unverified` integrity reply
+  names WHICH ladder branch gave up as a `branch=` suffix inside the message
+  (closed vocabulary, derived from the code by a truth test): `blind_read`,
+  `read_truncated`, `unstable_confirm`, `agreed_empty`, `not_landed`,
+  `no_baseline`, `transformed_buffer`, `landed_not_at_tail`, `horizon_blind`,
+  `horizon_unconfirmed`, `fast_budget_exhausted`, `repair_read_blind`,
+  `repair_unconfirmed`, `repair_over_budget`, `tail_unproven`.
 - **`ok` is the closed-token rule everywhere**: `ok = result ∈ {verified,
   marker}`. `dry_run` replies are now `ok:false` (they dispatch nothing — a
   deliberate no-op is not a success); `done`/`wait` carry `result:"marker"`
@@ -142,6 +164,22 @@ taught value from the code. Full offline suite at release: 3319 passed +
 
 ### Fixed
 
+- **False heal + substitution-unsafe repair (WP12b, VAL-WP12 blocker)**: the
+  suffix-diff repair matched the buffer's TAIL against typed prefixes — a
+  COINCIDENTAL tail match (typed `test`, buffer `tett`: both end with `t`)
+  triggered a retype of `est` and reported `integrity=verified(4/4) healed=3`
+  while the document held `tettest`. The repair is now BASELINE-GATED: the
+  focused control is read once BEFORE the first chunk is dispatched, and the
+  repair fires only when the trusted buffer is exactly that baseline plus a
+  proper prefix of the typed text (the suffix genuinely missing). A buffer that
+  begins correctly and then DIVERGES (`tett`/`test`, `brown xxx`/`brown fox`)
+  is flagged `integrity=mismatch` with ZERO retype; a masked/foreign buffer
+  (`●●●●`, `zzz`) is honest `unverified` (branch=transformed_buffer) — a masked
+  password field must not report a failure; text landed mid-buffer (caret,
+  autocomplete) is `unverified` branch=landed_not_at_tail, or `verified` when
+  the baseline proves the exact caret insertion. A repair that does not fit the
+  remaining per-action deadline is never typed
+  (`branch=repair_over_budget`).
 - The `via="clipboard"` type transport's restore raced the queued chord: a
   target reading the clipboard a few tens of milliseconds after the paste
   received the OLD text. The restore now runs after the verify settle (a
@@ -172,6 +210,13 @@ taught value from the code. Full offline suite at release: 3319 passed +
 - Measured against v0.7.5 (2ae76b0) with a fresh interleaved same-interpreter
   A/B on the fake backend (60 rounds/side hot path, 80 import pairs/side;
   bootstrap 95% CI; gate artifacts `.orvex/mission/artifacts/gates/wp11-*`):
+  - Real-backend typing (WP12a/WP12b): paced at 0.02 s per event pair by
+    default — e.g. 50 BMP chars ≈ 1 s; very long texts pace below 20 ms under
+    the 45 s per-action deadline (2000 characters — BMP or astral alike, paced
+    per character since WP12c — at 18 ms/sleep = 36 s of pacing); the fake
+    backend and the
+    offline suite are unchanged (unpaced). Each type action also pays ONE
+    extra focused-control read (the WP12b pre-dispatch baseline, ~1-10 ms).
   - Captures per action 3.0 -> 2.75 (ratio 0.9167) on the scripted
     effect-less workload (the cause was not isolated in this measurement).
   - Per-action verification time p50 29.15 -> 10.13 ms (ratio 0.35) on the
@@ -196,6 +241,15 @@ taught value from the code. Full offline suite at release: 3319 passed +
 
 ### Known limitations
 
+- **Windows 11 packaged Notepad needs paced input**: its RichEditD2DPT editor
+  corrupts/drops fast unicode bursts even without the product (live runs 4-7:
+  the RAW one-burst SendInput leg TRUNCATED the text to `e2e-ty`; the separate
+  unpaced PRODUCT leg substituted its tail to `brown xxx` — two distinct
+  corruption shapes; Arabic layout 0x04010401). The WP12a default pace
+  (0.02 s/char) mitigates it; `CORTEX_TYPE_INTERVAL=0` restores the vulnerable
+  unpaced burst. Compatibility impact: see the Compatibility notes entry on
+  typing pace and integrity outcomes. Calibration aid for lowering the pace
+  later: `tests/e2e/test_e2e_pace_calibration.py` (LIVE_DESKTOP-gated).
 - **Clipboard abort path**: when an abort (failsafe, stop token, blocked input)
   lands between the clipboard set and the chord, the `finally` restores the
   prior text but a destroyed non-text payload is NOT disclosed and a failed
@@ -206,6 +260,18 @@ taught value from the code. Full offline suite at release: 3319 passed +
 
 ### Compatibility notes
 
+- **Typing pace and integrity outcomes (WP12a/WP12b/WP12c/WP12d)**: typing on the
+  real SendInput path now costs ≈ 20 ms per character (the effective pace drops
+  below 20 ms above 1800 characters, BMP or astral alike — 2000 characters pace
+  at exactly 18 ms; see the Changed entry). Integrity outcomes changed meaning: a
+  buffer that began correctly and then diverged — or any positive divergence
+  against the pre-dispatch baseline — is now `integrity=mismatch`
+  (ok:false, verdict demoted to `uncertain`), where some of those shapes were
+  bare `unverified` before; `unverified` itself is NOT a veto (a corroborating
+  title/UI match still verifies — see the agent's D-2a annotation) and now
+  names its ladder branch as a `branch=` message suffix. Consumers that
+  treated `unverified` as "the text may or may not have landed, keep going"
+  should re-read the `branch=` token list in the skill glossary.
 - **Closed result token set; the ok rule**: every action-bearing execute reply
   (flat, follow-up item, plan step, terminal, wait family) carries `result`
   from the closed set and `ok = (result ∈ {verified, marker})`. Consumers that

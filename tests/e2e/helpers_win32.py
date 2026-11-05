@@ -40,17 +40,49 @@ import os
 import subprocess
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
+# WP12c: the Ctrl+W chord is built with the PRODUCT'S OWN SendInput record type
+# (the guard test pins the cbSize to ctypes.sizeof(_INPUT) — a private 32-byte
+# struct made SendInput reject the whole batch).
+from computer_use_mcp.desktop.input_engine import _INPUT, _key_event
+
+# WP12 (live-gate finding A): PRIVATE DLL instances. NEVER bind the shared
+# ``ctypes.windll.*`` objects here: windll hands out ONE shared DLL object per
+# process, and any argtypes/restype assignment on it mutates the prototype for
+# EVERY other consumer — the product binds the same object
+# (desktop/win32.py ``_user32 = ctypes.windll.user32``) and builds a FRESH
+# WINFUNCTYPE per call (desktop/windows.py ``find_window_by_title`` EnumWindows),
+# so a helper-set argtypes once made the product's own window search fail with
+# ``ArgumentError: ... expected WinFunctionType instance instead of
+# WinFunctionType`` (live failure: tests/test_t8_b5_backslash_type.py). Pinned by
+# tests/test_wp12_live_harness_guard.py.
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 GA_ROOT = 2
 WM_CLOSE = 0x0010
+WM_KEYDOWN = 0x0100
+VK_ESCAPE = 0x1B
+VK_CONTROL = 0x11
+VK_W = 0x57
+KEYEVENTF_KEYUP = 0x0002
 WM_GETTEXT = 0x000D
 WM_GETTEXTLENGTH = 0x000E
+EM_SETMODIFY = 0x00B9
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
+#: Window classes that carry a Notepad document's TEXT (WP12 live-run 3: the
+#: Windows 11 packaged app renders into ``RichEditD2DPT``; matched casefolded).
+TEXT_CONTROL_CLASSES = frozenset({"edit", "richeditd2dpt", "richedit50w", "richedit"})
+
+# --- atomic Ctrl+W batch (WP12b VAL MINOR: one SendInput, never 4 keybd_events) ---
+# WP12c (VAL-WP12-02 MAJOR): the Ctrl+W chord is built with the PRODUCT'S OWN
+# SendInput record type (input_engine._INPUT / _key_event) — a private struct with
+# only the keyboard member is 32 bytes on x64, SendInput requires the full 40-byte
+# record and rejects the whole batch (the live-run-6 failure class). No private
+# SendInput struct exists anywhere in tests/e2e (guard-pinned).
 _DPI_AWARENESS_DONE = False
 _WINDOW_TOKEN_COUNTER = 0
 
@@ -116,7 +148,7 @@ user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
 user32.SetForegroundWindow.restype = wt.BOOL
 user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
 user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
-user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_wchar_p]
+user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p]
 kernel32.GetCurrentThreadId.restype = wt.DWORD
 
 
@@ -359,16 +391,24 @@ def child_controls(hwnd: int) -> list[dict[str, Any]]:
 
 
 def read_edit_text(hwnd: int) -> str:
-    """Concatenated WM_GETTEXT text of all Edit-class children (Notepad's edit area)."""
+    """Concatenated WM_GETTEXT text of the window's TEXT controls (Notepad's editor).
+
+    WP12 live-run 3: Windows 11 packaged Notepad hosts its text in a
+    ``RichEditD2DPT`` control (tabs share one top-level window), not the classic
+    ``Edit`` child — read EVERY text-capable control class (Edit / RichEdit /
+    RICHEDIT50W / RichEditD2DPT; EnumChildWindows walks all descendants) via
+    WM_GETTEXTLENGTH + WM_GETTEXT, and fall back cleanly (a control with no
+    readable length is simply skipped).
+    """
     chunks: list[str] = []
     for control in child_controls(hwnd):
-        if control["cls"] != "Edit":
+        if control["cls"].casefold() not in TEXT_CONTROL_CLASSES:
             continue
         length = user32.SendMessageW(control["hwnd"], WM_GETTEXTLENGTH, 0, None)
         if length <= 0:
             continue
         buffer = ctypes.create_unicode_buffer(length + 1)
-        user32.SendMessageW(control["hwnd"], WM_GETTEXT, length + 1, buffer)
+        user32.SendMessageW(control["hwnd"], WM_GETTEXT, length + 1, ctypes.byref(buffer))
         chunks.append(buffer.value)
     return "\n".join(chunks)
 
@@ -545,8 +585,139 @@ def launch_gui(
     return proc, hwnd
 
 
-def unique_window_token(prefix: str = "cumcp-e2e") -> str:
+def launch_marked_notepad(
+    deadline: Deadline, file_path: Path, *, timeout_s: float = 30.0
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Launch Notepad on a marker-carrying scratch file; return (proc, hwnd).
+
+    WP12 live-gate finding C: on Windows 11 the ``System32\notepad.exe`` binary is
+    the launcher stub of the PACKAGED Notepad (Microsoft.WindowsNotepad) — it hands
+    the file off and exits, and the window is owned by a DIFFERENT pid, so the old
+    pid-scoped ``launch_gui`` wait timed out after 30 s while Notepad was open.
+    The wait is therefore marker-only (the token is run-unique — D6, the user's own
+    Notepad can never match), and the caller asserts identity via the REAL owning
+    pid (``window_pid`` + ``process_exe``) and kills BOTH pids on teardown.
+    """
+    ensure_dpi_awareness()  # physical-pixel waits/rects (lazy, E6 finding D10)
+    proc = subprocess.Popen(["notepad.exe", str(file_path)])
+    try:
+        hwnd = wait_for_marked_window(deadline, file_path.name, timeout_s=timeout_s)
+    except Exception:
+        kill_process_tree(proc.pid)
+        raise
+    real_pid = window_pid(hwnd)
+    exe = (process_exe(real_pid) or "").replace("/", "\\").casefold()
+    if not exe.endswith("notepad.exe"):
+        # WP12 live-run-2 safety: NEVER kill real_pid here — with the packaged app
+        # the marker window may live in the USER'S pre-running shared Notepad
+        # process. Kill only the stub we spawned. WP12b (VAL MINOR): do NOT close
+        # the window either — it is a marker-titled window this test did not
+        # create; record it in the raised error and leave it to the operator.
+        kill_process_tree(proc.pid)
+        raise RuntimeError(
+            f"marker window is not Notepad (left open, NOT closed: verify and close "
+            f"it manually if it is yours): hwnd={hwnd} pid={real_pid} exe={exe!r}"
+        )
+    return proc, hwnd
+
+
+def visible_windows_for_pid(pid: int) -> list[int]:
+    """Visible top-level windows owned by ``pid`` (teardown ownership checks)."""
+    return [hwnd for hwnd in top_level_windows() if window_pid(hwnd) == pid]
+
+
+def _title_has_marker(hwnd: int, markers: tuple[str, ...]) -> bool:
+    """True while the window title carries one of the suite's run markers."""
+    title = window_text(hwnd).casefold()
+    return any(marker.casefold() in title for marker in markers)
+
+
+def _send_ctrl_w(hwnd: int) -> None:
+    """Ctrl+W as ONE ATOMIC SendInput batch (VAL-WP12 MINOR), built with the
+    PRODUCT'S OWN record type (``input_engine._INPUT`` / ``_key_event`` — WP12c:
+    a private 32-byte struct made SendInput reject the whole batch). The caller
+    must ALREADY have re-verified the marker tab is active, focused AND
+    foreground; this helper adds the last foreground re-check immediately before
+    the batch and sends nothing if it moved."""
+    if int(user32.GetForegroundWindow() or 0) != hwnd:
+        return
+    events = (_INPUT * 4)(
+        _key_event(VK_CONTROL, 0, 0),
+        _key_event(VK_W, 0, 0),
+        _key_event(VK_W, 0, KEYEVENTF_KEYUP),
+        _key_event(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+    )
+    sent = int(user32.SendInput(len(events), events, ctypes.sizeof(_INPUT)))
+    if sent != len(events):  # never leave a dangling Ctrl: release it best-effort
+        user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        raise OSError(f"SendInput accepted only {sent}/{len(events)} Ctrl+W events")
+
+
+def release_notepad(proc: subprocess.Popen[bytes], hwnd: int, *markers: str) -> None:
+    """D6-safe, TABS-AWARE teardown for a Notepad instance this suite launched.
+
+    WP12 live-run 2 safety finding: packaged Windows 11 Notepad hosts EVERY
+    Notepad window of the session in ONE shared process — killing the real owning
+    pid would also kill the USER's open windows and unsaved work. WP12 live-run 3
+    tightens this further: Windows 11 Notepad may also restore the USER'S previous
+    unsaved TABS into the SAME top-level window our marker document opened in,
+    and the window title names only the ACTIVE tab — so tabs are INVISIBLE to
+    Win32 enumeration, and even "the host visibly owns only marker windows"
+    proves nothing. Teardown therefore:
+
+    1. CLASSIC topology (the window's real owner IS the pid we spawned — one
+       process, one document, no tab topology): best-effort clear the modify flag
+       on THIS window's own text controls (WM_CLOSE then closes without a save
+       prompt), then exact-hwnd ``WM_CLOSE`` (ESC + one retry if a prompt holds
+       it), then kill the spawned pid. The EM_SETMODIFY write NEVER happens in the
+       shared topology (VAL-WP12 M5): a shared window can host the user's restored
+       tabs, and its text controls are not ours to touch.
+    2. SHARED/packaged topology: close OUR TAB ONLY — ``Ctrl+W`` through the real
+       input path as ONE atomic SendInput batch, sent ONLY after the full guard
+       chain holds: the window is alive, its ACTIVE-tab title carries our run
+       marker, our window was focused, the marker title is re-verified, AND the
+       FOREGROUND window is re-checked to be ours immediately before the batch.
+       Any miss sends NOTHING (Ctrl+W would otherwise hit whatever tab is active).
+       The top-level window is NEVER ``WM_CLOSE``d and the shared host is NEVER
+       killed (its tabs are invisible; "only ours" is not provable) — the host
+       may linger as a harmless background process, and the window closes by
+       itself when our tab was its last one.
+    3. ONLY pids the test spawned are ever killed. Residual degraded outcome
+       (recorded by the caller's evidence): our own tab may be left open behind a
+       save prompt; its title carries the searchable run marker; the user's
+       tabs/windows are safe.
+    """
+    if window_pid(hwnd) == proc.pid:
+        for control in child_controls(hwnd):
+            if control["cls"].casefold() in TEXT_CONTROL_CLASSES:
+                user32.SendMessageW(control["hwnd"], EM_SETMODIFY, 0, None)
+        if not close_window(hwnd, wait_s=5.0):
+            user32.PostMessageW(hwnd, WM_KEYDOWN, ctypes.c_void_p(VK_ESCAPE), None)
+            user32.PostMessageW(hwnd, WM_CLOSE, None, None)
+            close_window(hwnd, wait_s=5.0)
+        kill_process_tree(proc.pid)
+        return
+    if (
+        window_exists(hwnd)
+        and _title_has_marker(hwnd, markers)
+        and focus_window(hwnd)
+        and _title_has_marker(hwnd, markers)
+        and int(user32.GetForegroundWindow() or 0) == hwnd
+    ):
+        _send_ctrl_w(hwnd)
+    kill_process_tree(proc.pid)
+
+
+def unique_window_token(stem: str = "window") -> str:
     """Run-unique window token for D6 window isolation.
+
+    The token ALWAYS carries the ``cumcp-e2e-`` marker, regardless of the
+    descriptive ``stem`` the caller passes (WP12 live-gate finding B: callers
+    passed stems positionally into the old ``prefix`` parameter, which REPLACED
+    the marker — scratch files then read ``identity-probe-<pid>-...`` with no
+    marker and every notepad test's marker assertion failed before it could
+    launch anything). A marker on the stem itself is stripped so it is never
+    doubled.
 
     Every app instance this suite opens carries this token in its window title
     (Notepad: the scratch FILENAME; Edge: the page <title>; Calculator: cannot set
@@ -558,7 +729,9 @@ def unique_window_token(prefix: str = "cumcp-e2e") -> str:
     """
     global _WINDOW_TOKEN_COUNTER
     _WINDOW_TOKEN_COUNTER += 1
-    return f"{prefix}-{os.getpid()}-{_WINDOW_TOKEN_COUNTER:03d}-{int(time.time() * 1000) % 100000000}"
+    if stem.startswith("cumcp-e2e-"):
+        stem = stem[len("cumcp-e2e-"):]
+    return f"cumcp-e2e-{stem}-{os.getpid()}-{_WINDOW_TOKEN_COUNTER:03d}-{int(time.time() * 1000) % 100000000}"
 
 
 def wait_until(deadline: Deadline, predicate: Callable[[], bool], what: str, timeout_s: float = 15.0) -> None:

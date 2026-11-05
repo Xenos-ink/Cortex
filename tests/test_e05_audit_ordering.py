@@ -76,11 +76,12 @@ class _MaskedPinWorld(ScriptedBackend):
 async def test_mismatch_demotion_audit_verdict_equals_the_reply_verdict(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """E-05, case 1 (mismatch veto): a masked PIN field plus a title that mirrors the
-    typed text vetoes ``verified`` down to ``uncertain`` BEFORE the record — exactly
-    one verification audit event, and its ``result`` equals the reply's
-    ``verification.outcome``."""
-    backend = _MaskedPinWorld(title="Sign in - account 1234", focused_control_value="••••")
+    """E-05, case 1 (mismatch veto): a focused read-back that began correctly and
+    then diverged (WP12b B1(c): '12••' for the typed '1234') plus a title that
+    mirrors the typed text vetoes ``verified`` down to ``uncertain`` BEFORE the
+    record — exactly one verification audit event, and its ``result`` equals the
+    reply's ``verification.outcome``."""
+    backend = _MaskedPinWorld(title="Sign in - account 1234", focused_control_value="12••")
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )

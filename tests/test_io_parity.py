@@ -237,7 +237,8 @@ def test_parity_type(real_backend: LocalComputerBackend, monkeypatch: pytest.Mon
     # exists for, so the additive ``TYPE_UNCONFIRMED`` suffix is now part of the expected
     # payload (prefix + integrity suffix unchanged; both engine paths stay identical).
     assert pa_msg == si_msg == (
-        "Executed type. integrity=unverified(0/2) TYPE_UNCONFIRMED no-readable-target "
+        "Executed type. integrity=unverified(0/2) branch=blind_read "
+        "TYPE_UNCONFIRMED no-readable-target "
         '(verify visually with a stated expected_effect (or retry with via="clipboard"))'
     )
     assert pa_calls == [("write", "h"), ("write", "i")]

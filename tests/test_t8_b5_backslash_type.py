@@ -12,13 +12,13 @@ wedge, not a text-content defect. Root-cause findings pinned here:
 - the B8 focus-transition settle paces keyboard input sent immediately after a window
   activation (win+r -> type with no settle was the wedge topology).
 
-Real-input tests close every window they open (taskkill on the spawned Notepad PID)
-and never park the mouse in a failsafe corner.
+Real-input tests close every window they open through the shared D6-safe helpers
+(marker-scoped launch and teardown; see tests/e2e/helpers_win32.py) and never park
+the mouse in a failsafe corner.
 """
 
 from __future__ import annotations
 
-import subprocess
 import threading
 import time
 from typing import Any
@@ -31,7 +31,6 @@ import computer_use_mcp.desktop.input_engine as input_engine_module
 from computer_use_mcp.desktop.backend import LocalComputerBackend
 from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 from computer_use_mcp.desktop.input_engine import _INPUT, _key_event, _text_to_key_units
-from computer_use_mcp.desktop.windows import find_window_by_title
 from computer_use_mcp.core.models import GroundedAction
 
 #: The exact incident payload shape: a raw single-backslash Windows path after a verb.
@@ -114,23 +113,52 @@ def test_real_dispatch_of_backslash_path_completes_under_a_second(
     integrity, which has its own suite (tests/test_r04_type_integrity.py). On a
     reference machine whose input stack drops keystrokes, an integrity-raising type
     would fail here for reasons unrelated to B5.
+
+    WP12d (VAL-WP12-03): this test tests a STALL, not pacing — the engine runs
+    UNPACED for this test only (interval restored by monkeypatch), keeping the
+    < 1.0 s bound meaningful against the WP12a default pace. And it is D6-scoped:
+    the Notepad instance is launched via the shared marker-scoped helpers
+    (``launch_marked_notepad`` + ``release_notepad``) — it can never attach to the
+    user's own untitled Notepad (the old unmarked-title attach) and teardown
+    closes only our marker window.
     """
     monkeypatch.setattr(backend_module, "TYPE_INTEGRITY_ENABLED", False)
+    monkeypatch.setattr(real_backend._engine, "type_interval", 0.0)  # unpaced: stall test
     result: dict[str, object] = {"done": False, "error": None}
+
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _e2e_dir = _Path(__file__).resolve().parent / "e2e"
+    if str(_e2e_dir) not in _sys.path:
+        _sys.path.insert(0, str(_e2e_dir))
+    import helpers_win32 as w32
+
+    token = w32.unique_window_token("t8b5-stall")
+    scratch = _Path(__file__).resolve().parent / "e2e" / "scratch" / "t8_b5_backslash"
+    scratch.mkdir(parents=True, exist_ok=True)
+    marker_file = scratch / f"{token}.txt"
+    marker_file.write_text("", encoding="utf-8")
 
     def worker() -> None:
         proc = None
+        hwnd = None
         try:
-            # Always OUR OWN Notepad instance: cleanup is exact (kill by PID).
-            proc = subprocess.Popen(["notepad.exe"])
-            window = None
-            deadline = time.time() + 8
-            while time.time() < deadline and window is None:
-                time.sleep(0.2)
-                window = find_window_by_title("Untitled - Notepad")
-            assert window is not None, "Notepad could not be launched for the B5 test"
-            real_backend.focus_window_title(window.title)
+            proc, hwnd = w32.launch_marked_notepad(
+                w32.Deadline(30.0), marker_file, timeout_s=30.0
+            )
+            # D6 right-window proof: OUR marker window is focused before typing.
+            assert w32.focus_window(hwnd), "could not focus the marker Notepad"
+            assert token.casefold() in w32.window_text(hwnd).casefold(), w32.window_text(hwnd)
             time.sleep(0.6)  # the driver-protocol settle after activation
+            # WP12e MINOR: re-check IMMEDIATELY before the dispatch — if focus moved
+            # during the settle, the 60-char burst must NOT be sent at all.
+            assert int(w32.user32.GetForegroundWindow() or 0) == hwnd, (
+                "focus moved during the settle; refusing to type"
+            )
+            assert token.casefold() in w32.window_text(hwnd).casefold(), (
+                "marker tab no longer active after the settle; refusing to type"
+            )
             action = GroundedAction(action="type", text=INCIDENT_TEXT, confidence=1.0)
             started = time.perf_counter()
             real_backend.execute(action, None)
@@ -139,13 +167,16 @@ def test_real_dispatch_of_backslash_path_completes_under_a_second(
         except Exception as exc:  # noqa: BLE001 - surfaced by the watchdog below
             result["error"] = f"{type(exc).__name__}: {exc}"
         finally:
-            if proc is not None:
-                subprocess.run(
-                    ["taskkill", "/PID", str(proc.pid), "/F"],
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
+            if proc is not None and hwnd is not None:
+                w32.release_notepad(proc, hwnd, token)
+            elif proc is not None:
+                w32.kill_process_tree(proc.pid)
+            # WP12e NIT: the scratch file is deleted after the run (it is
+            # git-ignored, tests/e2e/scratch/.gitignore).
+            try:
+                marker_file.unlink(missing_ok=True)
+            except OSError:
+                pass  # best-effort: the file is git-ignored and marker-named
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()

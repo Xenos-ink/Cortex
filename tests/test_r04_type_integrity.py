@@ -179,11 +179,13 @@ def test_verified_on_two_agreeing_reads_within_read_budget(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     text = "a" * 130  # chunk 64 -> 64 + 64 + 2
-    engine, reader = _typing_backend(real_backend, monkeypatch, reader_values=[text, text])
+    engine, reader = _typing_backend(
+        real_backend, monkeypatch, reader_values=["", text, text]
+    )
     message = real_backend.execute(_type_action(text))
     assert message == "Executed type. integrity=verified(130/130)"
     assert _dispatches(engine) == [text[:64], text[64:128], text[128:]]  # chunks only, NO retype
-    assert reader.reads_consumed == 2  # the happy path pays exactly TWO reads
+    assert reader.reads_consumed == 3  # WP12b baseline + the happy path's TWO reads
 
 
 def test_mid_drain_extension_verifies_without_waiting(
@@ -199,31 +201,34 @@ def test_mid_drain_extension_verifies_without_waiting(
     engine, reader = _typing_backend(
         real_backend,
         monkeypatch,
-        reader_values=[partial, full],
+        reader_values=["", partial, full],
         stability_seconds=2.5,
         confirm_gap_seconds=0.075,
     )
     message = real_backend.execute(_type_action(full))
     assert message == f"Executed type. integrity=verified({len(full)}/{len(full)})"
     assert 2.5 not in sleeps  # the lag horizon is NEVER consulted on the fast path
-    assert reader.reads_consumed == 2
+    assert reader.reads_consumed == 3  # WP12b baseline + the two quick reads
     assert _dispatches(engine) == [full[:64], full[64:]]  # chunks only, NO retype
 
 
-def test_verified_against_pre_existing_content_without_baseline_read(
+def test_pre_existing_content_tail_match_is_tail_unproven(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Suffix-diff semantics: pre-existing control content needs NO baseline read."""
+    """WP12c (VAL C2): the buffer ENDS with the typed text, but the KNOWN baseline
+    ('pref-abc' — the text was already there) proves no INSERTION happened (the
+    dispatch dropped entirely): honest ``unverified`` branch=tail_unproven — the
+    old suffix-diff tail match could false-verify exactly this shape."""
     engine, _ = _typing_backend(real_backend, monkeypatch, reader_values=["pref-abc", "pref-abc"])
     message = real_backend.execute(_type_action("abc"))
-    assert message == "Executed type. integrity=verified(3/3)"
+    assert message == "Executed type. integrity=unverified(0/3) branch=tail_unproven"
     assert _dispatches(engine) == ["abc"]
 
 
 def test_crlf_landing_matches_typed_newline(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    engine, _ = _typing_backend(real_backend, monkeypatch, reader_values=["a\r\nb", "a\r\nb"])
+    engine, _ = _typing_backend(real_backend, monkeypatch, reader_values=["", "a\r\nb", "a\r\nb"])
     message = real_backend.execute(_type_action("a\nb"))
     assert message == "Executed type. integrity=verified(3/3)"
     assert _dispatches(engine) == ["a\nb"]
@@ -233,12 +238,12 @@ def test_blind_reads_are_unverified_and_never_repaired(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine, reader = _typing_backend(
-        real_backend, monkeypatch, reader_values=[None], control_type=None
+        real_backend, monkeypatch, reader_values=[None, None], control_type=None
     )
     message = real_backend.execute(_type_action("abcdef"))
-    assert message == "Executed type. integrity=unverified(0/6)"
+    assert message == "Executed type. integrity=unverified(0/6) branch=blind_read"
     assert _dispatches(engine) == ["abcdef"]
-    assert reader.reads_consumed == 1  # read1 blind: no second read needed
+    assert reader.reads_consumed == 2  # WP12b baseline + read1: both blind, no second read
 
 
 def test_agreed_empty_buffer_is_unverified_and_never_repaired(
@@ -246,21 +251,28 @@ def test_agreed_empty_buffer_is_unverified_and_never_repaired(
 ) -> None:
     """An agreed EMPTY trusted buffer cannot be repaired by appending with confidence
     (the whole text would be re-sent on unproven grounds): unverified, never repair."""
-    engine, _ = _typing_backend(real_backend, monkeypatch, reader_values=["", ""])
+    engine, _ = _typing_backend(real_backend, monkeypatch, reader_values=["", "", ""])
     message = real_backend.execute(_type_action("abcdef"))
-    assert message == "Executed type. integrity=unverified(0/6)"
+    assert message == "Executed type. integrity=unverified(0/6) branch=agreed_empty"
     assert _dispatches(engine) == ["abcdef"]
 
 
-def test_masked_transformed_target_is_unverified_without_retype(
+def test_masked_password_buffer_is_unverified_transformed_buffer(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Non-empty agreed buffer sharing no expected suffix (masked field /
-    autocorrect / still-pending drain of pre-existing content): the honest fast
-    answer is unverified — appending would double-apply, so NO repair and no claim."""
-    engine, _ = _typing_backend(real_backend, monkeypatch, reader_values=["zzz", "zzz", "zzz", "zzz"])
+    """WP12b B1(d): a masked password field ('●●●●' for 4 typed characters, empty
+    baseline) shares NOTHING with the typed text — that is honest ``unverified``
+    with branch=transformed_buffer, NEVER a failure (the WP12a mismatch verdict for
+    this shape is reverted: a masked field must not report a failure) and never a
+    repair."""
+    engine, _ = _typing_backend(
+        real_backend,
+        monkeypatch,
+        reader_values=["", "●●●●", "●●●●", "●●●●", "●●●●"],
+        stability_seconds=1.0,
+    )
     message = real_backend.execute(_type_action("abcdef"))
-    assert message == "Executed type. integrity=unverified(0/6)"
+    assert message == "Executed type. integrity=unverified(0/6) branch=transformed_buffer"
     assert _dispatches(engine) == ["abcdef"]
 
 
@@ -272,46 +284,53 @@ def test_growth_outliving_the_fast_budget_is_unverified(
     engine, reader = _typing_backend(
         real_backend,
         monkeypatch,
-        reader_values=["a" * 30, "a" * 45, "a" * 60, "a" * 75],
+        reader_values=["", "a" * 30, "a" * 45, "a" * 60, "a" * 75],
         stability_seconds=2.5,
     )
     message = real_backend.execute(_type_action("a" * 81))
-    assert message == "Executed type. integrity=unverified(0/81)"
-    assert reader.reads_consumed == 4  # the whole fast budget, then honest surrender
+    assert message == "Executed type. integrity=unverified(0/81) branch=fast_budget_exhausted"
+    assert reader.reads_consumed == 5  # WP12b baseline + the whole fast budget
     assert _dispatches(engine) == ["a" * 64, "a" * 17]  # chunks only, NO retype
 
 
 # --- ESCALATION: suspicious pairs and agreed partials -----------------------------------------------
 
 
-def test_divergent_pair_escalates_through_the_horizon(
+def test_divergent_pair_escalates_and_a_foreign_buffer_is_never_a_failure(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """read2 that neither equals nor extends read1 is suspicious: the horizon pair
-    decides. Here it settles on a foreign buffer -> mismatch, no repair."""
+    decides. WP12b B1(d): the horizon-confirmed buffer 'zzzz' shares NOTHING with
+    the typed text and the empty baseline proves nothing of ours landed — a
+    transformed/foreign buffer is honest ``unverified`` (branch=transformed_buffer),
+    never a failure and never repaired."""
     sleeps: list[float] = []
     monkeypatch.setattr(backend_module.time, "sleep", lambda seconds: sleeps.append(seconds))
     engine, _ = _typing_backend(
         real_backend,
         monkeypatch,
-        reader_values=["abcdefX", "zzzz", "zzzz", "zzzz"],
+        reader_values=["", "abcdefX", "zzzz", "zzzz", "zzzz"],
         stability_seconds=1.5,
         confirm_gap_seconds=0.05,
     )
     message = real_backend.execute(_type_action("abcdef"))
-    assert message == "Executed type. integrity=mismatch(0/6)"
+    assert (
+        message == "Executed type. integrity=unverified(0/6) branch=transformed_buffer"
+    )
     assert 1.5 in sleeps  # the escalation consulted the landing-lag horizon
     assert _dispatches(engine) == ["abcdef"]
 
 
-def test_divergent_pair_horizon_blind_is_unverified(
+def test_divergent_pair_empty_horizon_reads_is_not_landed(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine, _ = _typing_backend(
-        real_backend, monkeypatch, reader_values=["abcdefX", "zzzz", None]
+        real_backend, monkeypatch, reader_values=["", "abcdefX", "zzzz", None]
     )
     message = real_backend.execute(_type_action("abcdef"))
-    assert message == "Executed type. integrity=unverified(0/6)"
+    # control_type defaults to "Edit": the horizon's None value reads as an EMPTY
+    # buffer; with the empty baseline nothing of ours landed -> WP12b not_landed.
+    assert message == "Executed type. integrity=unverified(0/6) branch=not_landed"
     assert _dispatches(engine) == ["abcdef"]
 
 
@@ -323,7 +342,7 @@ def test_agreed_partial_confirmed_stable_heals_exact_suffix(
     engine, _ = _typing_backend(
         real_backend,
         monkeypatch,
-        reader_values=["abc", "abc", "abc", "abc", "abcdef", "abcdef"],
+        reader_values=["", "abc", "abc", "abc", "abc", "abcdef", "abcdef"],
         stability_seconds=1.0,
     )
     message = real_backend.execute(_type_action("abcdef"))
@@ -340,7 +359,7 @@ def test_agreed_partial_that_drains_during_horizon_never_repairs(
     engine, _ = _typing_backend(
         real_backend,
         monkeypatch,
-        reader_values=["abc", "abc", "abcdef", "abcdef"],
+        reader_values=["", "abc", "abc", "abcdef", "abcdef"],
         stability_seconds=1.0,
     )
     message = real_backend.execute(_type_action("abcdef"))
@@ -356,7 +375,7 @@ def test_shrinking_pair_settles_to_stable_partial_then_heals(
     engine, _ = _typing_backend(
         real_backend,
         monkeypatch,
-        reader_values=["abcdefZZ", "abc", "abc", "abc", "abcdef", "abcdef"],
+        reader_values=["", "abcdefZZ", "abc", "abc", "abc", "abcdef", "abcdef"],
         stability_seconds=1.0,
     )
     message = real_backend.execute(_type_action("abcdef"))
@@ -364,14 +383,16 @@ def test_shrinking_pair_settles_to_stable_partial_then_heals(
     assert _dispatches(engine) == ["abcdef", "def"]
 
 
-def test_shrinking_pair_horizon_blind_is_unverified(
+def test_shrinking_pair_unstable_confirm_is_unverified(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine, _ = _typing_backend(
-        real_backend, monkeypatch, reader_values=["abcdef", "abc", None]
+        real_backend, monkeypatch, reader_values=["", "abcdef", "abc", None]
     )
     message = real_backend.execute(_type_action("abcdef"))
-    assert message == "Executed type. integrity=unverified(0/6)"
+    # read1 ALREADY equals the expected text (pre-existing-content shape): the
+    # unstable confirming read is what makes this honest unverified.
+    assert message == "Executed type. integrity=unverified(0/6) branch=unstable_confirm"
     assert _dispatches(engine) == ["abcdef"]
 
 
@@ -381,7 +402,7 @@ def test_confirmed_still_wrong_after_repair_raises_and_never_repeats(
     engine, _ = _typing_backend(
         real_backend,
         monkeypatch,
-        reader_values=["abc", "abc", "abc", "abc", "abc", "abc"],
+        reader_values=["", "abc", "abc", "abc", "abc", "abc", "abc"],
         stability_seconds=1.0,
     )
     with pytest.raises(TextIntegrityError, match="verified retype"):
@@ -397,11 +418,11 @@ def test_unconfirmed_repair_reports_unverified_without_raise(
     engine, _ = _typing_backend(
         real_backend,
         monkeypatch,
-        reader_values=["abc", "abc", "abc", "abc", "abcdef", "X"],
+        reader_values=["", "abc", "abc", "abc", "abc", "abcdef", "X"],
         stability_seconds=1.0,
     )
     message = real_backend.execute(_type_action("abcdef"))
-    assert message == "Executed type. integrity=unverified(0/6)"
+    assert message == "Executed type. integrity=unverified(0/6) branch=repair_unconfirmed"
     assert _dispatches(engine) == ["abcdef", "def"]
 
 
@@ -415,7 +436,7 @@ def test_valueless_non_edit_control_stays_unverified(
         real_backend, monkeypatch, reader_values=[None], control_type="Custom"
     )
     message = real_backend.execute(_type_action("abcdef"))
-    assert message == "Executed type. integrity=unverified(0/6)"
+    assert message == "Executed type. integrity=unverified(0/6) branch=blind_read"
     assert _dispatches(engine) == ["abcdef"]
 
 
@@ -426,7 +447,7 @@ def test_empty_edit_reads_as_empty_and_unverified_when_it_stays_empty(
     an empty buffer that stays empty across both quick reads is honest unverified."""
     engine, _ = _typing_backend(real_backend, monkeypatch, reader_values=[None, None])
     message = real_backend.execute(_type_action("Z"))
-    assert message == "Executed type. integrity=unverified(0/1)"
+    assert message == "Executed type. integrity=unverified(0/1) branch=agreed_empty"
     assert _dispatches(engine) == ["Z"]
 
 
@@ -475,7 +496,7 @@ def test_focus_hook_rides_every_chunk(
         hooks.append(1)
 
     message = real_backend.execute(_type_action("abcd"), None, focus_hook=hook)
-    assert message == "Executed type. integrity=unverified(0/4)"
+    assert message == "Executed type. integrity=unverified(0/4) branch=blind_read"
     assert len(hooks) == 2  # one per chunk (T8 focus-continuity cadence preserved)
     assert _dispatches(engine) == ["ab", "cd"]
 
@@ -512,7 +533,8 @@ def test_fake_backend_type_integrity_contract() -> None:
     # payload (prefix + integrity suffix unchanged).
     message = backend.execute(_type_action("abc"))
     assert message == (
-        "Simulated type. integrity=unverified(0/3) TYPE_UNCONFIRMED no-readable-target "
+        "Simulated type. integrity=unverified(0/3) branch=blind_read "
+        "TYPE_UNCONFIRMED no-readable-target "
         '(verify visually with a stated expected_effect (or retry with via="clipboard"))'
     )
     assert [item.action.value for item in backend.executed] == ["type"]
@@ -526,12 +548,17 @@ def test_fake_backend_type_integrity_contract() -> None:
     backend.focused_control_value = "a"
     assert backend.execute(_type_action("abc")) == "Simulated type. integrity=verified(3/3) healed=2"
     assert backend.focused_control_value == "abc"  # control now holds the full text
-    # agreed empty buffer: unverified, never repaired
+    # agreed empty buffer: unverified, never repaired (WP12b branch=not_landed)
     backend.focused_control_value = ""
-    assert backend.execute(_type_action("abc")) == "Simulated type. integrity=unverified(0/3)"
-    # unrelated content (masked/transformed): mismatch, never claimed verified
+    assert backend.execute(_type_action("abc")) == (
+        "Simulated type. integrity=unverified(0/3) branch=not_landed"
+    )
+    # unrelated content (masked/transformed): WP12b parity — honest unverified
+    # (branch=transformed_buffer), never claimed verified and never a failure
     backend.focused_control_value = "zzz"
-    assert backend.execute(_type_action("abc")) == "Simulated type. integrity=mismatch(0/3)"
+    assert backend.execute(_type_action("abc")) == (
+        "Simulated type. integrity=unverified(0/3) branch=transformed_buffer"
+    )
 
 
 def test_fake_backend_type_integrity_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -557,13 +584,15 @@ def test_chunks_reach_the_sendinput_engine_as_separate_batches(
     monkeypatch.setattr(input_engine_module, "_user32", fake_user32)
     monkeypatch.setattr(backend_module, "TYPE_VERIFY_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(backend_module, "TYPE_CHUNK_CHARS", 3)
-    monkeypatch.setattr(real_backend, "_engine", backend_module.SendInputEngine())
+    monkeypatch.setattr(real_backend, "_engine", backend_module.SendInputEngine(type_interval=0.0))
+    # ^ explicit UNPACED engine: this test pins backend-chunk -> engine-dispatch
+    # boundaries, not pacing (WP12a default pace applies only to the real path).
     monkeypatch.setattr(
         real_backend, "_semantic_reader", _ScriptedReader([None], control_type=None)
     )
     monkeypatch.setattr(real_backend, "_active_context", None)  # passthrough transform
     message = real_backend.execute(_type_action("abcdef"))
-    assert message == "Executed type. integrity=unverified(0/6)"
+    assert message == "Executed type. integrity=unverified(0/6) branch=blind_read"
     keyboard_batches = [
         [event for event in batch if event["kind"] == 1] for batch in fake_user32.batches
     ]

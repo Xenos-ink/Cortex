@@ -15,8 +15,12 @@ contract checks).
 - `ok` is True iff `result` is `verified` or `marker`. Everything else —
   `uncertain`, `failed`, `rejected`, `not_executed`, `dry_run`, `stopped`,
   `unknown`, a lifecycle refusal — is `ok:false`.
-- `message` on every reply (human-readable; `waited_seconds=` and `integrity=`
-  ride as `key=value` suffixes INSIDE the message, not as fields).
+- `message` on every reply (human-readable; `waited_seconds=`, `integrity=` and
+  the type-integrity `branch=` ladder token ride as `key=value` suffixes INSIDE
+  the message, not as fields). `branch=` appears only on `integrity=unverified`
+  type replies and names the verification ladder's giving-up reason — the closed
+  token list is derived from the code by a truth test and documented in the
+  skill glossary.
 - `result` on every action-bearing reply — one closed token set (below).
 - Dispatched input actions carry a `verification` block: `outcome`
   (`verified` / `uncertain` / `failed`), `confidence`, `evidence[]`,

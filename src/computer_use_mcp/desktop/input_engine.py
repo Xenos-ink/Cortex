@@ -48,14 +48,14 @@ _TYPE_INTERVAL_SECONDS = 0.01  # legacy per-char pacing (pyautogui fallback pari
 # --- input engine configuration (env-overridable; PERF-004) ---------------------------------
 INPUT_BACKEND_ENV = "CORTEX_INPUT_BACKEND"  # "sendinput" (default) | "pyautogui"
 PYAUTOGUI_PAUSE_ENV = "CORTEX_PYAUTOGUI_PAUSE"  # fallback-path PAUSE (default 0.0)
-TYPE_INTERVAL_ENV = "CORTEX_TYPE_INTERVAL"  # per-chunk typing pacing (default 0.0)
+TYPE_INTERVAL_ENV = "CORTEX_TYPE_INTERVAL"  # typing pacing (backend/SendInput default 0.02 s/char since WP12a; 0 = unpaced)
 DRAG_INTERPOLATE_ENV = "CORTEX_DRAG_INTERPOLATE"  # "0" restores the minimal teleport
 # stroke on the DEFAULT engine (the interpolated stroke ships as the factory default
 # since L1-NEW-2: freehand drawing apps sample held-button mouse moves — a
 # press/teleport/release stroke paints only dots, not a continuous line)
 DRAG_STEP_PAUSE_ENV = "CORTEX_DRAG_STEP_PAUSE"  # per-segment drag pacing (seconds)
 DRAG_STEP_PIXELS_ENV = "CORTEX_DRAG_STEP_PIXELS"  # drag stroke granularity (pixels)
-SENDINPUT_TYPE_INTERVAL = 0.0  # batched whole-string typing: no per-char cost
+SENDINPUT_TYPE_INTERVAL = 0.0  # the STANDALONE engine's library default (unpaced); the REAL backend paces at 0.02 (backend.DEFAULT_TYPE_INTERVAL_SECONDS)
 SENDINPUT_DRAG_STEP_PAUSE = 0.0  # minimal-segment drag: no per-segment cost
 SENDINPUT_DRAG_STEP_PIXELS = 0  # 0 = the coarse legacy ~40 px interpolation geometry
 _SENDINPUT_FACTORY_DRAG_STEP_PAUSE = 0.001  # L1-NEW-2 live default: ~1 ms per segment
@@ -212,28 +212,42 @@ def _key_event(vk: int, scan: int, dw_flags: int) -> _INPUT:
     )
 
 
+def _char_event_groups(text: str) -> list[list[tuple[int, int, int]]]:
+    """WP12c (VAL-WP12-02 C4): per-CHARACTER event groups for the paced path.
+
+    A surrogate pair travels in ONE group (one SendInput call, one sleep after
+    it), so the per-character focus probe and pacing run once per CHARACTER,
+    never per surrogate half. ``\\n``/``\\r`` become a VK_RETURN pair and ``\\t``
+    a VK_TAB pair; every source character is exactly one group.
+    """
+    groups: list[list[tuple[int, int, int]]] = []
+    for char in text:
+        if char in ("\n", "\r"):
+            groups.append([(0x0D, 0, 0), (0x0D, 0, _KEYEVENTF_KEYUP)])
+            continue
+        if char == "\t":
+            groups.append([(0x09, 0, 0), (0x09, 0, _KEYEVENTF_KEYUP)])
+            continue
+        encoded = char.encode("utf_16_le")
+        group: list[tuple[int, int, int]] = []
+        for index in range(0, len(encoded), 2):
+            code_unit = int.from_bytes(encoded[index : index + 2], "little")
+            group.append((0, code_unit, _KEYEVENTF_UNICODE))
+            group.append((0, code_unit, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP))
+        groups.append(group)
+    return groups
+
+
 def _text_to_key_units(text: str) -> list[tuple[int, int, int]]:
     """Whole-string typing as ``KEYEVENTF_UNICODE`` event triples ``(vk, scan, flags)``.
 
     Layout-proof: every character is injected as a UTF-16 code unit (VK_PACKET), so
     keyboard-layout remapping (e.g. Arabic) cannot garble it. ``'\\n'``/``'\\r'`` become
     ``VK_RETURN`` and ``'\\t'`` becomes ``VK_TAB`` (pyautogui ``write`` parity). Astral
-    characters split into surrogate pairs.
+    characters split into surrogate pairs. Built from :func:`_char_event_groups` (the
+    per-character pacing groups), so both paths share one event construction.
     """
-    units: list[tuple[int, int, int]] = []
-    for char in text:
-        if char in ("\n", "\r"):
-            units.extend(((0x0D, 0, 0), (0x0D, 0, _KEYEVENTF_KEYUP)))
-            continue
-        if char == "\t":
-            units.extend(((0x09, 0, 0), (0x09, 0, _KEYEVENTF_KEYUP)))
-            continue
-        encoded = char.encode("utf_16_le")
-        for index in range(0, len(encoded), 2):
-            code_unit = int.from_bytes(encoded[index : index + 2], "little")
-            units.append((0, code_unit, _KEYEVENTF_UNICODE))
-            units.append((0, code_unit, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP))
-    return units
+    return [unit for group in _char_event_groups(text) for unit in group]
 
 
 def _resolve_key_events(key: str) -> tuple[int, bool]:
@@ -535,7 +549,9 @@ class SendInputEngine(InputEngine):
       raises :class:`InputBlockedError` — strictly stronger than pyautogui, which
       silently swallows ``PermissionError``/``OSError`` from ``mouse_event``.
 
-    Pacing: typing stays batched and unpaced (whole-string dispatch); the drag
+    Pacing: the standalone engine stays batched and unpaced (whole-string
+    dispatch); the REAL backend paces it at 0.02 s/char by default via
+    ``type_interval`` (WP12a). The drag
     stroke policy is ENGINE-ATTRIBUTE-driven (L1-NEW-2): a bare engine keeps the
     legacy minimal defaults (teleport stroke, zero pause), while the backend's
     factory builds the live default — interpolated dense drag (~8 px segments
@@ -664,11 +680,6 @@ class SendInputEngine(InputEngine):
         if not text:
             return
         units = _text_to_key_units(text)
-        if self.type_interval > 0:
-            chunk_size = 2  # one character (down+up) per paced chunk
-        else:
-            chunk_size = _SENDINPUT_CHUNK_EVENTS - (_SENDINPUT_CHUNK_EVENTS % 2)
-        events = [_key_event(vk, scan, flags) for vk, scan, flags in units]
 
         def _batch_code_points(unit_batch: list[tuple[int, int, int]]) -> int:
             """MINOR-N4 (VAL-WP1-02): count CODE POINTS, never UTF-16 code units.
@@ -686,6 +697,33 @@ class SendInputEngine(InputEngine):
                 and not (flags & _KEYEVENTF_UNICODE and 0xDC00 <= code_unit <= 0xDFFF)
             )
 
+        if self.type_interval > 0:
+            # WP12c (VAL-WP12-02 C4): pace PER CHARACTER. One character — BMP or
+            # astral — is ONE SendInput call with ONE sleep after it, so the focus
+            # probe runs once per character and the sleep budget counts characters.
+            sent_chars = 0
+            for group in _char_event_groups(text):
+                if before_chunk is not None:
+                    try:
+                        before_chunk()
+                    except FocusDriftError as exc:
+                        # K-05 (ORVEX-2026-108): hook cadence == dispatch cadence (one
+                        # character per paced chunk); an abort BEFORE ``_send`` means
+                        # that character contributed nothing. ``sent_chars`` is the
+                        # exact CODE POINTS dispatched in THIS call; the caller adds
+                        # the offset of earlier chunks.
+                        exc.delivered_chars = sent_chars
+                        raise
+                self._send([_key_event(vk, scan, flags) for vk, scan, flags in group])
+                sent_chars += _batch_code_points(group)
+                time.sleep(self.type_interval)
+            return
+
+        # Unpaced: the whole string in large SendInput batches (offline/library fast
+        # path; the real backend paces by default since WP12a).
+        events = [_key_event(vk, scan, flags) for vk, scan, flags in units]
+        chunk_size = _SENDINPUT_CHUNK_EVENTS - (_SENDINPUT_CHUNK_EVENTS % 2)
+
         sent_chars = 0
         for start in range(0, len(events), chunk_size):
             batch_units = units[start : start + chunk_size]
@@ -694,17 +732,14 @@ class SendInputEngine(InputEngine):
                     before_chunk()
                 except FocusDriftError as exc:
                     # K-05 (ORVEX-2026-108): hook cadence == dispatch cadence (one
-                    # character per paced chunk when type_interval > 0; one BATCH of
-                    # characters per hook call otherwise — and an abort BEFORE
-                    # ``_send`` means that batch contributed nothing). ``sent_chars``
-                    # is the exact CODE POINTS dispatched in THIS call; the caller adds
-                    # the offset of earlier chunks.
+                    # BATCH of characters per hook call on the unpaced path — and an
+                    # abort BEFORE ``_send`` means that batch contributed nothing).
+                    # ``sent_chars`` is the exact CODE POINTS dispatched in THIS
+                    # call; the caller adds the offset of earlier chunks.
                     exc.delivered_chars = sent_chars
                     raise
             self._send(events[start : start + chunk_size])
             sent_chars += _batch_code_points(batch_units)
-            if self.type_interval > 0:
-                time.sleep(self.type_interval)
 
     def chord(self, keys: list[str]) -> None:
         self._send([_key_event(vk, scan, flags) for vk, scan, flags in _chord_key_units(keys)])

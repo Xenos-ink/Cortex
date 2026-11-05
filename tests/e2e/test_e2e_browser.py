@@ -2,12 +2,14 @@
 
 Setup launches Microsoft Edge (Server 2022 default enterprise browser) with a local HTML
 file (``file:///`` URL, unique marker title, no first-run wizards). The runtime then runs
-a direct ``computer_execute`` (``wait`` action) whose ``expected_effect`` carries the page
-marker, which the built-in ``WindowStateStrategy`` verifies against the post-action
-observation's REAL foreground title and the page's ``<title>`` — window identity
-verification from observation fields, no OCR, no pixel diff (RETARGETED, loop
-removal: the loop is gone; the window_state verification path is the direct
-path's).
+a direct ``computer_execute`` (``focus_window`` with the page marker as target), which
+0.7.6 maps to a WINDOW_STATE intent (pipeline/agent.py maps focus_window's target to the
+expected window title) that the built-in ``WindowStateStrategy`` verifies against the
+post-action observation's REAL foreground title and the page's ``<title>`` — window
+identity verification from observation fields, no OCR, no pixel diff (RETARGETED, loop
+removal: the loop is gone; the window_state verification path is the direct path's.
+WP12 live-run-2: the previous ``wait`` driver is by design a completion marker
+(``no_op_marker`` — it makes no screen claim) and can never exercise window_state).
 
 Environment notes (probed live): the Edge window carries a profile suffix
 ("... - Work - Microsoft Edge"), so verification uses contains-matching against the unique
@@ -137,7 +139,7 @@ def test_browser_local_page_window_state_verification(
             info = observation["active_window_info"]
             if evidence is not None:
                 evidence.save_observation("before", observation)
-            assert info["process_name"] == "msedge.exe", info
+            assert str(info["process_name"]).casefold() == "msedge.exe", info
             # Identity is asserted against the window's REAL owning pid (ground truth by
             # construction): with a pre-running Edge singleton the owner is the browser
             # process, not the short-lived launcher.
@@ -146,14 +148,25 @@ def test_browser_local_page_window_state_verification(
             assert PAGE_TITLE_MARKER in info["title"], info
             assert observation["coordinate_space"] == "verified_passthrough", observation
 
-            response = asyncio.run(
-                srv_server_execute.computer_execute(
-                    session_id, "wait", delta=1, expected_effect=PAGE_TITLE_MARKER
+            # THE ACTION UNDER TEST (WP12 live-run-2): a ``focus_window`` whose target
+            # is the run-unique page marker. 0.7.6 maps focus_window to a WINDOW_STATE
+            # intent (pipeline/agent.py:1059-1063 — window_title = action.target)
+            # verified by WindowStateStrategy (pipeline/verification.py:734-749, title
+            # contains-match case-insensitive) — a REAL checkable window-state claim.
+            # The previous ``wait`` driver is BY DESIGN a completion marker
+            # (verification_method 'no_op_marker'; it makes no screen claim), so it can
+            # never exercise window_state; focus_window can, without weakening the
+            # assertions below (all of them unchanged).
+            response = rt.execute_payload(
+                asyncio.run(
+                    srv_server_execute.computer_execute(
+                        session_id, "focus_window", target=PAGE_TITLE_MARKER
+                    )
                 )
             )
             if evidence is not None:
                 evidence.record(
-                    "computer_execute(wait)",
+                    "computer_execute(focus_window)",
                     ok=response.get("ok"),
                 )
             verification = response["verification"]

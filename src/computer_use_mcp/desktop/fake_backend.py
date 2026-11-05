@@ -22,7 +22,6 @@ from .backend import (
     TYPE_VERIFY_SETTLE_SECONDS,
     _CaptureContext,
     _format_integrity_status,
-    _landed_prefix_len,
     _mark_action_dispatched,
     _normalize_landed_text,
     _validate_action_defense,
@@ -550,31 +549,58 @@ class FakeComputerBackend(ComputerBackend):
                     message = (
                         "Simulated type. "
                         + _format_integrity_status(0, total, mismatch=0, unverified=total, healed=0)
+                        + " branch=blind_read"
                         + f" {TYPE_UNCONFIRMED_MARKER} ({TYPE_UNCONFIRMED_HINT_SENDINPUT})"
                     )
                 else:
                     expected_n = _normalize_landed_text(action.text)
-                    matched = _landed_prefix_len(landed_n, expected_n)
-                    if matched == len(expected_n):
+                    # WP12c (VAL MINOR): the old tail-match heal
+                    # (``_landed_prefix_len`` > 0 -> retype) reproduced the B1 false
+                    # heal ('tett' + 'test' -> verified healed=3, field 'tettest').
+                    # The fake now classifies by the COMMON PREFIX with the typed
+                    # text only: a genuinely missing suffix (buffer == a proper
+                    # typed prefix) heals; a diverged tail is a mismatch; a foreign
+                    # buffer is unverified transformed_buffer. The fake has NO
+                    # baseline (its documented model: the field starts empty), so
+                    # the real ladder's tail_unproven / landed_not_at_tail /
+                    # caret cases (which need a baseline) do not exist here.
+                    if landed_n.endswith(expected_n):
                         message = "Simulated type. " + _format_integrity_status(
                             total, total, mismatch=0, unverified=0, healed=0
                         )
-                    elif matched > 0:
-                        # Dropped-suffix signature: simulate the verified retype landing
-                        # (repair = exactly the missing suffix; an agreed EMPTY buffer is
-                        # unverified — never repaired — mirroring the fix3 fast path).
-                        missing = expected_n[matched:]
-                        self.focused_control_value = landed_n + missing
-                        message = "Simulated type. " + _format_integrity_status(
-                            total, total, mismatch=0, unverified=0, healed=len(missing)
-                        )
                     else:
-                        if landed_n == "":
-                            # Agreed empty buffer: unverified, never repaired (fix3).
+                        k = 0
+                        while (
+                            k < min(len(landed_n), len(expected_n))
+                            and landed_n[k] == expected_n[k]
+                        ):
+                            k += 1
+                        if k == len(landed_n) and 0 < k < len(expected_n):
+                            # Genuinely missing suffix: simulate the verified retype
+                            # landing (repair = exactly the missing suffix; an agreed
+                            # EMPTY buffer is unverified — never repaired).
+                            missing = expected_n[k:]
+                            self.focused_control_value = landed_n + missing
                             message = "Simulated type. " + _format_integrity_status(
-                                0, total, mismatch=0, unverified=total, healed=0
+                                total, total, mismatch=0, unverified=0, healed=len(missing)
                             )
+                        elif k == 0:
+                            if landed_n == "":
+                                # Agreed empty buffer: unverified, never repaired (fix3);
+                                # WP12b parity: branch=not_landed (nothing of ours landed).
+                                message = "Simulated type. " + _format_integrity_status(
+                                    0, total, mismatch=0, unverified=total, healed=0
+                                ) + " branch=not_landed"
+                            else:
+                                # WP12b parity: a foreign/masked buffer shares nothing
+                                # with the typed text — honest unverified (never a
+                                # failure), branch=transformed_buffer.
+                                message = "Simulated type. " + _format_integrity_status(
+                                    0, total, mismatch=0, unverified=total, healed=0
+                                ) + " branch=transformed_buffer"
                         else:
+                            # WP12b B1(c): began correctly (k correct characters) and
+                            # then DIVERGED — positive corruption evidence -> mismatch.
                             message = "Simulated type. " + _format_integrity_status(
                                 0, total, mismatch=total, unverified=0, healed=0
                             )

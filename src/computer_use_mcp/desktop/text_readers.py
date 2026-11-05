@@ -190,6 +190,10 @@ def _com_release(pointer: int | None) -> None:
 class UiaSemanticReader:
     """Warm UIA snapshot reader: focused element + bounded children (raw ctypes COM).
 
+    ``value_source = "uia"`` (WP12e): UIA values are NOT truncated at the
+    ``_WINDOW_TEXT_MAX_CHARS`` cap, so the backend's cap-blind rule does not
+    apply to them (only the Win32 fallback truncates).
+
     - ``warm()`` at backend init pays the one-time COM/class-object cost (~200 ms) so
       per-observation reads stay in the ~1-10 ms range (research digest Q3).
     - ``read()`` returns ``{"focused": {...}, "elements": [...]}`` bounded by
@@ -202,6 +206,8 @@ class UiaSemanticReader:
       GetElement=4). Property reads use ``GetCurrentPropertyValue`` exclusively so
       only five vtable slots are load-bearing.
     """
+
+    value_source = "uia"
 
     def __init__(self) -> None:
         self._automation: int | None = None
@@ -467,6 +473,10 @@ class Win32TextReader:
     """Win32-window-text semantic reader: the sanctioned fallback when raw UIA COM is
     unavailable (see the module-level rationale on :class:`UiaSemanticReader`).
 
+    ``value_source = "win32"`` (WP12e): this reader TRUNCATES control text at
+    ``_WINDOW_TEXT_MAX_CHARS`` — values at the cap are treated as blind
+    (branch=read_truncated) by the backend's integrity ladder.
+
     Emits the SAME snapshot shape as the UIA reader (``focused`` + bounded ``elements``
     list, every element carrying ``name``/``control_type``/``automation_id``/``value``/
     ``offscreen``/``rect``/``focused``/``source``), sourced from:
@@ -483,6 +493,8 @@ class Win32TextReader:
     (no Win32 equivalent), ``control_type`` is derived from the window class name, and
     names are limited to text the app exposes as window text.
     """
+
+    value_source = "win32"
 
     def __init__(self) -> None:
         self._available = IS_WINDOWS and _user32 is not None

@@ -31,6 +31,7 @@ Two pieces (both E7-owned, tests/e2e only):
 
 from __future__ import annotations
 
+import json
 import re
 from types import SimpleNamespace
 from typing import Any
@@ -289,6 +290,25 @@ class CalcDisplayPredicateStrategy:
             evidence=evidence,
             verification_method=self.name,
         )
+
+
+def execute_payload(response: Any) -> dict[str, Any]:
+    """Unwrap an executed MCP content-block reply to its dict payload (0.7.6 contract).
+
+    WP12 finding D: ``computer_execute`` returns MCP content blocks —
+    ``[TextContent(result JSON), ImageContent(png)]`` — never the bare result dict
+    the pre-0.4.1 tool surface used; the TextContent block carries the structured
+    reply (``{ok, result, verification, ...}`` per docs/REPLY-CONTRACT.md). A
+    legacy dict response (defensive) passes through unchanged.
+    """
+    if isinstance(response, dict):
+        return response
+    for block in response:
+        if getattr(block, "type", None) == "text":
+            payload = json.loads(block.text)
+            assert isinstance(payload, dict), payload
+            return payload
+    raise AssertionError(f"execute response carried no TextContent payload: {response!r}")
 
 
 def observation_center(observation: Any) -> tuple[int, int]:
