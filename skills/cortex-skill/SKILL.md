@@ -149,15 +149,15 @@ item, every plan step, the terminal plan, and wait/cancel/fetch):
   `click`/`right_click`/`keypress`/`hotkey` only, rejected fail-closed on every other
   action. Neither `hold_ms` nor `duration_ms` is a top-level `computer_execute`
   parameter — they ride a `follow_ups` entry or a plan point action. On `hotkey` all
-  keys go down together and release in reverse order. `hold_ms=0` is an explicit
-  zero-duration press/release, not a fast chord. `duration_ms` (0..5000 ms, `move`
-  only) is a timed-motion duration; outside a plan both motion and settle are instant
-  (0 ms / 0 ms). A plan's `settle_ms` (0..200 ms) is the explicit per-point settle.
-- `scroll`: POSITIVE = UP, away from you (negative reads further down), and the wheel
+  keys go down together and release in reverse order; a PLAIN `hotkey` (no `hold_ms`)
+  holds its keys 50 ms before the release (Store apps ignore zero-separation chords);
+  `hold_ms=0` is an explicit zero-duration press/release. `duration_ms` (0..5000 ms,
+  `move` only) is a timed-motion duration; outside a plan both motion and settle are
+  instant (0 ms / 0 ms); `settle_ms` (0..200 ms) is the per-point settle.
+- `scroll`: POSITIVE = UP (negative reads further down), and the wheel
   lands at the CURRENT CURSOR POSITION — `move` the pointer to the region first. The
-  delta band is -20..20; a `wait` delta outside it is rejected, one inside it is
-  clamped to the action's cap and the row's message carries
-  `waited_seconds=<effective>`.
+  delta band is -20..20; a `wait` delta outside it is rejected, one inside it is clamped
+  to the action's cap and the row's message carries `waited_seconds=<effective>`.
 - `via="clipboard"` (type actions only) pastes via the clipboard for apps that drop
   per-character typing; it never bypasses any gate. Known limit: on an ABORT path
   (failsafe, stop token, blocked input) between the clipboard set and the paste chord,

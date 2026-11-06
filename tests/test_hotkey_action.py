@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from recording_engine import RecordingEngine
 
 import computer_use_mcp.desktop.backend as backend_module
+from computer_use_mcp.desktop.backend import DEFAULT_HOTKEY_HOLD_MS
 import computer_use_mcp.server.lifecycle as srv_server_lifecycle
 import computer_use_mcp.server.wait_machine as srv_server_wait_machine
 import computer_use_mcp.server.wait as srv_server_wait
@@ -111,11 +112,23 @@ def test_fake_hotkey_input_blocked_records_nothing() -> None:
 def test_real_hotkey_calls_chord_with_key_names_verbatim(
     real_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """K1 (LIVE-WP13-02): a PLAIN hotkey uses the held path — key names still
+    pass verbatim, but as key-down alt/s-key-down, hold, key-up in reverse."""
     engine = RecordingEngine()
     monkeypatch.setattr(real_backend, "_engine", engine)
+    holds: list[float] = []
+    monkeypatch.setattr(
+        backend_module, "_wait_for_hold", lambda seconds, stop: holds.append(seconds)
+    )
     message = real_backend.execute(hotkey(["ctrl", "s"]))
     assert message == "Executed hotkey."
-    assert engine.calls == [("chord", "ctrl", "s")]
+    assert holds == [DEFAULT_HOTKEY_HOLD_MS / 1000.0]
+    assert engine.calls == [
+        ("key_down", "ctrl"),
+        ("key_down", "s"),
+        ("key_up", "s"),
+        ("key_up", "ctrl"),
+    ]
 
 
 @WINDOWS_ONLY

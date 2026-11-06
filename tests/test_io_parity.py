@@ -31,7 +31,6 @@ from computer_use_mcp.desktop.win32 import (
     _MOUSEEVENTF_MOVE,
     _MOUSEEVENTF_WHEEL,
 )
-import computer_use_mcp.desktop.input_engine as input_engine_module
 from computer_use_mcp.desktop.backend import LocalComputerBackend
 from computer_use_mcp.desktop.capture import _CaptureContext
 from computer_use_mcp.desktop.coordinates import CoordinateVerdict
@@ -82,6 +81,14 @@ class _ParityPyautogui:
     def hotkey(self, *args: object, **kwargs: object) -> None:
         self._guard()
         self.calls.append(("hotkey", *args))
+
+    def keyDown(self, key: str = "") -> None:
+        self._guard()
+        self.calls.append(("keyDown", key))
+
+    def keyUp(self, key: str = "") -> None:
+        self._guard()
+        self.calls.append(("keyUp", key))
 
     def scroll(self, *args: object, **kwargs: object) -> None:
         self._guard()
@@ -263,12 +270,30 @@ def test_parity_keypress(real_backend: LocalComputerBackend, monkeypatch: pytest
 
 @WINDOWS_ONLY
 def test_parity_hotkey(real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+    """K1: a PLAIN hotkey uses the held path on BOTH engines — keyDown/keyUp in
+    pyautogui vocabulary, keyboard down/up events in the SendInput batches —
+    with the same 50 ms default hold."""
+    holds: list[float] = []
+    monkeypatch.setattr(
+        backend_module, "_wait_for_hold", lambda seconds, stop: holds.append(seconds)
+    )
     action = GroundedAction(confidence=1.0, action="hotkey", keys=["ctrl", "s"])
     pa_calls, fake_user32, pa_msg, si_msg = _run_both(real_backend, monkeypatch, action)
     assert pa_msg == si_msg == "Executed hotkey."
-    assert pa_calls == [("hotkey", "ctrl", "s")]
-    downs = [e["vk"] for e in fake_user32.batches[0] if e["kind"] == 1 and e["flags"] == 0]
-    assert downs == [0x11, 0x53]
+    assert holds == [0.05, 0.05]  # one 50 ms hold per engine
+    assert pa_calls == [
+        ("keyDown", "ctrl"),
+        ("keyDown", "s"),
+        ("keyUp", "s"),
+        ("keyUp", "ctrl"),
+    ]
+    keyboard_events = [
+        e for batch in fake_user32.batches for e in batch if e["kind"] == 1
+    ]
+    downs = [e["vk"] for e in keyboard_events if e["flags"] == 0]
+    ups = [e["vk"] for e in keyboard_events if e["flags"] != 0]
+    assert downs == [0x11, 0x53]  # same chord (ctrl, s), pressed in order
+    assert ups == [0x53, 0x11]  # released in REVERSE order
 
 
 @WINDOWS_ONLY

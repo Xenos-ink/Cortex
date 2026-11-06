@@ -244,6 +244,14 @@ class InterferenceGuard:
         self._launcher_seed: frozenset[str] = frozenset()
         self._session_chord_keys: list[list[str]] = []
         self._refocus_attempted_for: set[str] = set()
+        # K2 (LIVE-WP13-02 run 4 T4): set right after an ensure_app LAUNCH — the
+        # new window has not appeared yet, so the post-action foreground is
+        # whatever happened to be there (a terminal, the taskbar) and a blind
+        # rebind armed the session against a window that was not ours (live:
+        # FOCUS_TAKEN_BY naming the fresh Notepad). While pending, the next
+        # pre-dispatch focus check ADOPTS the foreground window when its
+        # process matches the launched basename ("" = adopt any titled window).
+        self._pending_launched_adoption: str | None = None
 
     # ------------------------------------------------------------------ audit helper
 
@@ -318,6 +326,14 @@ class InterferenceGuard:
         # R-22 (D-2): the seed belongs to the launcher surface just left — a new
         # anchor invalidates it (the adoption rebind clears it with the anchor move).
         self._launcher_seed = frozenset()
+        # N-K2a (VAL-WP13-06): an explicit rebind (ensure_app REATTACH,
+        # focus_window) CANCELS any pending launch adoption — the session now
+        # has a deliberate target, and a late-appearing window of an earlier
+        # LAUNCHED process must be blocked as FOCUS_TAKEN_BY again, never
+        # adopted over the driver's own binding. The adoption path itself
+        # clears the pending state before its own rebind, so the genuine
+        # launch case still adopts.
+        self._pending_launched_adoption = None
         self._audit("bound", f"BOUND target={_describe_target(self.bound)}")
 
     def rebind_from_observation(self, observation: Observation | None) -> None:
@@ -327,6 +343,31 @@ class InterferenceGuard:
         info = observation.active_window_info
         if info is not None and (info.hwnd or info.process_name or info.title):
             self.rebind(info)
+
+    def begin_launched_adoption(self, process_hint: str | None = None) -> None:
+        """K2 (LIVE-WP13-02 run 4 T4): enter LAUNCHED lazy-adoption mode.
+
+        Called by the agent after an ensure_app outcome of ``launched`` INSTEAD
+        of the blind ``rebind_from_observation``: the spawned window has not
+        appeared yet, so the post-action foreground is an unrelated surface and
+        rebinding to it armed the session against a window that was not ours.
+        ``process_hint`` is the launched executable basename (e.g.
+        ``notepad.EXE`` — casefolded, ``.exe``-insensitive); while pending, the
+        next pre-dispatch focus check ADOPTS the foreground window ONLY when
+        its process matches the hint.
+
+        A1 (VAL-WP13-06): with NO known process hint the adoption is NEVER
+        armed — an empty hint would relax the steal protection onto ANY titled
+        foreground window (a browser, WhatsApp, the user's own work). This
+        method is then a NO-OP and the caller falls back to the pre-DELTA-8
+        behaviour (rebind from the post-action observation). One-shot: the
+        first pre-dispatch check consumes the pending state either way.
+        """
+        hint = (process_hint or "").strip().casefold().removesuffix(".exe")
+        if not hint:
+            self._pending_launched_adoption = None
+            return
+        self._pending_launched_adoption = hint
 
     def reanchor_after_success(self, new_window: WindowInfo | None) -> None:
         """B10 (b) + R-20: follow ONLY the session's OWN verified surface transitions.
@@ -659,6 +700,25 @@ class InterferenceGuard:
                 blocking=policy.policy != "observe_only",
                 hints=[REFOCUS_HINT],
             )
+        # K2 (LIVE-WP13-02 run 4 T4): lazy adoption of the window WE launched —
+        # one-shot, titled-window requirement (B10 c), and the foreground's
+        # process basename MUST match the launched basename. With NO hint the
+        # adoption is never armed (A1: an unrelated titled foreground must
+        # never become the session target), so this branch cannot fire without
+        # a hint. Anything else falls through to the normal ladder (steal
+        # protection untouched).
+        pending_hint = self._pending_launched_adoption
+        if pending_hint is not None:
+            self._pending_launched_adoption = None
+            foreground_basename = _exe_basename(foreground).casefold().removesuffix(".exe")
+            if (foreground.title or "").strip() and pending_hint and foreground_basename == pending_hint:
+                self.rebind(foreground)
+                self._audit(
+                    "launched_adopted",
+                    f"ADOPTED LAUNCHED target={_describe_target(foreground)}",
+                    action=action,
+                )
+                return None  # the window we launched is foreground: dispatch proceeds
         if self._matches_binding(foreground):
             return None
         # B6: the bound identity may be GONE (window closed). Rejecting forever against
@@ -673,6 +733,10 @@ class InterferenceGuard:
             unbind = self.policy.focus_guard.on_target_gone == "unbind_and_report"
             if unbind:
                 self.bound = None  # unbind: the guard returns to the dormant arming state
+                # N-K2a (VAL-WP13-06): a dropped binding also cancels any pending
+                # launch adoption — with no binding the pending state would linger
+                # until some later bind and adopt an unverified window.
+                self._pending_launched_adoption = None
             self._audit("target_gone", gone, action=action)
             return GuardVerdict(
                 event=gone,

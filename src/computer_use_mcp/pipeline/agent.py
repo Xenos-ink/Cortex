@@ -97,6 +97,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -104,7 +105,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from ..security.audit import AuditLogger, Metrics
-from ..desktop.backend import ComputerBackend, type_action_deadline_seconds
+from ..desktop.backend import (
+    ComputerBackend,
+    DEFAULT_HOTKEY_HOLD_MS,
+    type_action_deadline_seconds,
+)
 from ..desktop.client_budget import semantic_read_timeout_seconds
 from ..desktop.errors import FocusDriftError
 from ..desktop.motion import WAIT_MAX_SECONDS
@@ -1850,7 +1855,18 @@ class ComputerUseAgent:
                     stopped_reason = "time_budget"
                     break
                 if (
-                    ((item.hold_ms or 0) + (item.duration_ms or 0)) / 1000.0
+                    (
+                        ((item.hold_ms or 0) + (item.duration_ms or 0)) / 1000.0
+                        # K1 (LIVE-WP13-02 runs 3-4): a PLAIN hotkey now holds its
+                        # keys DEFAULT_HOTKEY_HOLD_MS (50 ms) before release — the
+                        # implicit hold counts against the remaining budget, so a
+                        # chain of hotkeys can never overrun it.
+                        + (
+                            DEFAULT_HOTKEY_HOLD_MS / 1000.0
+                            if item.action is ActionType.HOTKEY and item.hold_ms is None
+                            else 0.0
+                        )
+                    )
                 ) > remaining_budget:
                     stopped_reason = "time_budget"
                     break
@@ -2586,8 +2602,37 @@ class ComputerUseAgent:
                 else self._observe("post_action")
             )
             # T8: re-bind after an explicit focus/reattach action; run the sentinel.
+            # K2 (LIVE-WP13-02 run 4 T4): after an ensure_app LAUNCH the new window
+            # has not appeared yet — a blind rebind armed the session against the
+            # unrelated foreground (live: FOCUS_TAKEN_BY naming the fresh Notepad).
+            # LAUNCHED with a `launched=<exe>` token enters the guard's lazy launch
+            # adoption (A2: anchored to the documented token format). A LAUNCHED
+            # reply WITHOUT the token, and every other outcome (focus_window,
+            # REATTACHED), keeps the pre-DELTA-8 behaviour: rebind from the
+            # observation — never an unhinted adoption (A1: an unrelated titled
+            # foreground must never become the session target).
             if action.action in {ActionType.FOCUS_WINDOW, ActionType.ENSURE_APP}:
-                self.guard.rebind_from_observation(after)
+                message_text = str(message or "")
+                # D8-3 (VAL-WP13-06): the regex is anchored to the token's real
+                # position in the LAUNCHED payload (`... launch=server
+                # launched=<exe> (no existing ...`, backend.ensure_app) and the
+                # basename is captured up to the following ` (no existing` — so
+                # a quoted `target` value containing `launched=explorer` can
+                # never inject a hint, and launched names with spaces survive.
+                hint_match = (
+                    re.search(
+                        r" launch=server launched=(.+?) \(no existing", message_text
+                    )
+                    if (
+                        action.action is ActionType.ENSURE_APP
+                        and message_text.startswith("LAUNCHED")
+                    )
+                    else None
+                )
+                if hint_match is not None:
+                    self.guard.begin_launched_adoption(hint_match.group(1))
+                else:
+                    self.guard.rebind_from_observation(after)
             if action.action in {ActionType.KEYPRESS, ActionType.HOTKEY}:
                 self.guard.note_chord(action.keys)
             post_events, post_annotations, post_stops = self._post_action_guard_events(action, after)

@@ -596,22 +596,38 @@ def test_b9_key_actions_without_hold_ms_are_byte_identical_legacy(
     action: ActionType,
     keys: list[str],
 ) -> None:
-    """AC-6 / D5: exactly ONE ``engine.chord`` call, zero key-down/key-up events, zero waits.
-
-    This is the regression the whole design pivots on (``hold_ms is None`` is the legacy
-    path, byte-identical), so it must be green BEFORE and AFTER the change.
+    """AC-6 / D5, as amended by K1 (LIVE-WP13-02 runs 3-4): a KEYPRESS without
+    hold_ms is still exactly ONE ``engine.chord`` call (legacy, byte-identical);
+    a HOTKEY without hold_ms now uses the HELD path with the
+    DEFAULT_HOTKEY_HOLD_MS (50 ms) hold — key-downs in order, the hold
+    (`_wait_for_hold`), key-ups in reverse — because Store apps ignored the
+    zero-separation instant chord (4 of 5 live alt+f4 trials did nothing).
     """
     engine = _KeyRecordingEngine()
     install_engine(dispatching_backend, engine, monkeypatch)
+    holds: list[float] = []
+    monkeypatch.setattr(
+        backend_module, "_wait_for_hold", lambda seconds, stop: holds.append(seconds)
+    )
     recorder = _SleepRecorder(lambda: list(engine.keys_down))
     monkeypatch.setattr(backend_module.time, "sleep", recorder)
 
     kwargs = {} if hold == "omitted" else {"hold_ms": None}
     message = dispatching_backend.execute(build(action, keys=keys, **kwargs))
     assert message == f"Executed {action.value}."
-    assert engine.calls == [("chord", *keys)]
-    assert engine.key_calls == []
-    assert recorder.sleeps == []
+    if action is ActionType.KEYPRESS:
+        assert engine.calls == [("chord", *keys)]
+        assert engine.key_calls == []
+        assert holds == []
+        assert recorder.sleeps == []
+    else:
+        from computer_use_mcp.desktop.backend import DEFAULT_HOTKEY_HOLD_MS
+
+        downs = [call[1] for call in engine.key_calls if call[0] == "key_down"]
+        ups = [call[1] for call in engine.key_calls if call[0] == "key_up"]
+        assert downs == keys  # pressed in order
+        assert ups == list(reversed(keys))  # reverse release
+        assert holds == [DEFAULT_HOTKEY_HOLD_MS / 1000.0]
     assert engine.keys_down == []
 
 

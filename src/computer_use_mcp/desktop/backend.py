@@ -332,6 +332,16 @@ TYPE_CHUNK_CHARS = _env_int_in_range("CORTEX_TYPE_CHUNK_CHARS", 64, 1, 4096)
 #: SendInputEngine()/FakeComputerBackend library defaults stay 0.0 so the offline
 #: suite stays fast.
 DEFAULT_TYPE_INTERVAL_SECONDS = 0.02
+#: K1 (LIVE-WP13-02 runs 3-4): a PLAIN hotkey chord (no hold_ms given) holds
+#: its keys for this long before releasing them in reverse order. A plain
+#: chord is ONE SendInput batch with zero time between the key-down and
+#: key-up events, which Windows 11 Store apps IGNORED live (packaged Notepad
+#: 11.2607: only 1 of 5 plain alt+f4 chords closed the window, pixel diff 0;
+#: the held hold_ms=50 form closed 3 of 3 trials). An EXPLICIT hold_ms still wins, and
+#: hold_ms=0 keeps its documented meaning: the explicit zero-duration split
+#: press/release with zero wait — NOT the old single-batch chord, which is no
+#: longer reachable for a hotkey.
+DEFAULT_HOTKEY_HOLD_MS = 50
 #: WP13 (field e1/e2, Addendum 4): the HOST's per-tool-call timeout — one knob,
 #: ``CORTEX_CLIENT_TIMEOUT_SECONDS`` (default 60, band 10..600; out-of-band or
 #: unparsable values fall back to the default). Every long-blocking bound is
@@ -1715,13 +1725,25 @@ class LocalComputerBackend(ComputerBackend):
             # WP2 (ORVEX-2026-107): a held hotkey holds EVERY key SIMULTANEOUSLY for
             # the duration and releases them in reverse order — "chord, then wait"
             # would be vacuous, because a chord has already released everything by the
-            # time it returns (D1). hold_ms=None keeps the legacy chord
-            # byte-identical (D5).
+            # time it returns (D1). K1 (LIVE-WP13-02 runs 3-4): a PLAIN chord is ONE
+            # SendInput batch with zero time between the key-down and key-up events,
+            # which Windows 11 Store apps IGNORED live (packaged Notepad 11.2607:
+            # only 1 of 5 plain alt+f4 chords closed the window, pixel diff 0; the
+            # held hold_ms=50 form closed 3 of 3 trials) — a plain hotkey therefore uses the
+            # held path with a 50 ms default hold (DEFAULT_HOTKEY_HOLD_MS). An
+            # EXPLICIT hold_ms still wins; hold_ms=0 keeps its documented meaning,
+            # the explicit zero-duration split press/release with zero wait —
+            # NOT the old single-batch chord, which is no longer reachable for
+            # a hotkey.
             if action.hold_ms is not None:
                 self._dispatch_held_keys(action, list(action.keys), stop)
             else:
-                engine.chord(list(action.keys))
-                _mark_action_dispatched(action)
+                self._dispatch_held_keys(
+                    action,
+                    list(action.keys),
+                    stop,
+                    hold_ms_override=DEFAULT_HOTKEY_HOLD_MS,
+                )
             self._last_key_dispatch = time.monotonic()
         elif action.action == "scroll":
             if stop is not None:
@@ -1758,7 +1780,11 @@ class LocalComputerBackend(ComputerBackend):
         return get_cursor_position()
 
     def _dispatch_held_keys(
-        self, action: GroundedAction, keys: list[str], stop: StopToken | None
+        self,
+        action: GroundedAction,
+        keys: list[str],
+        stop: StopToken | None,
+        hold_ms_override: float | None = None,
     ) -> None:
         """WP2 (ORVEX-2026-107): key-DOWN -> sliced interruptible wait -> key-UP
         (reverse order).
@@ -1780,7 +1806,8 @@ class LocalComputerBackend(ComputerBackend):
         in reverse press order (D1), each release is ATTEMPTED even if an earlier one
         raises, and a failing release never masks the in-flight error.
         """
-        hold_seconds = action.hold_ms / 1000.0
+        hold_ms = hold_ms_override if hold_ms_override is not None else action.hold_ms
+        hold_seconds = hold_ms / 1000.0
         engine = self._engine
         keys_down = 0
         hold_error: BaseException | None = None

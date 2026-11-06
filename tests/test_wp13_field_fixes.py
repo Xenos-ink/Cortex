@@ -1738,6 +1738,533 @@ def test_verify_budget_gate_covers_the_quick_and_horizon_reads(
     assert _dispatches(engine_b) == ["test"]
 
 
+# --- WP13 DELTA 8 (LIVE-WP13-02 runs 3-4 fixes) --------------------------------------------------
+
+
+def test_plain_hotkey_holds_50ms_then_releases_in_reverse(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K1 (LIVE-WP13-02 runs 3-4): a PLAIN hotkey (no hold_ms) uses the held
+    dispatch path with the DEFAULT_HOTKEY_HOLD_MS (50 ms) hold — key-downs in
+    order, the 50 ms hold, then key-ups in REVERSE order; never the instant
+    chord (which Store Notepad ignored in 4 of 5 live trials)."""
+    from computer_use_mcp.core.models import GroundedAction
+    from recording_engine import RecordingEngine
+
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
+    holds: list[float] = []
+    monkeypatch.setattr(
+        backend_module, "_wait_for_hold", lambda seconds, stop: holds.append(seconds)
+    )
+    real_backend.execute(
+        GroundedAction(action="hotkey", keys=["alt", "f4"], confidence=1.0)
+    )
+    assert holds == [0.05], holds  # the DEFAULT_HOTKEY_HOLD_MS hold
+    downs = [c[1] for c in engine.calls if c[0] == "key_down"]
+    ups = [c[1] for c in engine.calls if c[0] == "key_up"]
+    assert downs == ["alt", "f4"]  # pressed in order
+    assert ups == ["f4", "alt"]  # released in REVERSE order
+    assert not any(c[0] == "chord" for c in engine.calls)  # never the instant batch
+
+
+def test_explicit_hotkey_hold_ms_still_wins_and_zero_keeps_its_meaning(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K1: an EXPLICIT hold_ms wins over the default (500 -> 0.5 s), and
+    hold_ms=0 keeps its documented meaning — the explicit zero-duration split
+    press/release (hold 0.0, still the held path, still reverse release)."""
+    from computer_use_mcp.core.models import GroundedAction
+    from recording_engine import RecordingEngine
+
+    for hold_ms, expected_hold in ((500, 0.5), (0, 0.0)):
+        engine = RecordingEngine()
+        monkeypatch.setattr(real_backend, "_engine", engine)
+        holds: list[float] = []
+        monkeypatch.setattr(
+            backend_module, "_wait_for_hold", lambda seconds, stop: holds.append(seconds)
+        )
+        real_backend.execute(
+            GroundedAction(
+                action="hotkey", keys=["alt", "f4"], hold_ms=hold_ms, confidence=1.0
+            )
+        )
+        assert holds == [expected_hold], (hold_ms, holds)
+        downs = [c[1] for c in engine.calls if c[0] == "key_down"]
+        ups = [c[1] for c in engine.calls if c[0] == "key_up"]
+        assert downs == ["alt", "f4"] and ups == ["f4", "alt"]
+
+
+def test_keypress_is_out_of_the_hotkey_hold_scope(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K1 scope decision: a keypress (single key, and even a multi-key one)
+    keeps the LEGACY instant chord when no hold_ms is given — the 50 ms
+    default hold applies to hotkey actions only; a keypress with an explicit
+    hold_ms still uses the held path."""
+    from computer_use_mcp.core.models import GroundedAction
+    from recording_engine import RecordingEngine
+
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
+    holds: list[float] = []
+    monkeypatch.setattr(
+        backend_module, "_wait_for_hold", lambda seconds, stop: holds.append(seconds)
+    )
+    real_backend.execute(GroundedAction(action="keypress", keys=["ctrl"], confidence=1.0))
+    assert holds == []  # no implicit hold on keypress
+    assert ("chord", "ctrl") in engine.calls  # the legacy instant chord
+    assert not any(c[0] == "key_down" for c in engine.calls)
+
+
+async def test_queue_budget_counts_the_implicit_hotkey_hold(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K1 budget: the implicit 50 ms hold of a PLAIN hotkey follow-up item
+    counts against the remaining budget — 0.04 s remaining stops the item
+    (time_budget, never dispatched) while 0.2 s remaining dispatches it."""
+    from types import SimpleNamespace as _NS
+
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS,
+        backend=ScriptedBackend(flip=False),
+    )
+    backend._engine = _NS(type_interval=0.0)
+    clock = _patch_agent_clock(monkeypatch, 15.0)
+
+    def _consume(action: Any) -> None:
+        clock.advance(14.96)  # remaining 0.04 s < the implicit 0.05 s hold
+
+    backend.execute_hooks.append(_consume)
+    payload = execute_payload(
+        await srv_server_execute.computer_execute(
+            session_id,
+            "done",
+            follow_ups=[{"action": "hotkey", "keys": ["alt", "f4"]}],
+        )
+    )
+    assert payload["follow_ups_stopped_reason"] == "time_budget", payload
+    assert len(payload["follow_up_results"]) == 1  # the hotkey never dispatched
+
+    clock2 = _patch_agent_clock(monkeypatch, 15.0)
+    session_id2, _b2, backend2, _ = make_session(
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS,
+        backend=ScriptedBackend(flip=False),
+    )
+    backend2._engine = _NS(type_interval=0.0)
+    backend2.execute_hooks.append(lambda action: clock2.advance(14.8))  # 0.2 s left
+    payload2 = execute_payload(
+        await srv_server_execute.computer_execute(
+            session_id2,
+            "done",
+            follow_ups=[{"action": "hotkey", "keys": ["alt", "f4"]}],
+        )
+    )
+    assert payload2.get("follow_ups_stopped_reason") in (None, "completed"), payload2
+    assert len(payload2["follow_up_results"]) == 2  # the hotkey DISPATCHED
+
+
+def test_launched_adoption_adopts_the_matching_foreground(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K2 (LIVE-WP13-02 run 4 T4): after an ensure_app LAUNCH, the next
+    pre-dispatch focus check ADOPTS the launched process's foreground window
+    (dispatch proceeds, the binding moves to the window we launched) instead
+    of rejecting it with FOCUS_TAKEN_BY."""
+    from computer_use_mcp.core.models import GroundedAction, Point, WindowInfo
+    from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+    from computer_use_mcp.desktop.interference import parse_interference
+
+    def _window(hwnd: int, pid: int, process: str, title: str) -> WindowInfo:
+        return WindowInfo(
+            hwnd=hwnd,
+            pid=pid,
+            process_name=process,
+            exe_path=f"C:/x/{process}",
+            window_class="Notepad" if "Notepad" in process else "Terminal",
+            title=title,
+            bounds=[0, 0, 800, 600],
+        )
+
+    class _FakeGuardBackend:
+        def __init__(self, foreground: WindowInfo) -> None:
+            self.foreground = foreground
+
+        def query_foreground_window(self) -> WindowInfo:
+            return self.foreground
+
+        def is_window_alive(self, hwnd: int) -> bool:
+            return True
+
+        def is_window_owned_by(self, a: int, b: int) -> bool:
+            return False
+
+        def focus_window_title(self, title: str) -> str:
+            raise RuntimeError("refocus must not run in the adoption path")
+
+    stale = _window(1, 10, "WindowsTerminal.exe", "cmd.exe - watch")
+    fresh_notepad = _window(2, 20, "Notepad.exe", "Untitled - Notepad")
+    guard = InterferenceGuard(backend=_FakeGuardBackend(fresh_notepad), emit=None)
+    guard.rebind(stale)
+    guard.begin_launched_adoption("Notepad.EXE")
+    action = GroundedAction(action="click", point=Point(x=100, y=100), confidence=1.0)
+    verdict = guard._verify_foreground(action)
+    assert verdict is None  # dispatch proceeds
+    assert guard.bound is not None and guard.bound.hwnd == 2  # ADOPTED the launch
+    assert guard._pending_launched_adoption is None  # one-shot
+
+    # a NON-matching foreground falls through to the normal ladder
+    guard2 = InterferenceGuard(backend=_FakeGuardBackend(stale), emit=None)
+    guard2.rebind(fresh_notepad)
+    guard2.begin_launched_adoption("Notepad.EXE")
+    backend2 = _FakeGuardBackend(stale)
+    guard2.backend = backend2
+    verdict2 = guard2._verify_foreground(action)
+    assert verdict2 is not None and verdict2.blocking, verdict2  # FOCUS_TAKEN_BY ladder
+    assert guard2._pending_launched_adoption is None  # consumed either way
+
+
+async def test_ensure_app_launched_enters_lazy_adoption_reattached_rebinds(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K2 wiring: an ensure_app action whose outcome is LAUNCHED calls
+    `guard.begin_launched_adoption` with the launched basename (extracted from
+    the payload) instead of rebinding from the post-action observation; a
+    REATTACHED outcome still rebinds from the observation."""
+    from types import SimpleNamespace
+
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.core.state import StopToken, TaskState
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.security.safety import SafetyPolicy
+
+    class _LaunchedBackend(FakeComputerBackend):
+        def ensure_app(self, target: str, allow_launch: bool = False) -> str:
+            return (
+                "LAUNCHED target='notepad' launch=server launched=notepad.EXE "
+                "(no existing window matched)"
+            )
+
+    backend = _LaunchedBackend()
+    agent = ComputerUseAgent(
+        backend,
+        provider=None,
+        safety=SafetyPolicy(),
+        task=TaskState(),
+        stop=StopToken(),
+        limits=Limits(
+            min_screenshot_interval_ms=1, max_actions=100, max_task_seconds=600.0
+        ).validate(),
+    )
+    adoption_calls: list[Any] = []
+    monkeypatch.setattr(
+        agent.guard, "begin_launched_adoption", lambda hint="": adoption_calls.append(hint)
+    )
+    rebind_calls: list[Any] = []
+    monkeypatch.setattr(
+        agent.guard,
+        "rebind_from_observation",
+        lambda observation: rebind_calls.append(observation is not None),
+    )
+    state = SimpleNamespace(
+        dry_run=False,
+        stopped=False,
+        allowed_windows=[],
+        min_confidence=0.0,
+        max_steps=100,
+        step_count=0,
+        require_approval=False,
+        max_retries_per_action=1,
+    )
+    outcome = await agent.run_single(
+        state,
+        GroundedAction(action="ensure_app", target="notepad", confidence=1.0),
+        approved=True,
+    )
+    assert outcome.result is not None
+    assert outcome.result.ensure_app_outcome == "launched", outcome.result
+    assert adoption_calls == ["notepad.EXE"], adoption_calls
+    assert rebind_calls == []  # LAUNCHED never rebinds from the observation
+
+
+async def test_launched_reply_without_token_never_enters_adoption(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A1 + A2 (VAL-WP13-06): a LAUNCHED reply WITHOUT the `launched=` token
+    gives NO hint and keeps the pre-DELTA-8 behaviour — rebind from the
+    post-action observation; the adoption is never armed, so an unrelated
+    titled foreground can never become the session target through it."""
+    from types import SimpleNamespace
+
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.core.state import StopToken, TaskState
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.security.safety import SafetyPolicy
+
+    class _TokenlessLaunchedBackend(FakeComputerBackend):
+        def ensure_app(self, target: str, allow_launch: bool = False) -> str:
+            # the LAUNCHED lead token WITHOUT the documented launched= token
+            return "LAUNCHED target='notepad' launch=server (no existing window matched)"
+
+    backend = _TokenlessLaunchedBackend()
+    agent = ComputerUseAgent(
+        backend,
+        provider=None,
+        safety=SafetyPolicy(),
+        task=TaskState(),
+        stop=StopToken(),
+        limits=Limits(
+            min_screenshot_interval_ms=1, max_actions=100, max_task_seconds=600.0
+        ).validate(),
+    )
+    adoption_calls: list[Any] = []
+    monkeypatch.setattr(
+        agent.guard, "begin_launched_adoption", lambda hint=None: adoption_calls.append(hint)
+    )
+    rebind_calls: list[Any] = []
+    monkeypatch.setattr(
+        agent.guard,
+        "rebind_from_observation",
+        lambda observation: rebind_calls.append(observation is not None),
+    )
+    state = SimpleNamespace(
+        dry_run=False,
+        stopped=False,
+        allowed_windows=[],
+        min_confidence=0.0,
+        max_steps=100,
+        step_count=0,
+        require_approval=False,
+        max_retries_per_action=1,
+    )
+    await agent.run_single(
+        state,
+        GroundedAction(action="ensure_app", target="notepad", confidence=1.0),
+        approved=True,
+    )
+    assert adoption_calls == []  # no hint -> adoption never armed (A1)
+    assert rebind_calls == [True]  # the pre-DELTA-8 rebind path ran instead
+
+
+async def test_launched_token_cannot_be_injected_via_the_target_value(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D8-3 (VAL-WP13-06): the `launched=` regex is anchored to the payload's
+    real ` launch=server launched=` position and captures the basename up to
+    ` (no existing` — a quoted `target` value containing `launched=explorer`
+    can never inject a hint, and the real basename still wins."""
+    from types import SimpleNamespace
+
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.core.state import StopToken, TaskState
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.security.safety import SafetyPolicy
+
+    class _InjectionBackend(FakeComputerBackend):
+        def ensure_app(self, target: str, allow_launch: bool = False) -> str:
+            return (
+                "LAUNCHED target='notepad|launched=explorer x' launch=server "
+                "launched=Notepad with spaces.EXE (no existing window matched)"
+            )
+
+    backend = _InjectionBackend()
+    agent = ComputerUseAgent(
+        backend,
+        provider=None,
+        safety=SafetyPolicy(),
+        task=TaskState(),
+        stop=StopToken(),
+        limits=Limits(
+            min_screenshot_interval_ms=1, max_actions=100, max_task_seconds=600.0
+        ).validate(),
+    )
+    adoption_calls: list[Any] = []
+    monkeypatch.setattr(
+        agent.guard, "begin_launched_adoption", lambda hint="": adoption_calls.append(hint)
+    )
+    state = SimpleNamespace(
+        dry_run=False,
+        stopped=False,
+        allowed_windows=[],
+        min_confidence=0.0,
+        max_steps=100,
+        step_count=0,
+        require_approval=False,
+        max_retries_per_action=1,
+    )
+    await agent.run_single(
+        state,
+        GroundedAction(action="ensure_app", target="notepad|launched=explorer x", confidence=1.0),
+        approved=True,
+    )
+    # the REAL basename wins (with its spaces); the injected `explorer` never does
+    assert adoption_calls == ["Notepad with spaces.EXE"], adoption_calls
+
+
+def test_launched_adoption_without_a_hint_never_adopts(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A1 (VAL-WP13-06): with NO process hint the adoption is NEVER armed —
+    `begin_launched_adoption(None)` is a no-op and an unrelated titled
+    foreground falls through to the normal ladder (FOCUS_TAKEN_BY), so no
+    input is dispatched to that window."""
+    from computer_use_mcp.core.models import GroundedAction, Point, WindowInfo
+    from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+    from computer_use_mcp.desktop.interference import parse_interference
+
+    def _window(hwnd: int, pid: int, process: str, title: str) -> WindowInfo:
+        return WindowInfo(
+            hwnd=hwnd,
+            pid=pid,
+            process_name=process,
+            exe_path=f"C:/x/{process}",
+            window_class="Notepad" if "Notepad" in process else "Terminal",
+            title=title,
+            bounds=[0, 0, 800, 600],
+        )
+
+    class _FakeGuardBackend:
+        def __init__(self, foreground: WindowInfo) -> None:
+            self.foreground = foreground
+
+        def query_foreground_window(self) -> WindowInfo:
+            return self.foreground
+
+        def is_window_alive(self, hwnd: int) -> bool:
+            return True
+
+        def is_window_owned_by(self, a: int, b: int) -> bool:
+            return False
+
+        def focus_window_title(self, title: str) -> str:
+            raise RuntimeError("refocus must not run in the adoption path")
+
+    unrelated = _window(3, 30, "msedge.exe", "A browser in front")  # unrelated app
+    guard = InterferenceGuard(backend=_FakeGuardBackend(unrelated), emit=None)
+    guard.rebind(_window(1, 10, "WindowsTerminal.exe", "cmd.exe - watch"))
+    guard.begin_launched_adoption(None)  # no hint: NEVER adopt
+    assert guard._pending_launched_adoption is None  # never armed
+    action = GroundedAction(action="click", point=Point(x=100, y=100), confidence=1.0)
+    verdict = guard._verify_foreground(action)
+    assert verdict is not None and verdict.blocking, verdict  # the normal ladder rejects
+    assert guard.bound is not None and guard.bound.hwnd == 1  # binding NOT moved to msedge
+
+
+def test_launch_adoption_pending_is_cancelled_by_an_explicit_rebind(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N-K2a (VAL-WP13-06 MAJOR): a pending launch adoption is CANCELLED by an
+    explicit rebind (ensure_app REATTACH or focus_window to another app — both
+    funnel through `rebind`). LAUNCH Notepad -> rebind Excel -> a late Notepad
+    in the foreground is FOCUS_TAKEN_BY (the pre-DELTA-8 behaviour), never
+    adopted over the driver's own binding."""
+    from computer_use_mcp.core.models import GroundedAction, Point, WindowInfo
+    from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+    from computer_use_mcp.desktop.interference import parse_interference
+
+    def _window(hwnd: int, pid: int, process: str, title: str) -> WindowInfo:
+        return WindowInfo(
+            hwnd=hwnd,
+            pid=pid,
+            process_name=process,
+            exe_path=f"C:/x/{process}",
+            window_class="Notepad" if "Notepad" in process else "Terminal",
+            title=title,
+            bounds=[0, 0, 800, 600],
+        )
+
+    class _MutableGuardBackend:
+        def __init__(self) -> None:
+            self.foreground = _window(1, 10, "WindowsTerminal.exe", "cmd.exe - watch")
+
+        def query_foreground_window(self) -> WindowInfo:
+            return self.foreground
+
+        def is_window_alive(self, hwnd: int) -> bool:
+            return True
+
+        def is_window_owned_by(self, a: int, b: int) -> bool:
+            return False
+
+        def focus_window_title(self, title: str) -> str:
+            raise RuntimeError("refocus must not run in this test")
+
+    backend = _MutableGuardBackend()
+    guard = InterferenceGuard(backend=backend, emit=None)
+    terminal = _window(1, 10, "WindowsTerminal.exe", "cmd.exe - watch")
+    excel = _window(4, 40, "Excel.exe", "Book1 - Excel")
+    notepad = _window(2, 20, "Notepad.exe", "Untitled - Notepad")
+    guard.rebind(terminal)  # pre-launch binding
+    guard.begin_launched_adoption("Notepad.EXE")  # LAUNCHED: adoption pending
+    assert guard._pending_launched_adoption == "notepad"
+    # the driver REATTACHES Excel (ensure_app) or focus_window targets Excel —
+    # both funnel through rebind(), which must CANCEL the pending adoption:
+    guard.rebind(excel)
+    assert guard._pending_launched_adoption is None, "an explicit rebind must cancel the pending adoption"
+    # the late-appearing Notepad takes the foreground:
+    backend.foreground = notepad
+    action = GroundedAction(action="keypress", keys=["x"], confidence=1.0)
+    verdict = guard._verify_foreground(action)
+    assert verdict is not None and verdict.blocking, verdict  # FOCUS_TAKEN_BY, never adopted
+    assert "Untitled - Notepad" in verdict.event, verdict  # named the stealer
+    assert guard.bound is not None and guard.bound.hwnd == 4  # Excel binding KEPT
+
+
+def test_launch_adoption_pending_is_cancelled_by_target_gone(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N-K2a: TARGET_GONE unbinding also cancels the pending adoption — with no
+    binding, a stale pending state must not adopt an unverified window later."""
+    from computer_use_mcp.core.models import GroundedAction, Point, WindowInfo
+    from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+    from computer_use_mcp.desktop.interference import parse_interference
+
+    def _window(hwnd: int, pid: int, process: str, title: str) -> WindowInfo:
+        return WindowInfo(
+            hwnd=hwnd,
+            pid=pid,
+            process_name=process,
+            exe_path=f"C:/x/{process}",
+            window_class="Notepad" if "Notepad" in process else "Terminal",
+            title=title,
+            bounds=[0, 0, 800, 600],
+        )
+
+    class _DeadTargetBackend:
+        def __init__(self, foreground: WindowInfo) -> None:
+            self.foreground = foreground
+
+        def query_foreground_window(self) -> WindowInfo:
+            return self.foreground
+
+        def is_window_alive(self, hwnd: int) -> bool:
+            return False  # the bound window is GONE
+
+        def is_window_owned_by(self, a: int, b: int) -> bool:
+            return False
+
+        def focus_window_title(self, title: str) -> str:
+            raise RuntimeError("refocus must not run in this test")
+
+    dead = _window(1, 10, "Notepad.exe", "Untitled - Notepad")
+    other = _window(3, 30, "WindowsTerminal.exe", "cmd.exe - watch")
+    backend = _DeadTargetBackend(other)
+    guard = InterferenceGuard(backend=backend, emit=None)
+    guard.rebind(dead)
+    guard.begin_launched_adoption("Notepad.EXE")  # armed, then the target dies
+    action = GroundedAction(action="keypress", keys=["x"], confidence=1.0)
+    verdict = guard._verify_foreground(action)
+    assert verdict is not None and verdict.event.startswith("TARGET_GONE"), verdict
+    assert guard.bound is None  # unbound
+    assert guard._pending_launched_adoption is None  # N-K2a: cancelled with the binding
+
+
 async def test_queued_type_item_that_cannot_run_paced_is_not_dispatched(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

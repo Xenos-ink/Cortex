@@ -183,6 +183,16 @@ There is deliberately no `key` action (single keys use `keypress`) and no
   `timeout_ms` 0..60000.
 - Scope note: `hold_ms` and `duration_ms` are NOT parameters of
   `computer_execute` — they ride a `follow_ups` entry or a plan point action.
+- Plain `hotkey` timing (DELTA 8): a hotkey WITHOUT `hold_ms` holds its keys
+  for 50 ms before releasing them in reverse order — the zero-separation
+  instant chord was ignored by Windows 11 Store apps (packaged Notepad:
+  4 of 5 plain alt+f4 trials did nothing live; hold_ms=50 closed all 3 held trials).
+  An explicit `hold_ms` wins; `hold_ms=0` is the explicit zero-duration split
+  press/release with zero wait — NOT the old single-batch chord, which no longer
+  exists for a hotkey. `keypress` actions are unchanged.
+  During the 50 ms hold the user's own keystrokes can combine with the held
+  modifiers; a stop mid-hold releases the keys (a stuck modifier is covered by
+  the next chord's stuck-modifier sweep).
 
 ### Type transports (`via`, type actions only)
 

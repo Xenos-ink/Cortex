@@ -196,6 +196,22 @@ taught value from the code. Full offline suite at release: 3319 passed +
   `Enter` and `ESC` now resolve to `f4`, `enter` and `esc` (before, they
   failed with an unsupported-key error). A single character keeps its exact
   meaning: an uppercase letter such as `A` still injects shift.
+- **A plain `hotkey` holds its keys for 50 ms before release**
+  (LIVE-WP13-02 runs 3-4, user approved): a hotkey WITHOUT `hold_ms` uses the
+  held dispatch path with `DEFAULT_HOTKEY_HOLD_MS = 50` — the zero-separation
+  instant chord was IGNORED by Windows 11 Store apps (packaged Notepad
+  11.2607: 4 of 5 plain alt+f4 trials did nothing live, pixel diff 0; the
+  `hold_ms=50` form closed it in all 3 held trials). An explicit `hold_ms`
+  wins; `hold_ms=0` keeps its documented meaning (the explicit zero-duration
+  split press/release with zero wait — NOT the old single-batch chord, which
+  no longer exists for a hotkey); `keypress` and `type` actions are
+  unchanged. The follow-up queue counts the implicit 50 ms against the
+  remaining budget, so a chain of hotkeys cannot overrun it. After an
+  ensure_app LAUNCH the guard no longer rebinds to whatever window happened
+  to be foreground (the launched window has not appeared yet — live: the
+  follow-up hotkey was rejected `focus_taken_by` against the fresh Notepad);
+  the next pre-dispatch focus check ADOPTS the launched process's foreground
+  window (titled, process-matched, one-shot) and dispatches.
 
 ### Fixed
 
