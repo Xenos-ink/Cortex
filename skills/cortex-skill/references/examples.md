@@ -95,11 +95,13 @@ dispatched but did not verify rides its honest verdict while the rest still runs
 ## Long or multi-line text (code, VBA, scripts)
 
 ```text
-computer_execute(session_id, action="type", text=<300 lines of VBA>, via="clipboard")
+computer_execute(session_id, action="type", text=<a VBA block, at most 2000 chars>, via="clipboard")
 ```
 
 Editors that auto-indent or auto-complete (VBA editor, code editors) mangle
 per-character bursts: the paced budget covers ~1800 chars at the default pace
 (less at a smaller client timeout) and `paced=partial` in the reply means the
 tail went in UNPACED — re-observe and never retype blind. One `via="clipboard"`
-type pastes the whole text in a single step instead.
+type pastes the whole text in a single step instead. `text` is capped at 2000
+characters on every type, clipboard included: split longer code at line
+boundaries into several clipboard types, and re-observe after each one.
