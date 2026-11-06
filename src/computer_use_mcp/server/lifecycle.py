@@ -12,7 +12,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
 
-from ..core.limits import LimitEnforcer, Limits
+from ..core.limits import ACTIONS_BAND, STEPS_BAND, LimitEnforcer, Limits
 from ..core.models import SessionState
 from ..core.state import SessionLimitExceeded
 from ..desktop.client_budget import client_timeout_seconds
@@ -867,6 +867,13 @@ def start_session(
         except Exception:
             logger.debug("resume audit failed", exc_info=True)
     payload = state.model_dump()
+    # DELTA 12 (Z3-a, VAL-WP13-08): the EFFECTIVE action cap is
+    # min(max_steps, max_actions) — `step_count` counts every dispatched action
+    # (follow_ups items and plan actions included) and safety refuses at
+    # `step_count >= max_steps`.
+    effective_cap = min(state.max_steps, limits_obj.max_actions)
+    binding = "max_steps" if state.max_steps <= limits_obj.max_actions else "max_actions"
+    caps_differ = state.max_steps != limits_obj.max_actions
     payload.update(
         {
             "allowed_processes": list(allowed_processes or []),
@@ -877,11 +884,29 @@ def start_session(
             # WP13 DELTA 1 #7 (field A): the driver SEES the effective budget.
             # ``message`` is a contract field on EVERY reply (REPLY-CONTRACT.md
             # envelope); the key=value suffix form is the sanctioned channel —
-            # no new top-level field.
+            # no new top-level field. DELTA 11 (Z3, sess_138fbd60): the caps are
+            # stated in the same line. DELTA 12 (Z3-a): the EFFECTIVE cap is
+            # stated with the binding limit named, and the caps-differ WARNING
+            # fires in either direction (the DEFAULT session is capped at 30,
+            # not 100).
             "message": (
                 f"Session started. client_timeout_s={client_timeout_seconds():g} "
                 "(the host's per-tool-call timeout: the wait segment, the type "
-                "deadline and the pacing budget derive from it)"
+                "deadline and the pacing budget derive from it). "
+                f"Effective action cap = min(max_steps={state.max_steps}, "
+                f"max_actions={limits_obj.max_actions}) = {effective_cap}"
+                f" ({binding} binds) — every dispatched action counts (each"
+                " follow_ups item and plan action included); raise max_steps via"
+                f" the start_session parameter (band {STEPS_BAND[0]}..{STEPS_BAND[1]})"
+                " and max_actions via"
+                f' limits={{"max_actions": N}} (band {ACTIONS_BAND[0]}..{ACTIONS_BAND[1]}).'
+                + (
+                    f" WARNING: the caps differ — {binding} binds, so the"
+                    " session is refused at action"
+                    f" {effective_cap + 1}."
+                    if caps_differ
+                    else ""
+                )
             ),
         }
     )

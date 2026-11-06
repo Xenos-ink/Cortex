@@ -499,7 +499,10 @@ def test_the_advertised_text_bounds_are_stated() -> None:
 
 def test_every_remaining_number_the_skill_states_is_pinned_from_code() -> None:
     """N1 (VAL-WP9-02): restored. Pins the numbers no other node pins, each derived
-    from the code: the 13-action enum, the wait-segment band, the 60 s client bound."""
+    from the code: the 13-action enum, the wait-segment band, the client-timeout
+    rule (the wait bullet states CORTEX_CLIENT_TIMEOUT_SECONDS with its 60 s
+    default — DELTA 12 (VAL-WP13-08 NIT) replaced the old hard-coded "60 s tool
+    timeout" wording in the skill)."""
     from computer_use_mcp.core.models import ActionType
     import computer_use_mcp.server.wait as wait_module
 
@@ -510,7 +513,8 @@ def test_every_remaining_number_the_skill_states_is_pinned_from_code() -> None:
         f"band {WAIT_SEGMENT_MIN_SECONDS:.0f}..{WAIT_SEGMENT_MAX_SECONDS:.0f}" in _flat()
     )
     assert "60 s tool timeout" in inspect.getsource(wait_module)
-    assert "60 s tool timeout" in _flat()
+    assert "CORTEX_CLIENT_TIMEOUT_SECONDS" in _flat()
+    assert "(default 60; ZCode hosts set 30)" in _flat()
 
 
 # --- behavioural truths the driver must be taught --------------------------------------------------

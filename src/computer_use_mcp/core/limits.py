@@ -37,6 +37,14 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+#: DELTA 12 (VAL-WP13-08 NIT): the clamp bands for ``max_actions`` and for the
+#: start_session ``max_steps`` (``max_session_steps``) parameter, in ONE place —
+#: the refusal messages and the docs interpolate these so the advertised
+#: "band 1..500" can never drift from the clamp.
+ACTIONS_BAND = (1, 500)
+STEPS_BAND = (1, 500)
+
+
 @dataclass(frozen=True)
 class Limits:
     """Hard execution limits (defaults per master-mission section 6).
@@ -97,7 +105,7 @@ class Limits:
         return replace(
             self,
             max_task_seconds=_clamp(self.max_task_seconds, 1.0, 3600.0),
-            max_actions=int(_clamp(self.max_actions, 1, 500)),
+            max_actions=int(_clamp(self.max_actions, *ACTIONS_BAND)),
             max_retries_per_action=int(_clamp(self.max_retries_per_action, 0, 5)),
             max_recovery_per_action=int(_clamp(self.max_recovery_per_action, 0, 10)),
             max_recovery_per_task=int(_clamp(self.max_recovery_per_task, 0, 50)),
@@ -108,7 +116,7 @@ class Limits:
             max_session_seconds=_clamp(self.max_session_seconds, 1.0, 86400.0),
             max_session_actions=int(_clamp(self.max_session_actions, 1, 2000)),
             max_session_model_calls=int(_clamp(self.max_session_model_calls, 1, 500)),
-            max_session_steps=int(_clamp(self.max_session_steps, 1, 500)),
+            max_session_steps=int(_clamp(self.max_session_steps, *STEPS_BAND)),
             max_subtasks=int(_clamp(self.max_subtasks, 1, 50)),
             context_summarize_every=int(_clamp(self.context_summarize_every, 1, 500)),
             approval_epoch_seconds=_clamp(self.approval_epoch_seconds, 60.0, 86400.0),
@@ -155,7 +163,10 @@ class LimitEnforcer:
         if self._actions >= self.limits.max_actions:
             raise LimitExceeded(
                 "max_actions",
-                f"Action limit {self.limits.max_actions} reached; refusing further actions.",
+                f"Action limit {self.limits.max_actions} reached; refusing further"
+                " actions. Each follow_ups item and plan action counts. To"
+                " continue: stop_session, then start_session with"
+                f' limits={{"max_actions": N}} (band {ACTIONS_BAND[0]}..{ACTIONS_BAND[1]}).',
             )
 
     def record_action(self) -> None:

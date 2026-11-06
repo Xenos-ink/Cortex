@@ -72,10 +72,15 @@ def test_hotkey_more_than_twelve_keys_rejected() -> None:
 
 
 def test_hotkey_empty_or_blank_key_names_rejected() -> None:
+    # D12-1 (VAL-WP13-09): "" is still rejected at the model — but a
+    # whitespace-ONLY name like "   " is NO LONGER a model rejection, because a
+    # single " " IS a real static-table key (VK_SPACE); the backend refuses a
+    # non-key blank name as unsupported_key instead (see
+    # test_real_hotkey_bad_chord_value_error_at_backend).
     with pytest.raises(ValidationError, match="2 to 12"):
         GroundedAction(action="hotkey", keys=["ctrl", ""])
-    with pytest.raises(ValidationError, match="2 to 12"):
-        GroundedAction(action="hotkey", keys=["ctrl", "   "])
+    accepted = GroundedAction(action="hotkey", keys=["ctrl", " "])
+    assert accepted.keys == ["ctrl", " "]
 
 
 # --- FakeComputerBackend: hotkey execution contract -----------------------------------------------
@@ -154,8 +159,12 @@ def test_real_hotkey_bad_chord_value_error_at_backend(
     single = GroundedAction.model_construct(action=ActionType.HOTKEY, keys=["ctrl"])
     with pytest.raises(ValueError, match="2 to 12"):
         real_backend.execute(single)
+    # D12-1 (VAL-WP13-09): a whitespace-ONLY multi-char name is not a real
+    # key — the backend now refuses it as UnsupportedKeyError (a typed
+    # ValueError naming the key with the type-escape teaching), not the "2 to
+    # 12" chord-shape error; nothing is dispatched either way.
     blank = GroundedAction.model_construct(action=ActionType.HOTKEY, keys=["ctrl", "  "])
-    with pytest.raises(ValueError, match="2 to 12"):
+    with pytest.raises(ValueError, match="unsupported keyboard character"):
         real_backend.execute(blank)
     assert engine.calls == []
 

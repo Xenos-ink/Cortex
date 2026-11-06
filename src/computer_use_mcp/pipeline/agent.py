@@ -111,7 +111,7 @@ from ..desktop.backend import (
     type_action_deadline_seconds,
 )
 from ..desktop.client_budget import semantic_read_timeout_seconds
-from ..desktop.errors import FocusDriftError
+from ..desktop.errors import FocusDriftError, UnsupportedKeyError
 from ..desktop.motion import WAIT_MAX_SECONDS
 from ..desktop.focus_guard import GuardVerdict, InterferenceGuard
 from .grounding import GroundingRouter
@@ -2239,7 +2239,6 @@ class ComputerUseAgent:
             premise_captured_at = getattr(observation, "_captured_monotonic", 0.0)
             reuse_window_ms = _validate_reuse_window_ms()
             current: Observation | None = None
-            probe_used = False
             if (
                 not marker
                 and source_observation is None
@@ -2250,7 +2249,6 @@ class ComputerUseAgent:
             ):
                 probe = self.backend.identity_probe(observation)
                 if probe is not None:
-                    probe_used = True
                     drift = self.validator._staleness_drift(observation, probe)
                     if drift is None:
                         current = observation
@@ -2853,6 +2851,65 @@ class ComputerUseAgent:
         except LimitExceeded as exc:
             self._audit("limit_exceeded", result="failed", metadata={"limit": exc.limit_name})
             raise
+        except UnsupportedKeyError as exc:
+            # Z2 (LIVE-WP13-02 sess_138fbd60): a key the engine cannot map is a
+            # typed REFUSAL, not an operation error — every key is mapped before
+            # the first key-down/chord event, so the reply is the contract
+            # rejection shape naming each unsupported key and teaching the
+            # escape hatches. Z2-c (VAL-WP13-08): if the failure can still land
+            # AFTER dispatch started (defensive — every key is mapped in the
+            # per-action pre-check before any input, so on the shipped path
+            # this is effectively unreachable), the reply must NOT claim
+            # "nothing was dispatched" — input already left the process, so
+            # the honest reason is dispatched_unverified (the held-key sweep
+            # already released what went down).
+            dispatched = bool(getattr(action, "_dispatch_started", False))
+            reasons = [f"unsupported_key: {key!r}" for key in exc.unsupported_keys]
+            if dispatched:
+                reasons.insert(
+                    0,
+                    "dispatched_unverified: part of the input may have landed;"
+                    " released what went down — re-observe",
+                )
+            self._audit(
+                "failure",
+                result="rejected",
+                metadata={
+                    "exception": "UnsupportedKeyError",
+                    "keys": exc.unsupported_keys,
+                    "dispatched": dispatched,
+                },
+            )
+            return (
+                SingleActionOutcome(
+                    kind="rejected",
+                    reasons=reasons
+                    + [
+                        'hint: a printable character belongs on action="type" (text="...") —'
+                        " key NAMES are case-insensitive and listed in the action vocabulary"
+                        ' (e.g. "ctrl", "a", "enter", "esc", "f4"); nothing was dispatched.'
+                        if not dispatched
+                        else 'hint: a printable character belongs on action="type" (text="...") —'
+                        " key NAMES are case-insensitive and listed in the action vocabulary"
+                        ' (e.g. "ctrl", "a", "enter", "esc", "f4").'
+                    ],
+                    message=(
+                        (
+                            "Refused: unsupported keyboard character or key name"
+                            f" ({', '.join(repr(key) for key in exc.unsupported_keys)});"
+                            " nothing was dispatched."
+                        )
+                        if not dispatched
+                        else (
+                            "Refused: unsupported keyboard character or key name"
+                            f" ({', '.join(repr(key) for key in exc.unsupported_keys)});"
+                            " the input had already started, so part of it may have"
+                            " landed — re-observe before retrying."
+                        )
+                    ),
+                ),
+                None,
+            )
         except Exception as exc:  # noqa: BLE001 - fail-closed: structured error, no crash
             self._audit(
                 "failure",

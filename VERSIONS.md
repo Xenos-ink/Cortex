@@ -196,6 +196,39 @@ taught value from the code. Full offline suite at release: 3319 passed +
   `Enter` and `ESC` now resolve to `f4`, `enter` and `esc` (before, they
   failed with an unsupported-key error). A single character keeps its exact
   meaning: an uppercase letter such as `A` still injects shift.
+- **An unmappable key is a typed rejection (sess_138fbd60)**: a keypress or
+  hotkey naming a key the engine cannot map — an unknown name, or a character
+  the ACTIVE keyboard layout cannot produce (e.g. `"'"` under an Arabic
+  layout) — now returns a contract rejection (`unsupported_key: '<key>'`
+  reasons — Python repr form, so `"` renders as `'"'` — naming every
+  unsupported member, a teaching hint pointing at
+  `type` for printable characters) with ZERO input dispatched: every key is
+  mapped before the first key-down or chord event. Before, it surfaced as a
+  raw `action_error` (`ValueError: unsupported keyboard character or key
+  name: ...`) after refusing.
+- **The paced-typing budget teaches its escape hatch (sess_138fbd60)**: a
+  type reply whose paced budget ran out (`paced=partial`) OR whose pace was
+  merely capped for length now carries an in-message hint — the paced budget
+  covers ~1800 chars at the default CONFIGURED 20 ms/char pace (pacing budget
+  ÷ the CONFIGURED pace; less at a smaller client timeout) — telling the
+  driver that long or multi-line text, especially code into editors that
+  auto-indent or auto-complete, should go through `via="clipboard"`. The char
+  count derives from the CONFIGURED per-character interval (the length-capped
+  interval merely echoes the text length), the hint also fires when the pace
+  was capped for length even without `paced=partial`, and a short type
+  carries no hint. Typing behaviour itself is unchanged.
+- **start_session states the EFFECTIVE action cap (sess_138fbd60)**: the reply
+  message now states `Effective action cap = min(max_steps=<M>,
+  max_actions=<N>) = <cap> (<which> binds)` — every dispatched action counts
+  (each follow_ups item and plan action included) — and WARNS whenever the
+  caps differ, naming the binding one and the action the session is refused
+  at (a DEFAULT session is capped at 30 by max_steps, not 100; before, a
+  driver asking for `max_steps=200` believed it had 200 actions while the
+  101st action was refused mid-task). Raise `max_steps` via the start_session
+  parameter (band 1..500) and `max_actions` via `limits={"max_actions": N}`
+  (band 1..500). The `limit_exceeded: max_actions` rejection AND the
+  "Maximum session steps reached." refusal now teach the restart path
+  (stop_session + start_session with a higher cap).
 - **A plain `hotkey` holds its keys for 50 ms before release**
   (LIVE-WP13-02 runs 3-4, user approved): a hotkey WITHOUT `hold_ms` uses the
   held dispatch path with `DEFAULT_HOTKEY_HOLD_MS = 50` — the zero-separation

@@ -299,13 +299,25 @@ def test_install_md_usage_lines_match_the_argparse_parser_exactly() -> None:
 
 
 def _limits_bands_from_validate_source() -> dict[str, tuple[float, float]]:
-    source = inspect.getsource(Limits.validate)
+    import computer_use_mcp.core.limits as limits_module
+
+    source_lines = inspect.getsource(Limits.validate).splitlines()
     bands: dict[str, tuple[float, float]] = {}
-    for match in re.finditer(
-        r"_clamp\(\s*self\.(\w+),\s*([^,]+?),\s*([^)]+?)\)", source
-    ):
-        field, lo, hi = match.group(1), match.group(2), match.group(3)
-        bands[field] = (float(ast.literal_eval(lo)), float(ast.literal_eval(hi)))
+    # DELTA 12 (VAL-WP13-08 NIT): a clamp may unpack a module constant
+    # (`int(_clamp(self.max_actions, *ACTIONS_BAND))`) — resolve the constant so
+    # the band stays DERIVED from the code. Line-based scanning so a clamp with
+    # no literal band can never bleed into the NEXT line's comma (the old
+    # whole-source regex captured across the newline and crashed).
+    for line in source_lines:
+        for match in re.finditer(r"_clamp\(\s*self\.(\w+),\s*\*(\w+)\s*\)", line):
+            field, constant_name = match.group(1), match.group(2)
+            constant = getattr(limits_module, constant_name)
+            bands[field] = (float(constant[0]), float(constant[1]))
+        for match in re.finditer(
+            r"_clamp\(\s*self\.(\w+),\s*([^,]+?),\s*([^)]+?)\)", line
+        ):
+            field, lo, hi = match.group(1), match.group(2), match.group(3)
+            bands[field] = (float(ast.literal_eval(lo)), float(ast.literal_eval(hi)))
     return bands
 
 

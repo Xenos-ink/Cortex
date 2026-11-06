@@ -34,6 +34,28 @@ class UnsupportedActionError(BackendError):
     """The backend received an action type it cannot execute."""
 
 
+class UnsupportedKeyError(ValueError):
+    """Z2 (LIVE-WP13-02 sess_138fbd60): a keypress/hotkey names a key the
+    engine cannot map — an unknown key name, or a character the ACTIVE
+    keyboard layout cannot produce (e.g. ``"'"`` under an Arabic layout).
+
+    A typed REFUSAL, not an operation error: it is raised BEFORE any input is
+    dispatched (every key is mapped before the first key-down/chord event), so
+    nothing reached the machine and the pipeline converts it into a
+    ``rejected`` reply naming each unsupported key. ``ValueError`` base keeps
+    the historical ``pytest.raises(ValueError)`` contract.
+    """
+
+    def __init__(self, unsupported_keys: list[str]) -> None:
+        self.unsupported_keys = list(unsupported_keys)
+        shown = ", ".join(repr(key) for key in self.unsupported_keys)
+        super().__init__(
+            f"unsupported keyboard character or key name: {shown} — a printable"
+            ' character belongs on action="type" (text="..."); key names are'
+            ' case-insensitive (e.g. "ctrl", "a", "enter", "esc", "f4")'
+        )
+
+
 class WindowFocusError(BackendError):
     """A focus_window action could not resolve or activate the requested window.
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import threading
 import re
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -343,7 +344,6 @@ def test_uia_hang_busy_gate_and_recovery(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(reader, "_read_unbounded", _hang)
     monkeypatch.setattr(text_readers_module, "semantic_read_timeout_seconds", lambda: 0.2)
-    began = _time.perf_counter()
     assert reader.read() is None
     assert reader.last_degraded_reason == "read_timeout"
     # busy gate: the second call during the hang answers AT ONCE
@@ -582,12 +582,21 @@ async def test_e2_shape_intrinsic_cost_is_bounded_and_timed(
     import time as _time
 
     recorded: list[float] = []
-    real_sleep = _time.sleep
 
     def _record_sleep(seconds: float) -> None:
         recorded.append(float(seconds))
 
-    monkeypatch.setattr(backend_module.time, "sleep", _record_sleep)
+    monkeypatch.setattr(
+        backend_module,
+        "time",
+        # NIT (VAL-WP13-08): patch the backend's module NAME (restored by
+        # monkeypatch), never the SHARED global time module — mutating
+        # ``backend_module.time.sleep`` would leak into every other module for
+        # the duration of the test.
+        SimpleNamespace(
+            sleep=_record_sleep, monotonic=_time.monotonic, perf_counter=_time.perf_counter
+        ),
+    )
 
     class _FakeInputUser32:
         """SendInput seam stub (the click must not touch the real desktop)."""
@@ -2107,6 +2116,74 @@ async def test_launched_token_cannot_be_injected_via_the_target_value(
     assert adoption_calls == ["Notepad with spaces.EXE"], adoption_calls
 
 
+async def test_start_session_message_states_caps_and_warns(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Z3-a (VAL-WP13-08 MAJOR): the EFFECTIVE action cap is min(max_steps,
+    max_actions) and the message names the binding limit. Defaults: cap 30,
+    max_steps binds, WARNING present (the field failure at the defaults)."""
+    from test_controller_integration import ScriptedBackend, ScriptedProvider
+
+    import computer_use_mcp.server.lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "_backend_factory", lambda: ScriptedBackend())
+    monkeypatch.setattr(lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = lifecycle.start_session(dry_run=True, require_approval=False)
+    message = response["message"]
+    assert "Effective action cap = min(max_steps=30, max_actions=100) = 30" in message, message
+    assert "max_steps binds" in message, message
+    assert "WARNING: the caps differ" in message, message
+    await lifecycle.stop_session(str(response["session_id"]))
+
+
+async def test_start_session_caps_warning_names_the_binder_both_directions(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Z3-a: the WARNING fires in both directions and names the binding limit:
+    max_steps=200 / max_actions=100 → max_actions binds at 100; max_steps=50 /
+    max_actions=300 → max_steps binds at 50."""
+    from test_controller_integration import ScriptedBackend, ScriptedProvider
+
+    import computer_use_mcp.server.lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "_backend_factory", lambda: ScriptedBackend())
+    monkeypatch.setattr(lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = lifecycle.start_session(
+        max_steps=200, dry_run=True, require_approval=False
+    )
+    message = response["message"]
+    assert "Effective action cap = min(max_steps=200, max_actions=100) = 100" in message, message
+    assert "max_actions binds" in message, message
+    assert "WARNING: the caps differ — max_actions binds" in message, message
+    await lifecycle.stop_session(str(response["session_id"]))
+
+    response = lifecycle.start_session(
+        max_steps=50,
+        limits={"max_actions": 300},
+        dry_run=True,
+        require_approval=False,
+    )
+    message = response["message"]
+    assert "Effective action cap = min(max_steps=50, max_actions=300) = 50" in message, message
+    assert "max_steps binds" in message, message
+    assert "WARNING: the caps differ — max_steps binds" in message, message
+    await lifecycle.stop_session(str(response["session_id"]))
+
+
+def test_limit_exceeded_message_teaches_the_restart_path() -> None:
+    """Z3: the max_actions `limit_exceeded` message teaches how to go on
+    (stop_session + start_session with a higher limits.max_actions)."""
+    from computer_use_mcp.core.limits import LimitEnforcer, Limits
+
+    enforcer = LimitEnforcer(Limits(max_actions=2).validate())
+    with pytest.raises(Exception) as info:
+        for _ in range(3):
+            enforcer.check_action()
+            enforcer.record_action()
+    assert "stop_session" in str(info.value)
+    assert 'limits={"max_actions": N}' in str(info.value)
+
+
 def test_launched_adoption_without_a_hint_never_adopts(
     real_backend: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2154,6 +2231,776 @@ def test_launched_adoption_without_a_hint_never_adopts(
     verdict = guard._verify_foreground(action)
     assert verdict is not None and verdict.blocking, verdict  # the normal ladder rejects
     assert guard.bound is not None and guard.bound.hwnd == 1  # binding NOT moved to msedge
+
+
+# --- WP13 DELTA 11 (sess_138fbd60 fixes) ---------------------------------------------------------
+
+
+def test_paced_partial_reply_carries_the_clipboard_hint(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Z1a (sess_138fbd60): a type reply whose paced budget ran out carries the
+    in-message teaching hint — long/multi-line text should go via="clipboard"
+    — with the DERIVED character threshold (pacing budget ÷ effective pace).
+    Deterministic: a ticking monotonic clock + a reader that consumes budget
+    time per read (the slow provider), no wall-clock sleeps."""
+    from types import SimpleNamespace
+    import time as _time
+
+    from test_wp12b_baseline_ladder import _type_action, _typing_backend
+
+    class _TickingClock:
+        def __init__(self) -> None:
+            self.now = 0.0
+
+        def __call__(self) -> float:
+            self.now += 0.01  # every monotonic read consumes 10 ms of budget
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    clock = _TickingClock()
+    # start from the REAL monotonic value: the shared session-scoped backend
+    # carries stamps (`_last_focus_transition`, `_last_key_dispatch`) taken with
+    # the real clock; a fake clock starting at 0 made `_apply_focus_settle`'s
+    # "remaining" hugely negative-negative → an unbounded real time.sleep (the
+    # DELTA-11 suite hang). Patched/restored by monkeypatch.
+    clock.now = _time.monotonic()
+    monkeypatch.setattr(
+        backend_module,
+        "time",
+        # NIT (VAL-WP13-08): replace the backend's module NAME (restored by
+        # monkeypatch), not the shared global time module.
+        SimpleNamespace(monotonic=clock, sleep=_time.sleep, perf_counter=_time.perf_counter),
+    )
+    monkeypatch.setattr(backend_module, "type_action_deadline_seconds", lambda: 0.5)
+    monkeypatch.setattr(backend_module, "semantic_read_timeout_seconds", lambda: 0.05)
+
+    class _SlowReader:
+        value_source = "uia"
+        available = True
+        warm_state = "ok"
+        last_degraded_reason: str | None = None
+        reads = 0
+        last_error: str | None = None
+
+        def read(self) -> dict[str, object]:
+            self.reads += 1
+            try:
+                clock.advance(0.29)  # the slow provider eats the budget per read
+                return {"focused": {"value": "pre", "control_type": "Edit"}, "elements": []}
+            except BaseException as exc:  # noqa: BLE001 - diagnostics for the assert
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                raise
+
+    engine, _reader = _typing_backend(
+        real_backend, monkeypatch, reader_values=[], control_type=None
+    )
+    engine.type_interval = 0.02  # the paced real-engine shape
+    monkeypatch.setattr(real_backend, "_semantic_reader", _SlowReader())
+    message = real_backend.execute(_type_action("pre" * 120))
+    reader_obj = real_backend._semantic_reader
+    assert "paced=partial" in message, (
+        message,
+        reader_obj.reads,  # type: ignore[attr-defined]
+        reader_obj.last_error,  # type: ignore[attr-defined]
+    )
+    assert 'via="clipboard"' in message, message
+    assert "hint:" in message, message
+    del engine
+
+
+def test_hint_uses_configured_interval_and_fires_without_paced_partial(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Z1-a (field shape): the live 1438-char case at a 30 s client must state
+    the CONFIGURED pace (~600 chars at 20 ms/char), NOT the capped one (which
+    just echoed the text length), and the hint must fire when the pace was
+    merely CAPPED for length — even without `paced=partial` (the RecordingEngine
+    dispatches instantly, so the deadline never flips). A SHORT type carries no
+    hint at all."""
+    from test_wp12b_baseline_ladder import _type_action, _typing_backend
+
+    monkeypatch.setattr(backend_module, "type_action_deadline_seconds", lambda: 15.0)
+    monkeypatch.setattr(backend_module, "pacing_budget_seconds", lambda: 12.0)
+    monkeypatch.setattr(backend_module, "semantic_read_timeout_seconds", lambda: 0.05)
+
+    engine, _reader = _typing_backend(
+        real_backend, monkeypatch, reader_values=[], control_type=None
+    )
+    engine.type_interval = 0.02  # the field case's configured pace (20 ms/char)
+
+    message = real_backend.execute(_type_action("x" * 1438))
+    assert " paced=partial" not in message, message  # instant engine: never flipped
+    assert "hint:" in message, message  # the pace was CAPPED for length (12/1438 < 0.02)
+    assert "~600 chars" in message, message  # 12 s budget ÷ the CONFIGURED 20 ms pace
+    assert "20 ms/char" in message, message
+    assert 'via="clipboard"' in message, message
+
+    short_message = real_backend.execute(_type_action("hello"))
+    assert "hint:" not in short_message, short_message  # short type: clean reply
+    assert " paced=partial" not in short_message, short_message
+
+
+def test_focus_settle_and_key_gap_clamp_against_a_future_stamp(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELTA 11: a stored monotonic stamp from the FUTURE (a clock jump, or a
+    test's fake clock base mismatched with the real clock — the DELTA-11 suite
+    hang) must never produce an unbounded sleep: `_apply_focus_settle` and
+    `_apply_key_dispatch_gap` clamp `remaining` to the configured band, so the
+    sleep is at most the settle/gap itself. A long-PAST stamp sleeps nothing."""
+    import time as _time
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        backend_module,
+        "time",
+        # NIT (VAL-WP13-08): the backend's module NAME, not the shared global
+        # time module (monkeypatch restores it).
+        SimpleNamespace(
+            sleep=lambda s: sleeps.append(s),
+            monotonic=_time.monotonic,
+            perf_counter=_time.perf_counter,
+        ),
+    )
+    now = _time.monotonic()
+
+    monkeypatch.setattr(real_backend, "_last_focus_transition", now + 10_000.0)
+    real_backend._apply_focus_settle()
+    assert sleeps == [backend_module.FOCUS_TRANSITION_SETTLE_SECONDS], sleeps
+
+    monkeypatch.setattr(real_backend, "_last_focus_transition", now - 100.0)
+    real_backend._apply_focus_settle()
+    assert sleeps == [backend_module.FOCUS_TRANSITION_SETTLE_SECONDS], sleeps
+
+    monkeypatch.setattr(real_backend, "_last_key_dispatch", now + 10_000.0)
+    real_backend._apply_key_dispatch_gap(["enter"])
+    assert sleeps == [
+        backend_module.FOCUS_TRANSITION_SETTLE_SECONDS,
+        backend_module.KEY_DISPATCH_GAP_SECONDS,
+    ], sleeps
+
+    monkeypatch.setattr(real_backend, "_last_key_dispatch", now - 100.0)
+    real_backend._apply_key_dispatch_gap(["enter"])
+    assert sleeps == [
+        backend_module.FOCUS_TRANSITION_SETTLE_SECONDS,
+        backend_module.KEY_DISPATCH_GAP_SECONDS,
+    ], sleeps
+
+
+def test_the_typed_pace_threshold_matches_the_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Z1b: the SKILL-stated pacing threshold (~1800 chars) is DERIVED from the
+    code — pacing_budget_seconds() ÷ DEFAULT_TYPE_INTERVAL_SECONDS at the
+    default client timeout — not a hand-written guess."""
+    import pathlib
+
+    from computer_use_mcp.desktop.backend import DEFAULT_TYPE_INTERVAL_SECONDS
+    from computer_use_mcp.desktop.client_budget import pacing_budget_seconds
+
+    monkeypatch.delenv("CORTEX_CLIENT_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("CORTEX_TYPE_INTERVAL", raising=False)
+    threshold = int(pacing_budget_seconds() / DEFAULT_TYPE_INTERVAL_SECONDS)
+    skill_text = pathlib.Path(__file__).parent.joinpath(
+        "..", "skills", "cortex-skill", "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert f"~{threshold} chars" in skill_text  # ties the stated number to the code
+
+
+def test_unmappable_keypress_is_refused_with_zero_dispatch(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Z2 (backend level): a character the active layout cannot map raises the
+    typed UnsupportedKeyError BEFORE any dispatch — zero engine calls."""
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.desktop.errors import UnsupportedKeyError
+    from recording_engine import RecordingEngine
+
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
+
+    def _raise(key: str) -> tuple[int, bool]:
+        raise UnsupportedKeyError([key])
+
+    monkeypatch.setattr(backend_module, "_resolve_key_events", _raise)
+    with pytest.raises(UnsupportedKeyError):
+        real_backend.execute(GroundedAction(action="keypress", keys=["'"], confidence=1.0))
+    assert engine.calls == []  # ZERO dispatch
+
+
+async def test_unmappable_keypress_pipeline_rejection(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch, real_backend: Any
+) -> None:
+    """Z2 (pipeline level): through run_single the UnsupportedKeyError becomes
+    a typed REJECTED outcome (no `error`, `unsupported_key:` reasons naming the
+    key, the type-escape teaching) and ZERO dispatch."""
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.desktop.errors import UnsupportedKeyError
+    from recording_engine import RecordingEngine
+
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
+
+    def _raise(key: str) -> tuple[int, bool]:
+        raise UnsupportedKeyError([key])
+
+    monkeypatch.setattr(backend_module, "_resolve_key_events", _raise)
+    monkeypatch.setattr(real_backend, "query_stuck_modifiers", lambda keys: [])
+    agent = _agent_for(real_backend)
+    outcome = await agent.run_single(_pipeline_state(), _keypress("'"), approved=True)
+    assert outcome.kind == "rejected"
+    assert outcome.result is None  # never executed
+    assert any(r.startswith("unsupported_key:") for r in outcome.reasons), outcome.reasons
+    assert 'action="type"' in " ".join(outcome.reasons), outcome.reasons
+    assert engine.calls == []  # still ZERO dispatch after the pipeline
+
+
+def test_unmappable_hotkey_chord_is_rejected_before_any_key_down(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Z2: one unmappable key in a hotkey chord rejects the WHOLE chord before
+    any key of it goes down (map-before-dispatch); known names are unaffected."""
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.desktop.errors import UnsupportedKeyError
+    from recording_engine import RecordingEngine
+
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
+
+    def _resolve(key: str) -> tuple[int, bool]:
+        if key == "'":
+            raise UnsupportedKeyError([key])
+        table = {"ctrl": (0x11, False), "enter": (0x0D, False), "f5": (0x74, False), "F4": (0x73, False)}
+        return table[key]
+
+    monkeypatch.setattr(backend_module, "_resolve_key_events", _resolve)
+    with pytest.raises(UnsupportedKeyError):
+        real_backend.execute(GroundedAction(action="hotkey", keys=["ctrl", "'"], confidence=1.0))
+    assert engine.calls == []  # no key of the chord went down
+    # known names are unaffected (uppercase F4 included — DELTA 6)
+    message_f4 = real_backend.execute(
+        GroundedAction(action="hotkey", keys=["enter", "F4"], confidence=1.0)
+    )
+    assert message_f4 == "Executed hotkey."
+    assert engine.calls, "known keys must dispatch"
+
+
+def test_stripped_key_names_precheck_and_dispatch_agree(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Z2-b (VAL-WP13-08): the hotkey pre-check and the dispatch use the SAME
+    stripped key list. `["alt", " f4"]` no longer passes the check on " f4".strip()
+    and then fails mid-chord dispatching the RAW name — the stripped list is
+    mapped, and the engine receives the stripped names. A key that is
+    unmappable even stripped is refused with ZERO engine calls."""
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.desktop.errors import UnsupportedKeyError
+    from recording_engine import RecordingEngine
+
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
+
+    def _resolve(key: str) -> tuple[int, bool]:
+        table = {"alt": (0x12, False), "f4": (0x73, False)}
+        return table[key]  # " f4" (unstripped) is NOT in the table
+
+    monkeypatch.setattr(backend_module, "_resolve_key_events", _resolve)
+    message = real_backend.execute(
+        GroundedAction(action="hotkey", keys=["alt", " f4"], confidence=1.0)
+    )
+    assert message == "Executed hotkey.", message
+    downs = [c for c in engine.calls if c[0] == "key_down"]
+    ups = [c for c in engine.calls if c[0] == "key_up"]
+    assert [c[1] for c in downs] == ["alt", "f4"], engine.calls  # STRIPPED names dispatched
+    assert [c[1] for c in ups] == ["f4", "alt"], engine.calls  # reverse-order release
+    assert not any(c[1] == " f4" for c in engine.calls if c[0] in ("key_down", "key_up"))
+
+    # a key unmappable EVEN STRIPPED is refused before any dispatch
+    engine2 = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine2)
+
+    def _resolve_strict(key: str) -> tuple[int, bool]:
+        if key != "alt":
+            raise UnsupportedKeyError([key])
+        return (0x12, False)
+
+    monkeypatch.setattr(backend_module, "_resolve_key_events", _resolve_strict)
+    with pytest.raises(UnsupportedKeyError):
+        real_backend.execute(
+            GroundedAction(action="hotkey", keys=["alt", " f4"], confidence=1.0)
+        )
+    assert engine2.calls == []  # zero dispatch
+
+
+def test_plan_steps_cutoff_identifies_the_refusal_by_its_prefix() -> None:
+    """Z3-a (VAL-WP13-08): the refusal message grew the restart teaching, so the
+    plan cut detector matches "Maximum session steps reached." by PREFIX — a
+    final safety_denied item carrying the full new message is still identified
+    as the max_steps cut (limit_name, executed_count from executed +
+    dispatched_unverified items); the OLD exact message still matches; another
+    safety message does not."""
+    from computer_use_mcp.server.plan_surface import _plan_limit_cutoff_from_outcome
+    from types import SimpleNamespace
+
+    new_message = (
+        "Maximum session steps reached. To continue: stop_session, then"
+        " start_session with a higher max_steps (Cortex's own start_session"
+        " parameter, band 1..500; every dispatched action counts — follow_ups"
+        " items and plan actions included)."
+    )
+
+    def _outcome(message: str) -> Any:
+        return SimpleNamespace(
+            follow_ups_stopped_reason="safety_denied",
+            follow_up_results=[
+                {"kind": "executed", "message": "Executed click."},
+                {"kind": "dispatched_unverified", "message": "Executed type."},
+                {"kind": "safety_denied", "message": message},
+            ],
+        )
+
+    cutoff = _plan_limit_cutoff_from_outcome(_outcome(new_message))
+    assert cutoff is not None and cutoff["limit_name"] == "max_steps", cutoff
+    assert cutoff["executed_count"] == 2, cutoff  # executed + dispatched_unverified
+    assert cutoff["resolved_count"] == 3, cutoff
+
+    legacy = _plan_limit_cutoff_from_outcome(
+        _outcome("Maximum session steps reached.")
+    )
+    assert legacy is not None and legacy["limit_name"] == "max_steps", legacy
+
+    other = _plan_limit_cutoff_from_outcome(
+        _outcome("Blocked: cursor in the failsafe corner.")
+    )
+    assert other is None, other
+
+
+def test_maximum_session_steps_refusal_teaches_the_restart_path() -> None:
+    """Z3-a (VAL-WP13-08): the safety gate's "Maximum session steps reached."
+    refusal now teaches the restart path (stop_session + start_session with a
+    higher max_steps, Cortex's own parameter, band interpolated from
+    STEPS_BAND; every dispatched action counts) — order and outcome unchanged."""
+    from computer_use_mcp.core.models import GroundedAction, SessionState
+    from computer_use_mcp.core.limits import STEPS_BAND
+    from computer_use_mcp.security.safety import SafetyPolicy
+
+    state = SessionState(session_id="test", max_steps=2, step_count=2)
+    decision = SafetyPolicy().evaluate(
+        GroundedAction(action="wait", delta=1), state
+    )
+    assert decision.allowed is False
+    assert decision.requires_approval is False
+    assert decision.reason.startswith("Maximum session steps reached."), decision.reason
+    assert "stop_session, then start_session with a higher max_steps" in decision.reason
+    assert f"band {STEPS_BAND[0]}..{STEPS_BAND[1]}" in decision.reason
+    assert "every dispatched action counts" in decision.reason
+
+
+def _agent_for(backend: Any) -> Any:
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.security.safety import SafetyPolicy
+
+    return ComputerUseAgent(
+        backend,
+        provider=None,
+        safety=SafetyPolicy(),
+        task=TaskState(),
+        stop=StopToken(),
+        limits=Limits(
+            min_screenshot_interval_ms=1, max_actions=100, max_task_seconds=600.0
+        ).validate(),
+    )
+
+
+def _pipeline_state() -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        dry_run=False,
+        stopped=False,
+        allowed_windows=[],
+        min_confidence=0.0,
+        max_steps=100,
+        step_count=0,
+        require_approval=False,
+        max_retries_per_action=1,
+    )
+
+
+def _keypress(key: str) -> Any:
+    from computer_use_mcp.core.models import GroundedAction
+
+    return GroundedAction(action="keypress", keys=[key], confidence=1.0)
+
+
+async def test_unmappable_key_follow_up_item_rejects_the_chain(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch, real_backend: Any
+) -> None:
+    """Z2: an unmappable key inside a follow_ups item comes back as that item's
+    typed rejection (unsupported_key reasons) and the chain stops with
+    `follow_ups_stopped_reason: "rejected"`."""
+    from computer_use_mcp.desktop.errors import UnsupportedKeyError
+
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS,
+        backend=real_backend,
+    )
+
+    def _raise(key: str) -> tuple[int, bool]:
+        raise UnsupportedKeyError([key])
+
+    monkeypatch.setattr(backend_module, "_resolve_key_events", _raise)
+    monkeypatch.setattr(real_backend, "query_stuck_modifiers", lambda keys: [])
+    payload = execute_payload(
+        await srv_server_execute.computer_execute(
+            session_id,
+            "done",
+            follow_ups=[{"action": "keypress", "keys": ["'"]}],
+        )
+    )
+    assert payload.get("follow_ups_stopped_reason") == "rejected", (
+        payload.get("follow_ups_stopped_reason"),
+        payload.get("follow_up_results"),
+        payload.get("message"),
+    )
+    item = payload["follow_up_results"][-1]
+    assert item["ok"] is False and item["kind"] == "rejected", item
+    assert any(r.startswith("unsupported_key:") for r in item.get("reasons", [])), item
+    assert 'action="type"' in " ".join(item.get("reasons", [])), item
+
+
+async def test_unmappable_hotkey_follow_up_names_all_bad_keys_and_rejects(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch, real_backend: Any
+) -> None:
+    """Z2 (hotkey): an unmappable key inside a hotkey follow_ups item rejects
+    with an `unsupported_key:` reason for the unmappable member, zero dispatch
+    of the chord, and the chain stops with `rejected`."""
+    from computer_use_mcp.desktop.errors import UnsupportedKeyError
+
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS,
+        backend=real_backend,
+    )
+
+    def _raise(key: str) -> tuple[int, bool]:
+        raise UnsupportedKeyError([key])
+
+    monkeypatch.setattr(backend_module, "_resolve_key_events", _raise)
+    payload = execute_payload(
+        await srv_server_execute.computer_execute(
+            session_id,
+            "done",
+            follow_ups=[{"action": "hotkey", "keys": ["ctrl", "'"]}],
+        )
+    )
+    assert payload.get("follow_ups_stopped_reason") == "rejected", payload
+    item = payload["follow_up_results"][-1]
+    assert item["ok"] is False and item["kind"] == "rejected", item
+    reasons = item.get("reasons", [])
+    # the patched resolver marks BOTH keys unmappable, so both are named
+    # (repr form: apostrophe renders double-quoted, ctrl single-quoted)
+    assert "unsupported_key: \"'\"" in reasons, reasons
+    assert "unsupported_key: 'ctrl'" in reasons, reasons
+
+
+def test_chord_mapping_collects_all_unsupported_keys_and_dispatches_nothing() -> None:
+    """Z2: `_chord_key_units` maps EVERY key BEFORE building events — one call
+    raises UnsupportedKeyError naming ALL unsupported members (never just the
+    first), so a chord can never go down partially."""
+    from computer_use_mcp.desktop.errors import UnsupportedKeyError
+    from computer_use_mcp.desktop.input_engine import _chord_key_units
+
+    with pytest.raises(UnsupportedKeyError) as info:
+        _chord_key_units(["ctrl", "<bad1>", "alt", "<bad2>"])
+    assert sorted(info.value.unsupported_keys) == ["<bad1>", "<bad2>"]
+
+
+def test_vkkeyscan_layout_change_between_actions_takes_effect(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C1 (DELTA 13): there is NO cross-action resolution cache. ``VkKeyScanW``
+    is layout-dependent — action 1 maps "'" under the (fake) English layout;
+    the layout then 'changes' so "'" is UNMAPPABLE; action 2 must be REFUSED
+    (the DELTA-12 process-global cache used to replay the stale VK and silently
+    send the wrong key). No ``_VK_RESOLUTION_CACHE`` exists any more."""
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.desktop import input_engine as engine_module
+    from computer_use_mcp.desktop.errors import UnsupportedKeyError
+    from recording_engine import RecordingEngine
+
+    assert not hasattr(engine_module, "_VK_RESOLUTION_CACHE"), (
+        "the process-global VkKeyScanW cache must stay removed (C1)"
+    )
+    calls = {"count": 0}
+
+    class _FakeUser32:
+        def VkKeyScanW(self, char: str) -> int:
+            calls["count"] += 1
+            return 0xFFFF if calls["count"] > 1 else 0x28  # layout changes after action 1
+
+    monkeypatch.setattr(engine_module, "_user32", _FakeUser32())
+    engine = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine)
+    real_backend.execute(GroundedAction(action="keypress", keys=["'"], confidence=1.0))
+    assert calls["count"] == 1  # resolved FRESH via VkKeyScanW (no cache hit)
+    assert ("chord", "'") in engine.calls
+
+    engine2 = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine2)
+    with pytest.raises(UnsupportedKeyError):
+        real_backend.execute(GroundedAction(action="keypress", keys=["'"], confidence=1.0))
+    assert engine2.calls == []  # refused under the NEW layout — the stale mapping is gone
+
+
+def test_one_action_press_and_release_share_one_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C1 (DELTA 13): WITHIN one action the press and the release share the
+    pre-check's mapping — `_chord_key_units`/`_chord_key_halves` consult the
+    passed ``resolved`` dict and never re-resolve, even though the resolver
+    (and thus the layout) could change mid-action."""
+    from computer_use_mcp.desktop import input_engine as engine_module
+
+    def _no_reresolve(key: str) -> tuple[int, bool]:
+        raise AssertionError("the press/release must use the per-action mapping")
+
+    monkeypatch.setattr(engine_module, "_resolve_key_events", _no_reresolve)
+    resolved = {"ctrl": (0x11, False), "a": (0x41, False)}
+    units = engine_module._chord_key_units(["ctrl", "a"], resolved)
+    keyup = engine_module._KEYEVENTF_KEYUP
+    assert [(u[0], u[2]) for u in units] == [
+        (0x11, 0),
+        (0x41, 0),
+        (0x41, keyup),
+        (0x11, keyup),
+    ]
+    press, release = engine_module._chord_key_halves(["ctrl", "a"], resolved)
+    assert [u[0] for u in press] == [0x11, 0x41]
+    assert [u[0] for u in release] == [0x41, 0x11]  # reverse-order release, same mapping
+
+
+def test_held_keypress_resolves_each_key_exactly_once_per_action(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C1 (DELTA 13): one HELD keypress consults ``VkKeyScanW`` exactly ONCE
+    per key — in the backend pre-check. The press AND the release are built
+    from that mapping (before DELTA 13, without the cache, the release
+    re-resolved and could diverge)."""
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.desktop import input_engine as engine_module
+    from computer_use_mcp.desktop.input_engine import SendInputEngine
+
+    calls = {"count": 0}
+
+    class _FakeUser32:
+        def VkKeyScanW(self, char: str) -> int:
+            calls["count"] += 1
+            return 0x41  # every character maps to VK 'A' under this fake layout
+
+        def SendInput(self, count: int, array: Any, cb_size: int) -> int:
+            return count
+
+        def GetCursorPos(self, point: Any) -> int:
+            point.x, point.y = 960, 540  # NOT a failsafe corner
+            return 1
+
+        def GetSystemMetrics(self, index: int) -> int:
+            return (1920, 1080)[index]
+
+    monkeypatch.setattr(engine_module, "_user32", _FakeUser32())
+    # HERMETIC (the DELTA-14 full-suite failure): `_cursor_in_failsafe_corner`
+    # reads the REAL desktop through win32's own binding, NOT this fake's
+    # GetCursorPos — patch `get_cursor_position` so the test never consults
+    # the physical cursor.
+    monkeypatch.setattr(engine_module, "get_cursor_position", lambda: (960, 540))
+    sent: list[Any] = []
+    engine = SendInputEngine(failsafe=True)
+    monkeypatch.setattr(
+        engine, "_dispatch", lambda events: sent.extend(events) or len(events)
+    )
+    monkeypatch.setattr(real_backend, "_engine", engine)
+    real_backend.execute(
+        GroundedAction(
+            action="keypress", keys=["'", ","], hold_ms=50, confidence=1.0
+        )
+    )
+    # exactly ONE resolution per key, in the pre-check — press and release
+    # reuse it (without the fix the release would re-resolve: 4 calls). "'" and
+    # "," are NOT in the static table, so each one reaches VkKeyScanW.
+    assert calls["count"] == 2, calls["count"]
+    kb = [e for e in sent if e.type == engine_module._INPUT_KEYBOARD]
+    assert kb, "the chord must dispatch keyboard events"
+    downs = [e for e in kb if not e.union.ki.dwFlags & engine_module._KEYEVENTF_KEYUP]
+    ups = [e for e in kb if e.union.ki.dwFlags & engine_module._KEYEVENTF_KEYUP]
+    assert [e.union.ki.wVk for e in downs] == [0x41, 0x41]  # both keys went down
+    assert [e.union.ki.wVk for e in ups] == [0x41, 0x41]  # and were released
+
+
+def test_single_whitespace_keys_dispatch_their_named_vk(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D12-1 (VAL-WP13-09): a single whitespace key is a REAL static-table key
+    (" " = VK_SPACE, "\\t" = VK_TAB, "\\n"/"\\r" = VK_RETURN) — the DELTA-12
+    blanket strip turned it into "" and refused a working input with
+    `unsupported_key: ''`. Strip only when the result is empty; the static
+    table (never VkKeyScanW) resolves them."""
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.desktop import input_engine as engine_module
+    from computer_use_mcp.desktop.input_engine import SendInputEngine
+
+    class _FakeUser32:
+        def VkKeyScanW(self, char: str) -> int:
+            raise AssertionError("whitespace keys resolve from the static table")
+
+        def SendInput(self, count: int, array: Any, cb_size: int) -> int:
+            return count
+
+        def GetCursorPos(self, point: Any) -> int:
+            point.x, point.y = 960, 540  # NOT a failsafe corner
+            return 1
+
+        def GetSystemMetrics(self, index: int) -> int:
+            return (1920, 1080)[index]
+
+    monkeypatch.setattr(engine_module, "_user32", _FakeUser32())
+    # HERMETIC: the failsafe corner probe reads the REAL desktop through
+    # win32's own binding — patch `get_cursor_position` so the physical
+    # cursor is never consulted.
+    monkeypatch.setattr(engine_module, "get_cursor_position", lambda: (960, 540))
+
+    for key, vk in ((" ", 0x20), ("\t", 0x09), ("\n", 0x0D), ("\r", 0x0D)):
+        sent: list[Any] = []
+        engine = SendInputEngine(failsafe=True)
+        monkeypatch.setattr(
+            engine, "_dispatch", lambda events, s=sent: s.extend(events) or len(events)
+        )
+        monkeypatch.setattr(real_backend, "_engine", engine)
+        message = real_backend.execute(
+            GroundedAction(action="keypress", keys=[key], confidence=1.0)
+        )
+        assert message == "Executed keypress.", (key, message)
+        kb = [e for e in sent if e.type == engine_module._INPUT_KEYBOARD]
+        assert [e.union.ki.wVk for e in kb] == [vk, vk], (key, sent)  # down + up
+
+
+def test_hotkey_whitespace_key_and_stripped_names_still_agree(
+    real_backend: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D12-1: hotkey ["shift", " "] dispatches shift+VK_SPACE (press order,
+    reverse-order release), while ["alt", " f4"] keeps the DELTA-12 behaviour
+    (dispatched as the STRIPPED alt/f4 names)."""
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.desktop import input_engine as engine_module
+    from computer_use_mcp.desktop.input_engine import SendInputEngine
+    from recording_engine import RecordingEngine
+
+    class _FakeUser32:
+        def VkKeyScanW(self, char: str) -> int:
+            raise AssertionError("shift and space resolve from the static table")
+
+        def SendInput(self, count: int, array: Any, cb_size: int) -> int:
+            return count
+
+        def GetCursorPos(self, point: Any) -> int:
+            point.x, point.y = 960, 540  # NOT a failsafe corner
+            return 1
+
+        def GetSystemMetrics(self, index: int) -> int:
+            return (1920, 1080)[index]
+
+    monkeypatch.setattr(engine_module, "_user32", _FakeUser32())
+    # HERMETIC: the failsafe corner probe reads the REAL desktop through
+    # win32's own binding — patch `get_cursor_position` so the physical
+    # cursor is never consulted.
+    monkeypatch.setattr(engine_module, "get_cursor_position", lambda: (960, 540))
+    sent: list[Any] = []
+    engine = SendInputEngine(failsafe=True)
+    monkeypatch.setattr(engine, "_dispatch", lambda events: sent.extend(events) or len(events))
+    monkeypatch.setattr(real_backend, "_engine", engine)
+    message = real_backend.execute(
+        GroundedAction(action="hotkey", keys=["shift", " "], confidence=1.0)
+    )
+    assert message == "Executed hotkey.", message
+    kb = [e for e in sent if e.type == engine_module._INPUT_KEYBOARD]
+    keyup = engine_module._KEYEVENTF_KEYUP
+    assert [e.union.ki.wVk for e in kb if not e.union.ki.dwFlags & keyup] == [0x10, 0x20]
+    assert [e.union.ki.wVk for e in kb if e.union.ki.dwFlags & keyup] == [0x20, 0x10]
+
+    # ["alt", " f4"] keeps the DELTA-12 stripped-list behaviour: the raw name
+    # never reaches the engine, the stripped names do
+    engine2 = RecordingEngine()
+    monkeypatch.setattr(real_backend, "_engine", engine2)
+    real_backend.execute(
+        GroundedAction(action="hotkey", keys=["alt", " f4"], confidence=1.0)
+    )
+    downs = [c for c in engine2.calls if c[0] == "key_down"]
+    assert [c[1] for c in downs] == ["alt", "f4"]
+
+
+def test_session_max_steps_band_is_the_shared_band() -> None:
+    """D12-3 (VAL-WP13-09): SessionState.max_steps' pydantic band IS the ONE
+    STEPS_BAND constant — 1..500 at both ends, driven from core.limits, so the
+    model bound, the clamp, the refusal messages and the docs cannot drift."""
+    import pydantic
+
+    from computer_use_mcp.core.limits import STEPS_BAND
+    from computer_use_mcp.core.models import SessionState
+
+    assert STEPS_BAND == (1, 500)
+    assert SessionState(session_id="x", max_steps=STEPS_BAND[1]).max_steps == 500
+    assert SessionState(session_id="x", max_steps=STEPS_BAND[0]).max_steps == 1
+    with pytest.raises(pydantic.ValidationError):
+        SessionState(session_id="x", max_steps=STEPS_BAND[1] + 1)
+    with pytest.raises(pydantic.ValidationError):
+        SessionState(session_id="x", max_steps=STEPS_BAND[0] - 1)
+
+
+async def test_key_failure_after_dispatch_reports_dispatched_unverified(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch, real_backend: Any
+) -> None:
+    """Z2-c: when the unmappable-key failure lands AFTER dispatch started
+    (defensive path — the held-key sweep has already released what went down),
+    the rejection must NOT claim "nothing was dispatched": it carries the
+    `dispatched_unverified` reason and tells the driver to re-observe."""
+    from computer_use_mcp.core.models import GroundedAction
+    from computer_use_mcp.desktop.errors import UnsupportedKeyError
+    from recording_engine import RecordingEngine
+
+    class _KeyUpFails(RecordingEngine):
+        def key_up(self, key: str) -> None:
+            self.calls.append(("key_up", key))
+            raise UnsupportedKeyError([key])
+
+    engine = _KeyUpFails()
+    monkeypatch.setattr(real_backend, "_engine", engine)
+
+    def _mappable(key: str) -> tuple[int, bool]:
+        return (0x11, False)
+
+    monkeypatch.setattr(backend_module, "_resolve_key_events", _mappable)
+    monkeypatch.setattr(real_backend, "query_stuck_modifiers", lambda keys: [])
+    agent = _agent_for(real_backend)
+    outcome = await agent.run_single(
+        _pipeline_state(),
+        GroundedAction(action="hotkey", keys=["ctrl", "a"], confidence=1.0),
+        approved=True,
+    )
+    assert outcome.kind == "rejected", outcome
+    assert any(r.startswith("dispatched_unverified:") for r in outcome.reasons), outcome.reasons
+    assert any(r.startswith("unsupported_key:") for r in outcome.reasons), outcome.reasons
+    assert "nothing was dispatched" not in outcome.message, outcome.message
+    assert "re-observe" in outcome.message, outcome.message
+    # the chord really went down: both key_downs landed, and the sweep attempted
+    # a release for every pressed key
+    downs = [c for c in engine.calls if c[0] == "key_down"]
+    ups = [c for c in engine.calls if c[0] == "key_up"]
+    assert [c[1] for c in downs] == ["ctrl", "a"]
+    assert len(ups) == 2
 
 
 def test_launch_adoption_pending_is_cancelled_by_an_explicit_rebind(

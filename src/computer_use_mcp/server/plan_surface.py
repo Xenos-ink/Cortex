@@ -261,7 +261,9 @@ def _plan_limit_cutoff_from_outcome(
     final = list(outcome.follow_up_results or [entries[-1]])[-1]
     if (
         final.get("kind") == "safety_denied"
-        and final.get("message") == "Maximum session steps reached."
+        and str(final.get("message", "")).startswith("Maximum session steps reached.")
+        # DELTA 12 (Z3-a): the refusal now carries the restart teaching after
+        # the leading sentence, so the cut is identified by its prefix.
     ):
         executed_count = sum(
             entry.get("kind") in {"executed", "dispatched_unverified"}

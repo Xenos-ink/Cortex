@@ -91,3 +91,15 @@ computer_execute(session_id, action="click", x=10, y=20, follow_ups=[
 Deterministic steps only. Read `follow_up_results[i].result` per item AND
 `follow_ups_stopped_reason` (None = the batch ran to completion); an item that
 dispatched but did not verify rides its honest verdict while the rest still runs.
+
+## Long or multi-line text (code, VBA, scripts)
+
+```text
+computer_execute(session_id, action="type", text=<300 lines of VBA>, via="clipboard")
+```
+
+Editors that auto-indent or auto-complete (VBA editor, code editors) mangle
+per-character bursts: the paced budget covers ~1800 chars at the default pace
+(less at a smaller client timeout) and `paced=partial` in the reply means the
+tail went in UNPACED — re-observe and never retype blind. One `via="clipboard"`
+type pastes the whole text in a single step instead.

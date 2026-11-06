@@ -15,13 +15,9 @@ for staleness, risk and approval), **execution** (input dispatched), **verificat
 (a post-action capture compared against the stated effect). The last three run inside
 `computer_execute`.
 
-- **Execution is not effect.** The input left the process; whether the app did the
-  thing is a separate question, answered by verification.
-- **The verdict is evidence, not a summary.** `verified` / `failed` / `uncertain`
-  answer "did the stated effect happen" — never "is my task done".
-- **Staleness is checked for you.** A coordinate-bearing action grounded on an old
-  observation gets one automatic re-capture and re-validation before any rejection.
-  Do not pre-empt it by re-observing speculatively.
+- **Execution is not effect.** The input left the process; whether the app did the thing is a separate question, answered by verification.
+- **The verdict is evidence, not a summary.** `verified` / `failed` / `uncertain` answer "did the stated effect happen" — never "is my task done".
+- **Staleness is checked for you.** A coordinate-bearing action grounded on an old observation gets one automatic re-capture and re-validation before any rejection — do not pre-empt it by re-observing speculatively.
 - **A rejection is produced before input, with two exceptions.** Rejections
   (`invalid_action`, safety, grounding, interference) dispatch nothing, so on a FLAT
   single-action call a re-send, after the gate's complaint is fixed, is safe from
@@ -96,25 +92,25 @@ item, every plan step, the terminal plan, and wait/cancel/fetch):
 
 ## Efficiency defaults
 
-- State `expected_effect` whenever you can — it is what verification checks. Without
-  it, a no-visible-change action (a focus-only click) degrades to `uncertain`.
-  `verified` is done: never re-observe a verified step to confirm it.
+- State `expected_effect` whenever you can — it is what verification checks. Without it, a no-visible-change action (a focus-only click) degrades to `uncertain`. `verified` is done: never re-observe a verified step to confirm it.
 - `follow_ups`: at most 5, ONLY for deterministic sequential steps known in advance
   (open → type → save); each item re-grounds from the fresh capture. If any step
   depends on reading the screen, issue it as a single call first.
 - Non-vision host: start the session with `image_delivery="text"`. Long flows: raise
-  `max_steps` in `start_session` instead of restarting mid-task. `require_approval=false`
-  only where host policy explicitly allows unattended driving.
+  `max_steps` in `start_session` (Cortex's own parameter — it counts every DISPATCHED
+  action, follow_ups items and plan actions included, not agent turns; the effective
+  action cap is the smaller of `max_steps` and `max_actions`, default 30) instead of
+  restarting mid-task. `require_approval=false` only where host policy explicitly
+  allows unattended driving.
 - Long pauses: the `computer_wait` tool, never a large flat `delta` (see below).
 
 ## When a step is not proven
 
-- `uncertain` = dispatched but unproven — never success, never failure. Look at the
-  attached image (the primary evidence). If the reply carried no image, nothing was
-  retained for that call — do not hunt for a fetchable id; call `computer_observe` for
-  fresh state. Ask the evidence a concrete question (is the dialog still open? is the
-  field populated?) and let the answer pick the next call. If it stays ambiguous,
-  report the step as unproven — do not claim either way.
+- `uncertain` = dispatched but unproven — never success, never failure. Look at the attached image (the primary
+  evidence). If the reply carried no image, nothing was retained for that call — do not hunt for a fetchable id;
+  call `computer_observe` for fresh state. Ask the evidence a concrete question (is the dialog still open? is the
+  field populated?) and let the answer pick the next call; if it stays ambiguous, report the step as unproven —
+  do not claim either way.
 - NEVER re-issue an action whose first attempt may have landed: re-sending an
   executed-but-unproven input risks a double-apply. Re-issue only after evidence shows
   the first attempt did not land.
@@ -154,49 +150,51 @@ item, every plan step, the terminal plan, and wait/cancel/fetch):
   `hold_ms=0` is an explicit zero-duration press/release. `duration_ms` (0..5000 ms,
   `move` only) is a timed-motion duration; outside a plan both motion and settle are
   instant (0 ms / 0 ms); `settle_ms` (0..200 ms) is the per-point settle.
-- `scroll`: POSITIVE = UP (negative reads further down), and the wheel
-  lands at the CURRENT CURSOR POSITION — `move` the pointer to the region first. The
-  delta band is -20..20; a `wait` delta outside it is rejected, one inside it is clamped
-  to the action's cap and the row's message carries `waited_seconds=<effective>`.
-- `via="clipboard"` (type actions only) pastes via the clipboard for apps that drop
-  per-character typing; it never bypasses any gate. Known limit: on an ABORT path
-  (failsafe, stop token, blocked input) between the clipboard set and the paste chord,
-  the prior clipboard text is restored, but a destroyed non-text payload is not
-  disclosed and a failed restore is not annotated. Treat any abort during a
-  `via="clipboard"` type as a possible silent clipboard change.
+- `scroll`: POSITIVE = UP (negative reads further down); the wheel lands at the CURRENT CURSOR
+  POSITION — `move` the pointer to the region first. The delta band is -20..20; a `wait` delta outside it is
+  rejected, one inside it is clamped and the row's message carries `waited_seconds=<effective>`.
+- `via="clipboard"` (type actions only) pastes via the clipboard for apps that drop per-character typing; it never
+  bypasses any gate. USE IT for long or multi-line text — especially code into editors that auto-indent or auto-complete
+  (VBA editor, code editors): the paced typing budget covers ~1800 chars at the default pace (pacing budget ÷ per-character
+  pace; less at a smaller client timeout), and `paced=partial` means the tail went in UNPACED — re-observe before anything
+  else; never retype blind. Known limit: on an ABORT path between the clipboard set and the paste chord, the prior clipboard
+  text is restored, but a destroyed non-text payload is not disclosed and a failed restore is not annotated — treat any abort
+  during a `via="clipboard"` type as a possible silent clipboard change.
 - `done` and the flat `wait` are markers: `result: "marker"` with `ok:true`,
-  `verification_method: no_op_marker`, confidence 1.0, and no screen claim — a stated
-  `expected_effect` is not consulted for them. That `marker` is about the marker being
-  handled, never about the task being finished, and `done` does not end the session —
-  only `stop_session` does. `dry_run:true` sessions validate without dispatching: the
-  row is `result: "dry_run"`, `ok:false` by design (`dry_run` defaults to false on
-  `start_session` — pass it only deliberately).
+  `verification_method: no_op_marker`, confidence 1.0, and no screen claim — a stated `expected_effect`
+  is not consulted for them; the marker is about being handled, never about the task being finished,
+  and `done` does not end the session — only `stop_session` does. `dry_run:true` sessions validate
+  without dispatching: the row is `result: "dry_run"`, `ok:false` by design (`dry_run` defaults to
+  false on `start_session` — pass it only deliberately).
 
 ## The wait family
 
 The flat `{"action":"wait","delta":N}` queue item is a short in-queue pause capped at 10 seconds — a different product from the wait tools:
 
-- `computer_wait(session_id, duration_seconds, label=None)` BLOCKS up to one segment
-  (default 45 s, env `CORTEX_WAIT_SEGMENT_SECONDS`, band 1..55 (ceiling = client
-  timeout − 5) — derived from the host's client timeout `CORTEX_CLIENT_TIMEOUT_SECONDS`
-  (default 60; ZCode hosts set 30), always under the host's 60 s tool timeout; out-of-band
-  values fall back to the default), then returns `status: "completed"` (with `elapsed_seconds` — act now) or
-  `status:"running"` with the `wait_id`, `elapsed_seconds`, `remaining_seconds`
-  and a poll hint. Ceiling: min(max_wait_seconds, 10800) — 10 800 s (3 h); over-cap
-  requests are refused. Splitting a long wait into several waits is visible, not a workaround.
+- `computer_wait(session_id, duration_seconds, label=None)` BLOCKS up to one segment (default 45 s,
+  env `CORTEX_WAIT_SEGMENT_SECONDS`, band 1..55 (ceiling = client timeout − 5) — derived from the
+  host's client timeout `CORTEX_CLIENT_TIMEOUT_SECONDS` (default 60; ZCode hosts set 30), always
+  under the host's client timeout; out-of-band values fall back to the default), then returns
+  `status: "completed"` (with `elapsed_seconds` — act now) or `status:"running"` with the `wait_id`,
+  `elapsed_seconds`, `remaining_seconds` and a poll hint. Ceiling: min(max_wait_seconds, 10800) —
+  10 800 s (3 h); over-cap requests are refused. Splitting a long wait into several waits is visible,
+  not a workaround.
 - `computer_wait_status(session_id, wait_id)` blocks for the NEXT segment and returns `completed` / `running` / `cancelled`; `block=false` peeks without waiting.
-- `computer_cancel_wait(session_id, wait_id)` ends a wait early: `cancelled` (with
-  elapsed/remaining), `completed` (it had finished; remaining 0), or `failed` + `error`
-  `wait_failed`. A duplicate cancel is safe: the same numbers plus
-  `already_cancelled:true`. Unknown and foreign ids get the byte-identical
-  `unknown_wait`. Waits: 4 per session and 16 process-wide, else `too_many_waits`;
-  only the last 8 finished waits are remembered per session. A wait consumes zero
-  `max_actions` slots; if YOUR CLIENT cancels a blocking wait call the wait keeps
-  running — call `computer_wait_status` again. A plan lease refuses
-  `computer_wait` / `computer_cancel_wait`; `computer_wait_status` stays allowed.
-- What actually ends a session: `stop_session`, an internal safety kill, exhausting
-  `max_actions`, the host's `max_steps`, or process exit. The advertised
-  `max_task_seconds` is a limit you may set, not a clock that ends your work.
+- `computer_cancel_wait(session_id, wait_id)` ends a wait early: `cancelled` (with elapsed/remaining),
+  `completed` (it had finished; remaining 0), or `failed` + `error` `wait_failed`. A duplicate cancel is
+  safe (same numbers plus `already_cancelled:true`); unknown and foreign ids get the byte-identical
+  `unknown_wait`. Waits: 4 per session and 16 process-wide, else `too_many_waits`; only the last 8
+  finished waits are remembered per session. A wait consumes zero `max_actions` slots; if YOUR CLIENT
+  cancels a blocking wait call the wait keeps running — call `computer_wait_status` again. A plan lease
+  refuses `computer_wait` / `computer_cancel_wait`; `computer_wait_status` stays allowed.
+- What actually ends a session: `stop_session`, an internal safety kill, exhausting `max_actions`, reaching
+  `max_steps`, or process exit. The advertised `max_task_seconds` is a limit you may set, not a clock that
+  ends your work. Caps: `max_steps` (default 30, band 1..500) is Cortex's own start_session parameter and
+  counts every DISPATCHED action (follow_ups items and plan actions included — not agent turns);
+  `max_actions` (default 100, band 1..500) counts the same. The EFFECTIVE cap is the smaller of the two —
+  a default session is refused at action 31 — start_session's message states it and warns when the caps
+  differ; on `limit_exceeded: max_actions` or the max_steps refusal, stop and restart with a higher
+  `max_steps` / `limits={"max_actions": N}`.
 
 ## Sessions, images, and safety truth
 

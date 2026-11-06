@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 
 from typing import TYPE_CHECKING
 
-from .errors import FocusDriftError, InputBlockedError, UnsupportedActionError
+from .errors import FocusDriftError, InputBlockedError, UnsupportedActionError, UnsupportedKeyError
 from .motion import _DRAG_STEP_PAUSE_SECONDS
 
 if TYPE_CHECKING:  # annotation-only names (lazy under __future__ annotations)
@@ -251,14 +251,23 @@ def _text_to_key_units(text: str) -> list[tuple[int, int, int]]:
 
 
 def _resolve_key_events(key: str) -> tuple[int, bool]:
-    """Resolve one key name to ``(virtual_key, needs_shift)``; unknown -> ValueError.
+    """Resolve one key name to ``(virtual_key, needs_shift)``; unknown -> error.
 
-    Named keys use the static table; other printable characters resolve via
-    ``VkKeyScanW`` (pyautogui parity: layout-dependent, shift flag honored).
+    C1 (DELTA 13, VAL-WP13-12): there is NO cross-action cache. ``VkKeyScanW``
+    is LAYOUT-DEPENDENT (the user switches between Arabic and English
+    layouts), so a process-global cache would (a) make a later keypress send
+    the WRONG key after a layout switch and (b) bypass the Z2 unmappable-key
+    refusal for a character the new layout cannot produce. The static
+    ``_VK_NAMED_KEYS`` table — layout-independent by construction — is
+    consulted first; everything else resolves FRESH on every call. Within ONE
+    action the press and the release share one mapping because the backend's
+    pre-check (:meth:`ComputerBackend._ensure_keys_dispatchable`) resolves
+    every key once and PASSES the mapping down (``chord_resolved`` /
+    ``key_down_resolved`` / ``key_up_resolved``); nothing is reused across
+    actions. Raises :class:`~computer_use_mcp.desktop.errors.UnsupportedKeyError`
+    (a ``ValueError`` subclass) when the key cannot be mapped (Z2,
+    LIVE-WP13-02).
     """
-    named = _VK_NAMED_KEYS.get(key)
-    if named is not None:
-        return (named, False)
     if len(key) > 1:
         # L3 (LIVE-WP13-02): a MULTI-character key name is always a KEY NAME —
         # it can never be text (text travels via KEYEVENTF_UNICODE on type
@@ -273,35 +282,57 @@ def _resolve_key_events(key: str) -> tuple[int, bool]:
         if lowered is not None:
             return (lowered, key.lower() != key)  # uppercase letter: inject shift too
     if not IS_WINDOWS or _user32 is None:
-        raise ValueError(f"unsupported key: {key!r}")
+        raise UnsupportedKeyError([key])
     try:
         result = int(_user32.VkKeyScanW(ctypes.c_wchar(key))) & 0xFFFF
     except (OSError, AttributeError, ValueError, TypeError):
         result = 0xFFFF  # VkKeyScanW returns -1 (0xFFFF) for unmappable characters
     if result == 0xFFFF:
-        raise ValueError(f"unsupported keyboard character or key name: {key!r}")
+        raise UnsupportedKeyError([key])
     vk = result & 0xFF
     needs_shift = bool(result & 0x0100)
     return (vk, needs_shift)
 
 
-def _chord_key_units(keys: list[str]) -> list[tuple[int, int, int]]:
+def _chord_key_units(
+    keys: list[str], resolved: dict[str, tuple[int, bool]] | None = None
+) -> list[tuple[int, int, int]]:
     """Chord events ``(vk, scan, flags)``: press in order, release in reverse order.
 
     All events land in ONE SendInput call — injected input is serialized into the input
     stream (never interleaved with real user input), which makes batched chords safer
     than four separate ``keybd_event`` calls. Shift that a member requires (via
     ``VkKeyScanW``) is pressed first and released last (stuck-modifier hygiene).
+    Z2 (LIVE-WP13-02): EVERY key is mapped BEFORE any event is built — one
+    unmappable key raises :class:`UnsupportedKeyError` naming ALL unsupported
+    members, with zero events dispatched.
+    C1 (DELTA 13): ``resolved`` is the backend pre-check's PER-ACTION mapping
+    (key name -> ``(vk, needs_shift)``); when a key is present in it the
+    mapping is used as-is and the resolver is NOT consulted again — the press
+    and the release of one action share the exact resolution the pre-check
+    got, even if the keyboard layout changes mid-action.
     """
-    resolved = [_resolve_key_events(key) for key in keys]
+    unsupported: list[str] = []
+    resolutions: list[tuple[int, bool]] = []
+    for key in keys:
+        mapped = resolved.get(key) if resolved is not None else None
+        if mapped is not None:
+            resolutions.append(mapped)
+            continue
+        try:
+            resolutions.append(_resolve_key_events(key))
+        except UnsupportedKeyError:
+            unsupported.append(key)
+    if unsupported:
+        raise UnsupportedKeyError(unsupported)
     units: list[tuple[int, int, int]] = []
     shift_pressed = False
-    for vk, needs_shift in resolved:
+    for vk, needs_shift in resolutions:
         if needs_shift and not shift_pressed:
             units.append((0x10, 0, 0))
             shift_pressed = True
         units.append((vk, 0, 0))
-    for vk, needs_shift in reversed(resolved):
+    for vk, needs_shift in reversed(resolutions):
         units.append((vk, 0, _KEYEVENTF_KEYUP))
         if needs_shift and shift_pressed:
             units.append((0x10, 0, _KEYEVENTF_KEYUP))
@@ -311,7 +342,9 @@ def _chord_key_units(keys: list[str]) -> list[tuple[int, int, int]]:
     return units
 
 
-def _chord_key_halves(keys: list[str]) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
+def _chord_key_halves(
+    keys: list[str], resolved: dict[str, tuple[int, bool]] | None = None
+) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
     """Split :func:`_chord_key_units` into its ``(press, release)`` halves at the first key-up.
 
     WP2 (ORVEX-2026-107): a HELD key is this split, not a new event model.
@@ -319,9 +352,10 @@ def _chord_key_halves(keys: list[str]) -> tuple[list[tuple[int, int, int]], list
     release half in reverse order with each synthesized shift released immediately
     after every key that required it, so splitting inherits reverse-order release and
     that per-key shift hygiene for free — a rewrite of the event model would only risk
-    regressing an invariant that is already correct.
+    regressing an invariant that is already correct. C1 (DELTA 13): ``resolved``
+    is the per-action pre-check mapping, passed straight through.
     """
-    units = _chord_key_units(keys)
+    units = _chord_key_units(keys, resolved)
     first_up = next(
         (index for index, (_vk, _scan, flags) in enumerate(units) if flags & _KEYEVENTF_KEYUP),
         len(units),
@@ -427,6 +461,32 @@ class InputEngine(ABC):
         chord log) — a key-up for a key we did not press is never sent.
         """
         return
+
+    # C1 (DELTA 13, VAL-WP13-12): the PER-ACTION resolved-input contract. The
+    # backend's pre-check maps every key of one action ONCE and passes the
+    # mapping down so the press AND the release use exactly that resolution
+    # (a mid-action layout change can never make the release differ), while
+    # NOTHING is reused across actions (``VkKeyScanW`` is layout-dependent).
+    # The base implementations FALL BACK to the name-based methods, so engines
+    # that resolve internally per call (pyautogui, test stubs) keep working
+    # unchanged — they simply resolve fresh every call and never cache.
+    def chord_resolved(
+        self, keys: list[str], resolved: dict[str, tuple[int, bool]]
+    ) -> None:
+        """Dispatch a chord using the backend pre-check's per-action mapping."""
+        self.chord(keys)
+
+    def key_down_resolved(
+        self, key: str, resolved: dict[str, tuple[int, bool]]
+    ) -> None:
+        """Press ``key`` using the per-action mapping (fallback: by name)."""
+        self.key_down(key)
+
+    def key_up_resolved(
+        self, key: str, resolved: dict[str, tuple[int, bool]]
+    ) -> None:
+        """Release ``key`` using the per-action mapping (fallback: by name)."""
+        self.key_up(key)
 
 
 class PyAutoGuiInputEngine(InputEngine):
@@ -753,6 +813,16 @@ class SendInputEngine(InputEngine):
     def chord(self, keys: list[str]) -> None:
         self._send([_key_event(vk, scan, flags) for vk, scan, flags in _chord_key_units(keys)])
 
+    def chord_resolved(
+        self, keys: list[str], resolved: dict[str, tuple[int, bool]]
+    ) -> None:
+        """C1 (DELTA 13): build the chord from the backend pre-check's mapping —
+        the resolver is NOT consulted again (nothing re-resolved, nothing
+        cached across actions)."""
+        self._send(
+            [_key_event(vk, scan, flags) for vk, scan, flags in _chord_key_units(keys, resolved)]
+        )
+
     def key_down(self, key: str) -> None:
         """Press-half of the existing chord event list for one key (WP2, ORVEX-2026-107).
 
@@ -771,6 +841,21 @@ class SendInputEngine(InputEngine):
         check ONLY (the zero-return fail-closed check stays); see ``_send_release``.
         """
         _press, release = _chord_key_halves([key])
+        self._send_release([_key_event(vk, scan, flags) for vk, scan, flags in release])
+
+    def key_down_resolved(
+        self, key: str, resolved: dict[str, tuple[int, bool]]
+    ) -> None:
+        """C1 (DELTA 13): press-half built from the PER-ACTION pre-check mapping."""
+        press, _release = _chord_key_halves([key], resolved)
+        self._send([_key_event(vk, scan, flags) for vk, scan, flags in press])
+
+    def key_up_resolved(
+        self, key: str, resolved: dict[str, tuple[int, bool]]
+    ) -> None:
+        """C1 (DELTA 13): release-half from the SAME per-action mapping (the
+        halt-safe release path is unchanged)."""
+        _press, release = _chord_key_halves([key], resolved)
         self._send_release([_key_event(vk, scan, flags) for vk, scan, flags in release])
 
     def release_modifiers(self, keys: list[str]) -> None:

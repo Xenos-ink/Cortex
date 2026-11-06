@@ -28,6 +28,8 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, PrivateAttr, computed_field, model_validator
 
+from .limits import STEPS_BAND
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
@@ -412,14 +414,17 @@ class GroundedAction(BaseModel):
 
     @model_validator(mode="after")
     def _hotkey_requires_compound_keys(self) -> GroundedAction:
-        """A hotkey is a compound chord: 2..12 non-empty key names, fail closed.
+        """A hotkey is a compound chord: 2..12 key names, fail closed.
 
-        Single-key presses deliberately stay on ``keypress``; an under/over-sized chord
-        or a blank key name never reaches the backend.
+        Single-key presses deliberately stay on ``keypress``; an under/over-sized
+        chord or a TRULY EMPTY key name never reaches the backend. D12-1
+        (VAL-WP13-09): a single whitespace key (" " = VK_SPACE) is a real
+        static-table key, so only ``""`` is rejected here — a blank-STRIPPED
+        name like " " must reach the backend, which strips-or-keeps and
+        resolves through the static table.
         """
         if self.action is ActionType.HOTKEY:
-            stripped = [key.strip() for key in self.keys]
-            if not 2 <= len(stripped) <= 12 or any(not key for key in stripped):
+            if not 2 <= len(self.keys) <= 12 or any(not key for key in self.keys):
                 raise ValueError(
                     "hotkey actions require 2 to 12 non-empty key names "
                     "(single-key presses belong on keypress actions)"
@@ -734,7 +739,9 @@ class ActionSpec(BaseModel):
 class SessionState(BaseModel):
     session_id: str
     step_count: int = 0
-    max_steps: int = Field(default=30, ge=1, le=500)
+    # D12-3 (VAL-WP13-09): the band is the ONE STEPS_BAND constant (core.limits)
+    # — the same tuple the clamp, the refusal messages and the docs interpolate.
+    max_steps: int = Field(default=30, ge=STEPS_BAND[0], le=STEPS_BAND[1])
     max_retries_per_action: int = Field(default=1, ge=0, le=5)
     min_confidence: float = Field(default=0.70, ge=0.0, le=1.0)
     dry_run: bool = True

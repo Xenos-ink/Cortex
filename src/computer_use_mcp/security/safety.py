@@ -32,6 +32,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from ..core.limits import STEPS_BAND
 from ..core.models import ActionType, GroundedAction, RiskLevel, SessionState, WindowInfo
 from ..core.textnorm import _FOLD_MARK, canonical_views, fold_marked
 
@@ -819,7 +820,20 @@ class SafetyPolicy:
         if state.stopped:
             return SafetyDecision(False, False, "Session is stopped.", risk, category)
         if state.step_count >= state.max_steps:
-            return SafetyDecision(False, False, "Maximum session steps reached.", risk, category)
+            return SafetyDecision(
+                False,
+                False,
+                (
+                    "Maximum session steps reached."
+                    " To continue: stop_session, then start_session with a higher"
+                    f" max_steps (Cortex's own start_session parameter, band"
+                    f" {STEPS_BAND[0]}..{STEPS_BAND[1]};"
+                    " every dispatched action counts — follow_ups items and plan"
+                    " actions included)."
+                ),
+                risk,
+                category,
+            )
         if action.action == ActionType.DONE:
             return SafetyDecision(True, False, "Completion marker.", RiskLevel.LOW, "completion")
         if gate_flags is not None and any(gate_flags):

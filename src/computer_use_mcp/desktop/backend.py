@@ -128,9 +128,11 @@ from .input_engine import (
     TYPE_INTERVAL_ENV,
     PyAutoGuiInputEngine,
     SendInputEngine,
+    _resolve_key_events,
     _SENDINPUT_FACTORY_DRAG_STEP_PAUSE,
     _SENDINPUT_FACTORY_DRAG_STEP_PIXELS,
 )
+from .errors import UnsupportedKeyError
 from .launch import _launch_unresolved_suffix, _mapped_launch_path, validate_launch_needle
 from .motion import (
     WAIT_MAX_SECONDS,
@@ -1462,6 +1464,34 @@ class LocalComputerBackend(ComputerBackend):
             time.sleep(_plan_point_settle_seconds(action))
         return message
 
+    def _ensure_keys_dispatchable(self, keys: list[str]) -> dict[str, tuple[int, bool]]:
+        """Z2 (LIVE-WP13-02 sess_138fbd60): map EVERY key BEFORE any input.
+
+        One unmappable key name/character raises :class:`UnsupportedKeyError`
+        listing ALL unsupported members — a typed refusal with ZERO input
+        dispatched (the live failure raised mid-hold with part of a chord
+        already down, and surfaced as a raw ``action_error`` instead of a
+        rejection). Must run BEFORE the B8/B3 settles so a refused keypress is
+        also wait-free. C1 (DELTA 13): returns the PER-ACTION mapping
+        (key name -> ``(vk, needs_shift)``); the caller passes it down to the
+        engine's ``*_resolved`` entry points so the press AND the release use
+        exactly this resolution — fresh per action, never reused across
+        actions (``VkKeyScanW`` is layout-dependent).
+        """
+        resolutions: dict[str, tuple[int, bool]] = {}
+        unsupported: list[str] = []
+        for key in keys:
+            if key in resolutions:
+                continue
+            try:
+                resolutions[key] = _resolve_key_events(key)
+            except UnsupportedKeyError:
+                if key not in unsupported:
+                    unsupported.append(key)
+        if unsupported:
+            raise UnsupportedKeyError(unsupported)
+        return resolutions
+
     def _execute_dispatched(
         self,
         action: GroundedAction,
@@ -1698,28 +1728,55 @@ class LocalComputerBackend(ComputerBackend):
         elif action.action == "keypress":
             if not action.keys:
                 raise ValueError("At least one key is required")
+            # Z2-b (VAL-WP13-08): pre-check and dispatch the SAME (stripped)
+            # key list everywhere, so a pre-check can never pass a list the
+            # dispatch would treat differently. D12-1 (VAL-WP13-09): strip only
+            # when the result is NON-EMPTY — a single whitespace key
+            # (" " = VK_SPACE, "\t" = VK_TAB, "\n"/"\r" = VK_RETURN) is a real
+            # static-table key, and a blanket strip turned it into "" and
+            # refused a working input.
+            keys = [key.strip() or key for key in action.keys]
             if stop is not None:
                 stop.ensure_live()
+            # Z2 (LIVE-WP13-02 sess_138fbd60): EVERY key is mapped BEFORE any
+            # input — one unmappable name/character raises
+            # UnsupportedKeyError (a typed refusal, zero dispatch) instead of
+            # failing mid-chord or mid-hold with part of the chord already down.
+            # C1 (DELTA 13): the mapping is passed down so the press AND the
+            # release use exactly these resolutions (never re-resolved, never
+            # reused across actions).
+            resolutions = self._ensure_keys_dispatchable(keys)
             self._apply_focus_settle()  # B8 settle after a recent focus transition
-            self._apply_key_dispatch_gap(action.keys)  # B3 settle/gap policy
+            self._apply_key_dispatch_gap(keys)  # B3 settle/gap policy
             # WP2 (ORVEX-2026-107): hold_ms=None keeps the legacy single atomic chord
             # batch byte-identical (D5); hold_ms=0 is an explicit zero-duration SPLIT
             # press, not a chord fast-path (D2), so adjacent values never diverge in
             # call count or release order.
             if action.hold_ms is not None:
-                self._dispatch_held_keys(action, list(action.keys), stop)
+                self._dispatch_held_keys(action, keys, stop, resolved=resolutions)
             else:
-                engine.chord(list(action.keys))
+                engine.chord_resolved(keys, resolutions)
                 _mark_action_dispatched(action)
             self._last_key_dispatch = time.monotonic()
         elif action.action == "hotkey":
             # Sibling of keypress for COMPOUND chords (2..12 keys, passed verbatim in
             # pyautogui vocabulary); single-key presses deliberately stay on keypress.
-            guard_keys = [key.strip() for key in action.keys]
+            # Z2-b (VAL-WP13-08): the pre-check and the dispatch use the SAME
+            # stripped key list — the old path pre-checked `guard_keys` but
+            # dispatched the RAW keys, so ["alt", " f4"] passed the check and
+            # then failed mid-chord with a false "nothing was dispatched".
+            # D12-1 (VAL-WP13-09): strip only when the result is non-empty,
+            # identically to the keypress branch — a single whitespace key
+            # (" " = VK_SPACE) is a real static-table key, never "".
+            guard_keys = [key.strip() or key for key in action.keys]
             if not 2 <= len(guard_keys) <= 12 or any(not key for key in guard_keys):
                 raise ValueError("Hotkey actions require 2 to 12 non-empty key names")
             if stop is not None:
                 stop.ensure_live()  # immediately before the single chord input
+            # Z2 (LIVE-WP13-02 sess_138fbd60): map EVERY key BEFORE any input
+            # (see the keypress branch above). C1 (DELTA 13): the mapping rides
+            # down to the held dispatch — press and release share it.
+            resolutions = self._ensure_keys_dispatchable(guard_keys)
             self._apply_focus_settle()  # B8 settle after a recent focus transition
             self._apply_key_dispatch_gap(guard_keys)  # B3 settle/gap policy
             # WP2 (ORVEX-2026-107): a held hotkey holds EVERY key SIMULTANEOUSLY for
@@ -1736,13 +1793,14 @@ class LocalComputerBackend(ComputerBackend):
             # NOT the old single-batch chord, which is no longer reachable for
             # a hotkey.
             if action.hold_ms is not None:
-                self._dispatch_held_keys(action, list(action.keys), stop)
+                self._dispatch_held_keys(action, guard_keys, stop, resolved=resolutions)
             else:
                 self._dispatch_held_keys(
                     action,
-                    list(action.keys),
+                    guard_keys,
                     stop,
                     hold_ms_override=DEFAULT_HOTKEY_HOLD_MS,
+                    resolved=resolutions,
                 )
             self._last_key_dispatch = time.monotonic()
         elif action.action == "scroll":
@@ -1785,6 +1843,7 @@ class LocalComputerBackend(ComputerBackend):
         keys: list[str],
         stop: StopToken | None,
         hold_ms_override: float | None = None,
+        resolved: dict[str, tuple[int, bool]] | None = None,
     ) -> None:
         """WP2 (ORVEX-2026-107): key-DOWN -> sliced interruptible wait -> key-UP
         (reverse order).
@@ -1796,7 +1855,10 @@ class LocalComputerBackend(ComputerBackend):
         returns (input has physically left the process, so a mid-hold stop is honestly
         "dispatched but unverified", never "cancelled before dispatch"); the wait is
         the EXISTING ``_sleep_for_hold``/``HOLD_SLICE_SECONDS`` machinery (D4), never a
-        key-specific fork.
+        key-specific fork. C1 (DELTA 13): ``resolved`` is the pre-check's PER-ACTION
+        mapping; press and release go through the engine's ``*_resolved`` entry
+        points so both use exactly this resolution (fresh per action, never
+        re-resolved and never reused across actions).
 
         THE RELEASE IS UNCONDITIONAL. A key left physically down rewrites every
         subsequent user keystroke on the operator's machine system-wide — this
@@ -1811,11 +1873,12 @@ class LocalComputerBackend(ComputerBackend):
         engine = self._engine
         keys_down = 0
         hold_error: BaseException | None = None
+        mapping = resolved if resolved is not None else {}
         try:
             for key in keys:
                 if stop is not None:
                     stop.ensure_live()  # before every key_down: no orphan half-pressed chord
-                engine.key_down(key)
+                engine.key_down_resolved(key, mapping)
                 keys_down += 1
             _mark_action_dispatched(action)
             _wait_for_hold(hold_seconds, stop)
@@ -1828,7 +1891,7 @@ class LocalComputerBackend(ComputerBackend):
             release_error: BaseException | None = None
             for index in range(keys_down - 1, -1, -1):
                 try:
-                    engine.key_up(keys[index])
+                    engine.key_up_resolved(keys[index], mapping)
                 except BaseException as error:  # noqa: BLE001 - a release must never abort the sweep
                     # ``BaseException``, not ``Exception``: one key-up raising must not
                     # abandon the remaining keys still physically down. The first
@@ -2004,10 +2067,37 @@ class LocalComputerBackend(ComputerBackend):
         # try: would otherwise leave the CAPPED interval on the engine for the rest
         # of the session.
         effective_interval = self._cap_type_interval(text)
+        # Z1-a (VAL-WP13-08): the hint's "~N chars" is computed from the
+        # CONFIGURED per-character interval (`_original_type_interval`, the
+        # value BEFORE `_cap_type_interval` squeezed it to budget/len — with
+        # the capped interval N just echoed the text length, the live 1438-char
+        # case said "~1438 chars (8 ms/char)" instead of the real 600 at 20
+        # ms/char). DELTA 12: the hint ALSO fires when the pace was merely
+        # CAPPED for length, even without `paced=partial`.
+        configured_interval = getattr(self, "_original_type_interval", 0.0)
+        pace_capped_for_length = (
+            configured_interval > 0
+            and effective_interval > 0
+            and effective_interval < configured_interval
+        )
+        hint_token = ""
+        if configured_interval > 0:
+            budget_chars = int(pacing_budget_seconds() / configured_interval)
+            hint_token = (
+                " hint: the paced budget covers ~"
+                f"{budget_chars} chars at the configured pace"
+                f" ({configured_interval * 1000:.0f} ms/char; less at a smaller"
+                ' client timeout) — for long or multi-line text, especially'
+                ' code into editors that auto-indent or auto-complete, use'
+                ' via="clipboard"'
+            )
         # WP12d (VAL R1 MINOR): " paced=partial" rides in the reply message when
         # the deadline forced the remaining text to finish unpaced (documented in
-        # docs/CONFIGURATION.md and VERSIONS.md).
-        pace_token = ""
+        # docs/CONFIGURATION.md and VERSIONS.md). Z1-a (VAL-WP13-08): the hint
+        # rides WITHOUT paced=partial when the pace was merely CAPPED for length
+        # (the text is long enough that the paced budget cannot cover it at the
+        # configured interval) — a SHORT type stays clean (no hint).
+        pace_token = hint_token if pace_capped_for_length else ""
         try:
             for chunk in _split_type_chunks(text, TYPE_CHUNK_CHARS):
                 if stop is not None:
@@ -2021,7 +2111,12 @@ class LocalComputerBackend(ComputerBackend):
                     chars_left = total - delivered
                     if remaining <= 0 or chars_left * effective_interval > remaining:
                         self._engine.type_interval = 0.0
-                        pace_token = " paced=partial"
+                        # DELTA 11 (Z1, sess_138fbd60): teach the escape hatch
+                        # INSIDE the message — long/multi-line text (the live
+                        # case: 1438 chars of VBA into the auto-indenting VBA
+                        # editor) exhausted the paced budget, the tail went in
+                        # unpaced and the editor mangled it.
+                        pace_token = " paced=partial" + hint_token
                 try:
                     self._engine.type_text(chunk, before_chunk=before_chunk)
                 except FocusDriftError as exc:
@@ -2958,7 +3053,12 @@ class LocalComputerBackend(ComputerBackend):
         if not (folded & TERMINAL_KEYS):
             return
         elapsed = time.monotonic() - self._last_key_dispatch
-        remaining = KEY_DISPATCH_GAP_SECONDS - elapsed
+        # DELTA 11: clamped like _apply_focus_settle — a stored stamp from the
+        # future (clock jump, test fake clock) must never sleep unbounded.
+        remaining = min(
+            max(KEY_DISPATCH_GAP_SECONDS - elapsed, 0.0),
+            KEY_DISPATCH_GAP_SECONDS,
+        )
         if remaining > 0:
             time.sleep(remaining)
 
@@ -3023,11 +3123,20 @@ class LocalComputerBackend(ComputerBackend):
         self._last_focus_transition = time.monotonic()
 
     def _apply_focus_settle(self) -> None:
-        """B8: pace keyboard input behind a recent focus transition (configurable)."""
+        """B8: pace keyboard input behind a recent focus transition (configurable).
+
+        DELTA 11: `remaining` is CLAMPED to [0, FOCUS_TRANSITION_SETTLE_SECONDS].
+        `_last_focus_transition` is a stored monotonic stamp — a clock jump or a
+        stamp from the future (e.g. a test's fake clock that starts at 0 against
+        a stamp taken from the real clock) must never produce an unbounded sleep.
+        """
         if FOCUS_TRANSITION_SETTLE_SECONDS <= 0:
             return
         elapsed = time.monotonic() - self._last_focus_transition
-        remaining = FOCUS_TRANSITION_SETTLE_SECONDS - elapsed
+        remaining = min(
+            max(FOCUS_TRANSITION_SETTLE_SECONDS - elapsed, 0.0),
+            FOCUS_TRANSITION_SETTLE_SECONDS,
+        )
         if remaining > 0:
             time.sleep(remaining)
 
