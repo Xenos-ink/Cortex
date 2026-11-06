@@ -259,6 +259,15 @@ def _resolve_key_events(key: str) -> tuple[int, bool]:
     named = _VK_NAMED_KEYS.get(key)
     if named is not None:
         return (named, False)
+    if len(key) > 1:
+        # L3 (LIVE-WP13-02): a MULTI-character key name is always a KEY NAME —
+        # it can never be text (text travels via KEYEVENTF_UNICODE on type
+        # actions) — so "F4", "Enter", "ESC" resolve case-insensitively to the
+        # table entries. Single characters keep the exact legacy path below
+        # (an uppercase letter such as "A" must keep its shift meaning).
+        lowered = _VK_NAMED_KEYS.get(key.lower())
+        if lowered is not None:
+            return (lowered, False)
     if len(key) == 1:
         lowered = _VK_NAMED_KEYS.get(key.lower())
         if lowered is not None:

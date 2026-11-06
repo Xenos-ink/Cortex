@@ -50,10 +50,20 @@ class _CortexFastMCP(FastMCP):
         if unknown:
             pacing_note = ""
             if any(arg in ("hold_ms", "duration_ms") for arg in unknown):
+                # L1 (LIVE-WP13-02): every taught example must be VALID — the
+                # old text taught hold_ms on a WAIT item, which the per-item
+                # validation rejects (hold_ms is only valid on
+                # click/right_click/keypress/hotkey; duration_ms on move; a
+                # PAUSE is a wait item with delta in SECONDS).
                 pacing_note = (
-                    " hold_ms/duration_ms are per-item values: send them INSIDE a "
-                    "follow_ups item (e.g. follow_ups=[{action: wait, hold_ms: 500}]) "
-                    "or inside a plan point's actions."
+                    " hold_ms/duration_ms are per-item values carried INSIDE a "
+                    "follow_ups item or a plan point's action: a HOLD belongs on a "
+                    'keypress/hotkey item (e.g. follow_ups=[{"action": "keypress", '
+                    '"keys": ["shift"], "hold_ms": 500}]) or a click/right_click item, '
+                    'a TIMED MOVE carries duration_ms (e.g. follow_ups=[{"action": '
+                    '"move", "x": 100, "y": 100, "duration_ms": 300}]), and a PAUSE is '
+                    'a wait item with delta in WHOLE SECONDS (e.g. follow_ups=[{"action": '
+                    '"wait", "delta": 1}]).'
                 )
             # WP13 DELTA-3 M1 (VAL-WP13-01): the reply contract forbids an
             # ``error`` key on rejected replies (REPLY-CONTRACT.md:33-36) — the

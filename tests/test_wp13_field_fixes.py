@@ -2099,3 +2099,149 @@ async def test_invalid_start_sessions_return_typed_errors_and_free_the_registry(
     # SessionState model dumps — the session itself is the success shape)
     assert response.get("session_id") and "error" not in response, response
     await lifecycle.stop_session(str(response["session_id"]))
+
+
+# --- WP13 DELTA 6 (LIVE-WP13-02 fixes) ----------------------------------------------------------
+
+
+def _extract_follow_up_examples(message: str) -> list[dict[str, Any]]:
+    """Extract every ``follow_ups=[...]`` JSON example a teaching message carries
+    (bracket-depth scan — the examples contain nested ``[...]`` key lists)."""
+    examples: list[dict[str, Any]] = []
+    marker = "follow_ups=["
+    index = 0
+    while True:
+        start = message.find(marker, index)
+        if start < 0:
+            return examples
+        start += len(marker)
+        depth = 0
+        end = None
+        for position in range(start, len(message)):
+            character = message[position]
+            if character in "[{":
+                depth += 1
+            elif character in "]}":
+                depth -= 1
+                if depth == 0:
+                    end = position + 1
+                    break
+        if end is None:
+            return examples
+        examples.append(json.loads(message[start:end]))
+        index = end
+
+
+async def test_hold_ms_teaching_examples_are_valid_actions() -> None:
+    """L1 (LIVE-WP13-02): every follow_ups example the hold_ms/duration_ms
+    teaching carries is a VALID action — parsed out of the real rejection
+    message and run through the REAL per-item validation
+    (ActionSpec -> to_grounded, the same path computer_execute follow_ups and
+    plan points use). The old teaching (hold_ms on a WAIT item) failed exactly
+    here on the live desktop."""
+    from computer_use_mcp.core.models import ActionSpec
+
+    payload = await mcp.call_tool(
+        "computer_execute",
+        {"session_id": "s", "action": "click", "x": 1, "y": 2, "hold_ms": 500},
+    )
+    body = _reply_body(payload)
+    assert "unknown_argument" in body.get("reasons", []), body
+    message = body["message"]
+    # every taught example parses as JSON and passes the REAL per-item validation
+    examples = _extract_follow_up_examples(message)
+    assert len(examples) >= 3, (message, examples)  # hold + duration_ms + pause
+    for item in examples:
+        spec = ActionSpec(**item)
+        grounded = spec.to_grounded(reason_prefix="L1 teaching check")  # must not raise
+        assert grounded is not None
+    # the PAUSE example is a WAIT item in SECONDS and carries NO hold_ms
+    wait_examples = [item for item in examples if item.get("action") == "wait"]
+    assert wait_examples, message
+    assert all("hold_ms" not in item for item in wait_examples), wait_examples
+    # the HOLD example is on a keys-taking action with hold_ms in MILLISECONDS
+    hold_examples = [item for item in examples if "hold_ms" in item]
+    assert hold_examples, message
+    assert all(
+        item.get("action") in {"click", "right_click", "keypress", "hotkey"}
+        for item in hold_examples
+    ), hold_examples
+    # the duration_ms example is on a MOVE item
+    duration_examples = [item for item in examples if "duration_ms" in item]
+    assert duration_examples, message
+    assert all(item.get("action") == "move" for item in duration_examples), duration_examples
+    # D6-4 (VAL-WP13-05): the teaching says WHOLE SECONDS — `delta` is an
+    # INTEGER, so the fractional pause a driver might send from the old
+    # "seconds" wording is REJECTED by the same real validation, and the
+    # teaching cannot drift apart from the validator.
+    assert "WHOLE SECONDS" in message, message
+    with pytest.raises(Exception):
+        ActionSpec(**{"action": "wait", "delta": 0.5}).to_grounded(
+            reason_prefix="D6-4 fractional-pause check"
+        )
+
+
+async def test_wait_hold_ms_rejection_has_no_unrelated_keys_hint(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L2 (LIVE-WP13-02): a hold_ms-on-wait follow_ups item is rejected with the
+    hold_ms teaching but WITHOUT the unrelated keys hint (the item has no keys
+    and takes none); a keys action that fails validation still gets it."""
+    session_id, _bundle, _backend, _provider = make_session(
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    payload = await mcp.call_tool(
+        "computer_execute",
+        {
+            "session_id": session_id,
+            "action": "wait",
+            "delta": 1,
+            "follow_ups": [{"action": "wait", "hold_ms": 500}],
+        },
+    )
+    body = _reply_body(payload)
+    assert body.get("result") == "rejected", body
+    assert body.get("reasons", [])[0] == "invalid_action", body
+    assert "hold_ms is only valid" in body.get("message", ""), body
+    assert not any("KEY NAMES" in reason for reason in body.get("reasons", [])), body["reasons"]
+
+    # contrast: a malformed KEYS action keeps the keys teaching
+    payload = await mcp.call_tool(
+        "computer_execute",
+        {
+            "session_id": session_id,
+            "action": "wait",
+            "delta": 1,
+            "follow_ups": [{"action": "hotkey", "keys": ["ctrl"]}],  # 1-key hotkey
+        },
+    )
+    body = _reply_body(payload)
+    assert body.get("result") == "rejected", body
+    assert any("KEY NAMES" in reason for reason in body.get("reasons", [])), body["reasons"]
+
+
+def test_multichar_key_names_resolve_case_insensitively() -> None:
+    """L3 (LIVE-WP13-02): MULTI-character key names resolve case-insensitively
+    ("F4", "Enter", "ESC" -> "f4", "enter", "esc") — they can never be text
+    keys; SINGLE characters keep the legacy meaning ("A" still injects shift,
+    "a" does not); unknown multi-character names still raise ValueError."""
+    from computer_use_mcp.desktop.input_engine import (
+        _chord_key_units,
+        _resolve_key_events,
+    )
+
+    assert _resolve_key_events("F4") == (0x73, False)
+    assert _resolve_key_events("f4") == (0x73, False)
+    assert _resolve_key_events("Enter")[0] == 0x0D
+    assert _resolve_key_events("ESC")[0] == 0x1B
+    # single characters: the legacy meaning is UNCHANGED
+    assert _resolve_key_events("A") == (0x41, True)  # uppercase letter -> shift
+    assert _resolve_key_events("a") == (0x41, False)
+    assert _resolve_key_events("4") == (0x34, False)
+    # unknown multi-character names still raise ValueError (never silently pass)
+    with pytest.raises(ValueError):
+        _resolve_key_events("F47")
+    # the chord builder accepts mixed-case names (press order + reverse release)
+    units = _chord_key_units(["Alt", "F4"])
+    vks = [unit[0] for unit in units]
+    assert vks.count(0x12) == 2 and vks.count(0x73) == 2  # down+up per key

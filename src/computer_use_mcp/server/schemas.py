@@ -460,8 +460,21 @@ def _teaching_invalid_action(exc: Exception, action: str | None) -> dict[str, ob
     schema but fail GroundedAction construction (half-specified ``drag``, 1-key
     ``hotkey``, target-less ``focus_window``/``ensure_app``, point-less ``move``).
     """
-    hints = [KEY_NAME_RULE]
+    # L2 (LIVE-WP13-02): the keys rule is only RELEVANT for actions that take
+    # keys (keypress/hotkey), when the action name itself is unknown (a
+    # generic malformed call), or when the validation error is ABOUT keys —
+    # a wait item with a stray hold_ms (the live case) has no keys and takes
+    # none; the unrelated keys hint there was noise next to the hold_ms
+    # complaint.
+    hints: list[str] = []
     tried = (action or "").strip().casefold()
+    if (
+        action is None
+        or tried == ""
+        or tried in {"keypress", "hotkey"}
+        or "keys" in str(exc).lower()
+    ):
+        hints.append(KEY_NAME_RULE)
     if tried == "key":
         hints.append(
             "You sent action=\"key\", which does not exist. For a single key press use "

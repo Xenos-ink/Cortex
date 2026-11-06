@@ -192,6 +192,10 @@ taught value from the code. Full offline suite at release: 3319 passed +
   `python -m computer_use_mcp.server`, `python -m computer_use_mcp.cli`, and the
   console scripts), but the module entry's logger name changed
   `__main__` → `computer_use_mcp.server`.
+- **Key names with more than one character are case-insensitive**: `F4`,
+  `Enter` and `ESC` now resolve to `f4`, `enter` and `esc` (before, they
+  failed with an unsupported-key error). A single character keeps its exact
+  meaning: an uppercase letter such as `A` still injects shift.
 
 ### Fixed
 
@@ -211,6 +215,14 @@ taught value from the code. Full offline suite at release: 3319 passed +
   `serverInfo.version` reports Cortex's own version (was the mcp SDK's 1.30.0).
   ensure_app NO_INSTANCE may carry an `ensure_app_hint:` naming the owning
   process(es) of matching visible window titles.
+- **Unknown-argument teaching shows only valid calls (live run)**: the hint
+  for a stray `hold_ms`/`duration_ms` taught `hold_ms` on a wait item, which
+  Cortex itself rejects. It now teaches a hold on a keypress/hotkey item
+  (`follow_ups=[{"action": "keypress", "keys": ["shift"], "hold_ms": 500}]`)
+  or a click/right_click item, `duration_ms` on a move item, and a pause as a
+  wait item with `delta` in whole seconds. The `invalid_action` rejection
+  carries the key-name hint only when the action takes keys or the error is
+  about keys.
 - **False heal + substitution-unsafe repair (WP12b, VAL-WP12 blocker)**: the
   COINCIDENTAL tail match (typed `test`, buffer `tett`: both end with `t`)
   triggered a retype of `est` and reported `integrity=verified(4/4) healed=3`
