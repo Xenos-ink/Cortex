@@ -74,7 +74,8 @@ typo into a different meaning where the row says "fallback-not-clamp").
 
 | Variable | Default | Values / band | Purpose |
 |---|---|---|---|
-| `CORTEX_WAIT_SEGMENT_SECONDS` | 45 | accepted 1..55; out-of-band → default (fallback-not-clamp) | how long one `computer_wait` / `computer_wait_status` call blocks; always kept under the MCP client's 60 s tool timeout |
+| `CORTEX_CLIENT_TIMEOUT_SECONDS` | 60 | 10..600; out-of-band → default (fallback-not-clamp) | the HOST's per-tool-call timeout (ZCode = 30, Claude Code = 60): derives the wait segment, the type deadline (timeout − 15) and the pacing budget (80% of it); `start_session`'s reply message states the effective value (`client_timeout_s=<n>`) |
+| `CORTEX_WAIT_SEGMENT_SECONDS` | 45 | accepted 1..55 (client timeout − 5; 1..25 at a 30 s host; out-of-band / unparsable → default, fallback-not-clamp) | how long one `computer_wait` / `computer_wait_status` call blocks; the ceiling keeps 5 s of headroom under the host's client timeout |
 
 ### Verification and pipeline
 
@@ -85,7 +86,7 @@ typo into a different meaning where the row says "fallback-not-clamp").
 | `CORTEX_QUEUE_STRICT_DIGEST` | off | exactly `1` = on | restore whole-screen premise checking for queued batches (default: only TRUE window-identity staleness stops) |
 | `CORTEX_DIFF_FAST` | on | `0` = off | the raw-frame pixel-diff fast path (disable for the legacy decode path) |
 | `CORTEX_OCR_TEXT_VERIFICATION` | off | truthy = opt-in | enable the OCR `text_predicate` verification tier as a last resort |
-| `CORTEX_UIA_READ` | on | `0` = off | the UIA semantic read that populates `ui_elements` / focused-control text |
+| `CORTEX_UIA_READ` | on | `0` = off | the UIA semantic read that populates `ui_elements` / focused-control text. Every UIA call runs on the reader's SINGLE COM owner thread; a read that exceeds its derived wall (2 s at the defaults, `client_timeout/10` capped at 2 s, floored at 0.5 s) — or that arrives while a hung provider still holds the owner busy — degrades VISIBLY: the typing ladder reports the `read_timeout` branch (`branch=read_timeout`, never repaired, never verified). The whole type action fits its derived deadline: a verification read the remaining deadline cannot cover reports the `verify_over_budget` branch. The one-time warm runs under the full call budget capped at 10 s; a warm timeout KEEPS the UIA reader (only a warm that ran and failed swaps to the Win32 fallback) |
 
 ### Capture and images
 

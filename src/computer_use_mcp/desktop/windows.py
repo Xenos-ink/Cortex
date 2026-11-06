@@ -195,6 +195,77 @@ def _title_match_rank(title: str, needle: str) -> int | None:
     return None
 
 
+def find_windows_by_title(title: str, limit: int = 3) -> list[WindowInfo]:
+    """Visible top-level windows whose title matches ``title`` (best-first).
+
+    WP13 DELTA-3 m11: the ensure_app hint's scan. ``EnumWindows`` (Z-order),
+    filtered to VISIBLE top-level windows (``IsWindowVisible``) whose title
+    matches case-insensitively with precedence exact > prefix > substring;
+    returns at most ``limit`` matches, best first (the same ranking
+    :func:`find_window_by_title` uses). Each entry is populated exactly like
+    :func:`find_window_by_title`. Non-Windows or an empty needle returns ``[]``.
+    """
+    if not IS_WINDOWS or _user32 is None or limit <= 0:
+        return []
+    needle = (title or "").strip().casefold()
+    if not needle:
+        return []
+    candidates: list[tuple[int, int, str]] = []  # (rank, z_index, hwnd)
+
+    def _on_window(hwnd: object, _lparam: object) -> bool:
+        try:
+            handle = int(hwnd)  # type: ignore[arg-type]
+            if not _user32.IsWindowVisible(ctypes.c_void_p(handle)):
+                return True  # m11a: VISIBLE top-level windows only
+            root = int(_user32.GetAncestor(int(hwnd), GA_ROOT) or int(hwnd))  # type: ignore[union-attr]
+        except (OSError, AttributeError, TypeError, ValueError):
+            return True  # keep enumerating; an unreadable window is simply not a candidate
+        text = _window_text(root)
+        if not text:
+            return True
+        rank = _title_match_rank(text, needle)
+        if rank is None:
+            return True
+        z_index = len(candidates)
+        candidates.append((rank, z_index, root))
+        return True
+
+    enum_proc = ctypes.WINFUNCTYPE(
+        ctypes.wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p
+    )(_on_window)
+    try:
+        _user32.EnumWindows(enum_proc, 0)
+    except (OSError, AttributeError):
+        return []
+    candidates.sort(key=lambda entry: (-entry[0], entry[1]))
+    # N8 (VAL-WP13-02): deduplicate by owning-process basename BEFORE cutting to
+    # the limit — three windows of one process must not hide another process.
+    windows: list[WindowInfo] = []
+    seen_basenames: set[str] = set()
+    for _rank, _z, hwnd in candidates:
+        pid = _window_pid(hwnd)
+        exe_path = _process_image_path(pid) if pid else None
+        basename = os.path.basename(exe_path) if exe_path else ""
+        if basename and basename in seen_basenames:
+            continue
+        if basename:
+            seen_basenames.add(basename)
+        windows.append(
+            WindowInfo(
+                hwnd=hwnd,
+                pid=pid,
+                process_name=basename or None,
+                exe_path=exe_path,
+                window_class=_window_class_name(hwnd),
+                title=_window_text(hwnd),
+                bounds=_window_rect(hwnd),
+            )
+        )
+        if len(windows) >= limit:
+            break
+    return windows
+
+
 def find_window_by_title(title: str) -> WindowInfo | None:
     """Find a top-level window by title; None when unavailable or unmatched.
 

@@ -104,8 +104,10 @@ from types import SimpleNamespace
 from typing import Any
 
 from ..security.audit import AuditLogger, Metrics
-from ..desktop.backend import ComputerBackend
+from ..desktop.backend import ComputerBackend, type_action_deadline_seconds
+from ..desktop.client_budget import semantic_read_timeout_seconds
 from ..desktop.errors import FocusDriftError
+from ..desktop.motion import WAIT_MAX_SECONDS
 from ..desktop.focus_guard import GuardVerdict, InterferenceGuard
 from .grounding import GroundingRouter
 from ..desktop.interference import REFOCUS_HINT, InterferencePolicy, parse_interference
@@ -1534,6 +1536,29 @@ class ComputerUseAgent:
 
     # ------------------------------------------------------------------ direct actions
 
+    def _queued_type_item_fits(self, item: Any, remaining: float) -> bool:
+        """WP13 DELTA-3 m8 (VAL-WP13-01): can a queued type item still run PACED?
+
+        ``True`` unless the remaining budget cannot cover the paced dispatch at
+        the engine's configured (proven-safe) interval plus a verification
+        reserve (the derived deadline's non-paced share — verification ladder,
+        horizon, possible repair — plus one read wall). An UNPACED engine
+        (interval 0) needs no pacing budget: the gate does not apply. When the
+        answer is False the queue stops with ``time_budget`` instead of
+        squeezing the interval toward 0 and sending an unpaced burst (the
+        Windows 11 Notepad fast-burst corruption hazard).
+        """
+        interval = float(getattr(getattr(self.backend, "_engine", None), "type_interval", 0.0) or 0.0)
+        if interval <= 0:
+            return True
+        text_len = len(getattr(item, "text", "") or "")
+        # the verification reserve: the deadline's non-paced share (20%) plus one
+        # read wall — the ladder, the horizon and a possible repair must still fit.
+        verification_reserve = (
+            semantic_read_timeout_seconds() + 0.2 * type_action_deadline_seconds()
+        )
+        return text_len * interval + verification_reserve <= remaining
+
     async def run_single(
         self,
         state: Any,
@@ -1781,6 +1806,14 @@ class ComputerUseAgent:
         source_observation: Observation | None = None
         executed_count = 0
         first_outcome: SingleActionOutcome | None = None
+        # WP13 A (field e1/e2): ONE wall-clock budget per call, DERIVED from the
+        # host's client timeout (60 -> 45 as shipped; a 30 s ZCode host -> 15 s).
+        # Checked at the TOP of every queue item (never mid-item): when the budget
+        # is gone, the remaining items are NOT dispatched and the reply names
+        # ``time_budget`` — the call returns to the host instead of being killed
+        # by the host's tool timeout.
+        queue_started = time.monotonic()
+        queue_budget = type_action_deadline_seconds()
         # WP7b DELTA 1 (#3): the step's interference events are collected from EVERY
         # queue item — item 0 (the plan path's transition move) is only one
         # contributor; a guard event observed on the point's ACTION item must reach
@@ -1794,6 +1827,45 @@ class ComputerUseAgent:
             plan_context["partial_results"] = follow_up_results
         for index, (item, item_effect) in enumerate(queue_items):
             self.stop_token.ensure_live()  # P0-C: kill path checked between queue items
+            # WP13 A + DELTA 1 #3: the per-call time budget. Checked before item 1
+            # onward (item 0 always dispatches; the host timeout covers its start);
+            # each LATER item gets its REMAINING share, so no single item can run
+            # past the budget: a type item's deadline/pacing is capped to the
+            # remaining time (backend._effective_type_deadline), and a wait/hold
+            # item whose duration exceeds the remaining budget is NOT dispatched —
+            # the reply names ``time_budget`` instead of being killed by the host.
+            if index > 0:
+                remaining_budget = queue_budget - (time.monotonic() - queue_started)
+                if remaining_budget <= 0:
+                    stopped_reason = "time_budget"
+                    break
+                if (
+                    item.action is ActionType.WAIT
+                    # WP13 DELTA-3 n4 (VAL-WP13-01): the backend CLAMPS waits to
+                    # WAIT_MAX_SECONDS (10 s) — the gate must compare the
+                    # CLAMPED duration, not the raw delta (else it stops too
+                    # early for deltas of 11..20).
+                    and min(float(item.delta), WAIT_MAX_SECONDS) > remaining_budget
+                ):
+                    stopped_reason = "time_budget"
+                    break
+                if (
+                    ((item.hold_ms or 0) + (item.duration_ms or 0)) / 1000.0
+                ) > remaining_budget:
+                    stopped_reason = "time_budget"
+                    break
+                if (
+                    item.action is ActionType.TYPE
+                    and not self._queued_type_item_fits(item, remaining_budget)
+                ):
+                    # WP13 DELTA-3 m8 (VAL-WP13-01): a queued type item whose
+                    # remaining budget cannot cover the paced dispatch at the
+                    # proven-safe interval (len × engine interval + a
+                    # verification reserve) is NOT dispatched — an unpaced
+                    # burst (the Windows 11 Notepad corruption hazard) is worse
+                    # than not running. The driver resends it in a new call.
+                    stopped_reason = "time_budget"
+                    break
             strict_digest = index > 0  # follow-ups stop on attached-window identity change
             # §1.4 delta 2 (MAJOR-1, ORVEX-2026-108): a limit trip on a QUEUED item is
             # caught HERE so the honest partial history survives. The triggering item
@@ -1804,6 +1876,15 @@ class ComputerUseAgent:
             # flat ``rejected`` reply, unchanged). Item N>=1 tripping converts to a
             # rejection entry below and stops the batch with the named reason.
             limit_trip: LimitExceeded | None = None
+            type_deadline_capped = False
+            if index > 0 and item.action is ActionType.TYPE:
+                # WP13 DELTA 1 #3: the item runs under min(derived, remaining) —
+                # the backend's deadline/pacing reads _queue_deadline_seconds.
+                remaining_budget = queue_budget - (time.monotonic() - queue_started)
+                self.backend._queue_deadline_seconds = min(
+                    type_action_deadline_seconds(), max(remaining_budget, 0.0)
+                )
+                type_deadline_capped = True
             try:
                 outcome, post = await _run_item_with_partial_truth(
                     index,
@@ -1823,6 +1904,9 @@ class ComputerUseAgent:
                     message=str(exc),
                 )
                 post = None
+            finally:
+                if type_deadline_capped:
+                    self.backend._queue_deadline_seconds = None
             if first_outcome is None:
                 first_outcome = outcome  # the legacy response payload stays item 0's
             # WP7b DELTA 1 (#3): merge THIS item's guard events into the step's list

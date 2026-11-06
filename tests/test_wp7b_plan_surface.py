@@ -1220,6 +1220,11 @@ async def test_plan_action_without_a_lease_is_invalid(
     payload = await srv_server_execute.computer_execute(session_id, "done", plan_action="continue")
     validate_reply(payload, "plan_refusal")
     assert payload["error"] == "invalid_plan_action"
+    # WP13 (field e5): the message must TEACH how to start a plan.
+    assert "To START a plan, send plan=... WITHOUT plan_action" in payload["message"], (
+        payload["message"]
+    )
+    assert "'continue', 'stop' and 'replace'" in payload["message"], payload["message"]
 
 
 async def test_a_bare_done_without_plan_action_mid_lease_returns_plan_lease(

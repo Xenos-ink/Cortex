@@ -226,7 +226,7 @@ def test_uia_reader_full_snapshot_via_fake_com(monkeypatch: pytest.MonkeyPatch) 
     world = _FakeUiaWorld()
     _install_fake_com(monkeypatch, world.automation_ptr)
     reader = UiaSemanticReader()
-    assert reader.warm() is True
+    assert reader.warm() == "ok"
     snapshot = reader.read()
     assert snapshot is not None
     focused = snapshot["focused"]
@@ -248,7 +248,7 @@ def test_uia_reader_reuses_automation_object(monkeypatch: pytest.MonkeyPatch) ->
     world = _FakeUiaWorld()
     _install_fake_com(monkeypatch, world.automation_ptr)
     reader = UiaSemanticReader()
-    assert reader.warm() is True
+    assert reader.warm() == "ok"
     assert reader.read() is not None
     assert reader.read() is not None  # second read: cached automation, no new activation
 
@@ -307,7 +307,7 @@ def test_snapshot_to_text_regions_skips_rectless_and_empty() -> None:
 def test_uia_reader_degrades_when_ole32_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(text_readers_module, "_ole32", None)
     reader = UiaSemanticReader()
-    assert reader.warm() is False
+    assert reader.warm() == "failed"
     assert reader.read() is None
     assert reader.available is False
 
@@ -322,7 +322,7 @@ def test_uia_reader_degrades_on_activation_failure(monkeypatch: pytest.MonkeyPat
         SimpleNamespace(CoInitializeEx=lambda _pv, _mode: 0, CoCreateInstance=failing_create),
     )
     reader = UiaSemanticReader()
-    assert reader.warm() is False  # never raises
+    assert reader.warm() == "failed"  # never raises
     assert reader.read() is None
 
 
@@ -548,8 +548,35 @@ def test_observe_unavailable_reader_keeps_fields_null(
 
 
 @WINDOWS_ONLY
-def test_observe_default_reader_is_wired(real_backend: Any) -> None:
-    """The constructor wired A reader (UIA on open boxes, Win32 fallback elsewhere)."""
-    assert real_backend._semantic_reader is not None
-    assert real_backend._semantic_reader.available is True
+def test_observe_default_reader_is_wired(real_backend: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """N12 (VAL-WP13-03): the constructor wiring is proven against the REAL
+    reader WITHOUT real COM — a LocalComputerBackend built against the fake-COM
+    seam (CoCreateInstance -> the fake automation object) gets a UiaSemanticReader
+    whose warm ran on its owner thread (available, warm_state "ok"), and whose
+    read feeds the observation's semantic fields (ui_elements carries the fake
+    world's focused element). Capture is stubbed (offline grab) — no desktop."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_uia_reader import _FakeUiaWorld, _install_fake_com  # self-import: explicit
+
+    import computer_use_mcp.desktop.backend as backend_module
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.text_readers import UiaSemanticReader
+
+    world = _FakeUiaWorld()
+    _install_fake_com(monkeypatch, world.automation_ptr)
+    from test_wp13_field_fixes import _offline_grab_png
+
+    monkeypatch.setattr(backend_module.LocalComputerBackend, "_grab_png", _offline_grab_png)
+    backend = LocalComputerBackend()
+    reader = backend._semantic_reader
+    assert isinstance(reader, UiaSemanticReader), type(reader)
+    assert reader.available is True
+    assert reader.warm_state == "ok"  # the warm ran (on the owner thread) and succeeded
+    observation = backend.observe()
+    assert observation.ui_elements, observation.ui_elements
+    assert observation.ui_elements[0]["name"] == "Untitled - Notepad"
+    assert real_backend._semantic_reader is not None  # the shared fixture stays wired
     assert real_backend.png_optimize is False  # PERF-004 default

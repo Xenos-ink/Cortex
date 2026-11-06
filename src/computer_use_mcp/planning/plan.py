@@ -1283,6 +1283,11 @@ _PLAN_STOP_REASON_TO_FAILURE_REASON: dict[str, str] = {
     "focus_identity_unknown": "focus_drifted",
     "stuck_modifier": "rejected",
     "target_gone": "rejected",
+    # WP13 A (field e1/e2): the follow-up chain's per-call time budget (derived
+    # from the host's client timeout) is spent — the remaining items were NOT
+    # dispatched.  The honest class is the same "dispatched, unproven" one §1.2
+    # uses; the exact cause stays verbatim in ``follow_ups_stopped_reason``.
+    "time_budget": "verification_uncertain",
 }
 # The complete, closed set the reply surface may report.  A strict consumer can
 # validate against it; ``unclassified`` is the documented escalation fallback.

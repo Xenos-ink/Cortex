@@ -111,8 +111,12 @@ def test_over_budget_repair_is_never_typed(
         stability_seconds=0.0,
     )
     # Shrink the deadline to nothing: by the time the repair is considered, the
-    # remaining wall clock cannot possibly fund it.
-    monkeypatch.setattr(backend_module, "TYPE_ACTION_DEADLINE_SECONDS", 1e-9)
+    # remaining wall clock cannot possibly fund it. DELTA-3 m7: the ladder's
+    # per-read budget checks use the semantic READ wall — zero it out here so
+    # the reads stay affordable and the ladder reaches the REPAIR decision,
+    # whose own (settle + 2 s) reserve still cannot fit the dead deadline.
+    monkeypatch.setattr(backend_module, "type_action_deadline_seconds", lambda: 1e-9)
+    monkeypatch.setattr(backend_module, "semantic_read_timeout_seconds", lambda: 0.0)
     message = real_backend.execute(_type_action("abcdef"))
     assert message == "Executed type. integrity=unverified(0/6) branch=repair_over_budget"
     assert _dispatches(engine) == ["abcdef"]
@@ -155,18 +159,34 @@ def test_capped_interval_is_restored_after_focus_drift(
 def test_capped_interval_is_restored_after_task_stop(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """WP12c M1/M2 restore pin (TaskStopped), over a LONG text where the cap
-    actually lowers the interval: a stop firing mid-dispatch still restores the
-    configured interval (the finally blocks cover every exit)."""
-    engine = RecordingEngine()
-    engine.type_interval = 0.02  # the configured (backend default) pace
-    monkeypatch.setattr(real_backend, "_engine", engine)
-    monkeypatch.setattr(real_backend, "_semantic_reader", _silent_reader())
+    """WP12e G1 (VAL-WP12-06 NIT), done properly per WP13 item G: the stop fires
+    MID-DISPATCH — a focus hook arms it after the first character group, so the
+    SECOND group's ``before_chunk`` chain (``stop.ensure_live``) raises
+    TaskStopped INSIDE the dispatch try, over a LONG text where the cap actually
+    lowers the interval: the CAPPED pace (0.018) was in use during the dispatch
+    and the CONFIGURED pace (0.02) is restored."""
+    intervals_at_call: list[float] = []
     stop = StopToken()
-    stop.stop()
+
+    class _HookCallingEngine(RecordingEngine):
+        def type_text(self, text: str, before_chunk: object = None) -> None:
+            intervals_at_call.append(self.type_interval)
+            if before_chunk is not None:
+                before_chunk()  # the backend's chain: stop.ensure_live raises here
+
+    hooking_engine = _HookCallingEngine()
+    hooking_engine.type_interval = 0.02  # the configured (backend default) pace
+    monkeypatch.setattr(real_backend, "_engine", hooking_engine)
+    monkeypatch.setattr(real_backend, "_semantic_reader", _silent_reader())
+
+    def _arming_hook() -> None:
+        stop.stop()  # the driver-side hook arms the stop after the first group
+
     with pytest.raises(TaskStopped):
-        real_backend.execute(_type_action("x" * 2000), stop)
-    assert engine.type_interval == pytest.approx(0.02)  # configured restored
+        real_backend.execute(_type_action("x" * 2000), stop, focus_hook=_arming_hook)
+    assert len(intervals_at_call) >= 1  # at least one group dispatched
+    assert all(iv == pytest.approx(0.018) for iv in intervals_at_call)  # capped pace
+    assert hooking_engine.type_interval == pytest.approx(0.02)  # restored
 
 
 def test_cap_is_not_applied_when_the_stop_fires_before_it(

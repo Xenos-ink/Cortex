@@ -375,12 +375,18 @@ async def computer_execute(
             view_provider=None,
         )
     if plan_action is not None:
+        # WP13 (field e5): teach the driver HOW to start — the pre-fix message did
+        # not say that starting means sending plan=... WITHOUT plan_action.
         return {
             "ok": False,
             "result": "rejected",
             "reasons": ["invalid_plan_action"],
             "error": "invalid_plan_action",
-            "message": "plan_action is only valid while a stepwise plan lease is active.",
+            "message": (
+                "To START a plan, send plan=... WITHOUT plan_action. While a "
+                "stepwise plan lease is active, the only valid plan_action values "
+                "are 'continue', 'stop' and 'replace'."
+            ),
         }
     # AL-002: resolve an explicit view request BEFORE anything runs (fail-closed — a
     # bad view name never dispatches input); the absent request adds only this

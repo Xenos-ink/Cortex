@@ -15,8 +15,10 @@ contract checks).
 - `ok` is True iff `result` is `verified` or `marker`. Everything else —
   `uncertain`, `failed`, `rejected`, `not_executed`, `dry_run`, `stopped`,
   `unknown`, a lifecycle refusal — is `ok:false`.
-- `message` on every reply (human-readable; `waited_seconds=`, `integrity=` and
-  the type-integrity `branch=` ladder token ride as `key=value` suffixes INSIDE
+- `message` on every reply (human-readable; `waited_seconds=`, `integrity=`,
+  `elapsed_ms=` (calls that ran ≥ 3 s), `client_timeout_s=<n>` (on
+  `start_session`, the effective host budget) and the type-integrity `branch=`
+  ladder token ride as `key=value` suffixes INSIDE
   the message, not as fields). `branch=` appears only on `integrity=unverified`
   type replies and names the verification ladder's giving-up reason — the closed
   token list is derived from the code by a truth test and documented in the
@@ -34,6 +36,10 @@ contract checks).
   gate-named `reasons` list and NO `error` key. (Execute-surface plan refusals —
   `plan_lease` / `invalid_plan_action` — additionally keep the typed `error` key
   and the handshake echo keys `blocked` / `executed_prefix` / `remaining`.)
+  One gate-named reason outside the plan surfaces: `unknown_argument` — a tool
+  received an argument it does not declare (e.g. a direct `hold_ms=`); the
+  message names the bad arguments, lists the valid ones and teaches where
+  per-item values belong.
 - A gated reply: `ok:false, result:"not_executed", requires_approval:true`. The
   string `approval_required` exists ONLY as a `failure_reason` value — never as
   a reply key.
@@ -53,8 +59,10 @@ contract checks).
 - `text_summary` exists only on `computer_observe` / `computer_zoom` replies —
   never on an execute reply.
 - After a batch: `follow_up_results` AND `follow_ups_stopped_reason` (`null` =
-  the batch ran to completion); an `uncertain` or `failed` verdict on an item
-  that already dispatched does NOT stop the batch.
+  the batch ran to completion; `time_budget` = the call's wall-clock budget ran
+  out — executed items keep their entries, nothing new was dispatched, and the
+  driver RESENDS the remaining items in a new call); an `uncertain` or `failed`
+  verdict on an item that already dispatched does NOT stop the batch.
 
 ## The `result` token set (closed)
 

@@ -110,7 +110,7 @@ def test_paced_budget_is_capped_for_the_longest_allowed_text(
       effective = 36 / 2000 = 0.018 — the same proven-safe pace for astral text
       (the WP12b per-pair counting gave 9 ms, below any evidence; fixed).
     Both restore the configured interval afterwards."""
-    assert backend_module.PACING_BUDGET_SECONDS == 36.0
+    assert backend_module.pacing_budget_seconds() == 36.0  # 80% of the derived 45 s deadline
     bmp = "x" * 2000
     effective = real_backend._cap_type_interval(bmp)
     assert effective == pytest.approx(36.0 / 2000)  # 18 ms — disclosed in the docs

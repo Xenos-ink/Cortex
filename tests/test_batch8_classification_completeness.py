@@ -293,6 +293,10 @@ EXPECTED_STOP_REASONS = frozenset(
         "focus_identity_unknown",
         "stuck_modifier",
         "target_gone",
+        # WP13 A: the per-call time budget ran out mid-chain — the executed items
+        # keep their entries, the rest were never dispatched (classified
+        # verification_uncertain).
+        "time_budget",
     }
 )
 

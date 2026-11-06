@@ -55,7 +55,15 @@ cause stays verbatim in `follow_ups_stopped_reason` and the entry's `reasons`.
 - `integrity=unverified` — the verification ladder could not decide. Since WP12b
   the reply names WHICH ladder branch gave up as a `branch=` suffix inside the
   message (closed vocabulary, derived from the code by a truth test):
-  `blind_read` (no readable focused target), `unstable_confirm`,
+  `blind_read` (no readable focused target), `read_timeout` (the UIA semantic
+  read hit its wall or the reader's single COM owner was still busy with a hung
+  provider — WP13 DELTA 2; the read never happened, so nothing is verified and
+  nothing is repaired; a degraded BASELINE read demotes the whole action the
+  same way, and no `TYPE_UNCONFIRMED` marker fires — the target exists, the
+  provider was slow), `verify_over_budget` (the whole type action must fit its
+  deadline: a verification read or horizon sleep the remaining deadline can no
+  longer cover stops verifying — never verified, never repaired; WP13 DELTA 3),
+  `unstable_confirm`,
   `agreed_empty`, `not_landed` (the buffer still equals the pre-dispatch
   baseline), `no_baseline` (the baseline read was blind — never repaired),
   `read_truncated` (the Win32 WM_GETTEXT read sat at its 8192-character
@@ -92,3 +100,9 @@ never conclude success from the title alone. `partial` is an annotated partial
 confirmation, and `unverified` is an annotated non-decision of the verification
 ladder (a blind read, a transformed buffer, a stall or an over-budget repair —
 see the `branch=` list above) — neither is a veto.
+
+`follow_ups_stopped_reason: "time_budget"` is the follow-up chain's wall clock:
+the call's per-call budget ran out before an item could run (each queued item
+runs on the REMAINING budget — a wait/hold that would overrun it, or a type item
+that could no longer run paced, is never dispatched). Executed items keep their
+entries; the driver RESENDS the remaining items in a new call.

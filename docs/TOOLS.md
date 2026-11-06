@@ -258,8 +258,10 @@ Needle→executable mapping for apps not on PATH: env `CORTEX_LAUNCH_PATHS`
 ## computer_wait / computer_wait_status / computer_cancel_wait
 
 - `computer_wait(session_id, duration_seconds, label=None)` BLOCKS up to one
-  segment (env `CORTEX_WAIT_SEGMENT_SECONDS`, default 45 s, band 1..55 — under
-  the MCP client's 60 s tool timeout), then returns `status: "completed"` (with
+  segment (env `CORTEX_WAIT_SEGMENT_SECONDS`, default 45 s, band 1..55 — the
+  default derives from CORTEX_CLIENT_TIMEOUT_SECONDS (default 60) minus a 15 s
+  margin; the band tops out at client timeout − 5 and an out-of-band override
+  falls back to the derived default), then returns `status: "completed"` (with
   `elapsed_seconds` — act now) or `status: "running"` with the `wait_id`,
   `elapsed_seconds`, `remaining_seconds` and a poll hint. `duration_seconds`
   must be > 0 and finite; the hard ceiling is

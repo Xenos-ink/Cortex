@@ -28,8 +28,8 @@ for staleness, risk and approval), **execution** (input dispatched), **verificat
   double-apply. Exceptions: a mid-type focus drift returns only after part of the
   text was already typed — it carries `partial_delivery` with `delivered_chars`
   (absence means nothing dispatched), so retype only deliberately; and a QUEUED batch
-  that stopped has already dispatched its earlier items — after a batch stop, send
-  only the unexecuted items (read `follow_up_results`).
+  that stopped has already dispatched its earlier items — after a batch stop, send only
+  the unexecuted items (`follow_up_results`; a `time_budget` stop = the call's wall clock ran out — resend the rest in a new call).
 
 ## The ten tools
 
@@ -41,7 +41,7 @@ for staleness, risk and approval), **execution** (input dispatched), **verificat
 | `computer_screenshot` | compatibility alias of `computer_observe` | never prefer it; use `computer_observe` |
 | `computer_zoom` | fresh capture cropped to a region `[left, top, width, height]` (observation-only) | detail on one area, or a coordinate grid |
 | `computer_execute` | act: the 13-action vocabulary, `follow_ups`, the waypoint `plan` handshake | every input, every click, every typed character |
-| `computer_wait` | blocking wait, up to one segment per call (default 45 s), with a `wait_id` | a pause you may want to cut short |
+| `computer_wait` | blocking wait, up to one segment per call (default 45 s = the host's client timeout minus a 15 s margin), with a `wait_id` | a pause you may want to cut short |
 | `computer_wait_status` | block for the next wait segment, or peek with `block=false` | you were told `status:"running"` |
 | `computer_cancel_wait` | end a wait early; reports elapsed/remaining | you no longer need the wait |
 | `computer_fetch_image` | re-serve a frame this session captured earlier, by `image_id` | look BACK at a frame a reply carried |
@@ -177,13 +177,13 @@ item, every plan step, the terminal plan, and wait/cancel/fetch):
 The flat `{"action":"wait","delta":N}` queue item is a short in-queue pause capped at 10 seconds — a different product from the wait tools:
 
 - `computer_wait(session_id, duration_seconds, label=None)` BLOCKS up to one segment
-  (default 45 s, env `CORTEX_WAIT_SEGMENT_SECONDS`, band 1..55 — under the MCP
-  client's 60 s tool timeout), then returns `status:"completed"` (with
-  `elapsed_seconds` — act now) or `status:"running"` with the `wait_id`,
-  `elapsed_seconds`, `remaining_seconds` and a poll hint. Ceiling: the effective cap
-  min(max_wait_seconds, 10800) — 10 800 s (3 h); a request above the cap is refused,
-  nothing starts, and a wait is never silently shortened. Splitting a long wait into
-  several waits is visible, not a workaround.
+  (default 45 s, env `CORTEX_WAIT_SEGMENT_SECONDS`, band 1..55 (ceiling = client
+  timeout − 5) — derived from the host's client timeout `CORTEX_CLIENT_TIMEOUT_SECONDS`
+  (default 60; ZCode hosts set 30), always under the host's 60 s tool timeout; out-of-band
+  values fall back to the default), then returns `status: "completed"` (with `elapsed_seconds` — act now) or
+  `status:"running"` with the `wait_id`, `elapsed_seconds`, `remaining_seconds`
+  and a poll hint. Ceiling: min(max_wait_seconds, 10800) — 10 800 s (3 h); over-cap
+  requests are refused. Splitting a long wait into several waits is visible, not a workaround.
 - `computer_wait_status(session_id, wait_id)` blocks for the NEXT segment and returns `completed` / `running` / `cancelled`; `block=false` peeks without waiting.
 - `computer_cancel_wait(session_id, wait_id)` ends a wait early: `cancelled` (with
   elapsed/remaining), `completed` (it had finished; remaining 0), or `failed` + `error`

@@ -351,6 +351,9 @@ def test_pre_existing_classifications_are_unchanged() -> None:
         "digest_surprise": "digest_surprise",
         # stable-only: the queue's ensure-app guard stop (dev has no such literal).
         "ensure_app_failed": "verification_uncertain",
+        # stable-only (WP13 A): the follow-up chain stops on the host time budget
+        # instead of being killed by the host (dev has no such literal).
+        "time_budget": "verification_uncertain",
         "focus_taken_by": "focus_drifted",
         "focus_identity_unknown": "focus_drifted",
         "stuck_modifier": "rejected",

@@ -22,6 +22,7 @@ that preserves the user's clipboard content.
 from __future__ import annotations
 
 import ctypes
+from typing import Any
 
 import pytest
 from desktop_tripwire import LIVE_DESKTOP
@@ -524,6 +525,23 @@ def test_fake_kill_switch_does_not_disable_the_explicit_clipboard_transport(
 _TEXT_CLIPBOARD_FORMATS = frozenset({1, 7, 13, 16})
 
 
+def _restore_user_clipboard(prior: str, restored: dict[str, Any]) -> None:
+    """WP13 G (VAL-WP12-06 NIT): best-effort restore of the user's text. Called
+    from the ``finally`` — INCLUDING when the test body already failed — so a
+    failed restore is never silently swallowed: it raises AssertionError (chained
+    with the body exception) instead of vanishing."""
+    if restored["ok"]:
+        return
+    ok = _clipboard_write_text(prior) is True
+    readback = _clipboard_read_verdict()[0]
+    if not (ok and readback == prior):
+        raise AssertionError(
+            f"clipboard restore FAILED after the body had already failed "
+            f"(write ok={ok}, readback={readback!r}, expected {prior!r}) — the "
+            "user's clipboard content could not be put back"
+        )
+
+
 def _require_text_only_clipboard() -> str:
     """WP12e P1 precondition for every LIVE clipboard test.
 
@@ -537,15 +555,18 @@ def _require_text_only_clipboard() -> str:
         pytest.skip("clipboard not readable as text right now (non-text content or locked)")
     if not clipboard_module._clipboard_open():
         pytest.skip("clipboard could not be opened for the read-only format check")
+    # WP13 G (VAL-WP12-06 NIT): bind EnumClipboardFormats on a PRIVATE WinDLL —
+    # setting argtypes on the SHARED clipboard_module._user32 object is exactly the
+    # shared-DLL mutation the WP12 class-A guard forbids.
+    private_user32 = ctypes.WinDLL("user32", use_last_error=True)
     try:
-        user32 = clipboard_module._user32
-        user32.EnumClipboardFormats.argtypes = [ctypes.c_uint]
-        user32.EnumClipboardFormats.restype = ctypes.c_uint
+        private_user32.EnumClipboardFormats.argtypes = [ctypes.c_uint]
+        private_user32.EnumClipboardFormats.restype = ctypes.c_uint
         formats: set[int] = set()
-        fmt = int(user32.EnumClipboardFormats(0))
+        fmt = int(private_user32.EnumClipboardFormats(0))
         while fmt:
             formats.add(fmt)
-            fmt = int(user32.EnumClipboardFormats(fmt))
+            fmt = int(private_user32.EnumClipboardFormats(fmt))
     finally:
         clipboard_module._user32.CloseClipboard()
     non_text = formats - _TEXT_CLIPBOARD_FORMATS
@@ -568,8 +589,7 @@ def test_real_win32_clipboard_roundtrip_preserves_prior_content() -> None:
         restored["ok"] = _clipboard_write_text(prior) is True
         restored["readback"] = _clipboard_read_verdict()[0]
     finally:
-        if not restored["ok"]:
-            _clipboard_write_text(prior)  # best-effort restore even when the body failed
+        _restore_user_clipboard(prior, restored)
     assert restored["ok"] is True and restored["readback"] == prior
 
 
@@ -694,8 +714,7 @@ def test_real_win32_clipboard_astral_roundtrip_byte_identical() -> None:
         restored["ok"] = _clipboard_write_text(prior) is True
         restored["readback"] = _clipboard_read_verdict()[0]
     finally:
-        if not restored["ok"]:
-            _clipboard_write_text(prior)  # best-effort restore even when the body failed
+        _restore_user_clipboard(prior, restored)
     assert restored["ok"] is True and restored["readback"] == prior
 
 
@@ -721,8 +740,7 @@ def test_real_win32_clipboard_property_roundtrip_bmp_and_astral() -> None:
         restored["ok"] = _clipboard_write_text(prior) is True
         restored["readback"] = _clipboard_read_verdict()[0]
     finally:
-        if not restored["ok"]:
-            _clipboard_write_text(prior)  # best-effort restore even when the body failed
+        _restore_user_clipboard(prior, restored)
     assert restored["ok"] is True and restored["readback"] == prior
 
 
@@ -764,8 +782,7 @@ def test_clipboard_transport_astral_paste_and_restore(
         restored["ok"] = _clipboard_write_text(user_text) is True
         restored["readback"] = _clipboard_read_verdict()[0]
     finally:
-        if not restored["ok"]:
-            _clipboard_write_text(user_text)  # best-effort restore of the USER's text
+        _restore_user_clipboard(user_text, restored)
     assert restored["ok"] is True and restored["readback"] == user_text
 
 

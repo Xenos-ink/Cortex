@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import ctypes
+import logging
+import queue
 import threading
 import time
 import uuid
+from collections.abc import Callable
 
 from ..core.models import TextRegion
+from .client_budget import semantic_read_timeout_seconds, semantic_warm_timeout_seconds
+
+logger = logging.getLogger(__name__)
 from .win32 import (
     IS_WINDOWS,
     _CLSCTX_INPROC_SERVER,
@@ -39,6 +45,116 @@ UIA_READ_ENV = "CORTEX_UIA_READ"  # "0" disables the UIA semantic read (default 
 #: WM_GETTEXT returns text from the START — the R-04 integrity verifier compares the
 #: buffer's TAIL against the typed text.
 _WINDOW_TEXT_MAX_CHARS = 8192
+
+
+class _SingleOwnerComWorker:
+    """ONE long-lived daemon thread owns COM for one UIA reader's whole life.
+
+    WP13 DELTA-2 BLOCKER fix (replaces the DELTA-1 per-call thread harness):
+    CoInitializeEx(APARTMENTTHREADED) + CoCreateInstance run on the OWNER
+    thread, and EVERY UIA call (warm, read, element summaries, property reads)
+    is submitted to and executed ONLY there — the raw ``IUIAutomation`` pointer
+    is never touched from any other thread, and the STA that owns the object
+    never dies while the reader lives.
+
+    Callers submit a request and wait at most their wall
+    (:func:`~computer_use_mcp.desktop.client_budget.semantic_read_timeout_seconds`).
+    While a request is still in flight past its wall (a hung WebView2/
+    Chromium provider), new requests are NOT queued behind it: they return
+    ``(None, timed_out=True)`` AT ONCE (busy/degraded; the gate is an atomic
+    ``Lock.acquire(blocking=False)`` — WP13 DELTA-3 n1). There is never more
+    than one worker per reader, so hung calls can never pile up threads or run
+    concurrently on one STA object. When the hung call finally returns, the
+    worker drops the stale result (its consumer is gone) and serves new
+    requests again — recovery without restart.
+
+    Shutdown (WP13 DELTA-3 m3): :meth:`stop` queues a sentinel request; the
+    owner then runs ``on_stop`` (release the CUIAutomation pointer ON the owner
+    thread) and ``CoUninitialize`` before exiting — no leaked COM object or
+    thread per session.
+    """
+
+    _STOP = object()  # sentinel request: stop the owner thread
+
+    def __init__(self, on_stop: Callable[[], None] | None = None) -> None:
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        # n1 (VAL-WP13-01): the busy gate is an atomic non-blocking acquire —
+        # check-then-set on an Event was not atomic under concurrent callers.
+        self._busy_lock = threading.Lock()
+        self._on_stop = on_stop
+        self._thread = threading.Thread(
+            target=self._serve, daemon=True, name="cortex-uia-com-owner"
+        )
+        self._thread.start()
+
+    @property
+    def owner_ident(self) -> int:
+        """The OWNER thread's ident (every UIA call runs on it — test seam)."""
+        return self._thread.ident or 0
+
+    def stop(self) -> None:
+        """Queue the stop sentinel; the owner releases COM and exits. Never
+        blocks (the sentinel result is nobody's business) and is idempotent."""
+        self._queue.put((self._STOP, threading.Event(), {"value": None, "done": False}))
+
+    def _serve(self) -> None:
+        while True:
+            fn, done, outcome = self._queue.get()
+            if fn is self._STOP:
+                if self._on_stop is not None:
+                    try:
+                        self._on_stop()
+                    except Exception:  # noqa: BLE001 - shutdown is best-effort
+                        pass
+                break
+            try:
+                try:
+                    outcome["value"] = fn()
+                except Exception:  # noqa: BLE001 - the read path degrades to None on any failure
+                    outcome["value"] = None
+                except SystemExit:
+                    raise
+                except KeyboardInterrupt:
+                    raise
+                except BaseException:
+                    # n3 (VAL-WP13-02): the owner must survive a stray
+                    # BaseException (a killed request must not silence the
+                    # reader for the rest of the process) — log at debug and
+                    # continue; SystemExit/KeyboardInterrupt re-raise above.
+                    logger.debug("UIA owner request raised BaseException", exc_info=True)
+                    outcome["value"] = None
+            finally:
+                outcome["done"] = True
+                done.set()
+                # A caller whose wall expired has ALREADY returned None; the
+                # stale result is dropped here (no late consumer exists) and
+                # the worker is free for new requests again.
+                self._busy_lock.release()
+
+    def run_bounded(self, fn: Callable[[], object], timeout_s: float) -> tuple[object, bool]:
+        """Run ``fn`` on the OWNER thread; ``(result, timed_out)``.
+
+        ``timed_out`` is True when the wall expired OR the worker is still busy
+        with a previous (hung) request — in both cases the caller's result is
+        ``None`` and the worker state is untouched. Calling this FROM the owner
+        thread is a programming error (M2, VAL-WP13-01): the busy gate would
+        swallow the call — it raises RuntimeError instead (tests fail loudly;
+        production readers call the ``_*_unbounded`` bodies directly and the
+        read-path callers degrade via their own ``except``).
+        """
+        if threading.get_ident() == self._thread.ident:
+            raise RuntimeError(
+                "run_bounded re-entered on the COM owner thread — call the "
+                "_*_unbounded body directly instead"
+            )
+        if not self._busy_lock.acquire(blocking=False):
+            return None, True  # busy: never queued behind a hang, never a second worker
+        done = threading.Event()
+        outcome: dict[str, object] = {"value": None, "done": False}
+        self._queue.put((fn, done, outcome))
+        if not done.wait(timeout_s):
+            return None, True  # still in flight: the caller degrades, the owner keeps working
+        return outcome["value"], False
 
 # --- UIA semantic read bounds (PERF-004; research digest Q3) --------------------------------
 UIA_MAX_ELEMENTS = 30  # bounded element list (visible buttons/fields)
@@ -214,6 +330,52 @@ class UiaSemanticReader:
         self._available = False
         self._lock = threading.Lock()
         self._com_initialized_threads: set[int] = set()
+        # WP13 DELTA-2: ONE daemon owner thread runs EVERY UIA call for this
+        # reader's whole life — COM is initialized and the automation object is
+        # created THERE, and no other thread ever touches the raw pointer.
+        # DELTA-3 m3: on stop, the owner releases the pointer + CoUninitializes.
+        self._worker = _SingleOwnerComWorker(on_stop=self._release_com_on_owner)
+        #: Typed degradation of the LAST read: ``"read_timeout"`` when the wall
+        #: expired (or the owner was still busy with a hung provider), ``None``
+        #: otherwise. The backend turns it into the typed unverified branch
+        #: ``branch=read_timeout`` — the degradation is VISIBLE, never silent.
+        self.last_degraded_reason: str | None = None
+        #: DELTA-3 m4: the warm's resolution — ``None`` (still in flight /
+        #: not started), ``"ok"``, ``"timeout"`` (still pending) or ``"failed"``.
+        #: The backend lazily swaps to the Win32 reader only on ``"failed"``.
+        #: N1 (VAL-WP13-02): written by BOTH the owner (final outcome) and the
+        #: warm caller (pending timeout) — guard the compare-and-set.
+        self.warm_state: str | None = None
+        self._warm_state_lock = threading.Lock()
+
+    @property
+    def owner_thread_ident(self) -> int:
+        """The COM OWNER thread's ident (every UIA call runs on it — test seam)."""
+        return self._worker.owner_ident
+
+    def stop_owner_thread(self) -> None:
+        """DELTA-3 m3: stop the COM owner thread (releases the CUIAutomation
+        pointer ON the owner thread + CoUninitialize). Idempotent, never blocks."""
+        self._worker.stop()
+
+    def _release_com_on_owner(self) -> None:
+        """Runs ON the owner thread (worker stop sentinel): release the cached
+        ``IUIAutomation`` pointer and CoUninitialize the apartment. No other
+        thread may touch the pointer (single-owner doctrine)."""
+        with self._lock:
+            if self._automation:
+                try:
+                    _com_call(self._automation, _COM_RELEASE, ())
+                except Exception:  # noqa: BLE001 - shutdown is best-effort
+                    pass
+                self._automation = None
+            self._available = False
+            if self._com_initialized_threads and _ole32 is not None:
+                try:
+                    _ole32.CoUninitialize()
+                except (OSError, AttributeError):
+                    pass
+                self._com_initialized_threads.clear()
 
     @property
     def available(self) -> bool:
@@ -259,19 +421,70 @@ class UiaSemanticReader:
             self._available = True
             return self._automation
 
-    def warm(self) -> bool:
-        """Warm the COM apartment + automation object; one throwaway focused read.
+    def _set_warm_state(self, value: str, only_if_pending: bool = False) -> None:
+        """Record the warm's resolution (N1, VAL-WP13-02): the OWNER thread's
+        final ``"ok"``/``"failed"`` must NEVER be overwritten by the caller's
+        late ``"timeout"`` — the compare-and-set is lock-guarded."""
+        with self._warm_state_lock:
+            if only_if_pending and self.warm_state is not None:
+                return
+            self.warm_state = value
 
-        Never raises: any failure leaves the reader permanently unavailable and the
-        observation's semantic fields stay ``None`` (silent degradation).
+    def warm(self) -> str:
+        """Warm the COM apartment + automation object on the OWNER thread; one
+        throwaway focused read.
+
+        Returns ``"ok"`` (warm completed), ``"timeout"`` (the wall expired —
+        the reader STAYS the active UIA reader: the queued warm may still
+        complete later, and the caller must NOT swap readers on a timeout) or
+        ``"failed"`` (the warm ran and genuinely failed — swap to the Win32
+        fallback is correct). Never raises: a failure leaves the reader
+        permanently unavailable and the observation's semantic fields stay
+        ``None`` (silent degradation). The warm runs under the derived
+        WARM wall (:func:`semantic_warm_timeout_seconds`, the full call-budget
+        share capped at 10 s) — a cold first CoCreateInstance on a slow machine
+        can exceed the per-read wall (WP13 DELTA-2).
+
+        N1 (VAL-WP13-02): the OUTCOME is recorded ON THE OWNER THREAD —
+        ``_warm_unbounded`` sets the final ``"ok"``/``"failed"`` itself when it
+        finishes, so a warm that times out and LATER fails still resolves to
+        ``"failed"`` (the backend's lazy Win32 swap fires on the next read);
+        the caller's late ``"timeout"`` only lands while the state is still
+        pending. When the owner already resolved by the time the caller gives
+        up, the RESOLVED state is returned.
         """
+        result, timed_out = self._worker.run_bounded(
+            self._warm_unbounded, semantic_warm_timeout_seconds()
+        )
+        if timed_out:
+            self.last_degraded_reason = "read_timeout"
+            self._set_warm_state("timeout", only_if_pending=True)
+            return self.warm_state
+        self.last_degraded_reason = None
+        if self.warm_state is None:
+            # the owner body records its own outcome; this fallback only
+            # covers warm bodies that predate the recording (never shipped)
+            self._set_warm_state("ok" if bool(result) else "failed")
+        return self.warm_state
+
+    def _warm_unbounded(self) -> bool:
+        """The warm body, run ON the owner thread: COM init + activation + the
+        throwaway focused read. M2 (VAL-WP13-01): the read calls
+        ``_read_unbounded`` DIRECTLY — ``self.read()`` would re-enter
+        ``run_bounded`` from the owner thread and be swallowed by the busy
+        gate, silently skipping the cold focused-read cost the warm exists to
+        pay. N1 (VAL-WP13-02): the body records its OWN final outcome
+        (``"ok"``/``"failed"``) here, on the owner thread."""
         try:
             automation = self._ensure_automation()
             if not automation:
+                self._set_warm_state("failed")
                 return False
-            self.read()  # one throwaway read; warms focused-element + property paths
+            self._read_unbounded()  # one throwaway read; warms focused-element + property paths
+            self._set_warm_state("ok" if self._available else "failed")
             return self._available
         except Exception:  # noqa: BLE001 - warm must never break backend construction
+            self._set_warm_state("failed")
             return False
 
     # -- property reads ------------------------------------------------------------------
@@ -376,7 +589,26 @@ class UiaSemanticReader:
         elements, and elements whose summary could not be read. Nothing is silently
         dropped any more: the breakdown rides the existing additive ``omitted_count``
         channel of the ``spatial_text`` block.
+
+        WP13 DELTA-2: the whole read runs on the reader's SINGLE COM OWNER
+        thread under the derived semantic-read wall (:meth:`_SingleOwnerComWorker.
+        run_bounded`) — the internal 0.05 s budget is only checked BETWEEN COM
+        calls, and one hung WebView2/Chromium provider call (field evidence:
+        WhatsApp) can otherwise block the calling tool forever. A wall expiry
+        (or a read while a previous hung call is still in flight) sets
+        :attr:`last_degraded_reason` to ``"read_timeout"`` — the visible,
+        typed degradation the typing ladder reports as ``branch=read_timeout``.
         """
+        result, timed_out = self._worker.run_bounded(
+            self._read_unbounded, semantic_read_timeout_seconds()
+        )
+        if timed_out:
+            self.last_degraded_reason = "read_timeout"
+            return None
+        self.last_degraded_reason = None
+        return result if isinstance(result, dict) or result is None else None
+
+    def _read_unbounded(self) -> dict[str, object] | None:
         if not IS_WINDOWS or _ole32 is None or _oleaut32 is None:
             return None
         deadline = time.perf_counter() + UIA_READ_BUDGET_SECONDS
@@ -498,6 +730,10 @@ class Win32TextReader:
 
     def __init__(self) -> None:
         self._available = IS_WINDOWS and _user32 is not None
+        #: Parity with UiaSemanticReader: this reader's reads are bounded by
+        #: SendMessageTimeoutW (abort-if-hung), never by the COM owner wall, so
+        #: no degradation reason is ever set here (backend getattr default).
+        self.last_degraded_reason: str | None = None
 
     @property
     def available(self) -> bool:

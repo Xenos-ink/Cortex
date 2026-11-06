@@ -46,30 +46,49 @@ from .state import _bundles, _lock
 # ``_retire_wait``. S-15 is fixed here: the concurrent-wait caps are checked BEFORE
 # any ``setdefault``, so a refused wait leaves no empty per-session dict behind.
 
-#: Env knob: how long ONE blocking segment may last, in seconds. Default 45; band
-#: 1..55 — every value keeps a call comfortably under the MCP client's 60 s tool
-#: timeout. Out-of-band / unparsable / non-finite values FALL BACK to the default
-#: (fallback-not-clamp, the WP-S knob style) — a typo can never silently arm a
-#: call-blocking 55+ s segment.
+from ..desktop.client_budget import (
+    CLIENT_TIMEOUT_DEFAULT_SECONDS,
+    CLIENT_TIMEOUT_MARGIN_SECONDS,
+    client_timeout_seconds,
+    wait_segment_default_seconds,
+)
+
+#: Env knob: an EXPLICIT blocking-segment length override, in seconds. It still
+#: wins over the derived default while INSIDE the valid band
+#: [1, client timeout − 5] (55 at the default 60 s client, 25 at a 30 s ZCode
+#: host); an out-of-band, unparsable or non-finite value FALLS BACK to the
+#: derived default (fallback-not-clamp, the house knob style) — WP13 DELTA 1:
+#: the old 59 s ceiling kept only 1 s of headroom under a 60 s host and CLAMPED
+#: out-of-band values; a 29 s segment under a 30 s host plus capture would be
+#: killed, so the headroom is 5 s and bad values fall back instead.
 WAIT_SEGMENT_ENV = "CORTEX_WAIT_SEGMENT_SECONDS"
-WAIT_SEGMENT_DEFAULT_SECONDS = 45.0
+
+#: The SHIPPED wait-segment constants at the DEFAULT client timeout (60 s): the
+#: derived default (60 − 15 = 45), the floor (1) and the override ceiling
+#: (client timeout − 5 — 55 at the default, 25 at a 30 s ZCode host). The
+#: RUNTIME segment is derived per call in _wait_segment_seconds.
+WAIT_SEGMENT_DEFAULT_SECONDS = CLIENT_TIMEOUT_DEFAULT_SECONDS - CLIENT_TIMEOUT_MARGIN_SECONDS
 WAIT_SEGMENT_MIN_SECONDS = 1.0
-WAIT_SEGMENT_MAX_SECONDS = 55.0
+WAIT_SEGMENT_MAX_SECONDS = CLIENT_TIMEOUT_DEFAULT_SECONDS - 5.0
 
 
 def _wait_segment_seconds() -> float:
-    """Resolve the blocking-segment length in seconds: env > default, fallback-not-clamp."""
+    """Resolve the blocking-segment length: an explicit CORTEX_WAIT_SEGMENT_SECONDS
+    override WINS while inside the valid band [1, client timeout − 5]; any
+    out-of-band, unparsable or non-finite value FALLS BACK to the derived default
+    (fallback-not-clamp). Without an override the DERIVED default applies (client
+    timeout minus the fixed 15 s safety margin: 60 -> 45 as shipped, 30 -> 15)."""
+    ceiling = max(1.0, client_timeout_seconds() - 5.0)
+    default = min(wait_segment_default_seconds(), ceiling)
     raw = os.environ.get(WAIT_SEGMENT_ENV, "").strip()
     if not raw:
-        return WAIT_SEGMENT_DEFAULT_SECONDS
+        return default
     try:
         value = float(raw)
     except ValueError:
-        return WAIT_SEGMENT_DEFAULT_SECONDS
-    if not math.isfinite(value):
-        return WAIT_SEGMENT_DEFAULT_SECONDS
-    if value < WAIT_SEGMENT_MIN_SECONDS or value > WAIT_SEGMENT_MAX_SECONDS:
-        return WAIT_SEGMENT_DEFAULT_SECONDS
+        return default
+    if not math.isfinite(value) or value < WAIT_SEGMENT_MIN_SECONDS or value > ceiling:
+        return default
     return value
 
 

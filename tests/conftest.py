@@ -8,6 +8,7 @@ name ``conftest`` is ambiguous between ``tests/`` and ``tests/e2e/``.
 from __future__ import annotations
 
 import os
+import warnings
 from typing import Any
 
 import pytest
@@ -90,7 +91,7 @@ def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
 
 
 def pytest_warning_recorded(
-    warning_message: "warnings.WarningMessage", when: str, nodeid: str | None = None
+    warning_message: warnings.WarningMessage, when: str, nodeid: str | None = None
 ) -> None:
     """N3 (VAL-WP6-02, WP4b): the belt-and-suspenders layer of the DELTA 2 guard.
 
@@ -135,7 +136,54 @@ def real_backend() -> LocalComputerBackend:
     Construction performs no window/input side effects beyond the one-time DPI
     awareness declaration, monitor enumeration, and the semantic-reader warm-up; tests
     that drive input inject a stubbed ``_engine`` (see ``tests/recording_engine.py``).
+
+    WP13 DELTA-4 N4 (VAL-WP13-02): the OFFLINE seams (no real UIA COM warm, no
+    real capture) are armed HERE — BEFORE construction, whatever the test
+    order — so the shared fixture can never be built unpatched. The module
+    bindings the seams replace are RESTORED after construction, so later
+    modules see exactly what they saw before; the built backend keeps its
+    offline semantic reader (an offline suite never touches real COM).
     """
     if not backend_module.IS_WINDOWS:
         pytest.skip("Real Win32 backend requires Windows.")
-    return LocalComputerBackend()
+
+    class _OfflineSemanticReader:
+        """The offline semantic-reader seam (m14): never touches real UIA COM."""
+
+        value_source = "uia"
+        last_degraded_reason: str | None = None
+        warm_state: str | None = "ok"
+
+        @property
+        def available(self) -> bool:
+            return True
+
+        def warm(self) -> str:
+            return "ok"
+
+        def read(self) -> dict[str, object] | None:
+            return None
+
+    def _offline_grab_png(self: Any, left: int, top: int, width: int, height: int) -> Any:
+        import base64
+        import io
+
+        from PIL import Image as PILImage
+
+        image = PILImage.new("RGB", (max(width, 1), max(height, 1)), (250, 250, 250))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return encoded, width, height, image
+
+    real_uia = backend_module.UiaSemanticReader
+    real_init = backend_module.LocalComputerBackend.__init__
+    real_grab = backend_module.LocalComputerBackend._grab_png
+    backend_module.UiaSemanticReader = _OfflineSemanticReader
+    backend_module.LocalComputerBackend._grab_png = _offline_grab_png
+    try:
+        return LocalComputerBackend()
+    finally:
+        backend_module.UiaSemanticReader = real_uia
+        backend_module.LocalComputerBackend.__init__ = real_init
+        backend_module.LocalComputerBackend._grab_png = real_grab

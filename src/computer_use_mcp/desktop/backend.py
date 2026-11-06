@@ -88,6 +88,11 @@ from .capture import (
     _DxgiDuplicator,
     _raw_payload_key,
 )
+from .client_budget import (
+    pacing_budget_seconds,
+    semantic_read_timeout_seconds,
+    type_action_deadline_seconds,
+)
 from .clipboard import (
     CLIPBOARD_NON_TEXT,
     CLIPBOARD_RESTORE_DESTROYED,
@@ -152,6 +157,7 @@ from .windows import (
     enumerate_app_windows,
     enumerate_monitors,
     find_window_by_title,
+    find_windows_by_title,
     get_cursor_position,
     is_window_owned_by,
     query_focus_target,
@@ -326,17 +332,23 @@ TYPE_CHUNK_CHARS = _env_int_in_range("CORTEX_TYPE_CHUNK_CHARS", 64, 1, 4096)
 #: SendInputEngine()/FakeComputerBackend library defaults stay 0.0 so the offline
 #: suite stays fast.
 DEFAULT_TYPE_INTERVAL_SECONDS = 0.02
-#: WP12b/c (VAL M1/M2 + C3): ONE wall-clock deadline per type action — pacing
-#: (counted per CHARACTER since the WP12c per-character pacing: a surrogate pair
-#: travels in ONE SendInput call with ONE sleep), the per-character probes,
-#: verification and a possible repair must together stay <= 45 s, comfortably
-#: inside the client's 60 s tool timeout. The paced-dispatch share of that
-#: deadline is PACING_BUDGET_SECONDS; the dispatch loop checks the deadline per
-#: chunk and finishes the rest UNPACED if the paced rest would overrun; a repair
-#: runs only if it fits the REMAINING deadline, else the reply is unverified
-#: with branch=repair_over_budget (never typed).
-TYPE_ACTION_DEADLINE_SECONDS = 45.0
-PACING_BUDGET_SECONDS = 36.0
+#: WP13 (field e1/e2, Addendum 4): the HOST's per-tool-call timeout — one knob,
+#: ``CORTEX_CLIENT_TIMEOUT_SECONDS`` (default 60, band 10..600; out-of-band or
+#: unparsable values fall back to the default). Every long-blocking bound is
+#: DERIVED from it with a fixed safety margin: at 60 the margins reproduce the
+#: shipped 45 s deadline / 36 s pacing budget / 45 s wait segments; at a 30 s
+#: host (ZCode) every bound drops to 15 s so no call can block past the host's
+#: timeout. Single source of truth: desktop.client_budget (imported below).
+#: One wall-clock deadline per type action — pacing (counted per CHARACTER since
+#: the WP12c per-character pacing: a surrogate pair travels in ONE SendInput call
+#: with ONE sleep), the per-character probes, verification and a possible repair
+#: must together stay inside the derived deadline. The paced-dispatch share of
+#: that deadline is 80% of it; the dispatch loop checks the deadline per chunk
+#: and finishes the rest UNPACED if the paced rest would overrun; a repair runs
+#: only if it fits the REMAINING deadline, else the reply is unverified with
+#: branch=repair_over_budget (never typed).
+
+
 #: Settle before the post-dispatch integrity read-back: SendInput returns when events
 #: are ACCEPTED by the input stack, not when the target app has processed them —
 #: reading too early would mistake queue lag for a drop.
@@ -882,9 +894,17 @@ class LocalComputerBackend(ComputerBackend):
             # Raw UIA COM first; the Win32 window-text reader is the sanctioned fallback
             # (PERF-004: this hardening-affected box refuses IUIAutomation from
             # CUIActivation via raw COM in every process — see change-log).
-            self._semantic_reader = uia_reader if uia_reader.warm() else Win32TextReader()
-        if self._semantic_reader is not None:
-            self._semantic_reader.warm()  # one-time warm-up; never raises
+            # WP13 DELTA-2: the warm runs under the derived WARM wall (full call
+            # budget share, capped at 10 s). Only a warm that RAN and FAILED
+            # swaps to the Win32 reader; a warm that TIMED OUT keeps the UIA
+            # reader in place (the queued warm may still complete on the owner
+            # thread — later reads then work).
+            warm_state = uia_reader.warm()
+            self._semantic_reader = uia_reader if warm_state != "failed" else Win32TextReader()
+        # Single warm only: the DELTA-1 double warm (swap-check + unconditional
+        # re-warm) re-ran the whole COM warm pointlessly; the Win32 fallback
+        # reader's warm is a no-op binding check that its own constructor
+        # already covers.
         self._refresh_monitors()
         # B3 settle/gap policy: monotonic timestamp of the last keyboard dispatch
         # (0.0 = epoch; the first dispatch of a session never waits).
@@ -1197,12 +1217,41 @@ class LocalComputerBackend(ComputerBackend):
         legacy message byte-identical. Never consulted as typing evidence.
         """
         reader = getattr(self, "_semantic_reader", None)
+        # WP13 DELTA-3 m4 (VAL-WP13-01): a warm that TIMED OUT and whose queued
+        # warm then FAILED (CoCreateInstance error) leaves this session with a
+        # permanently unavailable UIA reader — swap lazily to the Win32
+        # fallback on the next read. (Duck-typed on the reader's warm_state so
+        # test-double readers behave identically.)
+        if (
+            getattr(reader, "warm_state", None) == "failed"
+            and not getattr(reader, "available", False)
+        ):
+            self._semantic_reader = Win32TextReader()
+            reader = self._semantic_reader
         # WP12e (VAL MINOR): remember WHICH reader produced the value — the raw-cap
         # truncation rule (backend._read_landed_normalized) applies ONLY to the
         # truncating Win32 WM_GETTEXT reader; UIA values are not truncated.
         self._last_value_source = "none"
-        if reader is None or not reader.available:
+        self._last_read_degraded = None
+        if reader is None:
             self._last_read_had_target = False
+            return None
+        if not getattr(reader, "available", False):
+            # WP13 DELTA-3 m4: a read that arrives while a UIA warm is still
+            # pending (never resolved, or timed out) is a READ TIMEOUT (the
+            # provider may still answer) — NOT a blind read. Readers that do
+            # not model a warm at all (test doubles, the Win32 fallback) have
+            # no pending state and stay plain blind.
+            if getattr(reader, "warm_state", "done") in (None, "timeout"):
+                self._last_read_degraded = "read_timeout"
+                # N2 (VAL-WP13-02): the target may be perfectly readable — the
+                # provider is only slow — so the TYPE_UNCONFIRMED
+                # no-readable-target marker and the clipboard hint must NOT
+                # fire on this path either.
+                self._last_read_had_target = True
+            else:
+                self._last_read_degraded = None
+                self._last_read_had_target = False
             return None
         try:
             snapshot = reader.read()
@@ -1210,9 +1259,17 @@ class LocalComputerBackend(ComputerBackend):
             self._last_read_had_target = False
             return None
         self._last_value_source = getattr(reader, "value_source", "win32")
+        self._last_read_degraded = getattr(reader, "last_degraded_reason", None) or None
         focused = snapshot.get("focused") if isinstance(snapshot, dict) else None
         if not isinstance(focused, dict):
-            self._last_read_had_target = False
+            # WP13 DELTA-3 m6 (VAL-WP13-01): a READ TIMEOUT is not a missing
+            # target — the focused control EXISTS (the reader is available);
+            # the provider was slow, so the TYPE_UNCONFIRMED no-readable-target
+            # marker and the clipboard hint must NOT fire on it.
+            if snapshot is None and self._last_read_degraded == "read_timeout":
+                self._last_read_had_target = True
+            else:
+                self._last_read_had_target = False
             return None
         self._last_read_had_target = True
         value = focused.get("value")
@@ -1754,25 +1811,38 @@ class LocalComputerBackend(ComputerBackend):
             if release_error is not None and hold_error is None:
                 raise release_error
 
+    def _effective_type_deadline(self) -> float:
+        """WP13 DELTA 1 #3: the deadline ONE type dispatch runs under.
+
+        Inside a follow-up queue item (agent._run_action_queue) the queue caps
+        this to the item's REMAINING share of the ONE-CALL budget via
+        ``self._queue_deadline_seconds`` (None set = no queue item in flight, the
+        derived deadline applies). The engine is per-session and queue items run
+        sequentially, so the temporary override cannot interleave.
+        """
+        override = getattr(self, "_queue_deadline_seconds", None)
+        return override if override is not None else type_action_deadline_seconds()
+
     def _cap_type_interval(self, text: str) -> float:
         """WP12b/c (VAL M1/M2 + C4): cap the paced budget by the sleep count.
 
         Since WP12c the paced engine sleeps once per CHARACTER (a surrogate pair
         travels in one SendInput call with one sleep — input_engine.py
         ``_char_event_groups``), so the sleep count IS ``len(text)``. The effective
-        interval is ``min(configured, PACING_BUDGET_SECONDS / sleeps)`` and is
-        RETURNED so the repair can run under the same capped pace. The configured
-        interval is remembered and restored by :meth:`_restore_type_interval` (the
-        engine is per-session and actions run sequentially, so the temporary
-        override cannot interleave). Unpaced engines are a no-op (returns 0.0).
+        interval is ``min(configured, budget / sleeps)`` where the budget is the
+        paced 80% share of :meth:`_effective_type_deadline` (queue-capped inside a
+        follow-up item) and RETURNED so the repair can run under the same capped
+        pace. The configured interval is remembered and restored by
+        :meth:`_restore_type_interval` (the engine is per-session and actions run
+        sequentially, so the temporary override cannot interleave). Unpaced
+        engines are a no-op (returns 0.0).
         """
         self._original_type_interval = getattr(self._engine, "type_interval", 0.0)
         sleeps = len(text)
         self._capped_type_interval = 0.0
         if self._original_type_interval > 0 and sleeps > 0:
-            self._capped_type_interval = min(
-                self._original_type_interval, PACING_BUDGET_SECONDS / sleeps
-            )
+            pacing_budget = min(pacing_budget_seconds(), 0.8 * self._effective_type_deadline())
+            self._capped_type_interval = min(self._original_type_interval, pacing_budget / sleeps)
             self._engine.type_interval = self._capped_type_interval
         return self._capped_type_interval
 
@@ -1883,8 +1953,11 @@ class LocalComputerBackend(ComputerBackend):
 
         total = len(text)
         delivered = 0
-        # WP12b (VAL M1/M2): ONE wall-clock deadline per type action.
-        deadline = time.monotonic() + TYPE_ACTION_DEADLINE_SECONDS
+        # WP12b (VAL M1/M2) + WP13 A: ONE wall-clock deadline per type action,
+        # DERIVED from the host's client timeout (60 -> 45 as shipped; 30 -> 15),
+        # capped by the queue item's remaining share inside a follow-up chain
+        # (WP13 DELTA 1 #3).
+        deadline = time.monotonic() + self._effective_type_deadline()
         # WP12b (VAL B1a): one PRE-DISPATCH BASELINE read of the focused control
         # (the same bounded read path the verification reads use; it dispatches
         # nothing). None = unreadable: without a baseline the ladder can never
@@ -1895,6 +1968,10 @@ class LocalComputerBackend(ComputerBackend):
         if stop is not None:
             stop.ensure_live()
         baseline_n = self._read_landed_normalized()
+        # WP13 DELTA-3 m5 (VAL-WP13-01): a baseline read that TIMED OUT proves
+        # nothing for the WHOLE action — a later healthy read must not be
+        # accepted `verified` through the no-baseline tail-match rule.
+        baseline_degraded = getattr(self, "_last_read_degraded", None) == "read_timeout"
         # WP12c (VAL C1): the cap is applied AFTER the stop-check and the baseline
         # read — anything that can raise between applying the cap and the dispatch
         # try: would otherwise leave the CAPPED interval on the engine for the rest
@@ -1944,8 +2021,22 @@ class LocalComputerBackend(ComputerBackend):
         if stop is not None:
             stop.ensure_live()
         expected_n = _normalize_landed_text(text)
+        # WP13 DELTA-3 m7 (VAL-WP13-01): the WHOLE type action (dispatch + every
+        # verification read + horizon sleep) must fit the deadline. Before each
+        # verification read (and its leading sleep) the ladder checks that the
+        # remaining budget can still cover ONE read wall
+        # (semantic_read_timeout_seconds) — if not, it stops verifying with the
+        # typed branch ``verify_over_budget``: never verified, never a repair.
+        verify_read_wall = semantic_read_timeout_seconds()
+        self._verify_over_budget = False
+
+        def _budget_allows_read(leading_sleep: float = 0.0) -> bool:
+            return time.monotonic() + leading_sleep + verify_read_wall < deadline
 
         def _quick_read() -> str | None:
+            if not _budget_allows_read(TYPE_VERIFY_CONFIRM_GAP_SECONDS):
+                self._verify_over_budget = True
+                return None
             if TYPE_VERIFY_CONFIRM_GAP_SECONDS > 0:
                 time.sleep(TYPE_VERIFY_CONFIRM_GAP_SECONDS)
             if stop is not None:
@@ -1953,6 +2044,9 @@ class LocalComputerBackend(ComputerBackend):
             return self._read_landed_normalized()
 
         def _horizon_read() -> str | None:
+            if not _budget_allows_read(TYPE_VERIFY_STABILITY_SECONDS):
+                self._verify_over_budget = True
+                return None
             if TYPE_VERIFY_STABILITY_SECONDS > 0:
                 time.sleep(TYPE_VERIFY_STABILITY_SECONDS)
             if stop is not None:
@@ -1984,7 +2078,10 @@ class LocalComputerBackend(ComputerBackend):
             prefix/suffix — linear). With no baseline, today's tail match governs
             (returns True — nothing to prove against)."""
             if baseline_n is None:
-                return True
+                # WP13 DELTA-3 m5: a baseline read that TIMED OUT proves
+                # nothing — never accept `verified` through the no-baseline
+                # tail-match rule (the caller reports branch=read_timeout).
+                return not baseline_degraded
             if len(buffer) != len(baseline_n) + len(expected_n):
                 return False
             p = 0
@@ -2048,10 +2145,14 @@ class LocalComputerBackend(ComputerBackend):
                 stop.ensure_live()
             recheck1 = self._read_landed_normalized()
             if recheck1 is None:
+                if self._verify_over_budget:
+                    return _unverified("verify_over_budget")
                 return _unverified("repair_read_blind")
             recheck2 = _quick_read()
             if recheck2 is None or recheck2 != recheck1:
                 # Repair landing UNCONFIRMED: honest "unknown", never a second retype.
+                if self._verify_over_budget:
+                    return _unverified("verify_over_budget")
                 return _unverified("repair_unconfirmed")
             if recheck2.endswith(expected_n):
                 # WP12c (VAL C2): after a repair the expected buffer is exactly
@@ -2106,6 +2207,10 @@ class LocalComputerBackend(ComputerBackend):
                 # dispatch dropped entirely) is honest unknown.
                 if _baseline_landing_proven(trusted_n):
                     return _verified_full()
+                if baseline_degraded:
+                    # DELTA-3 m5: a DEGRADED baseline proves nothing — the
+                    # visible read_timeout, not tail_unproven.
+                    return _unverified("read_timeout")
                 return _unverified("tail_unproven")
             if expected_n in trusted_n:
                 # Landed but NOT at the tail: caret mid-text, inline autocomplete,
@@ -2150,10 +2255,22 @@ class LocalComputerBackend(ComputerBackend):
             # never retyped (appending would land after the corruption).
             return _mismatch()
 
+        # WP13 DELTA-3 m7: the deadline must cover one read wall BEFORE the
+        # first verification read — else the action stops verifying here.
+        if not _budget_allows_read():
+            return _unverified("verify_over_budget")
         prev = self._read_landed_normalized()
         if prev is None:
             # WP12e: a read at the Win32 WM_GETTEXT truncation cap gets its own
-            # branch (read_truncated); a plain blind read stays blind_read.
+            # branch (read_truncated); WP13 DELTA-2: a read that hit the UIA
+            # owner wall (or found the owner busy with a hung provider) is the
+            # visible read_timeout branch; DELTA-3 m7: a read the remaining
+            # deadline could not cover is verify_over_budget; a plain blind
+            # read stays blind_read.
+            if self._verify_over_budget:
+                return _unverified("verify_over_budget")
+            if getattr(self, "_last_read_degraded", None) == "read_timeout":
+                return _unverified("read_timeout")
             if getattr(self, "_last_read_truncated", False):
                 return _unverified("read_truncated")
             return _unverified("blind_read")
@@ -2169,7 +2286,15 @@ class LocalComputerBackend(ComputerBackend):
                         f"{_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
                         f"{pace_token}"
                     )
+                if baseline_degraded:
+                    # DELTA-3 m5: a DEGRADED baseline proves nothing — the
+                    # visible read_timeout, not tail_unproven.
+                    return _unverified("read_timeout")
                 return _unverified("tail_unproven")
+            if confirm is None and self._verify_over_budget:
+                # DELTA-4 N7 (VAL-WP13-02): a confirm read SKIPPED for budget is
+                # verify_over_budget, not unstable_confirm.
+                return _unverified("verify_over_budget")
             return _unverified("unstable_confirm")
 
         reads_left = TYPE_VERIFY_FAST_MAX_READS - 1
@@ -2178,6 +2303,13 @@ class LocalComputerBackend(ComputerBackend):
             reads_left -= 1
             current = _quick_read()
             if current is None:
+                # DELTA-2: the typed read_timeout branch outranks the raw-cap
+                # and plain blind branches (the read never happened at all);
+                # DELTA-3 m7: a read skipped for budget is verify_over_budget.
+                if self._verify_over_budget:
+                    return _unverified("verify_over_budget")
+                if getattr(self, "_last_read_degraded", None) == "read_timeout":
+                    return _unverified("read_timeout")
                 if getattr(self, "_last_read_truncated", False):
                     return _unverified("read_truncated")
                 return _unverified("blind_read")
@@ -2191,6 +2323,10 @@ class LocalComputerBackend(ComputerBackend):
                         f"{_format_integrity_status(total, total, mismatch=0, unverified=0, healed=0)}"
                         f"{pace_token}"
                     )
+                if baseline_degraded:
+                    # DELTA-3 m5: a DEGRADED baseline proves nothing — the
+                    # visible read_timeout, not tail_unproven.
+                    return _unverified("read_timeout")
                 return _unverified("tail_unproven")
             if not (current == prev or current.startswith(prev)):
                 escalated = True
@@ -2227,9 +2363,13 @@ class LocalComputerBackend(ComputerBackend):
             # honest fast answer is unverified (never a repair).
             trusted_n = _horizon_read()
             if trusted_n is None:
+                if self._verify_over_budget:
+                    return _unverified("verify_over_budget")
                 return _unverified("horizon_blind")
             confirm_n = _quick_read()
             if confirm_n is None or confirm_n != trusted_n:
+                if self._verify_over_budget:
+                    return _unverified("verify_over_budget")
                 return _unverified("horizon_unconfirmed")
             return _resolve_trusted(trusted_n)
         return _unverified("fast_budget_exhausted")
@@ -2375,7 +2515,7 @@ class LocalComputerBackend(ComputerBackend):
             return None
         # WP12e: the source attribute is set by read_focused_control_value; a test
         # double that replaces that method leaves it unset — treat as non-truncating.
-        if getattr(self, "_last_value_source", "none") == "win32" and len(raw) >= _WINDOW_TEXT_MAX_CHARS:
+        if getattr(self, "_last_value_source", "win32") == "win32" and len(raw) >= _WINDOW_TEXT_MAX_CHARS:
             # WP12e (VAL MINOR): only the Win32 WM_GETTEXT reader truncates at its
             # cap — UIA values are not truncated and keep full verification. A
             # capped Win32 read is BLIND and FLAGGED: the ladder answers
@@ -2463,12 +2603,68 @@ class LocalComputerBackend(ComputerBackend):
         """Synthetic key-up for the named (session-dispatched) modifiers (release mode)."""
         self._engine.release_modifiers(list(keys))
 
+    def close(self) -> None:
+        """WP13 DELTA-3 m3 (VAL-WP13-01): stop the UIA reader's single COM owner
+        thread — the sentinel request makes the owner release the CUIAutomation
+        pointer ON the owner thread and CoUninitialize before exiting. Idempotent
+        and never blocks; wired into the session-end funnel
+        (``server.lifecycle._close_stopped_bundle``)."""
+        reader = getattr(self, "_semantic_reader", None)
+        stop = getattr(reader, "stop_owner_thread", None)
+        if callable(stop):
+            stop()
+
     def focus_window_title(self, title: str) -> str:
         """Refocus primitive reused by the guard's ``refocus_then_abort`` policy."""
         action = GroundedAction(
             action="focus_window", target=title, reason="InterferenceGuard refocus", confidence=1.0
         )
         return self._execute_focus_window(action)
+
+    def _visible_title_hint(self, needle: str) -> str | None:
+        """WP13 (field e3): READ-ONLY visible-window title scan for ensure_app hints.
+
+        Enumerates VISIBLE top-level windows only (``IsWindowVisible`` filter,
+        read-only EnumWindows via ``windows.find_windows_by_title``) and, when
+        window TITLES contain ``needle`` case-insensitively, returns a typed
+        hint naming the window title and EVERY matching owning process basename
+        (deduplicated, capped at 3) — e.g. ``ensure_app_hint: a visible window
+        titled 'WhatsApp' belongs to process 'WhatsApp.Root.exe' — retry with
+        target='WhatsApp.Root.exe' or focus_window target='WhatsApp'``. Both taught
+        arguments are REAL (``target`` on ensure_app and focus_window) so the
+        taught retry passes the unknown-argument gate. Titles are
+        user-controlled and spoofable: this is a HINT for the driver, NEVER an
+        attach (the attach decision stays with the explicit target). Never
+        raises (n6): any enumeration failure returns None — the hint can never
+        turn a NO_INSTANCE reply into an error.
+        """
+        if not IS_WINDOWS or _user32 is None:
+            return None
+        needle_cf = (needle or "").strip().casefold()
+        if not needle_cf:
+            return None
+        try:
+            matches = find_windows_by_title(needle_cf, limit=3)
+        except Exception:  # noqa: BLE001 - n6: the hint must never break the reply
+            return None
+        if not matches:
+            return None
+        info = matches[0]
+        if not (info.title or "").strip():
+            return None
+        basenames: list[str] = []
+        for match in matches:
+            basename = (match.process_name or "").strip()
+            if basename and basename not in basenames:
+                basenames.append(basename)
+        if not basenames:
+            basenames = ["an unknown process"]
+        named = ", ".join(repr(name) for name in basenames[:3])
+        return (
+            f"ensure_app_hint: a visible window titled {info.title!r} belongs to "
+            f"process {named} — retry with target={basenames[0]!r} or focus_window "
+            f"target={info.title!r} (titles are spoofable: hint only, never an attach)"
+        )
 
     def ensure_app(self, target: str, allow_launch: bool = False) -> str:
         """Attach-or-launch probe (T8 mechanism ii) — bind to an EXISTING instance.
@@ -2511,8 +2707,11 @@ class LocalComputerBackend(ComputerBackend):
         - ``launch_unresolved=spawn-failed (<ExcType>: <msg[:120]>)`` — a resolved
           target whose ``Popen`` raised (the real OS error, bounded).
 
-        ``launch=driver`` payloads are byte-identical to v0.7.0: never a spawn, never
-        a suffix. Supported way to launch GUI executables not on PATH: configure
+        ``launch=driver`` payloads never spawn and never carry the launch
+        suffixes above; since WP13 (field e3) a NO_INSTANCE reply in EITHER
+        launch mode may carry the additive ``ensure_app_hint:`` message suffix
+        when a matching visible window exists. Supported way to launch GUI
+        executables not on PATH: configure
         ``CORTEX_LAUNCH_PATHS`` (``needle=path;...``, see README "Environment
         variables") — the mapping is consulted FIRST.
         """
@@ -2529,6 +2728,14 @@ class LocalComputerBackend(ComputerBackend):
         candidates = self.enumerate_app_windows(process_needle)
         if not candidates:
             payload = format_no_instance(target, "server" if allow_launch else "driver")
+            # WP13 (field e3): a READ-ONLY visible-window title scan — when a window
+            # TITLE contains the target, the hint names the owning process basename
+            # so the driver can retry with the real target (e.g. WhatsApp.Root) or
+            # focus the window by title. NEVER an attach: titles are user-controlled
+            # and spoofable, so this is a HINT, never automatic behaviour.
+            title_hint = self._visible_title_hint(process_needle)
+            if title_hint:
+                payload = f"{payload} {title_hint}"
             if allow_launch:
                 # REM-C (V-2 F3): a typed needle rejection folds into the NO_INSTANCE
                 # payload — nothing is spawned, ``launched=`` stays absent.

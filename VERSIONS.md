@@ -12,12 +12,13 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
-## v0.7.6 (2026-11-01, ORVEX-2026-108 — the unified-contract port)
+## v0.7.6 (2026-11-01, ORVEX-2026-108 — the unified-contract port; Addendum 4 field fixes WP13, 2026-11-06)
 
 0.7.6 re-implements the release's full feature set under a single unified reply
 contract: one definition of
 `ok` / `result` / `verification` that holds identically for every tool, every
 `follow_up_results` entry, every plan step and terminal reply, and the wait
+
 family — no compatibility flags, no per-tool variants. The served surface grows
 from six to ten tools; the code is restructured into a layered package
 (`core` / `security` / `desktop` / `vision` / `pipeline` / `planning` / `server`)
@@ -93,6 +94,36 @@ taught value from the code. Full offline suite at release: 3319 passed +
   env vars, bounds, links, versions) pinned by the new
   `tests/test_docs_truth.py` against the code.
 
+### Added
+
+- **Host timeout budget (WP13, Addendum 4)** — ONE knob,
+  `CORTEX_CLIENT_TIMEOUT_SECONDS` (default 60, band 10..600, fallback-not-clamp;
+  docs/CONFIGURATION.md) names the HOST's per-tool-call timeout. Every
+  long-blocking bound derives from it with a fixed 15 s margin: the type-action
+  deadline (60 → 45), the pacing budget (80% of it), and the wait-family segment
+  default (60 → 45). At a 30 s ZCode host every bound drops to 15 s. The
+  follow-up chain checks the budget per item and stops with
+  `follow_ups_stopped_reason: "time_budget"` instead of being killed by the
+  host. `start_session` sessions carry the effective `limits` and state the
+  effective budget in their `message` (`client_timeout_s=<n>`).
+- **Slow-call timing (WP13 B)** — replies to calls that ran ≥ 3 s carry
+  ` elapsed_ms=<n>` inside the message (contract-sanctioned key=value suffix),
+  so field reports show real host-side timings.
+- **ensure_app title hint (WP13 D)** — on NO_INSTANCE, a read-only visible-window
+  title scan may append ` ensure_app_hint: a visible window titled '...' belongs
+  to process '...' — retry with target=... or focus_window`. HINT ONLY: titles
+  are spoofable, never an automatic attach.
+- **Unknown-argument rejection (WP13 C)** — every tool rejects unknown
+  arguments with a contract REJECTION (`result: "rejected"`, reasons led by
+  `unknown_argument` naming the bad arguments, listing the valid ones, and
+  teaching that `hold_ms`/`duration_ms` belong inside `follow_ups` items or
+  plan `points`; a direct `hold_ms=...` was silently dropped before).
+- **`read_truncated` integrity branch (WP12e)** — a Win32 WM_GETTEXT read at the
+  8192-character truncation cap is blind and reported
+  `branch=read_truncated`; UIA values (not truncated) keep full verification.
+- **`tail_unproven` / `transformed_buffer` / `not_landed` integrity branches
+  (WP12b/c)** — baseline-gated verdicts; see the glossary branch list.
+
 ### Changed
 
 - **Default typing pace 0.02 s/char on the real SendInput path** (WP12a/WP12b,
@@ -164,8 +195,23 @@ taught value from the code. Full offline suite at release: 3319 passed +
 
 ### Fixed
 
+- **ZCode host timeouts + silent argument drops (WP13, Addendum 4 field
+  fixes)**: a 30 s ZCode host killed `computer_wait(30)` because the blocking
+  wait segment (45 s) assumed a 60 s client — all bounds now derive from
+  `CORTEX_CLIENT_TIMEOUT_SECONDS` (see Added). The separate slow
+  click+wait-follow-up call (field e2, ~53 s against a 30 s host timeout) is
+  NOT REPRODUCED offline — its intrinsic stages sum to ≈ 2.5 s — and WP13 does
+  NOT claim a root cause for it; what WP13 bounds is every blocking stage (the
+  one-call budget, per-item remaining shares, the UIA owner wall), so any
+  recurrence is attributable via the ` elapsed_ms=` reply suffix. A
+  direct `hold_ms=...` argument was silently dropped; unknown arguments are now
+  rejected on every tool with a contract rejection whose `reasons` lead with
+  `unknown_argument`, teaching where `hold_ms`/`duration_ms` belong.
+  `plan_action='start'` without a lease now TEACHES how to start a plan.
+  `serverInfo.version` reports Cortex's own version (was the mcp SDK's 1.30.0).
+  ensure_app NO_INSTANCE may carry an `ensure_app_hint:` naming the owning
+  process(es) of matching visible window titles.
 - **False heal + substitution-unsafe repair (WP12b, VAL-WP12 blocker)**: the
-  suffix-diff repair matched the buffer's TAIL against typed prefixes — a
   COINCIDENTAL tail match (typed `test`, buffer `tett`: both end with `t`)
   triggered a retype of `est` and reported `integrity=verified(4/4) healed=3`
   while the document held `tettest`. The repair is now BASELINE-GATED: the
@@ -260,6 +306,49 @@ taught value from the code. Full offline suite at release: 3319 passed +
 
 ### Compatibility notes
 
+- **Host timeout budget, timed replies, unknown-argument errors, ensure_app
+  hints, serverInfo.version (WP13, DELTA 1 + DELTA 3)**: set `CORTEX_CLIENT_TIMEOUT_SECONDS`
+  to your host's real per-tool-call timeout (ZCode = 30 s; Claude Code = 60 s) —
+  every Cortex blocking bound (wait segments, type deadlines, pacing,
+  follow-up chains) derives from it and stays inside it with a 15 s margin, and
+  `start_session`'s reply message states the effective value
+  (`client_timeout_s=<n>`). COMPATIBILITY CHANGE (m9, Commander-accepted): a
+  follow-up chain now stops with `follow_ups_stopped_reason: "time_budget"`
+  once 45 s are spent at the default; before, it had no wall-clock limit.
+  Each queued item runs on the REMAINING budget — a wait/hold item that would
+  overrun it, or a type item that could no longer run PACED at the proven-safe
+  interval, is never dispatched (resend the remaining items in a new call).
+  `CORTEX_WAIT_SEGMENT_SECONDS`: the accepted band is [1, client timeout − 5]
+  (1..55 at the default 60 s client — the pre-WP13 band; 1..25 at a 30 s host);
+  an out-of-band, unparsable or non-finite value FALLS BACK to the derived
+  default (fallback-not-clamp, as before WP13). Calls that run ≥ 3 s carry
+  ` elapsed_ms=<n>` in the message, serialized exactly like any other reply
+  (raw Unicode preserved). Unknown tool arguments are now REJECTED as a
+  contract rejection (`reasons` led by `unknown_argument`, no `error` key)
+  instead of being silently ignored — hosts passing extra keys (e.g. a direct
+  `hold_ms=`) must move them into `follow_ups` items or plan `points`.
+  `serverInfo.version` is now the Cortex version (0.7.6), not the mcp SDK
+  version. ensure_app NO_INSTANCE replies may carry an `ensure_app_hint:`
+  suffix naming the (deduplicated, ≤ 3) owning process basenames of matching
+  VISIBLE window titles and teaching a real `focus_window target='...'` retry
+  (hint only — never an attach; the suggested target is verified to match the
+  attach matcher). UIA semantic reads run on the reader's SINGLE long-lived
+  COM owner thread (one daemon worker per reader — COM is initialized and the
+  automation object lives there, never on per-call threads; stopped, the
+  pointer released and CoUninitialize run when the session ends); a read past
+  its derived wall (2 s at the defaults) — or while a hung WebView2/Chromium
+  provider still holds the owner busy — degrades VISIBLY as the
+  `read_timeout` branch (`branch=read_timeout`; never repaired, never
+  verified, no `TYPE_UNCONFIRMED` marker), a degraded BASELINE read demotes
+  the whole action the same way, and the reader recovers when the hung call
+  returns. The one-time warm runs under the full call budget capped at 10 s; a
+  warm timeout keeps the UIA reader, and the warm's FINAL outcome is recorded
+  ON the owner thread — a warm that times out and then fails swaps lazily to
+  the Win32 fallback on the next read (one that times out and then succeeds
+  keeps serving UIA reads). The whole type action
+  (dispatch + every verification read + horizon sleep) fits the derived
+  deadline: reads the remaining deadline can no longer cover report the
+  `verify_over_budget` branch.
 - **Typing pace and integrity outcomes (WP12a/WP12b/WP12c/WP12d)**: typing on the
   real SendInput path now costs ≈ 20 ms per character (the effective pace drops
   below 20 ms above 1800 characters, BMP or astral alike — 2000 characters pace

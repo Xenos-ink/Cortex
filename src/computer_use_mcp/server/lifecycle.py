@@ -10,10 +10,12 @@ import os
 import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
 
 from ..core.limits import LimitEnforcer, Limits
 from ..core.models import SessionState
 from ..core.state import SessionLimitExceeded
+from ..desktop.client_budget import client_timeout_seconds
 from ..desktop.interference import parse_interference
 from ..pipeline.agent import ComputerUseAgent
 from ..planning.checkpoint_manager import (
@@ -173,6 +175,18 @@ def _close_stopped_bundle(
         # tool call resuming after the pop cannot find a store — the resurrection race
         # dies here.  A second call finds no key and releases nothing (exactly-once).
         released_frames = dispose_store(bundle.extra)
+        # WP13 DELTA-3 m3 (VAL-WP13-01): stop the backend's UIA COM owner thread
+        # (releases the CUIAutomation pointer ON the owner thread +
+        # CoUninitialize) — no leaked thread or COM object per session. The
+        # sentinel is fire-and-forget (never blocks the teardown); a backend
+        # without the hook (test doubles) is skipped.
+        backend = getattr(bundle, "backend", None)
+        backend_close = getattr(backend, "close", None)
+        if callable(backend_close):
+            try:
+                backend_close()
+            except Exception:
+                logger.debug("backend close (UIA owner stop) failed", exc_info=True)
         snapshot: dict[str, Any] = {}
         try:
             snapshot = {
@@ -681,6 +695,9 @@ def start_session(
             "idle_timeout_seconds": idle_timeout,
         }
     session_id = context.session_id
+    backend: Any = None  # N10 (VAL-WP13-03): bound BEFORE the try — the except
+    # handler below runs even when SessionState(...) or _backend_factory()
+    # raises, and must never read an unbound name.
     try:
         state = SessionState(
             session_id=session_id,
@@ -722,7 +739,23 @@ def start_session(
             except Exception:
                 logger.debug("backend rejected raw payload keys; text session keeps PNGs")
     except Exception as exc:  # noqa: BLE001 - structured error, no traceback
-        _registry.remove(session_id)
+        # WP13 DELTA-4 N3 (VAL-WP13-02): the backend (and its UIA COM owner
+        # thread) may already be built when this start failed — stop it exactly
+        # like every other session-end path. N10 (VAL-WP13-03): ``backend`` is
+        # None when SessionState(...) or _backend_factory() itself raised, and
+        # ``_registry.remove`` runs WHATEVER close() does — an invalid
+        # start_session must always return the typed error AND free its
+        # registry slot (4 orphan slots would lock out every new session).
+        backend_close = getattr(backend, "close", None)
+        if callable(backend_close):
+            try:
+                backend_close()
+            except Exception:
+                logger.debug("backend close on failed start raised", exc_info=True)
+        try:
+            _registry.remove(session_id)
+        except Exception:
+            logger.debug("registry remove on failed start raised", exc_info=True)
         return _error_response(exc)
     with _lock:
         _bundles[session_id] = _SessionBundle(
@@ -785,6 +818,14 @@ def start_session(
                 # failed resume start is a session END — dispose the store exactly
                 # once before the bundle is dropped, like every other end path.
                 dispose_store(bundle.extra)
+                # WP13 DELTA-4 N3 (VAL-WP13-02): stop the backend's UIA COM owner
+                # thread too — never let close() raise into the refusal path.
+                resume_backend_close = getattr(backend, "close", None)
+                if callable(resume_backend_close):
+                    try:
+                        resume_backend_close()
+                    except Exception:
+                        logger.debug("backend close on failed resume raised", exc_info=True)
                 # WP7b (defensive): a fresh session cannot carry a plan lease (no
                 # plan call has run yet), but the release is idempotent and keeps
                 # the lease lifecycle total across every bundle-drop path.
@@ -833,6 +874,15 @@ def start_session(
             "task_id": context.task.task_id,
             # D1: the mode is visible in the transcript right after creation.
             "image_delivery": image_mode,
+            # WP13 DELTA 1 #7 (field A): the driver SEES the effective budget.
+            # ``message`` is a contract field on EVERY reply (REPLY-CONTRACT.md
+            # envelope); the key=value suffix form is the sanctioned channel —
+            # no new top-level field.
+            "message": (
+                f"Session started. client_timeout_s={client_timeout_seconds():g} "
+                "(the host's per-tool-call timeout: the wait segment, the type "
+                "deadline and the pacing budget derive from it)"
+            ),
         }
     )
     if image_mode == "text":

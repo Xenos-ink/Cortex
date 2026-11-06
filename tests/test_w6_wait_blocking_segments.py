@@ -347,21 +347,25 @@ async def test_block_false_peeks_without_blocking(
 def test_wait_segment_knob_band_and_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Default 45; band 1..55; ANYTHING else (unparsable, non-finite, out of band)
-    FALLS BACK to the default — never clamped to the nearest edge."""
+    """WP13 A + DELTA 1: the default is DERIVED (client timeout 60 − 15 margin = 45)
+    and an explicit override WINS inside the band [1, client timeout − 5]; any
+    out-of-band, unparsable or non-finite value FALLS BACK to the derived default
+    (fallback-not-clamp — nothing is clamped into the band)."""
     assert srv_server_wait_machine.WAIT_SEGMENT_DEFAULT_SECONDS == 45.0
+    assert srv_server_wait_machine.WAIT_SEGMENT_MAX_SECONDS == 55.0
     cases: list[tuple[str | None, float]] = [
         (None, 45.0),
         ("", 45.0),
         ("30", 30.0),
         ("1", 1.0),
-        ("55", 55.0),
-        ("0.5", 45.0),   # below the band -> default, NOT clamped to 1
-        ("56", 45.0),    # above the band -> default, NOT clamped to 55
-        ("abc", 45.0),
+        ("55", 55.0),   # at the ceiling: client timeout 60 - 5
+        ("56", 45.0),   # above the ceiling -> FALLS BACK to the default
+        ("0.5", 45.0),  # below the floor -> falls back
+        ("100", 45.0),  # above the ceiling -> falls back
+        ("abc", 45.0),  # unparsable -> derived default
         (str(float("nan")), 45.0),
         (str(float("inf")), 45.0),
-        ("-10", 45.0),
+        ("-10", 45.0),  # below the floor -> falls back
     ]
     for raw, expected in cases:
         if raw is None:
@@ -369,6 +373,25 @@ def test_wait_segment_knob_band_and_fallback(
         else:
             monkeypatch.setenv(srv_server_wait_machine.WAIT_SEGMENT_ENV, raw)
         assert srv_server_wait._wait_segment_seconds() == expected, raw
+
+
+def test_wait_segment_clamps_below_a_30s_host_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP13 A (field e1): with a 30 s ZCode host, the derived default drops to
+    15 s and the override band tops out at 25 s (client timeout − 5); an
+    out-of-band override falls back to the derived default."""
+    monkeypatch.setenv("CORTEX_CLIENT_TIMEOUT_SECONDS", "30")
+    monkeypatch.delenv(srv_server_wait_machine.WAIT_SEGMENT_ENV, raising=False)
+    assert srv_server_wait._wait_segment_seconds() == 15.0
+    monkeypatch.setenv(srv_server_wait_machine.WAIT_SEGMENT_ENV, "24")
+    assert srv_server_wait_machine._wait_segment_seconds() == 24.0
+    monkeypatch.setenv(srv_server_wait_machine.WAIT_SEGMENT_ENV, "25")
+    assert srv_server_wait_machine._wait_segment_seconds() == 25.0
+    monkeypatch.setenv(srv_server_wait_machine.WAIT_SEGMENT_ENV, "26")
+    assert srv_server_wait_machine._wait_segment_seconds() == 15.0
+    monkeypatch.setenv(srv_server_wait_machine.WAIT_SEGMENT_ENV, "55")
+    assert srv_server_wait._wait_segment_seconds() == 15.0  # out of the 30 s band
 
 
 # --- (i) idle integration: a running wait is never reaped; idle counts from its end -------------
