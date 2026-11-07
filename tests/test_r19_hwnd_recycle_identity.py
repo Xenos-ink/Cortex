@@ -10,10 +10,10 @@ a foreign process falls through to the pid-verified rules and rejects with
 
 from __future__ import annotations
 
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import FOCUS_TAKEN_BY, parse_interference
-from computer_use_mcp.models import FailureClass, GroundedAction, WindowInfo
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import FOCUS_TAKEN_BY, parse_interference
+from computer_use_mcp.core.models import FailureClass, GroundedAction, WindowInfo
 
 TARGET = WindowInfo(
     hwnd=1, pid=100, process_name="EXCEL.EXE", exe_path="C:\\apps\\EXCEL.EXE",

@@ -8,8 +8,8 @@ prefers the top-of-Z-order TITLED match) and a typed :class:`WindowFocusError` i
 raised when no matched instance can name a focus target (loud, structured failure —
 the agent's failure handling turns it into a normal error outcome, never a crash).
 
-Both backend implementations are pinned: :class:`~computer_use_mcp.backend.
-FakeComputerBackend` (the test parity surface) and :class:`~computer_use_mcp.backend.
+Both backend implementations are pinned: :class:`~computer_use_mcp.desktop.backend.
+FakeComputerBackend` (the test parity surface) and :class:`~computer_use_mcp.desktop.backend.
 LocalComputerBackend` (the real body, exercised via a probe-only instance the same way
 the B11 ownership tests do).
 """
@@ -20,13 +20,11 @@ from typing import Any
 
 import pytest
 
-from computer_use_mcp.backend import (
-    AppWindowCandidate,
-    FakeComputerBackend,
-    LocalComputerBackend,
-    WindowFocusError,
-)
-from computer_use_mcp.models import WindowInfo
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.errors import WindowFocusError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.launch import AppWindowCandidate
+from computer_use_mcp.core.models import WindowInfo
 
 TITLED = WindowInfo(hwnd=11, pid=100, process_name="excel.exe", window_class="XLMAIN", title="Book1 - Excel")
 UNTITLED = WindowInfo(hwnd=12, pid=100, process_name="excel.exe", window_class="XLMAIN", title="")

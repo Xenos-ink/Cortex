@@ -44,12 +44,15 @@ from test_controller_integration import (
 )
 from test_provider_safety import capturing_transport, judge_response
 
-from computer_use_mcp import server
-from computer_use_mcp.models import GroundedAction, RiskLevel, SessionState
-from computer_use_mcp.provider import OpenAICompatibleVisionProvider
-from computer_use_mcp.redaction import contains_secret, redact_text
-from computer_use_mcp.safety import SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.core.models import GroundedAction, RiskLevel, SessionState
+from computer_use_mcp.pipeline.provider import OpenAICompatibleVisionProvider
+from computer_use_mcp.security.redaction import contains_secret, redact_text
+from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry
 
 LEGACY_GATE_REASON = "Text resembles a secret, credential, or destructive command."
 
@@ -261,9 +264,11 @@ def test_ac21a_bearer_length_floors_keep_short_strings_clean() -> None:
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same isolation as test_p5)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 async def test_sinks_approval_response_and_audit_jsonl_carry_no_raw_secret(
@@ -276,7 +281,7 @@ async def test_sinks_approval_response_and_audit_jsonl_carry_no_raw_secret(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(session_id, "type", text=raw)
+    response = await srv_server_execute.computer_execute(session_id, "type", text=raw)
     payload = execute_payload(response)  # approval_required shapes stay plain dicts
     assert payload.get("ok") is False and payload.get("requires_approval") is True, payload
     message = str(payload.get("message", ""))

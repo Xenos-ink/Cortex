@@ -44,8 +44,8 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp.models import Observation
-from computer_use_mcp.verification import (
+from computer_use_mcp.core.models import Observation
+from computer_use_mcp.pipeline.verification import (
     DIFF_FAST_ENV,
     STRONG_CHANGE_MIN_PIXELS,
     STRONG_PIXEL_DELTA,

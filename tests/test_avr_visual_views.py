@@ -38,11 +38,17 @@ from typing import Any
 import pytest
 from PIL import Image, ImageDraw
 
-from computer_use_mcp import server
-from computer_use_mcp.models import CoordinateSpace, MonitorInfo, Observation, TextRegion
-from computer_use_mcp.observation import observation_digest
-from computer_use_mcp.state import SessionRegistry
-from computer_use_mcp.visual_views import (
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.state as srv_server_state
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.fetch as srv_server_fetch
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.core.models import CoordinateSpace, MonitorInfo, Observation, TextRegion
+from computer_use_mcp.vision.observation import observation_digest
+from computer_use_mcp.core.state import SessionRegistry
+from computer_use_mcp.vision.visual_views import (
     DEFAULT_GRID_DENSITY,
     GRID_DENSITIES,
     LABEL_COLOR,
@@ -64,27 +70,59 @@ from computer_use_mcp.visual_views import (
     resolve_view,
     spatial_text_of,
 )
-from computer_use_mcp.visual_views import SPATIAL_TEXT_CAP
+from computer_use_mcp.vision.visual_views import SPATIAL_TEXT_CAP
 import test_controller_integration as tci
 
 FAST_LIMITS = {"min_screenshot_interval_ms": 0}
 
-#: The stock observe metadata key sets (the pre-AL-002 shapes; H19 pins these exactly).
+#: §1.1 (ORVEX-2026-108) also adds ok + message to EVERY reply (incl. read-only
+#: metadata) — recorded alongside the D-3 exception below.
+#: The stock observe metadata key sets. §1.1 D-3 (ORVEX-2026-108) adds the single
+#: measured scale key ``image_outbound_scale`` to every image-bearing reply — a
+#: recorded, deliberate exception to the H19 "absent request = byte-identical shape"
+#: doctrine (the unified reply contract mandates the key). Text mode carries it as
+#: ``None`` (honest: no image served, no scale applied).
 STOCK_IMAGE_KEYS = [
+    "ok",
+    "message",
     "observation",
     "digest",
     "observation_id",
     "active_app",
     "image_format",
+    "image_outbound_scale",
     "text_summary",
 ]
+#: RESTATED (ORVEX-2026-108 WP5): every image-BEARING observe/zoom reply now also
+#: carries the evidence block — the capture the reply actually carries is retained
+#: and the reply names its id.  Additive keys only, appended in this order after the
+#: stock keys (the text-mode shapes carry NONE of these: a reply with no image stores
+#: nothing).  Nothing was removed or reordered — the AL-002 stock-key pin holds
+#: exactly for the stock prefix; these keys come from the evidence store, not from
+#: the visual-view layer.
+EVIDENCE_IMAGE_KEYS = [
+    "image_stored",
+    "image_attached",
+    "image_id",
+    "image_captured_at",
+    "image_age_seconds",
+    "image_bytes",
+    "image_width",
+    "image_height",
+    "evidence_retention",
+    "evidence_source",
+    "evidence_fetch",
+]
 STOCK_TEXT_KEYS = [
+    "ok",
+    "message",
     "observation",
     "digest",
     "observation_id",
     "active_app",
     "image_format",
     "image_delivery",
+    "image_outbound_scale",
     "image_delivery_note",
     "text_summary",
 ]
@@ -108,6 +146,10 @@ STOCK_OBSERVATION_KEYS = [
     "active_window_info",
     "ocr_text",
     "ui_elements",
+    # D15 (ORVEX-2026-108 WP4b) amendment: ``ocr_dropped`` is the ONE additive key —
+    # the producer's own known-but-dropped count, riding the existing additive
+    # ``omitted_count`` channel of the ``spatial_text`` block.
+    "ocr_dropped",
 ]
 
 
@@ -195,10 +237,13 @@ def _region_entries(block: dict[str, Any]) -> list[dict[str, Any]]:
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (full session isolation)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_stopped_sessions", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_lifecycle, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_state, "_stopped_sessions", srv_server_lifecycle._stopped_sessions)
+    return None
 
 
 def make_session(
@@ -211,14 +256,14 @@ def make_session(
     """Start one session through the tool with injected fake backend/provider."""
     backend = backend if backend is not None else tci.ScriptedBackend()
     provider = provider if provider is not None else tci.ScriptedProvider([])
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: provider)
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: provider)
+    response = srv_server_lifecycle.start_session(
         dry_run=False, require_approval=False, limits=FAST_LIMITS, **start_kwargs
     )
     assert response.get("session_id"), response
     session_id = str(response["session_id"])
-    return session_id, server._get_bundle(session_id), backend
+    return session_id, srv_server_lifecycle._get_bundle(session_id), backend
 
 
 def observe_metadata(blocks: Any) -> dict[str, Any]:
@@ -228,18 +273,21 @@ def observe_metadata(blocks: Any) -> dict[str, Any]:
 # --- item 1: raw representation compatibility (H19) ---------------------------------------------
 
 
-def test_item1_absent_request_observe_image_mode_byte_identical_shape(
+def test_item1_absent_request_observe_image_mode_stock_shape_with_additive_evidence_keys(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Absent visual_view: stock keys ONLY, stock image bytes, no spatial-text work."""
+    """Absent visual_view: stock keys ONLY + the WP5 additive evidence keys (the
+    carried capture is retained), stock image bytes, no spatial-text work."""
     session_id, bundle, backend = make_session(monkeypatch)
-    blocks = server.computer_observe(session_id)
+    blocks = srv_server_observe.computer_observe(session_id)
     assert len(blocks) == 2
     metadata = observe_metadata(blocks)
-    assert list(metadata.keys()) == STOCK_IMAGE_KEYS
+    assert list(metadata.keys()) == STOCK_IMAGE_KEYS + EVIDENCE_IMAGE_KEYS
+    assert metadata["image_stored"] is True
+    assert metadata["image_id"].startswith("img_")
     assert list(metadata["observation"].keys()) == STOCK_OBSERVATION_KEYS
     observation = backend.observed[-1]
-    expected_b64, expected_mime = server._bound_outbound_image(
+    expected_b64, expected_mime, _expected_scale = srv_server_fetch._bound_outbound_image(
         observation.image_base64, frame=getattr(observation, "_frame", None)
     )
     assert blocks[1].data == expected_b64  # stock outbound bytes, untouched
@@ -255,7 +303,7 @@ def test_item1_absent_request_observe_text_mode_byte_identical_shape(
 ) -> None:
     """Absent visual_view in text mode: the stock single-text-block shape exactly."""
     session_id, bundle, _backend = make_session(monkeypatch, image_delivery="text")
-    blocks = server.computer_observe(session_id)
+    blocks = srv_server_observe.computer_observe(session_id)
     assert len(blocks) == 1
     metadata = observe_metadata(blocks)
     assert list(metadata.keys()) == STOCK_TEXT_KEYS
@@ -269,13 +317,14 @@ async def test_item1_absent_request_execute_byte_identical_shape(
 ) -> None:
     """Absent visual_view on execute: stock result payload (no view keys), stock image."""
     session_id, bundle, _backend = make_session(monkeypatch)
-    response = await server.computer_execute(session_id, "click", x=10, y=10)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     payload = tci.execute_payload(response)
     assert payload["ok"] is True
     assert "visual_view" not in payload
     assert "visual_view_scale" not in payload
     assert "spatial_text" not in payload
-    assert payload["image_scale"] == 0.5  # the stock half-res default marker, untouched
+    # §1.1 D-3 (ORVEX-2026-108): the measured scale key (image_scale deleted).
+    assert payload["image_outbound_scale"] == 0.5
     counters = bundle.metrics.snapshot()["counters"]
     assert counters.get("spatial_text_compute", 0) == 0
 
@@ -286,20 +335,22 @@ def test_item1_explicit_raw_serves_stock_bytes_plus_additive_keys(
     """Explicit raw: SAME outbound bytes as the absent request + the additive keys
     (degraded UIA read: spatial_text null + the availability marker)."""
     session_id, _bundle, _backend = make_session(monkeypatch)
-    absent = server.computer_observe(session_id)
+    absent = srv_server_observe.computer_observe(session_id)
     absent_meta = observe_metadata(absent)
-    explicit = server.computer_observe(session_id, visual_view="raw")
+    explicit = srv_server_observe.computer_observe(session_id, visual_view="raw")
     raw_meta = observe_metadata(explicit)
     # same image bytes (a fresh fake capture is pixel-identical, so the payload matches)
     assert explicit[1].data == absent[1].data
     assert explicit[1].mimeType == absent[1].mimeType
     # additive keys ONLY: stock keys unchanged and in order, then the additions
+    # (WP5 DELTA 1: the evidence block sits AFTER the view keys — the hook runs at
+    # the final return, so a late view failure can never leave an orphan frame)
     assert list(raw_meta.keys()) == STOCK_IMAGE_KEYS + [
         "visual_view",
         "visual_view_scale",
         "spatial_text",
         "spatial_text_available",  # degraded UIA read (ScriptedBackend carries no regions)
-    ]
+    ] + EVIDENCE_IMAGE_KEYS
     assert raw_meta["visual_view"] == "raw"
     assert raw_meta["visual_view_scale"] is None  # raw adds no view transform
     assert raw_meta["spatial_text"] is None
@@ -441,7 +492,7 @@ async def test_item4_click_grounded_on_grid_view_executes_through_stock_transfor
 ) -> None:
     """F1: a click grounded on a GRID-view observation goes through the ONE stock
     transform (origin + screenshot*scale) — never a re-scale (H20 falsifier (c))."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend(
         640,
@@ -454,9 +505,9 @@ async def test_item4_click_grounded_on_grid_view_executes_through_stock_transfor
         ],
     )
     session_id, _bundle, _ = make_session(monkeypatch, backend=backend)
-    blocks = server.computer_observe(session_id, visual_view="grid")  # GRID view in flight
+    blocks = srv_server_observe.computer_observe(session_id, visual_view="grid")  # GRID view in flight
     assert observe_metadata(blocks)["visual_view"] == "grid"
-    response = await server.computer_execute(session_id, "click", x=100, y=50)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=100, y=50)
     payload = tci.execute_payload(response)
     assert backend.executed, "the grounded action executed (the click dispatched)"
     assert payload["action"]["grounding"]["strategy"] == "coordinate"
@@ -501,8 +552,8 @@ def test_item6_ocr_once_same_observation_two_view_requests(
 ) -> None:
     """Two explicit view requests on ONE observation: exactly 1 computation, tool-level."""
     session_id, bundle, backend = make_session(monkeypatch, backend=SameObservationBackend())
-    first = observe_metadata(server.computer_observe(session_id, visual_view="raw"))
-    second = observe_metadata(server.computer_observe(session_id, visual_view="grid"))
+    first = observe_metadata(srv_server_observe.computer_observe(session_id, visual_view="raw"))
+    second = observe_metadata(srv_server_observe.computer_observe(session_id, visual_view="grid"))
     observation = backend.observed[0]
     assert observation._spatial_text_compute_count == 1  # H21: 1 for N>=2 views
     assert bundle.metrics.snapshot()["counters"]["spatial_text_compute"] == 1
@@ -518,8 +569,8 @@ def test_item6_second_observation_gets_own_computation_no_cross_hit(
         fixed_regions=[TextRegion(text="old-screen", x=5, y=5, width=9, height=9)]
     )
     session_id, bundle, _ = make_session(monkeypatch, backend=backend)
-    first = observe_metadata(server.computer_observe(session_id, visual_view="grid"))
-    second = observe_metadata(server.computer_observe(session_id, visual_view="grid"))
+    first = observe_metadata(srv_server_observe.computer_observe(session_id, visual_view="grid"))
+    second = observe_metadata(srv_server_observe.computer_observe(session_id, visual_view="grid"))
     assert first["observation_id"] != second["observation_id"]
     assert first["spatial_text"]["regions"][0]["text"] == "old-screen"
     assert second["spatial_text"]["regions"][0]["text"] == "new-screen"  # no foreign text
@@ -535,7 +586,7 @@ def test_item7_raw_grid_raw_same_observation_one_computation(
     """raw -> grid -> raw on one observation: the computation count stays 1."""
     session_id, bundle, backend = make_session(monkeypatch, backend=SameObservationBackend())
     for view in ("raw", "grid", "raw"):
-        blocks = server.computer_observe(session_id, visual_view=view)
+        blocks = srv_server_observe.computer_observe(session_id, visual_view=view)
         assert observe_metadata(blocks)["visual_view"] == view
     assert backend.observed[0]._spatial_text_compute_count == 1
     assert bundle.metrics.snapshot()["counters"]["spatial_text_compute"] == 1
@@ -555,7 +606,7 @@ def test_item8_observation_identity_and_digest_unchanged_by_view_requests(
     """View requests never mutate the canonical observation (I-5) nor its digest."""
     backend = SameObservationBackend()
     session_id, _bundle, _ = make_session(monkeypatch, backend=backend)
-    _blocks = server.computer_observe(session_id)  # absent request
+    _blocks = srv_server_observe.computer_observe(session_id)  # absent request
     observation = backend.observed[0]
     baseline = {
         "observation_id": observation.observation_id,
@@ -566,7 +617,7 @@ def test_item8_observation_identity_and_digest_unchanged_by_view_requests(
         "ocr": observation.ocr_text,
     }
     for view in ("raw", "grid", "raw"):
-        server.computer_observe(session_id, visual_view=view)
+        srv_server_observe.computer_observe(session_id, visual_view=view)
     assert observation.observation_id == baseline["observation_id"]
     assert observation_digest(observation) == baseline["digest"]  # digest over image_base64
     assert observation.image_base64 == baseline["image"]
@@ -593,14 +644,17 @@ def test_item8_cache_invisible_to_serialization() -> None:
 
 async def _queue_scenario(backend: Any) -> tuple[Any, list[Any], int]:
     """One queued click after a screen change: (response payload, item kinds, executed)."""
-    server._registry = SessionRegistry(max_sessions=8)
-    server._bundles = {}
-    server._stopped_sessions = {}
-    server._backend_factory = lambda: backend
-    server._provider_factory = lambda: tci.ScriptedProvider([])
-    start = server.start_session(dry_run=False, require_approval=False, limits=FAST_LIMITS)
+    srv_server_lifecycle._registry = SessionRegistry(max_sessions=8)
+    srv_server_lifecycle._bundles = {}
+    srv_server_wait_machine._bundles = srv_server_lifecycle._bundles
+    srv_server_wait._bundles = srv_server_lifecycle._bundles
+    srv_server_lifecycle._stopped_sessions = {}
+    srv_server_state._stopped_sessions = srv_server_lifecycle._stopped_sessions
+    srv_server_lifecycle._backend_factory = lambda: backend
+    srv_server_lifecycle._provider_factory = lambda: tci.ScriptedProvider([])
+    start = srv_server_lifecycle.start_session(dry_run=False, require_approval=False, limits=FAST_LIMITS)
     session_id = str(start["session_id"])
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, follow_ups=[{"action": "click", "x": 20, "y": 20}]
     )
     payload = tci.execute_payload(response)
@@ -620,13 +674,16 @@ async def test_item9_stale_queue_rejection_identical_without_and_with_grid_view(
     backend_grid = ShiftingScreenBackend()
     # premise O123 in hand; an EXPLICIT grid view request rides the observation, the
     # screen then changes and O124 exists when the queued item re-grounds.
-    server._registry = SessionRegistry(max_sessions=8)
-    server._bundles = {}
-    server._stopped_sessions = {}
-    server._backend_factory = lambda: backend_grid
-    server._provider_factory = lambda: tci.ScriptedProvider([])
-    start = server.start_session(dry_run=False, require_approval=False, limits=FAST_LIMITS)
-    grid_blocks = server.computer_observe(str(start["session_id"]), visual_view="grid")
+    srv_server_lifecycle._registry = SessionRegistry(max_sessions=8)
+    srv_server_lifecycle._bundles = {}
+    srv_server_wait_machine._bundles = srv_server_lifecycle._bundles
+    srv_server_wait._bundles = srv_server_lifecycle._bundles
+    srv_server_lifecycle._stopped_sessions = {}
+    srv_server_state._stopped_sessions = srv_server_lifecycle._stopped_sessions
+    srv_server_lifecycle._backend_factory = lambda: backend_grid
+    srv_server_lifecycle._provider_factory = lambda: tci.ScriptedProvider([])
+    start = srv_server_lifecycle.start_session(dry_run=False, require_approval=False, limits=FAST_LIMITS)
+    grid_blocks = srv_server_observe.computer_observe(str(start["session_id"]), visual_view="grid")
     grid_meta = observe_metadata(grid_blocks)
     assert grid_meta["visual_view"] == "grid"
     premise_id = grid_meta["observation_id"]
@@ -649,10 +706,10 @@ def test_item10_view_request_validation_casefold_and_typed_errors(
 ) -> None:
     """'GRID' resolves (casefold); unknown/empty are typed errors naming the views."""
     session_id, _bundle, _ = make_session(monkeypatch)
-    blocks = server.computer_observe(session_id, visual_view="GRID")
+    blocks = srv_server_observe.computer_observe(session_id, visual_view="GRID")
     assert observe_metadata(blocks)["visual_view"] == "grid"  # casefold resolves
     for bad in ("3d", ""):
-        result = server.computer_observe(session_id, visual_view=bad)
+        result = srv_server_observe.computer_observe(session_id, visual_view=bad)
         assert result["ok"] is False
         assert result["error"] == "invalid_visual_view"
         assert "'grid'" in result["message"] and "'raw'" in result["message"]  # teaches views
@@ -669,9 +726,13 @@ async def test_item10_invalid_view_on_execute_never_dispatches(
 ) -> None:
     """An invalid view name on execute fails BEFORE anything runs — no input dispatched."""
     session_id, _bundle, backend = make_session(monkeypatch)
-    result = await server.computer_execute(session_id, "click", x=10, y=10, visual_view="3d")
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, visual_view="3d")
     assert result["ok"] is False
-    assert result["error"] == "invalid_visual_view"
+    # §1.4 delta (ORVEX-2026-108): on the EXECUTE surface the malformed-parameter
+    # refusal is a rejection (typed code as first reason); observe/zoom keep the
+    # typed invalid_visual_view error (read-only refusals, §1.3).
+    assert result["result"] == "rejected"
+    assert result["reasons"][0].startswith("invalid_visual_view")
     assert backend.executed == []  # nothing dispatched, fail-closed
 
 
@@ -684,14 +745,14 @@ def test_item11_derive_failure_typed_error_and_canonical_path_still_usable(
     """Corrupt payload + no frame stash -> typed view_derive_failed, no raw substitute;
     the canonical observe path keeps working afterwards."""
     session_id, _bundle, _ = make_session(monkeypatch, backend=CorruptPayloadBackend())
-    result = server.computer_observe(session_id, visual_view="grid")
+    result = srv_server_observe.computer_observe(session_id, visual_view="grid")
     assert result["ok"] is False
     assert result["error"] == "view_derive_failed"
     assert "undecodable" in result["message"]
     # NOT a silent raw substitution: no content blocks were served under the error
     assert not isinstance(result, list)
     # the canonical path remains usable (the layer can never break stock observe)
-    blocks = server.computer_observe(session_id)
+    blocks = srv_server_observe.computer_observe(session_id)
     assert len(blocks) == 2
     assert blocks[1].mimeType == "image/png"  # the stock degradation served the payload
 
@@ -701,7 +762,7 @@ async def test_item11_execute_path_derive_failure_keeps_executed_result(
 ) -> None:
     """Execute-path backstop: a derive failure NEVER hides the executed result and
     NEVER substitutes raw — the typed marker rides, no image block ships."""
-    from computer_use_mcp.visual_views import ViewDeriveError
+    from computer_use_mcp.vision.visual_views import ViewDeriveError
 
     session_id, _bundle, backend = make_session(monkeypatch)
 
@@ -709,7 +770,7 @@ async def test_item11_execute_path_derive_failure_keeps_executed_result(
         raise ViewDeriveError("synthetic derive failure")
 
     monkeypatch.setattr(GridOverlayProvider, "derive", _explode)
-    response = await server.computer_execute(session_id, "click", x=10, y=10, visual_view="grid")
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, visual_view="grid")
     payload = tci.execute_payload(response)
     assert payload["ok"] is True  # the action RAN; its outcome is not hidden
     assert backend.executed, "the action physically dispatched"
@@ -729,14 +790,14 @@ async def test_item12_safety_and_queue_shapes_unchanged_with_view_layer(
     backend = tci.ScriptedBackend()
     backend.set_input_blocked(True)
     session_id, _bundle, _ = make_session(monkeypatch, backend=backend)
-    server.computer_observe(session_id, visual_view="grid")  # the layer is in flight
-    denied = await server.computer_execute(session_id, "click", x=5, y=5, visual_view="grid")
+    srv_server_observe.computer_observe(session_id, visual_view="grid")  # the layer is in flight
+    denied = await srv_server_execute.computer_execute(session_id, "click", x=5, y=5, visual_view="grid")
     assert denied["ok"] is False
     assert denied["message"]  # the stock safety denial shape (plain dict, no image)
     assert "screenshot_after_base64" not in denied
 
     backend.set_input_blocked(False)
-    queued = await server.computer_execute(
+    queued = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -760,15 +821,15 @@ async def test_item13_grounding_noninterference_text_anchor_fail_closed_holds(
     """The spatial_text block NEVER makes grounding strategies fire: with a grid view
     (and its attached text) in flight, a point action still grounds via the coordinate
     strategy, and text-anchor's fail-closed contract is untouched."""
-    from computer_use_mcp.grounding import TextAnchorGroundingStrategy, UnsupportedGroundingError
+    from computer_use_mcp.pipeline.grounding import TextAnchorGroundingStrategy, UnsupportedGroundingError
 
     # ocr_text ABSENT: the observe response ships spatial_text: null + the marker
     session_id, _bundle, _ = make_session(monkeypatch)
-    blocks = server.computer_observe(session_id, visual_view="raw")
+    blocks = srv_server_observe.computer_observe(session_id, visual_view="raw")
     metadata = observe_metadata(blocks)
     assert metadata["spatial_text"] is None
     assert metadata["spatial_text_available"] is False
-    response = await server.computer_execute(session_id, "click", x=30, y=40, visual_view="grid")
+    response = await srv_server_execute.computer_execute(session_id, "click", x=30, y=40, visual_view="grid")
     payload = tci.execute_payload(response)
     assert payload["ok"] is True
     assert payload["action"]["grounding"]["strategy"] == "coordinate"  # none fired by text
@@ -787,16 +848,16 @@ async def test_item13_grounding_noninterference_text_anchor_fail_closed_holds(
             fixed_regions=[TextRegion(text="label", x=0, y=0, width=10, height=10)]
         ),
     )
-    blocks2 = server.computer_observe(session_id2, visual_view="grid")
+    blocks2 = srv_server_observe.computer_observe(session_id2, visual_view="grid")
     block = observe_metadata(blocks2)["spatial_text"]
     assert block is not None and block["region_count"] == 1  # the block is attached
-    response2 = await server.computer_execute(session_id2, "click", x=30, y=40)
+    response2 = await srv_server_execute.computer_execute(session_id2, "click", x=30, y=40)
     payload2 = tci.execute_payload(response2)
     assert payload2["action"]["grounding"]["strategy"] == "coordinate"  # metadata never routes
 
 
 def _grounded_click() -> Any:
-    from computer_use_mcp.models import ActionType, GroundedAction
+    from computer_use_mcp.core.models import ActionType, GroundedAction
 
     return GroundedAction(action=ActionType.CLICK, confidence=1.0)
 
@@ -810,12 +871,13 @@ async def test_item14_stock_action_markers_intact_with_views_absent(
     """Stock action behavior with the layer absent: half-res marker, opt-out, shapes."""
     session_id, _bundle, _ = make_session(monkeypatch)
     default = tci.execute_payload(
-        await server.computer_execute(session_id, "click", x=10, y=10)
+        await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     )
-    assert default["ok"] is True and default["image_scale"] == 0.5  # stock default image
+    # §1.1 D-3 (ORVEX-2026-108): the single MEASURED scale key (image_scale deleted).
+    assert default["ok"] is True and default["image_outbound_scale"] == 0.5
     assert "visual_view" not in default
     opt_out = tci.execute_payload(
-        await server.computer_execute(session_id, "click", x=10, y=10,
+        await srv_server_execute.computer_execute(session_id, "click", x=10, y=10,
                                       include_screenshot_after=False)
     )
     assert "screenshot_after_base64" not in opt_out  # stock opt-out untouched
@@ -828,14 +890,14 @@ async def test_item14_execute_path_visual_view_grid(
     """Execute path: an explicit grid request derives the view ONCE and honors it on
     the default (half-res) returned image, with the honest scale reported."""
     session_id, bundle, _ = make_session(monkeypatch)
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=20, y=20, visual_view="grid"
     )
     payload = tci.execute_payload(response)
     assert payload["ok"] is True
     assert payload["visual_view"] == "grid"
     assert payload["visual_view_scale"] == 0.5  # the stock half-res policy, reported
-    assert payload["image_scale"] == 0.5  # the stock marker coexists
+    assert payload["image_outbound_scale"] == 0.5  # the measured key rides beside it
     assert payload["image_format"] == "image/jpeg"
     assert len(response) == 2  # TextContent + the GRID ImageContent
     served = Image.open(io.BytesIO(base64.b64decode(response[1].data)))
@@ -846,8 +908,8 @@ async def test_item14_execute_path_visual_view_grid(
     session_id2, _bundle2, _ = make_session(
         monkeypatch, backend=tci.ScriptedBackend(flip=False)
     )
-    stock_response = await server.computer_execute(session_id2, "click", x=20, y=20)
-    grid_response = await server.computer_execute(
+    stock_response = await srv_server_execute.computer_execute(session_id2, "click", x=20, y=20)
+    grid_response = await srv_server_execute.computer_execute(
         session_id2, "click", x=20, y=20, visual_view="grid"
     )
     assert grid_response[1].data != stock_response[1].data  # not a silent raw substitute
@@ -858,9 +920,9 @@ async def test_item14_execute_path_visual_view_raw_same_bytes(
 ) -> None:
     """Execute path: explicit raw ships the SAME image bytes as the absent request."""
     session_id, _bundle, _ = make_session(monkeypatch, backend=tci.ScriptedBackend(flip=False))
-    absent = await server.computer_execute(session_id, "click", x=10, y=10)
-    explicit = await server.computer_execute(session_id, "click", x=10, y=10, visual_view="raw")
-    again = await server.computer_execute(session_id, "click", x=10, y=10)
+    absent = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
+    explicit = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, visual_view="raw")
+    again = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     assert tci.execute_payload(explicit)["visual_view"] == "raw"
     assert tci.execute_payload(explicit)["visual_view_scale"] is None
     # identical stock image BLOCK bytes on every execute (a non-flipping fake captures
@@ -882,11 +944,11 @@ def test_item15_absent_request_latency_sanity_loose_guard(
     default path performs ZERO spatial-text work. No cost claim is made — the measured
     value is recorded, and the REAL bars freeze at EXP-020 (W3) for EXP-021 (W4)."""
     session_id, bundle, _ = make_session(monkeypatch)
-    server.computer_observe(session_id)  # priming rep (declared, untimed)
+    srv_server_observe.computer_observe(session_id)  # priming rep (declared, untimed)
     samples = []
     for _ in range(30):
         clock = time.perf_counter()
-        server.computer_observe(session_id)
+        srv_server_observe.computer_observe(session_id)
         samples.append((time.perf_counter() - clock) * 1000.0)
     mean_ms = statistics.mean(samples)
     assert mean_ms < 20.0, f"absent-request observe mean {mean_ms:.2f} ms exceeded the loose band"
@@ -915,9 +977,9 @@ def test_text_mode_view_request_keys_ride_single_text_block(
     assert backend._fixed is not None
     backend._fixed.ocr_text = [TextRegion(text="meta", x=2, y=3, width=4, height=5)]
     session_id, bundle, _ = make_session(monkeypatch, backend=backend, image_delivery="text")
-    absent = server.computer_observe(session_id)
+    absent = srv_server_observe.computer_observe(session_id)
     assert list(observe_metadata(absent).keys()) == STOCK_TEXT_KEYS
-    blocks = server.computer_observe(session_id, visual_view="grid")
+    blocks = srv_server_observe.computer_observe(session_id, visual_view="grid")
     assert len(blocks) == 1  # never an image block in text mode
     metadata = observe_metadata(blocks)
     assert list(metadata.keys()) == STOCK_TEXT_KEYS + [
@@ -942,12 +1004,12 @@ def test_spatial_text_degradation_marker_and_truthful_empty(
     degraded result is computed ONCE — later field mutation cannot recompute it."""
     backend = SameObservationBackend()
     session_id, bundle, _ = make_session(monkeypatch, backend=backend)
-    degraded = observe_metadata(server.computer_observe(session_id, visual_view="raw"))
+    degraded = observe_metadata(srv_server_observe.computer_observe(session_id, visual_view="raw"))
     assert degraded["spatial_text"] is None
     assert degraded["spatial_text_available"] is False  # the AL-002 truth marker
     assert backend._fixed is not None
     backend._fixed.ocr_text = []  # a later mutation can NEVER re-open the memo (I-2)
-    still_degraded = observe_metadata(server.computer_observe(session_id, visual_view="grid"))
+    still_degraded = observe_metadata(srv_server_observe.computer_observe(session_id, visual_view="grid"))
     assert still_degraded["spatial_text"] is None
     assert bundle.metrics.snapshot()["counters"].get("spatial_text_compute", 0) == 1
 
@@ -957,7 +1019,7 @@ def test_spatial_text_degradation_marker_and_truthful_empty(
     assert backend2._fixed is not None
     backend2._fixed.ocr_text = []
     session_id2, _bundle2, _ = make_session(monkeypatch, backend=backend2)
-    empty = observe_metadata(server.computer_observe(session_id2, visual_view="raw"))
+    empty = observe_metadata(srv_server_observe.computer_observe(session_id2, visual_view="raw"))
     block = empty["spatial_text"]
     assert block is not None
     assert block["region_count"] == 0
@@ -972,9 +1034,9 @@ def test_spatial_text_cap_reports_omitted_count() -> None:
         TextRegion(text=f"region-{i:02d}", x=i, y=i, width=10, height=10) for i in range(30)
     ]
     observation = Observation(image_base64=_png_b64(), width=1280, height=720, ocr_text=regions)
-    block = spatial_text_of(observation, cap=server.OBSERVE_METADATA_ELEMENT_CAP)
+    block = spatial_text_of(observation, cap=srv_server_observe.OBSERVE_METADATA_ELEMENT_CAP)
     assert block is not None
-    assert SPATIAL_TEXT_CAP == server.OBSERVE_METADATA_ELEMENT_CAP  # structural lockstep
+    assert SPATIAL_TEXT_CAP == srv_server_observe.OBSERVE_METADATA_ELEMENT_CAP  # structural lockstep
     assert block["region_count"] == 20
     assert block["omitted_count"] == 10
     assert len(block["regions"]) == 20
@@ -982,7 +1044,7 @@ def test_spatial_text_cap_reports_omitted_count() -> None:
 
 def test_registry_matches_models_constant() -> None:
     """The registry keys and models.VISUAL_VIEWS agree (R2 extensibility contract)."""
-    from computer_use_mcp.models import VISUAL_VIEWS
+    from computer_use_mcp.core.models import VISUAL_VIEWS
 
     assert sorted(VISUAL_VIEWS) == ["grid", "raw"]
     assert isinstance(resolve_view("raw"), RawPassThroughProvider)
@@ -1001,19 +1063,25 @@ def test_visual_view_is_trailing_optional_none_default_on_both_tools() -> None:
     stay untouched by the observe-side additions."""
     import inspect
 
-    observe_params = list(inspect.signature(server.computer_observe).parameters.values())
+    observe_params = list(inspect.signature(srv_server_observe.computer_observe).parameters.values())
     assert [p.name for p in observe_params] == [
         "session_id", "visual_view", "visual_view_density", "pixel_evidence",
     ]
     assert all(p.default is None for p in observe_params[1:])
-    zoom_params = list(inspect.signature(server.computer_zoom).parameters.values())
+    zoom_params = list(inspect.signature(srv_server_observe.computer_zoom).parameters.values())
     assert [p.name for p in zoom_params] == [
         "session_id", "region", "visual_view", "visual_view_density", "pixel_evidence",
     ]
     assert zoom_params[-1].default is None
-    execute_params = list(inspect.signature(server.computer_execute).parameters.values())
-    assert execute_params[-1].name == "visual_view"  # A2: execute does NOT take the flag
+    execute_params = list(inspect.signature(srv_server_execute.computer_execute).parameters.values())
+    # CHANGED PIN (WP7b, §-reason: contract item (a) — `plan`/`plan_action` join as
+    # trailing optionals AFTER visual_view, so visual_view is no longer the LAST
+    # parameter; the pinned property "trailing optional, None == legacy" is
+    # unchanged, and visual_view keeps its position and None default)
+    assert execute_params[-1].name == "plan_action"
     assert execute_params[-1].default is None
+    assert execute_params[-3].name == "visual_view"
+    assert execute_params[-3].default is None
     assert [p.name for p in execute_params][:12] == [
         "session_id", "action", "x", "y", "text", "keys", "delta", "approved",
         "expected_effect", "x2", "y2", "target",
@@ -1172,7 +1240,7 @@ def test_a1_pixel_evidence_one_decode_per_block_build(monkeypatch: pytest.Monkey
     """A1.1 decode discipline (A2 opt-in form): with evidence ON and absent ``_frame``
     -> the payload is decoded EXACTLY once per block build and reused for every region;
     the OCR-once cache never rebuilds."""
-    from computer_use_mcp import visual_views as vv
+    from computer_use_mcp.vision import visual_views as vv
 
     regions = [TextRegion(text=f"r{i}", x=2 + i, y=2, width=8, height=6) for i in range(4)]
     observation = Observation(image_base64=_png_b64(), width=1280, height=720, ocr_text=regions)
@@ -1215,11 +1283,11 @@ def test_a1_density_defaults_to_coarse_and_enum_resolves(
     """Absent density == explicit "coarse" (the W2.1-adjudicated default); names are
     trimmed/casefolded; both serve byte-identical grid pixels."""
     session_id, _, _ = make_session(monkeypatch, backend=SyntheticFrameBackend(320, 240))
-    default_blocks = server.computer_observe(session_id, visual_view="grid")
-    coarse_blocks = server.computer_observe(
+    default_blocks = srv_server_observe.computer_observe(session_id, visual_view="grid")
+    coarse_blocks = srv_server_observe.computer_observe(
         session_id, visual_view="grid", visual_view_density="coarse"
     )
-    casefold_blocks = server.computer_observe(
+    casefold_blocks = srv_server_observe.computer_observe(
         session_id, visual_view="grid", visual_view_density="  COARSE "
     )
     assert observe_metadata(default_blocks)["visual_view"] == "grid"
@@ -1236,21 +1304,21 @@ def test_a1_density_unknown_is_typed_error_raw_ignores_silently(
     (A1.2); an ABSENT view request never even resolves it (H19 byte-identity)."""
     session_id, bundle, _ = make_session(monkeypatch)
     before = bundle.metrics.snapshot()["counters"]["screenshot_count"]
-    result = server.computer_observe(session_id, visual_view="grid", visual_view_density="ultra")
+    result = srv_server_observe.computer_observe(session_id, visual_view="grid", visual_view_density="ultra")
     assert result["ok"] is False
     assert result["error"] == "invalid_visual_view"
     assert "'coarse'" in result["message"] and "'fine'" in result["message"]
     assert "visual_view_density" in result["message"]
     assert bundle.metrics.snapshot()["counters"]["screenshot_count"] == before  # no capture
-    raw_blocks = server.computer_observe(
+    raw_blocks = srv_server_observe.computer_observe(
         session_id, visual_view="raw", visual_view_density="ultra"
     )
     raw_meta = observe_metadata(raw_blocks)
     assert raw_meta["visual_view"] == "raw"  # served anyway, density ignored silently
     absent_meta = observe_metadata(
-        server.computer_observe(session_id, visual_view=None, visual_view_density="ultra")
+        srv_server_observe.computer_observe(session_id, visual_view=None, visual_view_density="ultra")
     )
-    assert list(absent_meta.keys()) == STOCK_IMAGE_KEYS  # byte-identical default shape
+    assert list(absent_meta.keys()) == STOCK_IMAGE_KEYS + EVIDENCE_IMAGE_KEYS  # stock + WP5 evidence
     with pytest.raises(InvalidVisualViewError):
         resolve_density("ultra")
 
@@ -1262,12 +1330,15 @@ def test_a1_zoom_metadata_shape(fresh_server: Any, monkeypatch: pytest.MonkeyPat
     """The zoom result mirrors computer_observe's explicit-request shape + ``crop_region``."""
     backend = RegionFrameBackend(regions=[TextRegion(text="in", x=80, y=60, width=20, height=10)])
     session_id, _, _ = make_session(monkeypatch, backend=backend)
-    blocks = server.computer_zoom(session_id, [8, 8, 32, 16])
+    blocks = srv_server_observe.computer_zoom(session_id, [8, 8, 32, 16])
     assert isinstance(blocks, list) and len(blocks) == 2
     meta = observe_metadata(blocks)
     assert list(meta.keys()) == [
-        "observation", "digest", "observation_id", "active_app", "image_format",
+        "ok", "message", "observation", "digest", "observation_id", "active_app", "image_format",
+        "image_outbound_scale",
         "text_summary", "crop_region", "visual_view", "visual_view_scale", "spatial_text",
+        # WP5: the carried crop is retained, so the evidence block rides too.
+        *EVIDENCE_IMAGE_KEYS,
     ]
     assert meta["visual_view"] == "raw"  # the zoom default view
     assert meta["visual_view_scale"] == 1.0  # under the outbound budget: no ladder scale
@@ -1284,7 +1355,7 @@ def test_a1_zoom_geometry_crop_equals_requested_region(
     backend = SyntheticFrameBackend(320, 240)
     session_id, bundle, _ = make_session(monkeypatch, backend=backend)
     before = bundle.metrics.snapshot()["counters"]["screenshot_count"]
-    blocks = server.computer_zoom(session_id, [64, 48, 128, 96])
+    blocks = srv_server_observe.computer_zoom(session_id, [64, 48, 128, 96])
     meta = observe_metadata(blocks)
     served = Image.open(io.BytesIO(base64.b64decode(blocks[1].data))).convert("RGB")
     served.load()
@@ -1294,7 +1365,7 @@ def test_a1_zoom_geometry_crop_equals_requested_region(
     assert bundle.metrics.snapshot()["counters"]["screenshot_count"] == before + 1
     # the screen changes -> the next zoom serves the FRESH capture's region, new id
     backend.frame = _unique_color_frame(320, 240, offset=97)
-    blocks2 = server.computer_zoom(session_id, [64, 48, 128, 96])
+    blocks2 = srv_server_observe.computer_zoom(session_id, [64, 48, 128, 96])
     meta2 = observe_metadata(blocks2)
     served2 = Image.open(io.BytesIO(base64.b64decode(blocks2[1].data))).convert("RGB")
     served2.load()
@@ -1311,7 +1382,7 @@ def test_a1_zoom_grid_labels_show_canonical_values(
     rendered per the spec recipe on the exact requested crop."""
     backend = SyntheticFrameBackend(320, 240)
     session_id, _, _ = make_session(monkeypatch, backend=backend)
-    blocks = server.computer_zoom(
+    blocks = srv_server_observe.computer_zoom(
         session_id, [64, 48, 128, 96], visual_view="grid", visual_view_density="fine"
     )
     meta = observe_metadata(blocks)
@@ -1359,7 +1430,7 @@ def test_a1_zoom_spatial_text_filtered_canonical_and_full_frame_evidence(
     ]
     backend = RegionFrameBackend(regions=regions)
     session_id, _, _ = make_session(monkeypatch, backend=backend)
-    blocks = server.computer_zoom(session_id, [64, 48, 128, 96], pixel_evidence=True)
+    blocks = srv_server_observe.computer_zoom(session_id, [64, 48, 128, 96], pixel_evidence=True)
     meta = observe_metadata(blocks)
     block = meta["spatial_text"]
     assert block is not None
@@ -1399,7 +1470,7 @@ def test_a1_zoom_fail_closed_region_matrix(
         [10, 10, -1, 10],
     ]
     for bad in pre_capture_bad:
-        result = server.computer_zoom(session_id, bad)
+        result = srv_server_observe.computer_zoom(session_id, bad)
         assert result["ok"] is False and result["error"] == "invalid_region"
         assert isinstance(result["message"], str) and result["message"]
         assert not isinstance(result, list)  # no content blocks under the error
@@ -1411,7 +1482,7 @@ def test_a1_zoom_fail_closed_region_matrix(
         [0, 0, 321, 10],
         [0, 0, 10, 241],
     ):
-        result = server.computer_zoom(session_id, bad)
+        result = srv_server_observe.computer_zoom(session_id, bad)
         assert result["ok"] is False and result["error"] == "invalid_region"
         assert "never clips" in result["message"]  # the bounds are named, no fallback
     assert bundle.metrics.snapshot()["counters"]["screenshot_count"] > baseline
@@ -1423,7 +1494,7 @@ def test_a1_zoom_refuses_unverifiable_coordinate_space(
     """An UNVERIFIABLE coordinate space refuses the zoom with the typed error — the
     same doctrine as coordinate actions (A1.3 item 2)."""
     session_id, _, _ = make_session(monkeypatch, backend=UnverifiableSpaceBackend())
-    result = server.computer_zoom(session_id, [0, 0, 32, 24])
+    result = srv_server_observe.computer_zoom(session_id, [0, 0, 32, 24])
     assert result["ok"] is False
     assert result["error"] == "invalid_region"
     assert "unverifiable" in result["message"]
@@ -1438,7 +1509,7 @@ def test_a1_zoom_text_mode_single_text_block(
     session_id, _, _ = make_session(
         monkeypatch, backend=SyntheticFrameBackend(320, 240), image_delivery="text"
     )
-    blocks = server.computer_zoom(session_id, [10, 10, 40, 30])
+    blocks = srv_server_observe.computer_zoom(session_id, [10, 10, 40, 30])
     assert isinstance(blocks, list) and len(blocks) == 1
     meta = observe_metadata(blocks)
     assert meta["image_format"] == "none"
@@ -1467,8 +1538,8 @@ def test_a1_zoom_fresh_observation_audit_and_metrics(
 
     bundle.auditor.emit = _recording_emit
     before = bundle.metrics.snapshot()["counters"]["screenshot_count"]
-    first = observe_metadata(server.computer_zoom(session_id, [0, 0, 32, 24]))
-    second = observe_metadata(server.computer_zoom(session_id, [0, 0, 32, 24]))
+    first = observe_metadata(srv_server_observe.computer_zoom(session_id, [0, 0, 32, 24]))
+    second = observe_metadata(srv_server_observe.computer_zoom(session_id, [0, 0, 32, 24]))
     assert first["observation_id"] != second["observation_id"]  # fresh capture per call
     assert bundle.metrics.snapshot()["counters"]["screenshot_count"] == before + 2
     assert bundle.extra["last_observation_digest"] == second["digest"]
@@ -1494,13 +1565,16 @@ async def test_a1_zoom_staleness_binding_queue_premise_stock_path(
     payload_off, kinds_off, executed_off = await _queue_scenario(backend_off)
 
     backend_zoom = ShiftingSyntheticFrameBackend(width=320, height=240)
-    server._registry = SessionRegistry(max_sessions=8)
-    server._bundles = {}
-    server._stopped_sessions = {}
-    server._backend_factory = lambda: backend_zoom
-    server._provider_factory = lambda: tci.ScriptedProvider([])
-    start = server.start_session(dry_run=False, require_approval=False, limits=FAST_LIMITS)
-    zoom_blocks = server.computer_zoom(str(start["session_id"]), [0, 0, 32, 24])
+    srv_server_lifecycle._registry = SessionRegistry(max_sessions=8)
+    srv_server_lifecycle._bundles = {}
+    srv_server_wait_machine._bundles = srv_server_lifecycle._bundles
+    srv_server_wait._bundles = srv_server_lifecycle._bundles
+    srv_server_lifecycle._stopped_sessions = {}
+    srv_server_state._stopped_sessions = srv_server_lifecycle._stopped_sessions
+    srv_server_lifecycle._backend_factory = lambda: backend_zoom
+    srv_server_lifecycle._provider_factory = lambda: tci.ScriptedProvider([])
+    start = srv_server_lifecycle.start_session(dry_run=False, require_approval=False, limits=FAST_LIMITS)
+    zoom_blocks = srv_server_observe.computer_zoom(str(start["session_id"]), [0, 0, 32, 24])
     premise_id = observe_metadata(zoom_blocks)["observation_id"]
     payload_zoom, kinds_zoom, executed_zoom = await _queue_scenario(backend_zoom)
 
@@ -1520,7 +1594,7 @@ def test_a1_zoom_density_grid_served_and_raw_ignores(
     raw ignores a bogus density silently (A1.2) and still serves the crop + block."""
     backend = SyntheticFrameBackend(320, 240)
     session_id, _, _ = make_session(monkeypatch, backend=backend)
-    grid_blocks = server.computer_zoom(
+    grid_blocks = srv_server_observe.computer_zoom(
         session_id, [16, 16, 96, 64], visual_view="grid", visual_view_density="fine"
     )
     grid_meta = observe_metadata(grid_blocks)
@@ -1531,7 +1605,7 @@ def test_a1_zoom_density_grid_served_and_raw_ignores(
         backend.frame.crop((16, 16, 112, 80)), origin_x=16, origin_y=16, density="fine"
     )
     assert served.tobytes() == reference.tobytes()
-    raw_blocks = server.computer_zoom(
+    raw_blocks = srv_server_observe.computer_zoom(
         session_id, [16, 16, 96, 64], visual_view="raw", visual_view_density="ultra"
     )
     raw_meta = observe_metadata(raw_blocks)
@@ -1554,7 +1628,7 @@ def test_a1_zoom_crop_from_payload_when_stash_absent(
 
     monkeypatch.setattr(SyntheticFrameBackend, "observe", _no_stash)
     session_id, _, _ = make_session(monkeypatch, backend=backend)
-    blocks = server.computer_zoom(session_id, [64, 48, 128, 96])
+    blocks = srv_server_observe.computer_zoom(session_id, [64, 48, 128, 96])
     meta = observe_metadata(blocks)
     assert meta["image_format"] == "image/png"
     served = Image.open(io.BytesIO(base64.b64decode(blocks[1].data))).convert("RGB")
@@ -1579,7 +1653,7 @@ def test_a1_zoom_undecodable_payload_typed_error(
 
     monkeypatch.setattr(SyntheticFrameBackend, "observe", _corrupt)
     session_id, _, _ = make_session(monkeypatch, backend=backend)
-    result = server.computer_zoom(session_id, [64, 48, 128, 96])
+    result = srv_server_observe.computer_zoom(session_id, [64, 48, 128, 96])
     assert result["ok"] is False
     assert result["error"] == "view_derive_failed"
     assert "undecodable" in result["message"]
@@ -1626,19 +1700,19 @@ def test_w51_r10_attach_failure_is_typed_not_nameerror_both_modes(
     regions = [TextRegion(text="T", x=4, y=4, width=10, height=10)]
     # image mode: the guarded attach (pre-fix: NameError escaped `except VisualViewError`)
     session_id, _, _ = make_session(monkeypatch, backend=LazyFrameRegionsBackend(regions))
-    result = server.computer_observe(session_id, visual_view="raw", pixel_evidence=True)
+    result = srv_server_observe.computer_observe(session_id, visual_view="raw", pixel_evidence=True)
     assert result["ok"] is False
     assert result["error"] == "view_derive_failed"
     assert "NameError" not in str(result["message"])
     assert "spatial-text attach failed" in str(result["message"])
     assert not isinstance(result, list)  # the typed error, not half-served blocks
-    blocks = server.computer_observe(session_id)  # canonical path still usable
+    blocks = srv_server_observe.computer_observe(session_id)  # canonical path still usable
     assert len(blocks) == 2
     # text mode: the previously UNGUARDED branch (pre-fix: NameError escaped uncaught)
     session_id2, _, _ = make_session(
         monkeypatch, backend=LazyFrameRegionsBackend(regions), image_delivery="text"
     )
-    result2 = server.computer_observe(session_id2, visual_view="raw", pixel_evidence=True)
+    result2 = srv_server_observe.computer_observe(session_id2, visual_view="raw", pixel_evidence=True)
     assert result2["ok"] is False
     assert result2["error"] == "view_derive_failed"
     assert "NameError" not in str(result2["message"])
@@ -1670,7 +1744,7 @@ def test_w51_r12_zoom_geometry_divergence_fails_closed_never_fabricates(
     session_id, _, _ = make_session(monkeypatch, backend=DivergentFrameBackend())
     for region in ([1100, 640, 160, 64], [0, 0, 32, 24]):  # the repro + an in-frame region
         for view in ("raw", "grid"):  # the crop (and its guard) precedes any rendering
-            result = server.computer_zoom(session_id, region, visual_view=view)
+            result = srv_server_observe.computer_zoom(session_id, region, visual_view=view)
             assert result["ok"] is False
             assert result["error"] == "view_derive_failed"
             assert "64x48" in str(result["message"]) and "1280x720" in str(result["message"])
@@ -1685,11 +1759,11 @@ def test_w51_r12_zoom_geometry_divergence_fails_closed_never_fabricates(
 
     monkeypatch.setattr(DivergentFrameBackend, "observe", _no_stash)
     session_id2, _, _ = make_session(monkeypatch, backend=DivergentFrameBackend())
-    result2 = server.computer_zoom(session_id2, [0, 0, 32, 24])
+    result2 = srv_server_observe.computer_zoom(session_id2, [0, 0, 32, 24])
     assert result2["ok"] is False and result2["error"] == "view_derive_failed"
     assert "64x48" in str(result2["message"]) and "1280x720" in str(result2["message"])
     # the guard is zoom-crop-only: the canonical observe path remains usable
-    blocks = server.computer_observe(session_id)
+    blocks = srv_server_observe.computer_observe(session_id)
     assert len(blocks) == 2
 
 
@@ -1705,7 +1779,7 @@ def test_w24_default_evidence_off_field_absent_mode_off_no_sigma_work(
     entirely (absent, never null-fabricated), the block records
     ``"pixel_evidence_mode": "off"``, and NO sigma computation runs — the A1.1 formula
     is never invoked (the canary would explode if it were), on observe AND zoom."""
-    from computer_use_mcp import visual_views as vv
+    from computer_use_mcp.vision import visual_views as vv
 
     def _must_not_compute(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("pixel_evidence computation ran while the flag is OFF")
@@ -1713,7 +1787,7 @@ def test_w24_default_evidence_off_field_absent_mode_off_no_sigma_work(
     monkeypatch.setattr(vv, "pixel_evidence_for", _must_not_compute)
     backend = RegionFrameBackend(regions=[TextRegion(text="Save", x=12, y=34, width=50, height=16)])
     session_id, _, _ = make_session(monkeypatch, backend=backend)
-    meta = observe_metadata(server.computer_observe(session_id, visual_view="raw"))
+    meta = observe_metadata(srv_server_observe.computer_observe(session_id, visual_view="raw"))
     block = meta["spatial_text"]
     assert block is not None
     assert block["pixel_evidence_mode"] == "off"
@@ -1721,7 +1795,7 @@ def test_w24_default_evidence_off_field_absent_mode_off_no_sigma_work(
     assert "pixel_evidence" not in block["regions"][0]  # absent, not null
     assert block["regions"][0]["text"] == "Save"  # the UIA text itself is untouched
     # zoom default: the same opt-in shape (the flag rides the single zoom build)
-    zmeta = observe_metadata(server.computer_zoom(session_id, [0, 0, 100, 80]))
+    zmeta = observe_metadata(srv_server_observe.computer_zoom(session_id, [0, 0, 100, 80]))
     zblock = zmeta["spatial_text"]
     assert zblock is not None
     assert zblock["pixel_evidence_mode"] == "off"
@@ -1739,7 +1813,7 @@ def test_w24_evidence_on_field_present_bounded_mode_on(
     )
     session_id, _, _ = make_session(monkeypatch, backend=backend)
     meta = observe_metadata(
-        server.computer_observe(session_id, visual_view="raw", pixel_evidence=True)
+        srv_server_observe.computer_observe(session_id, visual_view="raw", pixel_evidence=True)
     )
     block = meta["spatial_text"]
     assert block is not None
@@ -1762,11 +1836,11 @@ def test_w24_non_bool_pixel_evidence_typed_error_before_capture(
     session_id, bundle, _ = make_session(monkeypatch, backend=backend)
     baseline = bundle.metrics.snapshot()["counters"]["screenshot_count"]
     for bad in ("yes", 1, 0, 3.14, "true"):
-        result = server.computer_observe(session_id, visual_view="raw", pixel_evidence=bad)
+        result = srv_server_observe.computer_observe(session_id, visual_view="raw", pixel_evidence=bad)
         assert result["ok"] is False
         assert result["error"] == "invalid_pixel_evidence"
         assert "must be a boolean" in result["message"]
-        zoomed = server.computer_zoom(session_id, [0, 0, 32, 24], pixel_evidence=bad)
+        zoomed = srv_server_observe.computer_zoom(session_id, [0, 0, 32, 24], pixel_evidence=bad)
         assert zoomed["ok"] is False
         assert zoomed["error"] == "invalid_pixel_evidence"
         assert not isinstance(result, list) and not isinstance(zoomed, list)
@@ -1787,10 +1861,10 @@ def test_w24_h21_prime_counter_unchanged_by_flag_and_zoom_honors_flag(
     assert backend._fixed is not None
     backend._fixed.ocr_text = list(regions)
     session_id, bundle, _ = make_session(monkeypatch, backend=backend)
-    off_meta = observe_metadata(server.computer_observe(session_id, visual_view="raw"))
+    off_meta = observe_metadata(srv_server_observe.computer_observe(session_id, visual_view="raw"))
     assert off_meta["spatial_text"]["pixel_evidence_mode"] == "off"
     on_request = observe_metadata(
-        server.computer_observe(session_id, visual_view="raw", pixel_evidence=True)
+        srv_server_observe.computer_observe(session_id, visual_view="raw", pixel_evidence=True)
     )
     assert on_request["spatial_text"]["pixel_evidence_mode"] == "off"  # the cached build
     assert backend._fixed._spatial_text_compute_count == 1  # H21': never a second build
@@ -1802,7 +1876,7 @@ def test_w24_h21_prime_counter_unchanged_by_flag_and_zoom_honors_flag(
     backend2._fixed.ocr_text = list(regions)
     session_id2, bundle2, _ = make_session(monkeypatch, backend=backend2)
     on_meta = observe_metadata(
-        server.computer_observe(session_id2, visual_view="raw", pixel_evidence=True)
+        srv_server_observe.computer_observe(session_id2, visual_view="raw", pixel_evidence=True)
     )
     assert on_meta["spatial_text"]["pixel_evidence_mode"] == "on"
     assert "pixel_evidence" in on_meta["spatial_text"]["regions"][0]
@@ -1811,11 +1885,11 @@ def test_w24_h21_prime_counter_unchanged_by_flag_and_zoom_honors_flag(
     # zoom honors the flag both ways on a fresh matching-geometry session
     backend3 = RegionFrameBackend(regions=list(regions))
     session_id3, _, _ = make_session(monkeypatch, backend=backend3)
-    z_off = observe_metadata(server.computer_zoom(session_id3, [0, 0, 100, 80]))
+    z_off = observe_metadata(srv_server_observe.computer_zoom(session_id3, [0, 0, 100, 80]))
     assert z_off["spatial_text"]["pixel_evidence_mode"] == "off"
     assert "pixel_evidence" not in z_off["spatial_text"]["regions"][0]
     z_on = observe_metadata(
-        server.computer_zoom(session_id3, [0, 0, 100, 80], pixel_evidence=True)
+        srv_server_observe.computer_zoom(session_id3, [0, 0, 100, 80], pixel_evidence=True)
     )
     assert z_on["spatial_text"]["pixel_evidence_mode"] == "on"
     assert "pixel_evidence" in z_on["spatial_text"]["regions"][0]

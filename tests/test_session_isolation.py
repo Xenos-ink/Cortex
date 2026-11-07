@@ -25,9 +25,14 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
-from computer_use_mcp.models import AgentDecision
-from computer_use_mcp.state import SessionRegistry
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.state as srv_server_state
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.core.models import AgentDecision
+from computer_use_mcp.core.state import SessionRegistry
 
 
 @pytest.fixture
@@ -39,10 +44,13 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     the reset that dict leaks across tests and makes results order-dependent).
     """
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_stopped_sessions", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_lifecycle, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_state, "_stopped_sessions", srv_server_lifecycle._stopped_sessions)
+    return None
 
 # --- zero cross-talk -------------------------------------------------------------------------
 
@@ -65,9 +73,9 @@ async def test_concurrent_sessions_have_zero_state_cross_talk(
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
     await asyncio.gather(
-        server.computer_execute(sid_one, "click", x=10, y=10),
-        server.computer_execute(sid_two, "click", x=40, y=40),
-        server.computer_execute(sid_two, "click", x=50, y=50),
+        srv_server_execute.computer_execute(sid_one, "click", x=10, y=10),
+        srv_server_execute.computer_execute(sid_two, "click", x=40, y=40),
+        srv_server_execute.computer_execute(sid_two, "click", x=50, y=50),
     )
 
     # Executed actions: each backend saw exactly its own session's calls.
@@ -117,9 +125,9 @@ async def test_step_counts_and_histories_stay_per_session(
     sid_two, bundle_two, _, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    await server.computer_execute(sid_one, "click", x=10, y=10)
-    await server.computer_execute(sid_one, "click", x=20, y=20)
-    await server.computer_execute(sid_two, "click", x=60, y=60)
+    await srv_server_execute.computer_execute(sid_one, "click", x=10, y=10)
+    await srv_server_execute.computer_execute(sid_one, "click", x=20, y=20)
+    await srv_server_execute.computer_execute(sid_two, "click", x=60, y=60)
 
     assert bundle_one.state.step_count == 2
     assert bundle_two.state.step_count == 1
@@ -150,13 +158,13 @@ async def test_stop_session_a_does_not_stop_session_b(
         monkeypatch, backend=backend_two,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    stop_response = server.stop_session(sid_one)
+    stop_response = await srv_server_lifecycle.stop_session(sid_one)
     assert stop_response["ok"] is True
     assert bundle_two.context.stop.stopped is False
     assert bundle_two.state.stopped is False
 
     # Session B completes untouched after A's stop: no stop audit leaked into B.
-    response = await server.computer_execute(sid_two, "click", x=40, y=40)
+    response = await srv_server_execute.computer_execute(sid_two, "click", x=40, y=40)
     payload = json.loads(response[0].text)
     assert payload["ok"] is True
     assert executed_summary(backend_two_ref) == [("click", (40, 40), None)]
@@ -180,36 +188,38 @@ async def test_stop_session_a_does_not_stop_session_b(
 
 
 def test_registry_cap_enforced_fail_closed(fresh_server: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=2))
-    first = server.start_session(dry_run=True)
-    second = server.start_session(dry_run=True)
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=2))
+    first = srv_server_lifecycle.start_session(dry_run=True)
+    second = srv_server_lifecycle.start_session(dry_run=True)
     assert "session_id" in first and "session_id" in second
 
-    third = server.start_session(dry_run=True)
+    third = srv_server_lifecycle.start_session(dry_run=True)
     assert third["ok"] is False
     assert third["error"] == "session_limit_exceeded"
     assert third["max_sessions"] == 2
-    assert len(server._registry) == 2  # live sessions were never evicted
+    assert len(srv_server_lifecycle._registry) == 2  # live sessions were never evicted
 
 
 async def test_removed_session_frees_slot_and_unknown_sessions_fail_closed(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=1))
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=1))
     sid, _bundle, _, _ = make_session(monkeypatch, dry_run=True)
-    assert server._registry.remove(sid) is not None  # slot released
-    fourth = server.start_session(dry_run=True)
+    assert srv_server_lifecycle._registry.remove(sid) is not None  # slot released
+    fourth = srv_server_lifecycle.start_session(dry_run=True)
     assert "session_id" in fourth  # the freed slot is reusable
 
     # Every tool fails closed for an unknown session id — no state resurrection.
-    observe = server.computer_observe("does-not-exist")
+    observe = srv_server_observe.computer_observe("does-not-exist")
     assert observe["ok"] is False
     assert observe["error"] == "unknown_session"
     assert observe["session_id"] == "does-not-exist"
-    stopped_tool = server.stop_session("does-not-exist")
+    stopped_tool = await srv_server_lifecycle.stop_session("does-not-exist")
     assert stopped_tool["ok"] is False and stopped_tool["error"] == "unknown_session"
-    executed = await server.computer_execute("does-not-exist", "wait", delta=1)
-    assert executed["ok"] is False and executed["error"] == "unknown_session"
+    executed = await srv_server_execute.computer_execute("does-not-exist", "wait", delta=1)
+    # §1.4 delta (ORVEX-2026-108): execute-surface unknown-session refusal = rejection.
+    assert executed["ok"] is False and executed["result"] == "rejected"
+    assert executed["reasons"] == ["unknown_session"]
     assert "Traceback" not in json.dumps(
         [observe, stopped_tool, executed]
     )
@@ -224,21 +234,23 @@ async def test_tools_on_a_stopped_session_fail_safe(
     sid, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    server.stop_session(sid)
+    await srv_server_lifecycle.stop_session(sid)
 
     # D1 (fixed): stopping closes and removes the bundle — memory freed, registry consistent.
-    assert sid not in server._bundles
-    assert server._registry.get(sid) is None
+    assert sid not in srv_server_lifecycle._bundles
+    assert srv_server_lifecycle._registry.get(sid) is None
 
     # AMENDED (loop removal): the removed loop tool's stopped-session shape check
     # died with the loop; every surviving tool fails closed with session_stopped.
-    observe = server.computer_observe(sid)
+    observe = srv_server_observe.computer_observe(sid)
     assert observe["ok"] is False
     assert observe["error"] == "session_stopped"
 
-    executed = await server.computer_execute(sid, "click", x=5, y=5)
+    executed = await srv_server_execute.computer_execute(sid, "click", x=5, y=5)
     assert executed["ok"] is False
-    assert executed["error"] == "session_stopped"
+    # §1.4 delta (ORVEX-2026-108): execute-surface stopped refusal = rejection.
+    assert executed["result"] == "rejected"
+    assert executed["reasons"] == ["session_stopped"]
     assert executed_summary(backend) == []  # a stopped session never produces inputs
 
 
@@ -263,16 +275,16 @@ async def test_repeated_session_calls_in_a_loop_never_lose_the_session(
         limits={"min_screenshot_interval_ms": 0},
     )
     for _ in range(40):
-        observe = server.computer_observe(session_id)
+        observe = srv_server_observe.computer_observe(session_id)
         assert not (isinstance(observe, dict) and observe.get("error") == "unknown_session")
-        shot = server.computer_screenshot(session_id)
+        shot = srv_server_observe.computer_screenshot(session_id)
         assert not (isinstance(shot, dict) and shot.get("error") == "unknown_session")
-        execute = await server.computer_execute(session_id, "wait", delta=0)
+        execute = await srv_server_execute.computer_execute(session_id, "wait", delta=0)
         assert not (isinstance(execute, dict) and execute.get("error") == "unknown_session")
-        assert session_id in server._bundles
-        assert server._registry.get(session_id) is bundle.context
+        assert session_id in srv_server_lifecycle._bundles
+        assert srv_server_lifecycle._registry.get(session_id) is bundle.context
     # 120 distinct tool calls total: the session is exactly as alive as at the start.
-    assert server._bundles.get(session_id) is bundle
+    assert srv_server_lifecycle._bundles.get(session_id) is bundle
 
 
 async def test_stop_session_then_every_tool_says_session_stopped_not_unknown(
@@ -282,13 +294,15 @@ async def test_stop_session_then_every_tool_says_session_stopped_not_unknown(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, provider=provider, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
-    stopped = server.stop_session(session_id)
+    stopped = await srv_server_lifecycle.stop_session(session_id)
     assert stopped["ok"] is True
     for _ in range(10):
-        observe = server.computer_observe(session_id)
+        observe = srv_server_observe.computer_observe(session_id)
         assert observe["error"] == "session_stopped"  # NEVER unknown_session
-        execute = await server.computer_execute(session_id, "wait", delta=0)
-        assert execute["error"] == "session_stopped"
+        execute = await srv_server_execute.computer_execute(session_id, "wait", delta=0)
+        # §1.4 delta (ORVEX-2026-108): execute-surface stopped refusal = rejection.
+        assert execute["result"] == "rejected"
+        assert execute["reasons"] == ["session_stopped"]
 
 
 async def test_teardown_snapshot_failure_still_remembers_session_as_stopped(
@@ -305,13 +319,13 @@ async def test_teardown_snapshot_failure_still_remembers_session_as_stopped(
         raise RuntimeError("metrics sink exploded during teardown")
 
     monkeypatch.setattr(bundle.metrics, "snapshot", _exploding_snapshot)
-    stopped = server.stop_session(session_id)
+    stopped = await srv_server_lifecycle.stop_session(session_id)
     assert stopped["ok"] is True  # teardown survived the injected failure
     # The session is REMEMBERED as stopped: structured session_stopped, never unknown.
-    response = server.computer_observe(session_id)
+    response = srv_server_observe.computer_observe(session_id)
     assert response["error"] == "session_stopped"
-    assert session_id not in server._bundles
-    assert session_id in server._stopped_sessions
+    assert session_id not in srv_server_lifecycle._bundles
+    assert session_id in srv_server_lifecycle._stopped_sessions
 
 
 def test_registry_and_bundle_store_stay_consistent_across_start_stop_cycles(
@@ -322,8 +336,8 @@ def test_registry_and_bundle_store_stay_consistent_across_start_stop_cycles(
         session_id, _bundle, _backend, _ = make_session(
             monkeypatch, provider=provider, dry_run=True, require_approval=False, limits=FAST_LIMITS
         )
-        assert server._registry.get(session_id) is not None
-        assert server.stop_session(session_id)["ok"] is True
-        assert server._registry.get(session_id) is None
-        assert session_id not in server._bundles
-        assert session_id in server._stopped_sessions
+        assert srv_server_lifecycle._registry.get(session_id) is not None
+        assert (asyncio.run(srv_server_lifecycle.stop_session(session_id)))["ok"] is True
+        assert srv_server_lifecycle._registry.get(session_id) is None
+        assert session_id not in srv_server_lifecycle._bundles
+        assert session_id in srv_server_lifecycle._stopped_sessions

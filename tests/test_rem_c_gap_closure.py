@@ -39,8 +39,8 @@ from unittest.mock import patch
 import pytest
 from PIL import Image
 
-from computer_use_mcp.models import Observation, WindowInfo
-from computer_use_mcp.verification import (
+from computer_use_mcp.core.models import Observation, WindowInfo
+from computer_use_mcp.pipeline.verification import (
     FOCUS_CHANGE_INTENT_FLAG,
     STRONG_CHANGE_MIN_PIXELS,
     FocusChangeStrategy,
@@ -199,11 +199,15 @@ def test_f1_real_focus_change_still_verifies_with_identical_pixels() -> None:
     assert engine.verify(_focused_intent("Hex input focused"), before, after).outcome == "verified"
 
 
-def test_f1_digest_change_with_strong_pixel_magnitude_verifies() -> None:
-    """F1 positive pin: the digest change IS corroborated by real changed-pixel
-    magnitude (>= STRONG_CHANGE_MIN_PIXELS strongly-changed pixels) — a real
-    focus-invisible transition (e.g. the dialog opened after the capture while the
-    focus/window fields are unchanged) may verify through the digest signal again."""
+def test_f1_corroborated_digest_change_abstains_and_never_claims_the_effect() -> None:
+    """F1 positive pin, RE-PINNED by WP4a (the digest-arm verdict change, upstream
+    F1 fix 1.1): the digest change IS corroborated by real changed-pixel magnitude
+    (>= STRONG_CHANGE_MIN_PIXELS strongly-changed pixels) — a real redraw — but a
+    pixel magnitude is evidence about PIXELS, not about the described effect. The
+    digest arm therefore abstains (``uncertain``, ``changed=True``) and never asserts
+    the expectation; the redraw fact stays on the evidence channel. The deterministic
+    identity signals (a)/(b) remain the only verify path in this tier (the positive
+    siblings above)."""
     before = _observation(_white(), ui_elements=_elements(["canvas"], focused=True))
     after_image = _white()
     changed = STRONG_CHANGE_MIN_PIXELS * 3
@@ -214,9 +218,18 @@ def test_f1_digest_change_with_strong_pixel_magnitude_verifies() -> None:
     result = FocusChangeStrategy().verify(
         _focused_intent("Edit colors dialog opens"), before, after
     )
-    assert result.outcome == "verified", (
-        f"a strongly-corroborated digest change must still verify: {result.outcome} ({result.note})"
+    assert result.outcome == "uncertain", (
+        f"a corroborated digest change must abstain, not verify: {result.outcome} ({result.note})"
     )
+    assert result.changed is True  # the redraw is reported, not claimed as the effect
+    assert "Edit colors dialog opens" not in result.note, result.note
+    evidence = " | ".join(result.evidence)
+    assert "corroborated pixel magnitude" in evidence, result.evidence
+    # the engine chain agrees: focus tier abstains, pixel tier cannot claim a stated
+    # effect either (F1 fix 1.1), so the chain lands on the honest combined uncertain
+    engine = VerificationEngine(judge=None)
+    chain = engine.verify(_focused_intent("Edit colors dialog opens"), before, after)
+    assert chain.outcome == "uncertain", chain
 
 
 def test_f1_subthreshold_digest_change_degrades_to_uncertain_not_failed() -> None:
@@ -300,9 +313,26 @@ def test_f2_focus_appearing_where_absent_still_verifies() -> None:
     assert result.verification_method == "focus_change"
 
 
-def test_f2_focus_disappearing_still_verifies() -> None:
-    """F2 preservation pin (mirror): a focus marker present BEFORE and absent AFTER
-    is also a real focused-element transition (focus left the control)."""
+def test_f2_focus_disappearing_does_not_verify_the_lost_elements_effect() -> None:
+    """F2 preservation pin (mirror), RE-PINNED by ORVEX-2026-105 (owner-approved
+    C-3b) — the original reasoning is kept verbatim, then superseded:
+
+    > F2 preservation pin (mirror): a focus marker present BEFORE and absent AFTER
+    > is also a real focused-element transition (focus left the control).
+
+    That original assertion was itself the named-identity defect in miniature. It
+    scored ``verified`` for the effect ``"Hex input focused"`` while its own after
+    observation is ``Pane "canvas"`` — the hex field is NOT focused, so the
+    observation CONTRADICTS the effect. What the signal really reported was "the
+    focused element changed", and a changed focus is not the stated effect: every
+    click that merely moves focus anywhere satisfies it.
+
+    Under the ORVEX-2026-105 named-identity binding the transition is still detected
+    and still reported (``changed=True``, the signal line stays in the evidence), but
+    the AFTER identity must NAME something the effect named: ``E = {hex}`` against a
+    novel ``{canvas}`` is empty, so the tier abstains. Owner-approved re-pin
+    (MISSION C-3b) — the scenario is preserved, the verdict is honest.
+    """
     before = _observation(
         _white(),
         ui_elements=[
@@ -316,8 +346,67 @@ def test_f2_focus_disappearing_still_verifies() -> None:
     )
     after = _observation(_white(), ui_elements=_elements(["canvas"]))  # focus gone
     result = FocusChangeStrategy().verify(_focused_intent(), before, after)
-    assert result.outcome == "verified"
+    assert result.outcome == "uncertain"
+    assert result.verified is False
     assert result.verification_method == "focus_change"
+    # The change is still OBSERVED and reported — the abstention is not a denial.
+    assert result.changed is True
+    assert any("focused element" in line for line in result.evidence)
+    # ...but the note never asserts the expectation, exactly as arm (c) never does.
+    assert "Hex input focused" not in result.note, result.note
+    assert any("corroboration searched effect tokens ['hex']" in line for line in result.evidence)
+
+
+def test_f2_focus_disappearing_still_reports_the_transition_it_saw() -> None:
+    """The sibling of the re-pin above: the honest verdict must not become a silent
+    one. A focus marker disappearing is still a real, deterministic transition — it is
+    carried in the evidence (including the same-process precondition and the tokens
+    that were searched), so a host or the owner can see exactly what was observed and
+    why it was not treated as the effect."""
+    before = _observation(
+        _white(),
+        ui_elements=[
+            {
+                "control_type": "Edit",
+                "name": "Hex color input",
+                "automation_id": "hexInput",
+                "focused": True,
+            }
+        ],
+    )
+    after = _observation(_white(), ui_elements=_elements(["canvas"]))
+    evidence = "\n".join(
+        FocusChangeStrategy().verify(_focused_intent(), before, after).evidence
+    )
+    assert "focused element identity disappeared" in evidence
+    assert "Hex color input" in evidence  # the control that lost focus is named
+    assert "same-process precondition" in evidence
+    assert "'hex'" in evidence  # the effect token that was searched for
+
+
+def test_named_identity_focus_disappearing_verifies_when_the_after_identity_does_name_the_effect() -> None:
+    """The same arm-(a) transition, WITH the corroboration the re-pin above lacks: the
+    focus leaves the hex field and lands on a control the effect actually NAMED. The
+    named-identity binding gates on correspondence, it is not a blanket demotion of
+    arm (a) — this is the positive half, and it is why the re-pin above is a verdict
+    change rather than a capability loss."""
+    before = _observation(
+        _white(),
+        ui_elements=[
+            {"control_type": "Edit", "name": "Hex color input", "automation_id": "hexInput", "focused": True}
+        ],
+    )
+    after = _observation(
+        _white(),
+        ui_elements=[
+            {"control_type": "Edit", "name": "Palette", "automation_id": "palette", "focused": True}
+        ],
+    )
+    result = FocusChangeStrategy().verify(
+        _focused_intent("The palette control gains focus"), before, after
+    )
+    assert result.outcome == "verified", result
+    assert any("corroborated by effect token 'palette'" in line for line in result.evidence)
 
 
 def test_f2_no_uia_data_at_all_still_abstains() -> None:
@@ -337,7 +426,8 @@ def test_f3_quote_breakout_needle_is_typed_rejected_and_nothing_spawns() -> None
     ``subprocess.Popen([needle], shell=True)`` and executed the smuggled second
     command is now a typed rejection — validation fires BEFORE any spawn (Popen
     never called)."""
-    from computer_use_mcp.backend import LaunchTargetError, LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.errors import LaunchTargetError
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)  # _launch_process touches no instance state
     with patch.object(subprocess, "Popen") as popen:
@@ -350,7 +440,8 @@ def test_f3_quote_breakout_needle_is_typed_rejected_and_nothing_spawns() -> None
 def test_f3_needle_charset_rejects_all_smuggled_forms() -> None:
     """F3 pin: every metachar-bearing needle (every cmd.exe operator and quote form
     V-2 tried, plus path separators/colons) is rejected by validation alone."""
-    from computer_use_mcp.backend import LaunchTargetError, validate_launch_needle
+    from computer_use_mcp.desktop.errors import LaunchTargetError
+    from computer_use_mcp.desktop.launch import validate_launch_needle
 
     for needle in (
         'x" & victim2.bat',
@@ -392,7 +483,7 @@ def test_f3_needle_charset_rejects_all_smuggled_forms() -> None:
 def test_f3_valid_needles_pass_validation() -> None:
     """F3 pin: legitimate process-name shapes (alnum, dot, underscore, space,
     hyphen) still validate — REM-B's mspaint launch keeps working."""
-    from computer_use_mcp.backend import validate_launch_needle
+    from computer_use_mcp.desktop.launch import validate_launch_needle
 
     for needle in (
         "mspaint.exe",
@@ -411,7 +502,7 @@ def test_f3_fake_backend_rejects_bad_needle_and_spawns_nothing() -> None:
     """F3 pin: the FAKE backend (used by the e2e REM-B launch tests) applies the
     same typed validation before recording a launch — a hostile target never
     reaches the ``launched=`` payload and is never recorded as spawned."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend()  # no app_windows: NO_INSTANCE path
     payload = backend.ensure_app('x" & victim2.bat', allow_launch=True)
@@ -425,7 +516,7 @@ def test_f3_real_ensure_app_folds_typed_rejection_into_payload() -> None:
     """F3 pin: the REAL backend's ensure_app folds the typed rejection into the
     NO_INSTANCE payload (probe-outcome contract preserved — the controller still
     sees a NO_INSTANCE probe, now with an explicit launch_rejected marker)."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)
     backend.enumerate_app_windows = lambda needle: []  # nothing to attach to
@@ -438,7 +529,7 @@ def test_f3_fake_backend_still_launches_valid_needle() -> None:
     """F3 preservation pin: the REM-B end-to-end launch scenario (allowlisted
     ``mspaint.exe`` target, no existing window) still launches and still reports
     ``launched=``."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend()  # no app_windows: nothing to attach to
     payload = backend.ensure_app("mspaint.exe", allow_launch=True)
@@ -450,7 +541,7 @@ def test_f3_valid_needle_resolves_via_which_and_spawns_without_shell() -> None:
     """F3 pin (mspaint must still launch): a valid needle resolves via
     ``shutil.which`` and is spawned as a plain one-element argv — ``shell`` is
     falsy (the cmd.exe quote-breakout surface is gone)."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)
     resolved = r"C:\Windows\System32\mspaint.exe"
@@ -468,7 +559,7 @@ def test_f3_unresolvable_bare_name_falls_back_to_raw_name() -> None:
     """F3 pin (PATH resolution preserved): when ``shutil.which`` cannot resolve the
     bare name, the raw name still goes to Popen (Windows CreateProcess searches
     PATH) — the pre-F3 launchability of bare names is kept, minus the shell."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)
     with patch.object(shutil, "which", return_value=None):
@@ -483,7 +574,7 @@ def test_f3_unknown_valid_name_still_fails_soft_not_raises() -> None:
     """F3 pin: a VALID-charset needle that does not exist keeps the REM-B
     soft-failure contract — ``None`` (payload degrade), never an exception; the
     typed rejection fires only for INVALID needles."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     backend = LocalComputerBackend.__new__(LocalComputerBackend)
     with patch.object(shutil, "which", return_value=None):
@@ -500,7 +591,7 @@ def test_f4_env_knob_docstrings_are_truthful(monkeypatch: pytest.MonkeyPatch) ->
     ``driver``" — parsing is case-insensitive and whitespace-trimmed, and the docs
     must say so. The BEHAVIOR was already case/whitespace-tolerant (direction of
     the discrepancy is safe); only the claim was wrong."""
-    from computer_use_mcp import interference
+    from computer_use_mcp.desktop import interference
 
     source = interference.__doc__ or ""
     source += "\n" + interference.ATTACH_OR_LAUNCH_ENV

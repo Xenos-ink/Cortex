@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from computer_use_mcp.models import (
+from computer_use_mcp.core.models import (
     ActionType,
     AgentDecision,
     CoordinateSpace,

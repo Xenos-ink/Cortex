@@ -42,15 +42,15 @@ def _ms(xs: list[float]) -> dict[str, float]:
 
 
 async def main() -> int:
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.audit import AuditLogger, Metrics
-    from computer_use_mcp.backend import LocalComputerBackend
-    from computer_use_mcp.limits import LimitEnforcer, Limits
-    from computer_use_mcp.models import GroundedAction, SessionState
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
-    from computer_use_mcp.validator import GroundingValidator
-    from computer_use_mcp.verification import VerificationEngine
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.security.audit import AuditLogger, Metrics
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
+    from computer_use_mcp.core.limits import LimitEnforcer, Limits
+    from computer_use_mcp.core.models import GroundedAction, SessionState
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.validator import GroundingValidator
+    from computer_use_mcp.pipeline.verification import VerificationEngine
 
     backend = LocalComputerBackend()
     backend.execute = lambda *a, **k: "Simulated click (input stubbed: no OS input dispatched)."
@@ -134,7 +134,7 @@ async def main() -> int:
 
     before = backend.observe()
     after = backend.observe()
-    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+    from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
     engine = VerificationEngine()
     intent = VerificationIntent(kind=VerificationKind.VISUAL_CHANGE, expected_change=True)
     xs = []
@@ -142,11 +142,11 @@ async def main() -> int:
         t0 = time.perf_counter(); engine.verify(intent, before, after); xs.append((time.perf_counter() - t0) * 1000.0)
     report["verify_fastpath_after"] = _ms(xs)
 
-    from computer_use_mcp import server as srv
+    import computer_use_mcp.server.fetch as srv_server_fetch
     xs = []
     for _ in range(8):
         t0 = time.perf_counter()
-        srv._bound_outbound_image(after.image_base64, frame=getattr(after, "_frame", None))
+        srv_server_fetch._bound_outbound_image(after.image_base64, frame=getattr(after, "_frame", None))
         xs.append((time.perf_counter() - t0) * 1000.0)
     report["bound_outbound_after"] = _ms(xs)
 

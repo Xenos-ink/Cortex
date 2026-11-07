@@ -37,13 +37,11 @@ from typing import Any
 
 import pytest
 
-from computer_use_mcp.backend import (
-    FakeComputerBackend,
-    LaunchTargetError,
-    LocalComputerBackend,
-    parse_launch_paths,
-)
-from computer_use_mcp.interference import NO_INSTANCE, format_no_instance
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.errors import LaunchTargetError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.launch import parse_launch_paths
+from computer_use_mcp.desktop.interference import LAUNCHED, NO_INSTANCE, format_no_instance
 
 LAUNCH_PATHS_ENV = "CORTEX_LAUNCH_PATHS"
 
@@ -160,7 +158,7 @@ def test_mapped_path_launches_when_needle_not_on_path(
     monkeypatch.delenv(LAUNCH_PATHS_ENV, raising=False)
     exe = _mapping(monkeypatch, tmp_path)
     monkeypatch.setattr(
-        "computer_use_mcp.backend.shutil.which", lambda needle: None
+        "computer_use_mcp.desktop.backend.shutil.which", lambda needle: None
     )  # needle NOT on PATH (the field condition)
     recorded = _popen_recorder(monkeypatch)
     result = _bare_backend()._launch_process("blender")
@@ -172,7 +170,7 @@ def test_mapped_needle_matches_case_insensitively_as_a_whole(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
     _mapping(monkeypatch, tmp_path)
-    monkeypatch.setattr("computer_use_mcp.backend.shutil.which", lambda needle: None)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend.shutil.which", lambda needle: None)
     recorded = _popen_recorder(monkeypatch)
     assert _bare_backend()._launch_process("BLENDER") == "blender.exe"
     assert len(recorded) == 1  # mapping hit — never reached the raw fallback
@@ -183,7 +181,7 @@ def test_mapping_goes_before_which(monkeypatch: pytest.MonkeyPatch, tmp_path: An
     mapping when both exist."""
     exe = _mapping(monkeypatch, tmp_path)
     monkeypatch.setattr(
-        "computer_use_mcp.backend.shutil.which", lambda needle: r"C:\elsewhere\blender.exe"
+        "computer_use_mcp.desktop.backend.shutil.which", lambda needle: r"C:\elsewhere\blender.exe"
     )
     recorded = _popen_recorder(monkeypatch)
     assert _bare_backend()._launch_process("blender") == "blender.exe"
@@ -196,7 +194,7 @@ def test_mapping_for_another_needle_changes_nothing(
     """A mapping for needle X never affects needle Y: the raw-name fallback is
     attempted unchanged (v0.7.0 order preserved behind the mapping)."""
     _mapping(monkeypatch, tmp_path)  # maps "blender" only
-    monkeypatch.setattr("computer_use_mcp.backend.shutil.which", lambda needle: None)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend.shutil.which", lambda needle: None)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "empty"))
     (tmp_path / "empty").mkdir(exist_ok=True)
     recorded = _popen_recorder(monkeypatch)
@@ -215,7 +213,7 @@ def test_path_lookup_missed_suffix_replaces_silent_degradation(
     a bare silent NO_INSTANCE."""
     monkeypatch.delenv(LAUNCH_PATHS_ENV, raising=False)
     _alias_miss(monkeypatch, tmp_path)
-    monkeypatch.setattr("computer_use_mcp.backend.shutil.which", lambda needle: None)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend.shutil.which", lambda needle: None)
 
     def _missing(argv: list[str], *args: Any, **kwargs: Any) -> None:
         raise FileNotFoundError(f"[WinError 2] The system cannot find the file specified: {argv[0]}")
@@ -237,7 +235,7 @@ def test_spawn_failed_suffix_surfaces_the_os_error_bounded(
     """A RESOLVED target whose Popen raises reports ``spawn-failed`` with the
     exception type and a bounded message."""
     _mapping(monkeypatch, tmp_path)
-    monkeypatch.setattr("computer_use_mcp.backend.shutil.which", lambda needle: None)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend.shutil.which", lambda needle: None)
     long_message = "access denied: " + "x" * 500
 
     def _denied(argv: list[str], *args: Any, **kwargs: Any) -> None:
@@ -265,7 +263,7 @@ def test_malformed_config_entries_are_skipped_fail_safe(
         LAUNCH_PATHS_ENV,
         f"noequals; ={real};inv@lid={real};ghost={tmp_path / 'missing.exe'};good={real};;",
     )
-    monkeypatch.setattr("computer_use_mcp.backend.shutil.which", lambda needle: None)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend.shutil.which", lambda needle: None)
     recorded = _popen_recorder(monkeypatch)
     backend = _bare_backend()
     assert backend._launch_process("good") == "good.exe"  # the valid entry works
@@ -286,7 +284,7 @@ def test_malformed_only_config_never_spawns_and_degrades_typed(
         raise FileNotFoundError(argv[0])
 
     monkeypatch.setattr(subprocess, "Popen", _missing)
-    monkeypatch.setattr("computer_use_mcp.backend.shutil.which", lambda needle: None)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend.shutil.which", lambda needle: None)
     _alias_miss(monkeypatch, tmp_path)
     _no_windows(monkeypatch)
     payload = _bare_backend().ensure_app("blender", allow_launch=True)
@@ -301,7 +299,7 @@ def test_directory_mapped_path_is_skipped_not_spawned(
     directory = tmp_path / "blender-dir"
     directory.mkdir()
     monkeypatch.setenv(LAUNCH_PATHS_ENV, f"blender={directory}")
-    monkeypatch.setattr("computer_use_mcp.backend.shutil.which", lambda needle: None)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend.shutil.which", lambda needle: None)
 
     def _missing(argv: list[str], *args: Any, **kwargs: Any) -> None:
         raise FileNotFoundError(argv[0])
@@ -333,7 +331,7 @@ def test_spawn_failure_via_alias_still_returns_none_from_launch_process(
     ``None`` on any failure — the typed suffix travels out-of-band, so every
     pre-existing pin (``is None``) keeps holding."""
     _alias_miss(monkeypatch, tmp_path)
-    monkeypatch.setattr("computer_use_mcp.backend.shutil.which", lambda needle: None)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend.shutil.which", lambda needle: None)
 
     def _denied(argv: list[str], *args: Any, **kwargs: Any) -> None:
         raise PermissionError("access denied")
@@ -353,7 +351,11 @@ def test_fake_mapping_launches_and_records_basename(
     exe = _mapping(monkeypatch, tmp_path)
     backend = FakeComputerBackend()
     payload = backend.ensure_app("blender", allow_launch=True)
-    assert payload.startswith(NO_INSTANCE)
+    # WP4b (C8 / dev F3 fix 5.1): a REAL spawn now leads with ``LAUNCHED``. The old
+    # ``NO_INSTANCE`` token was chosen BEFORE the launch attempt and never revised,
+    # so the first word of a successful spawn said the opposite of what happened.
+    # ``launch=server``, ``launched=<exe>`` and the recorded process are UNCHANGED.
+    assert payload.startswith(LAUNCHED)
     assert "launch=server" in payload
     assert "launched=blender.exe" in payload
     assert backend.launched_processes == ["blender.exe"]
@@ -403,7 +405,7 @@ def test_driver_payload_exact_string_never_changes(monkeypatch: pytest.MonkeyPat
     """``launch=driver`` payloads are EXACTLY the v0.7.0 string — no suffix, no
     spawn — even with a mapping configured for the needle."""
     _mapping(monkeypatch, tmp_path)
-    monkeypatch.setattr("computer_use_mcp.backend.shutil.which", lambda needle: None)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend.shutil.which", lambda needle: None)
     _no_windows(monkeypatch)
 
     def _must_not_spawn(argv: list[str], *args: Any, **kwargs: Any) -> None:  # pragma: no cover
@@ -422,7 +424,7 @@ def test_baseline_server_payload_shapes_are_additive(monkeypatch: pytest.MonkeyP
     NO_INSTANCE probe — the suffixes are strictly additive."""
     monkeypatch.delenv(LAUNCH_PATHS_ENV, raising=False)
     _alias_miss(monkeypatch, tmp_path)
-    monkeypatch.setattr("computer_use_mcp.backend.shutil.which", lambda needle: None)
+    monkeypatch.setattr("computer_use_mcp.desktop.backend.shutil.which", lambda needle: None)
 
     def _missing(argv: list[str], *args: Any, **kwargs: Any) -> None:
         raise FileNotFoundError(argv[0])

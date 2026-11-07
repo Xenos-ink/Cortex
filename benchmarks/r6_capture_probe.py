@@ -50,7 +50,7 @@ def main() -> int:
 
     import mss
 
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     iters = 12
     backend = LocalComputerBackend()
@@ -96,7 +96,7 @@ def main() -> int:
                 shot2 = cap.grab(region)
             gdi = Image.frombuffer("RGB", shot2.size, shot2.raw, "raw", "BGRX", 0, 1)
             # desktops animate (clock etc.) — compare mean delta, not identity
-            from computer_use_mcp.verification import _diff_magnitude
+            from computer_use_mcp.pipeline.verification import _diff_magnitude
             mean_d, strong = _diff_magnitude(frames[-1], gdi)
             print(f"#   DXGI-vs-GDI mean-diff on same instant: {mean_d:.3f} "
                   f"(strongly-changed {strong}) — animations make 0 impossible")
@@ -123,7 +123,7 @@ def main() -> int:
     for y in range(300, 320):
         for x in range(400, 800):
             px[x, y] = (255, 255, 255)
-    from computer_use_mcp.verification import _diff_magnitude as diff_full
+    from computer_use_mcp.pipeline.verification import _diff_magnitude as diff_full
 
     xs = []
     for _ in range(iters):

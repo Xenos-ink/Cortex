@@ -8,7 +8,7 @@ resolves uniquely to this file.
 
 from __future__ import annotations
 
-from computer_use_mcp.backend import InputEngine
+from computer_use_mcp.desktop.input_engine import InputEngine
 
 
 class RecordingEngine(InputEngine):
@@ -48,6 +48,14 @@ class RecordingEngine(InputEngine):
 
     def chord(self, keys: list[str]) -> None:
         self.calls.append(("chord", *keys))
+
+    def key_down(self, key: str) -> None:
+        # DELTA 1 (F3): every test engine implements the held-key pair, so a held
+        # keypress exercises the same dispatch discipline as on the shipped engines.
+        self.calls.append(("key_down", key))
+
+    def key_up(self, key: str) -> None:
+        self.calls.append(("key_up", key))
 
     def scroll(self, delta: int) -> None:
         self.calls.append(("scroll", delta))

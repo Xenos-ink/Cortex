@@ -21,8 +21,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.models import GroundedAction, TextRegion, WindowInfo
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.core.models import GroundedAction, TextRegion, WindowInfo
 
 from .appwin import CALC_BUTTON_LAYOUT
 

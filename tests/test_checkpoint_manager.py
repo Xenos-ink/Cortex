@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from computer_use_mcp.checkpoint_manager import (
+from computer_use_mcp.planning.checkpoint_manager import (
     CHECKPOINT_EVERY_SECONDS,
     CHECKPOINT_EVERY_STEPS,
     CHECKPOINT_FILENAME,
@@ -38,17 +38,17 @@ from computer_use_mcp.checkpoint_manager import (
     SessionSnapshot,
     should_checkpoint,
 )
-from computer_use_mcp.context_manager import ContextManager
-from computer_use_mcp.limits import Limits, SessionBudgetTracker
-from computer_use_mcp.models import (
+from computer_use_mcp.planning.context_manager import ContextManager
+from computer_use_mcp.core.limits import Limits, SessionBudgetTracker
+from computer_use_mcp.core.models import (
     ActionType,
     ExecutionResult,
     GroundedAction,
     Subtask,
     SubtaskStatus,
 )
-from computer_use_mcp.redaction import contains_secret
-from computer_use_mcp.subtask_manager import SubtaskManager
+from computer_use_mcp.security.redaction import contains_secret
+from computer_use_mcp.planning.subtask_manager import SubtaskManager
 
 
 def make_limits(**overrides: Any) -> Limits:
@@ -326,7 +326,7 @@ def test_atomic_write_no_partial_observation_and_crash_safety(
         observed["previous_goal"] = json.loads(path.read_text(encoding="utf-8"))["goal"]
         raise OSError("simulated crash between temp write and replace")
 
-    monkeypatch.setattr("computer_use_mcp.checkpoint_manager.os.replace", crashing_replace)
+    monkeypatch.setattr("computer_use_mcp.planning.checkpoint_manager.os.replace", crashing_replace)
     with pytest.raises(CheckpointWriteError, match="previous checkpoint left intact"):
         manager.write_checkpoint(**{**kwargs, "goal": "revised goal"})
     monkeypatch.undo()
@@ -418,7 +418,7 @@ def test_redaction_refusal_is_fail_closed(tmp_path: Path, monkeypatch: pytest.Mo
 
     # Simulate a broken redaction layer: values pass through untouched.
     monkeypatch.setattr(
-        "computer_use_mcp.checkpoint_manager.redact_text", lambda text: (text, 0)
+        "computer_use_mcp.planning.checkpoint_manager.redact_text", lambda text: (text, 0)
     )
     with pytest.raises(CheckpointRedactionError, match="refusing to write"):
         manager.write_checkpoint(**{**kwargs, "goal": "exfiltrate password=hunter2secret"})

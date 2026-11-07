@@ -36,21 +36,21 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.interference import NO_INSTANCE, REATTACHED
-from computer_use_mcp.models import GroundedAction, Observation, WindowInfo
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.observation import ObservationEngine
-from computer_use_mcp.safety import SafetyPolicy
-from computer_use_mcp.state import StopToken, TaskState
-from computer_use_mcp.validator import GroundingValidator
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.interference import LAUNCHED, NO_INSTANCE, REATTACHED
+from computer_use_mcp.core.models import GroundedAction, Observation, WindowInfo
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.core.limits import Limits
+from computer_use_mcp.vision.observation import ObservationEngine
+from computer_use_mcp.security.safety import SafetyPolicy
+from computer_use_mcp.core.state import StopToken, TaskState
+from computer_use_mcp.pipeline.validator import GroundingValidator
 
 
 def _foreign_foreground_observation() -> Observation:
     """The fresh-session screen: the DRIVER TERMINAL is in the foreground
     (the logged WindowsTerminal.exe/ZCode.exe), not any allowlisted app."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend()
     backend.set_active_window(
@@ -161,7 +161,11 @@ def test_pin4_fresh_session_ensure_app_reattaches_end_to_end() -> None:
     """End-to-end with an EXISTING instance: the fresh-session ensure_app on the
     allowlisted target executes (REATTACHED), ok=True — exactly the live-test flow
     that died in the FailedLog."""
-    from computer_use_mcp.backend import AppWindowCandidate, doc_token_from_title, is_unsaved_candidate_title
+    from computer_use_mcp.desktop.launch import (
+        AppWindowCandidate,
+        doc_token_from_title,
+        is_unsaved_candidate_title,
+    )
 
     backend = FakeComputerBackend()
     paint = WindowInfo(
@@ -239,5 +243,9 @@ def test_pin5_no_allowlist_ensure_app_unchanged() -> None:
     )
     assert outcome.kind == "executed" and outcome.result is not None
     assert outcome.result.ok is True
-    assert outcome.result.message.startswith(NO_INSTANCE)
+    # WP4b (C8 / dev F3 fix 5.1): a REAL spawn now leads with ``LAUNCHED`` (the old
+    # ``NO_INSTANCE`` token was chosen before the launch attempt and never revised).
+    # The launch itself — ``launched=<exe>``, ok True, the probe verification method —
+    # is UNCHANGED.
+    assert outcome.result.message.startswith(LAUNCHED)
     assert "launched=mspaint.exe" in outcome.result.message

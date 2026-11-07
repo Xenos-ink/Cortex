@@ -11,9 +11,9 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
-from computer_use_mcp.audit import AuditEvent, AuditLogger, Metrics
-from computer_use_mcp.limits import LimitEnforcer, LimitExceeded, Limits
-from computer_use_mcp.redaction import contains_secret, redact_image, redact_text, safe_repr
+from computer_use_mcp.security.audit import AuditEvent, AuditLogger, Metrics
+from computer_use_mcp.core.limits import LimitEnforcer, LimitExceeded, Limits
+from computer_use_mcp.security.redaction import contains_secret, redact_image, redact_text, safe_repr
 
 # --- Limits ------------------------------------------------------------------------------
 
@@ -376,6 +376,8 @@ def test_metrics_snapshot_covers_all_counters_and_latencies() -> None:
         "verification_verified",
         "verification_failed",
         "verification_uncertain",
+        # WP4a (F2-3/E-02): the ONE bounded late-repaint re-capture counter.
+        "verification_recapture",
         "grounding_failure",
         "safety_block",
         "approval_requested",

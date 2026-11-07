@@ -54,30 +54,36 @@ from test_controller_integration import (
     ScriptedProvider,
 )
 
-from computer_use_mcp import server
-from computer_use_mcp.checkpoint_manager import (
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.state as srv_server_state
+from computer_use_mcp.planning.checkpoint_manager import (
     INTEGRITY_KEY_FILENAME,
     SEAL_ALGORITHM,
     CheckpointManager,
     CheckpointValidationError,
 )
-from computer_use_mcp.limits import Limits, SessionBudgetExceeded
-from computer_use_mcp.long_running import LongRunningRuntime
-from computer_use_mcp.resume_manager import ResumeManager
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.limits import Limits, SessionBudgetExceeded
+from computer_use_mcp.planning.long_running import LongRunningRuntime
+from computer_use_mcp.planning.resume_manager import ResumeManager
+from computer_use_mcp.core.state import SessionRegistry
 
 
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Per-test server isolation incl. the shared checkpoint store (same base+key)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_lifecycle, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_state, "_stopped_sessions", srv_server_lifecycle._stopped_sessions)
     checkpoint_manager = CheckpointManager(tmp_path / "checkpoints")
-    monkeypatch.setattr(server, "_checkpoint_manager", checkpoint_manager)
-    monkeypatch.setattr(server, "_resume_manager", ResumeManager(checkpoint_manager))
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_checkpoint_manager", checkpoint_manager)
+    monkeypatch.setattr(srv_server_lifecycle, "_resume_manager", ResumeManager(checkpoint_manager))
+    return None
 
 
 def _tamper(path: Any, mutate: Any) -> dict[str, Any]:
@@ -307,7 +313,7 @@ async def test_sealed_overshoot_counters_resume_exactly_then_fail_closed_at_run_
     overshoot the session block mid-run), so a SEALED checkpoint can carry 1e9 — and it
     must resume with counters EXACT while every further run fails closed with the typed
     ``limit_exceeded`` error (inflated counters are DoS-only, never a bypass)."""
-    manager = server._checkpoint_manager
+    manager = srv_server_lifecycle._checkpoint_manager
     limits = Limits(**FAST_LIMITS).validate()
     payload = manager.capture_payload(
         session_id="sess-sealed-overshoot",
@@ -322,14 +328,14 @@ async def test_sealed_overshoot_counters_resume_exactly_then_fail_closed_at_run_
     # Hermetic resume: inject fake backend/provider factories — otherwise start_session
     # would construct a REAL LocalComputerBackend and consume the process-once per-
     # monitor DPI awareness the session-scoped real_backend fixture depends on.
-    monkeypatch.setattr(server, "_backend_factory", ScriptedBackend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(limits=FAST_LIMITS, resume_from_checkpoint=str(path))
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", ScriptedBackend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(limits=FAST_LIMITS, resume_from_checkpoint=str(path))
     assert "error" not in response, response
     new_session_id = str(response["session_id"])
 
     # Counters are restored EXACT (never reset) into the live session's shared budget.
-    bundle = server._bundles[new_session_id]
+    bundle = srv_server_lifecycle._bundles[new_session_id]
     runtime = bundle.extra["long_running"]
     assert isinstance(runtime, LongRunningRuntime)
     restored = runtime.budget.snapshot()

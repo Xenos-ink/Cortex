@@ -21,8 +21,8 @@ import httpx
 import pytest
 from PIL import Image
 
-from computer_use_mcp import provider as provider_module
-from computer_use_mcp.models import (
+from computer_use_mcp.pipeline import provider as provider_module
+from computer_use_mcp.core.models import (
     AgentDecision,
     GroundedAction,
     Observation,
@@ -30,7 +30,7 @@ from computer_use_mcp.models import (
     SessionState,
     WindowInfo,
 )
-from computer_use_mcp.provider import (
+from computer_use_mcp.pipeline.provider import (
     CHANNEL_SYSTEM_POLICY,
     OpenAICompatibleVisionProvider,
     ProviderError,
@@ -39,7 +39,7 @@ from computer_use_mcp.provider import (
     build_judge_messages,
     parse_decision,
 )
-from computer_use_mcp.safety import SafetyContext, SafetyDecision, SafetyPolicy
+from computer_use_mcp.security.safety import SafetyContext, SafetyDecision, SafetyPolicy
 
 # --- fixtures and helpers ---------------------------------------------------------------------
 

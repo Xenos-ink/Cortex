@@ -38,22 +38,22 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp.interference import NO_INSTANCE, parse_interference
-from computer_use_mcp.models import (
+from computer_use_mcp.desktop.interference import NO_INSTANCE, parse_interference
+from computer_use_mcp.core.models import (
     ActionSpec,
     GroundedAction,
     MonitorInfo,
     Observation,
     WindowInfo,
 )
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.observation import ObservationEngine
-from computer_use_mcp.safety import SafetyPolicy
-from computer_use_mcp.state import StopToken, TaskState
-from computer_use_mcp.validator import GroundingValidator
-from computer_use_mcp.verification import VerificationIntent, VerificationKind
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.core.limits import Limits
+from computer_use_mcp.vision.observation import ObservationEngine
+from computer_use_mcp.security.safety import SafetyPolicy
+from computer_use_mcp.core.state import StopToken, TaskState
+from computer_use_mcp.pipeline.validator import GroundingValidator
+from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
 
 def _png(color: str = "white", width: int = 64, height: int = 48) -> str:
@@ -168,7 +168,7 @@ def test_fix1_no_instance_with_allowlisted_target_launches_end_to_end() -> None:
     """The logged failure end-to-end: no window exists, the target IS allowlisted,
     the default policy lets the backend spawn it (NO_INSTANCE payload gains
     ``launched=``) instead of leaving the driver to launch out-of-band."""
-    from computer_use_mcp.backend import FakeComputerBackend
+    from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
 
     backend = FakeComputerBackend()  # no app_windows: nothing to attach to
     # A foreign foreground (the logged ZCode console) is fine now: the process
@@ -487,7 +487,7 @@ def test_fix4_click_verifies_via_focused_element_change_not_pixels() -> None:
     # The plain pixel-diff strategy defers honestly on unchanged pixels for a
     # stated effect (W-1 flagged degrade; RC-D11/058 extended it to any stated
     # effect — a sub-threshold diff is no-data, not proof of absence)...
-    from computer_use_mcp.verification import ScreenshotDiffStrategy
+    from computer_use_mcp.pipeline.verification import ScreenshotDiffStrategy
 
     assert ScreenshotDiffStrategy().verify(intent, before, after).outcome == "uncertain"
     # ...but the full agent pipeline verifies via the deterministic focus tier.

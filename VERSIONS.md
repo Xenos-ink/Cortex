@@ -1,16 +1,489 @@
 # VERSIONS
 
 A per-release ledger for Cortex (`computer-use-mcp`). Newest first. Reconstructed
-from the repository's git history (`git log --oneline`) and the
-`docs/ARCHITECTURE.md` header. Internal engineering-process designations are omitted
-on purpose — releases are described by content only. The version in `pyproject.toml`
-is the authoritative released version.
+from the repository's git history (`git log --oneline`) and the release
+documentation (README.md, docs/). Internal engineering-process designations are
+omitted on purpose — releases are described by content only. The version in
+`pyproject.toml` is the authoritative released version.
 
 **Convention for future entries:** while work is in flight, land its notes under the
 topmost `## Unreleased` heading; at release time they are folded into a new
 `## vX.Y.Z (date, mission)` entry with **Added / Changed / Fixed / Performance**
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
+
+## v0.7.6 (2026-11-01, ORVEX-2026-108 — the unified-contract port; Addendum 4 field fixes WP13, 2026-11-06)
+
+0.7.6 re-implements the release's full feature set under a single unified reply
+contract: one definition of
+`ok` / `result` / `verification` that holds identically for every tool, every
+`follow_up_results` entry, every plan step and terminal reply, and the wait
+
+family — no compatibility flags, no per-tool variants. The served surface grows
+from six to ten tools; the code is restructured into a layered package
+(`core` / `security` / `desktop` / `vision` / `pipeline` / `planning` / `server`)
+with the public launch paths unchanged. The shipped `cortex-skill` is rewritten
+(core ≤ 250 lines + `references/`) and pinned by truth tests that derive every
+taught value from the code. Full offline suite at release: 3319 passed +
+19 skipped with `-W error::RuntimeWarning` (≈1.9× the v0.7.5 suite's
+1753+11; the live-desktop e2e is the final gate).
+
+### Added
+
+- **Unified reply contract** — every action-bearing reply carries a closed
+  `result` token (`verified` / `uncertain` / `failed` / `rejected` /
+  `not_executed` / `dry_run` / `marker` / `stopped` / `unknown`) and
+  `ok = (result ∈ {verified, marker})`; `verification` blocks name their tier via
+  `verification_method`; plan step/terminal replies always carry `failure_reason`
+  (a closed 16-token vocabulary, `unclassified` fallback) and `not_executed`;
+  rejections carry `reasons` (never an `error` key) and a mid-type focus drift
+  additionally carries `partial_delivery.delivered_chars`.
+- **`hold_ms`** (0..5000 ms) on `click` / `right_click` / `keypress` / `hotkey`
+  queue entries: press, hold, release (hotkeys go down together, release in
+  reverse order); **`duration_ms`** (0..5000 ms, `move` only) for timed motion,
+  and a plan point's `settle_ms` (0..200 ms) is really applied after the point's
+  last item.
+- **The wait family** — the new `computer_wait` tool blocks up to one segment (env
+  `CORTEX_WAIT_SEGMENT_SECONDS`, default 45 s, band 1..55, under the client's
+  60 s tool timeout) and answers `completed` / `running` itself;
+  `computer_wait_status` (new tool) blocks the next segment or peeks with
+  `block=false`; `computer_cancel_wait` cancels. Waits are tool-running time,
+  never idle time; caps 4 per session / 16 process-wide, last 8 tombstones.
+- **Evidence store + `computer_fetch_image`** — the 10th tool; reply-bearing
+  captures are retained (16 frames / 24 MB / 3600 s) and fetchable by `image_id`
+  at the fetch's own disclosed `image_outbound_scale`; fetch is allowed during a
+  plan lease.
+- **Waypoint plans** — `computer_execute` gains trailing optional `plan` /
+  `plan_action` (typed object schema, no anyOf/$ref, no string arm): one
+  waypoint step per call, a plan lease with typed `plan_lease` refusals for the
+  other mid-lease tools (`computer_wait_status` and `computer_fetch_image` stay
+  allowed), per-step `continue`/`stop`/`replace`, retained-prefix disclosure,
+  B6–B8 failure classification, and new `plan_start` / `plan_point` /
+  `plan_complete` / `plan_stopped` audit events.
+- **Session idle timeout** — a session with no tool call for 15 minutes (env
+  `CORTEX_SESSION_IDLE_TIMEOUT_SECONDS`, band 60..86400, `0` disabled,
+  fallback-not-clamp) and nothing in flight is stopped through the stop_session
+  kill path (audited, later calls get `session_stopped` with the inactivity
+  reason); sweeping is lazy (every tool entry + `start_session` before the
+  limit check), so a registry full of forgotten sessions frees itself.
+- **Clipboard honesty (D13)** — the save reads a three-way verdict
+  (`restorable` / `non_text` / `unknown`); the restore moved AFTER the verify
+  settle (a late-reading target pastes the intended text); a destroyed non-text
+  payload (copied image / file drop / RTF) is disclosed as
+  `clipboard_restore=non_text_destroyed`; a truly empty clipboard claims no loss.
+- **Dropped-element accounting (D15)** — semantic reads report their omissions:
+  `region_count + omitted_count` accounts for the whole read, clipped labels
+  carry `text_truncated`, and the reader's own offscreen/unavailable/cap/budget
+  drops are counted (not zeroed).
+- **Input honesty** — `ensure_app` launch failures (`not_found` /
+  `launch_rejected` / `launch_unresolved`) reply `failed`, never `verified`
+  (`ambiguous` is `uncertain`); every executed action emits exactly ONE
+  `verification` audit event carrying the FINAL verdict (markers and ensure_app
+  probes included).
+- **`cortex-skill` rewrite** — core ≤ 250 lines + `references/`
+  (plan-protocol, reply-contract, glossary, examples), accurate triggers, and
+  `tests/test_skill_truth.py` deriving every taught value (bounds, token sets,
+  tool count) from the code at test time.
+- **Docs restructure** — README rewritten as a concise current entry point
+  (≤ 250 lines: what Cortex is, install/update, quick start, the ten tools,
+  the reply contract in brief, the skill, safety summary, configuration
+  pointers); docs/ reorganized into current-truth references (ARCHITECTURE,
+  SAFETY, TOOLS, REPLY-CONTRACT, CONFIGURATION, INSTALL) with superseded and
+  removed-feature records moved to docs/history/ under explicit HISTORICAL
+  headers; the facts a test can check (tools, limits, result/failure tokens,
+  env vars, bounds, links, versions) pinned by the new
+  `tests/test_docs_truth.py` against the code.
+
+### Added
+
+- **Host timeout budget (WP13, Addendum 4)** — ONE knob,
+  `CORTEX_CLIENT_TIMEOUT_SECONDS` (default 60, band 10..600, fallback-not-clamp;
+  docs/CONFIGURATION.md) names the HOST's per-tool-call timeout. Every
+  long-blocking bound derives from it with a fixed 15 s margin: the type-action
+  deadline (60 → 45), the pacing budget (80% of it), and the wait-family segment
+  default (60 → 45). At a 30 s ZCode host every bound drops to 15 s. The
+  follow-up chain checks the budget per item and stops with
+  `follow_ups_stopped_reason: "time_budget"` instead of being killed by the
+  host. `start_session` sessions carry the effective `limits` and state the
+  effective budget in their `message` (`client_timeout_s=<n>`).
+- **Slow-call timing (WP13 B)** — replies to calls that ran ≥ 3 s carry
+  ` elapsed_ms=<n>` inside the message (contract-sanctioned key=value suffix),
+  so field reports show real host-side timings.
+- **ensure_app title hint (WP13 D)** — on NO_INSTANCE, a read-only visible-window
+  title scan may append ` ensure_app_hint: a visible window titled '...' belongs
+  to process '...' — retry with target=... or focus_window`. HINT ONLY: titles
+  are spoofable, never an automatic attach.
+- **Unknown-argument rejection (WP13 C)** — every tool rejects unknown
+  arguments with a contract REJECTION (`result: "rejected"`, reasons led by
+  `unknown_argument` naming the bad arguments, listing the valid ones, and
+  teaching that `hold_ms`/`duration_ms` belong inside `follow_ups` items or
+  plan `points`; a direct `hold_ms=...` was silently dropped before).
+- **`read_truncated` integrity branch (WP12e)** — a Win32 WM_GETTEXT read at the
+  8192-character truncation cap is blind and reported
+  `branch=read_truncated`; UIA values (not truncated) keep full verification.
+- **`tail_unproven` / `transformed_buffer` / `not_landed` integrity branches
+  (WP12b/c)** — baseline-gated verdicts; see the glossary branch list.
+
+### Changed
+
+- **Default typing pace 0.02 s/char on the real SendInput path** (WP12a/WP12b,
+  user ruling 2026-11-02 "pause by default + flag corruption"): Windows 11
+  packaged Notepad corrupts/drops fast unicode bursts (live runs 4-7: the RAW
+  one-burst leg TRUNCATED the text to `e2e-ty`; the unpaced PRODUCT leg
+  substituted its tail, `brown xxx` for `brown fox`). The `CORTEX_TYPE_INTERVAL`
+  env is read ONCE PER SESSION (when the backend is built) and still overrides;
+  `0` restores the old unpaced burst; the default applies to the SendInput
+  engine only (the pyautogui fallback keeps its unpaced default). ONE wall-clock
+  deadline per type action (45 s, comfortably inside the client's 60 s tool
+  timeout): pacing gets at most 36 s counted per CHARACTER (WP12c: a surrogate
+  pair travels in ONE SendInput call with ONE sleep), so very long texts pace
+  below 20 ms above 1800 characters, BMP or astral alike — 2000 characters of
+  either kind at 18 ms. When the deadline would overrun, the dispatch loop
+  finishes the remaining text UNPACED and the reply carries ` paced=partial`.
+  The standalone engine / fake-backend defaults
+  stay 0.0 — the offline suite is not slowed. Every `unverified` integrity reply
+  names WHICH ladder branch gave up as a `branch=` suffix inside the message
+  (closed vocabulary, derived from the code by a truth test): `blind_read`,
+  `read_truncated`, `unstable_confirm`, `agreed_empty`, `not_landed`,
+  `no_baseline`, `transformed_buffer`, `landed_not_at_tail`, `horizon_blind`,
+  `horizon_unconfirmed`, `fast_budget_exhausted`, `repair_read_blind`,
+  `repair_unconfirmed`, `repair_over_budget`, `tail_unproven`.
+- **`ok` is the closed-token rule everywhere**: `ok = result ∈ {verified,
+  marker}`. `dry_run` replies are now `ok:false` (they dispatch nothing — a
+  deliberate no-op is not a success); `done`/`wait` carry `result:"marker"`
+  with `ok:true` (an acknowledgement, not a screen claim).
+- **A real server-side `ensure_app` launch is prefixed `LAUNCHED`** (was
+  `NO_INSTANCE ... launched=<exe>`); suffix vocabulary unchanged.
+  `AMBIGUOUS_INSTANCE` lists EVERY candidate (was: the unsaved subset only).
+- **One image-scale key**: `image_scale` is deleted; `image_outbound_scale` is
+  the only scale key on every image-bearing reply (the measured applied
+  downscale; `None` for raw pass-through).
+- **Plan honesty**: the terminal reply's `ok = (result == "verified")` —
+  `unknown` and `stopped` are never success, and a verified-but-partial prefix
+  is capped at `unknown`; a plan walk whose last step does not verify itself
+  parks the lease (retry = `replace`).
+- **Plan approval (O-03)** is decided ONCE on the first plan call and INHERITED
+  by every step and by `replace`; `continue` never re-asks; a gated step replies
+  `not_executed` + `requires_approval:true`.
+- **Stated-effect honesty (E-03)**: an action with a stated `expected_effect`
+  that only changed pixels stays `uncertain` (`ok:false`) — the deterministic
+  tiers (window state, process state, UI control text, focus identity) are the
+  verify path; the bounded late-repaint re-capture fires only when a stated
+  effect or a repaint-prone action class makes it plausible.
+- **Type-integrity mismatch veto**: a read-back `integrity=mismatch` demotes a
+  `verified` verdict to `uncertain` (a masked or transformed field may
+  legitimately hold something that differs); only mismatch confirms a drop.
+- **Cursor-reposition settle default 50 → 0 ms** (`CORTEX_MOVE_SETTLE_MS`,
+  band 0..200, fallback-not-clamp): outside plans a move is instant; an
+  operator who wants a settle sets the knob.
+- **Terminal `unknown` plans report nested `plan.status: "unknown"`** (was
+  `"blocked"`); the replace disclosure (`replaced_plan_id` / `replaced_prefix`)
+  rides only the replace call's own reply.
+- **The `session_limit_exceeded` reply now lists the live sessions**
+  (`live_sessions`, most-idle first, with idle/in-flight/age) plus
+  `idle_timeout_seconds`, so an agent that lost its session ids can recover by
+  stopping one.
+- **`package.json` (the `cortex-agent-skill` npm wrapper) version 0.6.0 →
+  0.7.6** — policy: the skill package tracks the server release.
+- **Layered package restructure** (reorganization only): `src/computer_use_mcp/`
+  is now `core/`, `security/`, `desktop/`, `vision/`, `pipeline/`,
+  `planning/`, `server/` with layering enforced by a test. The public launch
+  paths are unchanged (`computer_use_mcp.server:main`, `computer_use_mcp.cli:main`,
+  `python -m computer_use_mcp.server`, `python -m computer_use_mcp.cli`, and the
+  console scripts), but the module entry's logger name changed
+  `__main__` → `computer_use_mcp.server`.
+- **Key names with more than one character are case-insensitive**: `F4`,
+  `Enter` and `ESC` now resolve to `f4`, `enter` and `esc` (before, they
+  failed with an unsupported-key error). A single character keeps its exact
+  meaning: an uppercase letter such as `A` still injects shift.
+- **An unmappable key is a typed rejection (sess_138fbd60)**: a keypress or
+  hotkey naming a key the engine cannot map — an unknown name, or a character
+  the ACTIVE keyboard layout cannot produce (e.g. `"'"` under an Arabic
+  layout) — now returns a contract rejection (`unsupported_key: '<key>'`
+  reasons — Python repr form, so `"` renders as `'"'` — naming every
+  unsupported member, a teaching hint pointing at
+  `type` for printable characters) with ZERO input dispatched: every key is
+  mapped before the first key-down or chord event. Before, it surfaced as a
+  raw `action_error` (`ValueError: unsupported keyboard character or key
+  name: ...`) after refusing.
+- **The paced-typing budget teaches its escape hatch (sess_138fbd60)**: a
+  type reply whose paced budget ran out (`paced=partial`) OR whose pace was
+  merely capped for length now carries an in-message hint — the paced budget
+  covers ~1800 chars at the default CONFIGURED 20 ms/char pace (pacing budget
+  ÷ the CONFIGURED pace; less at a smaller client timeout) — telling the
+  driver that long or multi-line text, especially code into editors that
+  auto-indent or auto-complete, should go through `via="clipboard"`. The char
+  count derives from the CONFIGURED per-character interval (the length-capped
+  interval merely echoes the text length), the hint also fires when the pace
+  was capped for length even without `paced=partial`, and a short type
+  carries no hint. Typing behaviour itself is unchanged.
+- **start_session states the EFFECTIVE action cap (sess_138fbd60)**: the reply
+  message now states `Effective action cap = min(max_steps=<M>,
+  max_actions=<N>) = <cap> (<which> binds)` — every dispatched action counts
+  (each follow_ups item and plan action included) — and WARNS whenever the
+  caps differ, naming the binding one and the action the session is refused
+  at (a DEFAULT session is capped at 30 by max_steps, not 100; before, a
+  driver asking for `max_steps=200` believed it had 200 actions while the
+  101st action was refused mid-task). Raise `max_steps` via the start_session
+  parameter (band 1..500) and `max_actions` via `limits={"max_actions": N}`
+  (band 1..500). The `limit_exceeded: max_actions` rejection AND the
+  "Maximum session steps reached." refusal now teach the restart path
+  (stop_session + start_session with a higher cap).
+- **A plain `hotkey` holds its keys for 50 ms before release**
+  (LIVE-WP13-02 runs 3-4, user approved): a hotkey WITHOUT `hold_ms` uses the
+  held dispatch path with `DEFAULT_HOTKEY_HOLD_MS = 50` — the zero-separation
+  instant chord was IGNORED by Windows 11 Store apps (packaged Notepad
+  11.2607: 4 of 5 plain alt+f4 trials did nothing live, pixel diff 0; the
+  `hold_ms=50` form closed it in all 3 held trials). An explicit `hold_ms`
+  wins; `hold_ms=0` keeps its documented meaning (the explicit zero-duration
+  split press/release with zero wait — NOT the old single-batch chord, which
+  no longer exists for a hotkey); `keypress` and `type` actions are
+  unchanged. The follow-up queue counts the implicit 50 ms against the
+  remaining budget, so a chain of hotkeys cannot overrun it. After an
+  ensure_app LAUNCH the guard no longer rebinds to whatever window happened
+  to be foreground (the launched window has not appeared yet — live: the
+  follow-up hotkey was rejected `focus_taken_by` against the fresh Notepad);
+  the next pre-dispatch focus check ADOPTS the launched process's foreground
+  window (titled, process-matched, one-shot) and dispatches.
+
+### Fixed
+
+- **ZCode host timeouts + silent argument drops (WP13, Addendum 4 field
+  fixes)**: a 30 s ZCode host killed `computer_wait(30)` because the blocking
+  wait segment (45 s) assumed a 60 s client — all bounds now derive from
+  `CORTEX_CLIENT_TIMEOUT_SECONDS` (see Added). The separate slow
+  click+wait-follow-up call (field e2, ~53 s against a 30 s host timeout) is
+  NOT REPRODUCED offline — its intrinsic stages sum to ≈ 2.5 s — and WP13 does
+  NOT claim a root cause for it; what WP13 bounds is every blocking stage (the
+  one-call budget, per-item remaining shares, the UIA owner wall), so any
+  recurrence is attributable via the ` elapsed_ms=` reply suffix. A
+  direct `hold_ms=...` argument was silently dropped; unknown arguments are now
+  rejected on every tool with a contract rejection whose `reasons` lead with
+  `unknown_argument`, teaching where `hold_ms`/`duration_ms` belong.
+  `plan_action='start'` without a lease now TEACHES how to start a plan.
+  `serverInfo.version` reports Cortex's own version (was the mcp SDK's 1.30.0).
+  ensure_app NO_INSTANCE may carry an `ensure_app_hint:` naming the owning
+  process(es) of matching visible window titles.
+- **Unknown-argument teaching shows only valid calls (live run)**: the hint
+  for a stray `hold_ms`/`duration_ms` taught `hold_ms` on a wait item, which
+  Cortex itself rejects. It now teaches a hold on a keypress/hotkey item
+  (`follow_ups=[{"action": "keypress", "keys": ["shift"], "hold_ms": 500}]`)
+  or a click/right_click item, `duration_ms` on a move item, and a pause as a
+  wait item with `delta` in whole seconds. The `invalid_action` rejection
+  carries the key-name hint only when the action takes keys or the error is
+  about keys.
+- **False heal + substitution-unsafe repair (WP12b, VAL-WP12 blocker)**: the
+  COINCIDENTAL tail match (typed `test`, buffer `tett`: both end with `t`)
+  triggered a retype of `est` and reported `integrity=verified(4/4) healed=3`
+  while the document held `tettest`. The repair is now BASELINE-GATED: the
+  focused control is read once BEFORE the first chunk is dispatched, and the
+  repair fires only when the trusted buffer is exactly that baseline plus a
+  proper prefix of the typed text (the suffix genuinely missing). A buffer that
+  begins correctly and then DIVERGES (`tett`/`test`, `brown xxx`/`brown fox`)
+  is flagged `integrity=mismatch` with ZERO retype; a masked/foreign buffer
+  (`●●●●`, `zzz`) is honest `unverified` (branch=transformed_buffer) — a masked
+  password field must not report a failure; text landed mid-buffer (caret,
+  autocomplete) is `unverified` branch=landed_not_at_tail, or `verified` when
+  the baseline proves the exact caret insertion. A repair that does not fit the
+  remaining per-action deadline is never typed
+  (`branch=repair_over_budget`).
+- The `via="clipboard"` type transport's restore raced the queued chord: a
+  target reading the clipboard a few tens of milliseconds after the paste
+  received the OLD text. The restore now runs after the verify settle (a
+  late-reading target pastes the intended text), and a KNOWN non-text payload
+  destroyed by the set is disclosed (`clipboard_restore=non_text_destroyed`)
+  instead of being lost silently. (Present in v0.7.5 through the v0.7.1
+  clipboard transport.)
+
+- Hardened during the port (defects found in this release's own development
+  sources — never shipped in v0.7.5, so no 0.7.5 user could have hit them):
+  - Terminal plan replies could claim `ok:true` while the aggregate verdict
+    was `unknown` — the ok rule is the aggregate's by construction.
+  - A plan point's declared `settle_ms` was stamped as a flag but never
+    carried its millisecond value to the dispatch path — the producer stamps
+    both, and the backend sleeps exactly the declared duration.
+  - Semantic-read drop accounting was overwritten by a dict merge that zeroed
+    the counts a walk had already accumulated (a capped read could report
+    `offscreen: 0`) — the cap/budget split now accumulates.
+  - Audit verdicts could disagree with reply verdicts (drift- or
+    mismatch-demoted actions were audited `verified`; ensure_app probes
+    emitted no verification event at all) — every executed action now records
+    once, after all demotions.
+  - A refused wait could leave an empty per-session registry entry behind
+    (the cap check now precedes the insert).
+
+### Performance
+
+- Measured against v0.7.5 (2ae76b0) with a fresh interleaved same-interpreter
+  A/B on the fake backend (60 rounds/side hot path, 80 import pairs/side;
+  bootstrap 95% CI; gate artifacts `.orvex/mission/artifacts/gates/wp11-*`):
+  - Real-backend typing (WP12a/WP12b): paced at 0.02 s per event pair by
+    default — e.g. 50 BMP chars ≈ 1 s; very long texts pace below 20 ms under
+    the 45 s per-action deadline (2000 characters — BMP or astral alike, paced
+    per character since WP12c — at 18 ms/sleep = 36 s of pacing); the fake
+    backend and the
+    offline suite are unchanged (unpaced). Each type action also pays ONE
+    extra focused-control read (the WP12b pre-dispatch baseline, ~1-10 ms).
+  - Captures per action 3.0 -> 2.75 (ratio 0.9167) on the scripted
+    effect-less workload (the cause was not isolated in this measurement).
+  - Per-action verification time p50 29.15 -> 10.13 ms (ratio 0.35) on the
+    same workload: 0.7.6 performs less verification work there (fewer
+    verification calls); the screenshot-diff engine itself is unchanged
+    (its stage timings are ≈ 1.0).
+  - Per-action input dispatch +8.3 us p50 (22.4 -> 30.7 us) / +19.7 us p95
+    (59.8 -> 79.4 us), attributed to the two new per-action safety checks
+    (`_validate_action_defense`, `_mark_action_dispatched`; call counts
+    confirmed by profiling, their exact time share not isolated). Accepted by
+    ruling as their cost.
+  - Start-up import: cold 1354 -> 1414 ms (≈ +4.4%, 95% CI +0.6% .. +8.1%:
+    slower, but not shown to exceed +5%), warm 899 -> 941 ms (≈ +4.7%, CI
+    -0.8% .. +10.0%: not established); a one-time cost per server start, not
+    per action. Accepted by ruling.
+  - 17 of 37 measured metrics (hot path plus benchmark stages) straddle the
+    noise floor (CI contains 1.05 with median <= 1.05) and are reported
+    NOISE-UNRESOLVED; one stage "regression" (foreground-window query p95
+    0.0005 -> 0.0006 ms) is a single timer tick on identical code; nothing
+    was tuned. All numbers are on the fake backend — real capture cost, move
+    durations, and OS input latency are not modeled by it.
+
+### Known limitations
+
+- **Windows 11 packaged Notepad needs paced input**: its RichEditD2DPT editor
+  corrupts/drops fast unicode bursts even without the product (live runs 4-7:
+  the RAW one-burst SendInput leg TRUNCATED the text to `e2e-ty`; the separate
+  unpaced PRODUCT leg substituted its tail to `brown xxx` — two distinct
+  corruption shapes; Arabic layout 0x04010401). The WP12a default pace
+  (0.02 s/char) mitigates it; `CORTEX_TYPE_INTERVAL=0` restores the vulnerable
+  unpaced burst. Compatibility impact: see the Compatibility notes entry on
+  typing pace and integrity outcomes. Calibration aid for lowering the pace
+  later: `tests/e2e/test_e2e_pace_calibration.py` (LIVE_DESKTOP-gated).
+- **Clipboard abort path**: when an abort (failsafe, stop token, blocked input)
+  lands between the clipboard set and the chord, the `finally` restores the
+  prior text but a destroyed non-text payload is NOT disclosed and a failed
+  restore is NOT annotated — the exception propagates and the annotation is
+  lost. Behaviour matches the pre-existing v0.7.1 design; fixing it needs an
+  annotation channel on the abort path (recorded, deliberately not changed in
+  this release).
+
+### Compatibility notes
+
+- **Host timeout budget, timed replies, unknown-argument errors, ensure_app
+  hints, serverInfo.version (WP13, DELTA 1 + DELTA 3)**: set `CORTEX_CLIENT_TIMEOUT_SECONDS`
+  to your host's real per-tool-call timeout (ZCode = 30 s; Claude Code = 60 s) —
+  every Cortex blocking bound (wait segments, type deadlines, pacing,
+  follow-up chains) derives from it and stays inside it with a 15 s margin, and
+  `start_session`'s reply message states the effective value
+  (`client_timeout_s=<n>`). COMPATIBILITY CHANGE (m9, Commander-accepted): a
+  follow-up chain now stops with `follow_ups_stopped_reason: "time_budget"`
+  once 45 s are spent at the default; before, it had no wall-clock limit.
+  Each queued item runs on the REMAINING budget — a wait/hold item that would
+  overrun it, or a type item that could no longer run PACED at the proven-safe
+  interval, is never dispatched (resend the remaining items in a new call).
+  `CORTEX_WAIT_SEGMENT_SECONDS`: the accepted band is [1, client timeout − 5]
+  (1..55 at the default 60 s client — the pre-WP13 band; 1..25 at a 30 s host);
+  an out-of-band, unparsable or non-finite value FALLS BACK to the derived
+  default (fallback-not-clamp, as before WP13). Calls that run ≥ 3 s carry
+  ` elapsed_ms=<n>` in the message, serialized exactly like any other reply
+  (raw Unicode preserved). Unknown tool arguments are now REJECTED as a
+  contract rejection (`reasons` led by `unknown_argument`, no `error` key)
+  instead of being silently ignored — hosts passing extra keys (e.g. a direct
+  `hold_ms=`) must move them into `follow_ups` items or plan `points`.
+  `serverInfo.version` is now the Cortex version (0.7.6), not the mcp SDK
+  version. ensure_app NO_INSTANCE replies may carry an `ensure_app_hint:`
+  suffix naming the (deduplicated, ≤ 3) owning process basenames of matching
+  VISIBLE window titles and teaching a real `focus_window target='...'` retry
+  (hint only — never an attach; the suggested target is verified to match the
+  attach matcher). UIA semantic reads run on the reader's SINGLE long-lived
+  COM owner thread (one daemon worker per reader — COM is initialized and the
+  automation object lives there, never on per-call threads; stopped, the
+  pointer released and CoUninitialize run when the session ends); a read past
+  its derived wall (2 s at the defaults) — or while a hung WebView2/Chromium
+  provider still holds the owner busy — degrades VISIBLY as the
+  `read_timeout` branch (`branch=read_timeout`; never repaired, never
+  verified, no `TYPE_UNCONFIRMED` marker), a degraded BASELINE read demotes
+  the whole action the same way, and the reader recovers when the hung call
+  returns. The one-time warm runs under the full call budget capped at 10 s; a
+  warm timeout keeps the UIA reader, and the warm's FINAL outcome is recorded
+  ON the owner thread — a warm that times out and then fails swaps lazily to
+  the Win32 fallback on the next read (one that times out and then succeeds
+  keeps serving UIA reads). The whole type action
+  (dispatch + every verification read + horizon sleep) fits the derived
+  deadline: reads the remaining deadline can no longer cover report the
+  `verify_over_budget` branch.
+- **Typing pace and integrity outcomes (WP12a/WP12b/WP12c/WP12d)**: typing on the
+  real SendInput path now costs ≈ 20 ms per character (the effective pace drops
+  below 20 ms above 1800 characters, BMP or astral alike — 2000 characters pace
+  at exactly 18 ms; see the Changed entry). Integrity outcomes changed meaning: a
+  buffer that began correctly and then diverged — or any positive divergence
+  against the pre-dispatch baseline — is now `integrity=mismatch`
+  (ok:false, verdict demoted to `uncertain`), where some of those shapes were
+  bare `unverified` before; `unverified` itself is NOT a veto (a corroborating
+  title/UI match still verifies — see the agent's D-2a annotation) and now
+  names its ladder branch as a `branch=` message suffix. Consumers that
+  treated `unverified` as "the text may or may not have landed, keep going"
+  should re-read the `branch=` token list in the skill glossary.
+- **Closed result token set; the ok rule**: every action-bearing execute reply
+  (flat, follow-up item, plan step, terminal, wait family) carries `result`
+  from the closed set and `ok = (result ∈ {verified, marker})`. Consumers that
+  treated `ok:true` on a dry-run reply, or `result != "failed"` as success,
+  must re-read the contract: `dry_run`, `uncertain`, `rejected`,
+  `not_executed`, `stopped` and `unknown` are all `ok:false` now, and
+  `done`/`wait` markers are `ok:true` with `result:"marker"`.
+- **`image_scale` is gone**: the only scale key on any image-bearing reply is
+  `image_outbound_scale`. Readers of v0.7.5's constant-keyed `image_scale`
+  field must switch (the single measured key replaces it; `None` for raw
+  pass-through).
+- **Terminal plan ok rule**: `ok = (result == "verified")`; `unknown` (any
+  abstaining step, or a verified-but-partial prefix) and `stopped` are never
+  success. Plan STEP replies report `uncertain`; the `unknown` token is
+  reserved for the terminal aggregate.
+- **`LAUNCHED` prefix**: a real server-side `ensure_app` spawn message now
+  starts with `LAUNCHED` (was `NO_INSTANCE`); matchers on the leading token
+  must be updated. Launch gating truth: the process allowlist restricts
+  launches ONLY when one is configured — with no allowlist, `launch="server"`
+  (the default) may launch any resolvable target; `CORTEX_ATTACH_OR_LAUNCH=driver`
+  restores never-launch.
+- **Surface 6 → 10 tools**: the new `computer_wait` (blocks in segments under
+  the client's tool timeout), `computer_cancel_wait`, `computer_wait_status`,
+  and `computer_fetch_image` join the surface. A mid-plan lease refuses flat
+  execute / a second plan / wait / cancel / observe / zoom / screenshot with
+  the typed `plan_lease` error; `computer_wait_status` and
+  `computer_fetch_image` stay allowed.
+- **Mismatch veto + stated-effect uncertainty**: a stated-effect action whose
+  only evidence is a pixel change answers `uncertain` (E-03) where some paths
+  previously escalated to the pixel ladder and could answer `verified`; a
+  type-integrity `mismatch` demotes `verified` to `uncertain` instead of
+  reporting success beside a disagreeing read-back.
+- **Settle 50 → 0 ms**: the unconditional post-move settle is gone (default
+  `CORTEX_MOVE_SETTLE_MS=0`, band 0..200, fallback-not-clamp). The clipboard
+  transport's restore runs ~50 ms later (after the verify settle), so the
+  user's clipboard holds the agent's text slightly longer.
+- **Plan approval inheritance (O-03)**: approval is decided on the FIRST plan
+  call; `replace` inherits it and deliberately never reads the replace call's
+  own `approved` parameter — an approved plan can be replaced without
+  re-approval (per-item safety classification still applies to every action).
+- **Session idle timeout + recoverable session-limit reply**: sessions idle
+  > 15 min (configurable, `0` disables) with nothing in flight are stopped
+  automatically; `session_limit_exceeded` replies carry `live_sessions` and
+  `idle_timeout_seconds`; the `session_stopped` message for idle-reaped
+  sessions names the inactivity stop. Agents that poll slowly between calls
+  will find sessions stopped — call more often or raise the knob. A running
+  wait is never reaped; idle counting starts when it ends.
+- **Layered package restructure**: module paths moved (`computer_use_mcp.backend`
+  → `computer_use_mcp.desktop.backend`, `server.py` → the `server/` package,
+  etc.) with NO compatibility re-exports — importers of old paths must update.
+  The public launch paths are unchanged; `python -m computer_use_mcp.server`'s
+  logger name is now `computer_use_mcp.server` (was `__main__`), which matters
+  only to log-config filters keyed on logger names.
+- **Additive disclosure keys**: clipboard `non_text_destroyed` annotation,
+  semantic-read `ocr_dropped` / `text_truncated`, plan audit event types
+  (`plan_start` / `plan_point` / `plan_complete` / `plan_stopped`),
+  `partial_delivery`, `evidence_by_backend`, `ensure_app_outcome` (typed enum),
+  `replaced_plan_id` / `replaced_prefix`. All additive; no pre-existing key was
+  removed except `image_scale` (above).
+- **`package.json` policy**: the `cortex-agent-skill` npm wrapper previously
+  carried its own 0.6.0 version; it now tracks the server release (0.7.6), so
+  the npm version jumps to match and stays aligned going forward.
 
 ## v0.7.5 (2026-09-18, MISSION-CRF-AVR-010 — adaptive visual representations)
 

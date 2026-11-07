@@ -22,28 +22,45 @@ that preserves the user's clipboard content.
 from __future__ import annotations
 
 import ctypes
+from typing import Any
 
 import pytest
+from desktop_tripwire import LIVE_DESKTOP
+
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp.backend import (
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.clipboard as clipboard_module
+from computer_use_mcp.desktop.backend import (
     TYPE_UNCONFIRMED_HINT_CLIPBOARD,
     TYPE_UNCONFIRMED_HINT_SENDINPUT,
     TYPE_UNCONFIRMED_MARKER,
-    FakeComputerBackend,
-    InputBlockedError,
     LocalComputerBackend,
-    _clipboard_read_text,
     _clipboard_write_text,
 )
-from computer_use_mcp.models import ActionSpec, ActionType, GroundedAction, SessionState
-from computer_use_mcp.safety import SafetyContext, SafetyPolicy
-from computer_use_mcp.server import _grounded_shape_hint
-from computer_use_mcp.state import StopToken, TaskStopped
-from computer_use_mcp.validator import GroundingValidator
+from computer_use_mcp.desktop.clipboard import _clipboard_read_verdict
+from computer_use_mcp.desktop.errors import InputBlockedError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction, SessionState
+from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
+from computer_use_mcp.server.schemas import _grounded_shape_hint
+from computer_use_mcp.core.state import StopToken, TaskStopped
+from computer_use_mcp.pipeline.validator import GroundingValidator
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
+
+# DELTA 1 (VAL-WP4b BLOCKER): the five real-Win32 tests below TOUCH THE USER'S LIVE
+# SYSTEM CLIPBOARD (save/set/restore of real content, including a test that writes a
+# pre-existing astral payload without a save). They are the v0.7.1 F-01 live proofs and
+# are NOT part of the offline suite any more: they run only under the project's live
+# opt-in (CUMCP_RUN_E2E=1 — the same gate as tests/e2e, i.e. the WP12 live gate).
+# Everything they pin that is testable WITHOUT the OS is pinned offline by the stubbed
+# equivalents below (the F-01 code-unit sizing on the recording kernel32 fake, the
+# stubbed-OS astral roundtrip, and the refused-write-never-opens ordering).
+# WP-H: LIVE_CLIPBOARD is now the SHARED LIVE_DESKTOP marker
+# (tests/desktop_tripwire.py) — one gate and one reason for every real-desktop test
+# (real input, real system clipboard, real app launches).
+LIVE_CLIPBOARD = LIVE_DESKTOP
 
 
 # --- helpers ----------------------------------------------------------------------------------------
@@ -107,9 +124,11 @@ def _clipboard_backend(
     writes: list[str] = []
     reads_seen: list[str] = []
 
-    def _read() -> str | None:
+    reason = "restorable" if prior_clipboard is not None else "non_text"
+
+    def _verdict() -> tuple[str | None, str]:
         reads_seen.append("read")
-        return prior_clipboard
+        return (prior_clipboard, reason)
 
     failures = write_failures or set()
 
@@ -117,7 +136,13 @@ def _clipboard_backend(
         writes.append(text)
         return text not in failures
 
-    monkeypatch.setattr(backend_module, "_clipboard_read_text", _read)
+    # D13 / repair 3.3 + WP10a: the transport reads the clipboard ONLY through
+    # ``_clipboard_read_verdict`` (the three-way ``restorable``/``non_text``/``unknown``
+    # answer); the two-valued ``_clipboard_read_text`` projection was deleted as dead
+    # code.  The verdict is patched on the backend module, where production looks it up.
+    # The verdict shape is what production gets: ``prior_clipboard=None`` is reported as
+    # a NON-TEXT payload, which is exactly the case 3.3 discloses.
+    monkeypatch.setattr(backend_module, "_clipboard_read_verdict", _verdict)
     monkeypatch.setattr(backend_module, "_clipboard_write_text", _write)
     return engine, writes, reads_seen
 
@@ -379,17 +404,26 @@ def test_sendinput_via_and_default_pay_zero_clipboard_cost(
     reader = _ScriptedReader(["abc"])
     engine, _writes, _reads = _clipboard_backend(real_backend, monkeypatch, reader=reader)
 
-    def _bomb_read() -> str | None:
+    def _bomb_verdict() -> tuple[str | None, str]:
         raise AssertionError("clipboard read reached on the sendinput path")
 
     def _bomb_write(text: str) -> bool:
         raise AssertionError("clipboard write reached on the sendinput path")
 
-    monkeypatch.setattr(backend_module, "_clipboard_read_text", _bomb_read)
+    # D13 / repair 3.3 + WP10a: the verdict form is the ONLY reader the clipboard
+    # transport calls (the two-valued ``_clipboard_read_text`` projection was deleted
+    # as dead code), so the "the default path pays ZERO clipboard cost" bombs are
+    # planted on the verdict and the write.
+    monkeypatch.setattr(backend_module, "_clipboard_read_verdict", _bomb_verdict)
     monkeypatch.setattr(backend_module, "_clipboard_write_text", _bomb_write)
     legacy = real_backend.execute(_type_action("abc"))  # via=None
     explicit = real_backend.execute(_type_action("abc", "sendinput"))  # explicit default
-    assert legacy == explicit == "Executed type. integrity=verified(3/3)"
+    # WP12c C2: the field already holds 'abc' (the scripted baseline) and the
+    # dispatch cannot prove the insertion — honest unverified, ZERO clipboard cost
+    # either way (the point of this test).
+    assert legacy == explicit == (
+        "Executed type. integrity=unverified(0/3) branch=tail_unproven"
+    )
     assert [call[0] for call in engine.calls] == ["type_text", "type_text"]
 
 
@@ -400,7 +434,7 @@ def test_unverified_sendinput_blind_target_carries_typed_diagnostic_and_hint(
     engine, _writes, _reads = _clipboard_backend(real_backend, monkeypatch, reader=reader)
     message = real_backend.execute(_type_action("abcdef"))  # default transport, blind target
     assert message == (
-        "Executed type. integrity=unverified(0/6) "
+        "Executed type. integrity=unverified(0/6) branch=blind_read "
         f"{TYPE_UNCONFIRMED_MARKER} ({TYPE_UNCONFIRMED_HINT_SENDINPUT})"
     )
     assert ("type_text", "abcdef") in engine.calls
@@ -410,10 +444,11 @@ def test_unverified_sendinput_valueless_but_present_target_keeps_legacy_message(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Regression pin: a present-but-valueless control does NOT fire the marker.
+    # WP12a: the reply names the ladder branch (blind read) inside the message.
     reader = _ScriptedReader([None], control_type=None)
     _engine, _writes, _reads = _clipboard_backend(real_backend, monkeypatch, reader=reader)
     message = real_backend.execute(_type_action("abcdef"))
-    assert message == "Executed type. integrity=unverified(0/6)"
+    assert message == "Executed type. integrity=unverified(0/6) branch=blind_read"
 
 
 # --- FakeComputerBackend mirror -----------------------------------------------------------------------
@@ -458,7 +493,7 @@ def test_fake_sendinput_blind_target_still_carries_the_diagnostic() -> None:
     backend = FakeComputerBackend()
     message = backend.execute(_type_action("abc"))  # default transport
     assert message == (
-        "Simulated type. integrity=unverified(0/3) "
+        "Simulated type. integrity=unverified(0/3) branch=blind_read "
         f"{TYPE_UNCONFIRMED_MARKER} ({TYPE_UNCONFIRMED_HINT_SENDINPUT})"
     )
 
@@ -468,7 +503,10 @@ def test_fake_kill_switch_does_not_disable_the_explicit_clipboard_transport(
 ) -> None:
     # CORTEX_TYPE_INTEGRITY=0 removes the read-back LADDER, not an explicitly requested
     # transport: the paste still rides the chord path and reports honestly.
-    monkeypatch.setattr(backend_module, "TYPE_INTEGRITY_ENABLED", False)
+    # C-4: the driven reader is FakeComputerBackend — patch ITS binding.
+    from computer_use_mcp.desktop import fake_backend as fake_backend_module
+
+    monkeypatch.setattr(fake_backend_module, "TYPE_INTEGRITY_ENABLED", False)
     backend = FakeComputerBackend()
     backend.focused_control_value = ""
     message = backend.execute(_type_action("abc", "clipboard"))
@@ -479,17 +517,80 @@ def test_fake_kill_switch_does_not_disable_the_explicit_clipboard_transport(
 # --- real Win32 clipboard mechanics (Windows-gated roundtrip; preserves user content) -----------------
 
 
-@WINDOWS_ONLY
-def test_real_win32_clipboard_roundtrip_preserves_prior_content() -> None:
-    prior = _clipboard_read_text()
+#: The plain-text clipboard formats whose loss a test's save/restore can undo.
+#: Anything else (bitmap, HDROP file list, enhanced metafile, ...) alongside or
+#: instead of text would be DESTROYED by a write+restore cycle, so the live tests
+#: SKIP unless the clipboard holds only these. (CF_TEXT=1, CF_OEMTEXT=7,
+#: CF_UNICODETEXT=13, CF_LOCALE=16.)
+_TEXT_CLIPBOARD_FORMATS = frozenset({1, 7, 13, 16})
+
+
+def _restore_user_clipboard(prior: str, restored: dict[str, Any]) -> None:
+    """WP13 G (VAL-WP12-06 NIT): best-effort restore of the user's text. Called
+    from the ``finally`` — INCLUDING when the test body already failed — so a
+    failed restore is never silently swallowed: it raises AssertionError (chained
+    with the body exception) instead of vanishing."""
+    if restored["ok"]:
+        return
+    ok = _clipboard_write_text(prior) is True
+    readback = _clipboard_read_verdict()[0]
+    if not (ok and readback == prior):
+        raise AssertionError(
+            f"clipboard restore FAILED after the body had already failed "
+            f"(write ok={ok}, readback={readback!r}, expected {prior!r}) — the "
+            "user's clipboard content could not be put back"
+        )
+
+
+def _require_text_only_clipboard() -> str:
+    """WP12e P1 precondition for every LIVE clipboard test.
+
+    Enumerates the clipboard formats READ-ONLY (open + EnumClipboardFormats +
+    CloseClipboard — no EmptyClipboard, no writes) and SKIPS the test unless the
+    clipboard holds ONLY plain-text formats AND is readable as text. Returns the
+    user's text so the test can restore it in a ``finally`` (with a read-back
+    verification)."""
+    prior = _clipboard_read_verdict()[0]
     if prior is None:
         pytest.skip("clipboard not readable as text right now (non-text content or locked)")
+    if not clipboard_module._clipboard_open():
+        pytest.skip("clipboard could not be opened for the read-only format check")
+    # WP13 G (VAL-WP12-06 NIT): bind EnumClipboardFormats on a PRIVATE WinDLL —
+    # setting argtypes on the SHARED clipboard_module._user32 object is exactly the
+    # shared-DLL mutation the WP12 class-A guard forbids.
+    private_user32 = ctypes.WinDLL("user32", use_last_error=True)
+    try:
+        private_user32.EnumClipboardFormats.argtypes = [ctypes.c_uint]
+        private_user32.EnumClipboardFormats.restype = ctypes.c_uint
+        formats: set[int] = set()
+        fmt = int(private_user32.EnumClipboardFormats(0))
+        while fmt:
+            formats.add(fmt)
+            fmt = int(private_user32.EnumClipboardFormats(fmt))
+    finally:
+        clipboard_module._user32.CloseClipboard()
+    non_text = formats - _TEXT_CLIPBOARD_FORMATS
+    if non_text:
+        pytest.skip(
+            f"clipboard holds non-text formats {sorted(non_text)}; a write+restore "
+            "cycle would destroy them — not overwriting the user's clipboard"
+        )
+    return prior
+
+
+@WINDOWS_ONLY
+@LIVE_CLIPBOARD
+def test_real_win32_clipboard_roundtrip_preserves_prior_content() -> None:
+    prior = _require_text_only_clipboard()  # P1: text-only or skip; user's text saved
+    restored = {"ok": False, "readback": None}
     try:
         assert _clipboard_write_text("cortex-v071-clipboard-roundtrip") is True
-        assert _clipboard_read_text() == "cortex-v071-clipboard-roundtrip"
+        assert _clipboard_read_verdict()[0] == "cortex-v071-clipboard-roundtrip"
+        restored["ok"] = _clipboard_write_text(prior) is True
+        restored["readback"] = _clipboard_read_verdict()[0]
     finally:
-        assert _clipboard_write_text(prior) is True
-    assert _clipboard_read_text() == prior
+        _restore_user_clipboard(prior, restored)
+    assert restored["ok"] is True and restored["readback"] == prior
 
 
 # --- F-01 (RED-1) regression: allocation sizing by UTF-16 CODE UNITS, never char count ---------------
@@ -575,10 +676,10 @@ def test_clipboard_alloc_size_counts_utf16_code_units_not_characters(
     recorded size is simply wrong). Hermetic — no real clipboard.
     """
     kernel32 = _FakeAllocKernel32()
-    monkeypatch.setattr(backend_module, "_kernel32", kernel32)
-    monkeypatch.setattr(backend_module, "_user32", _FakeClipboardUser32(kernel32))
+    monkeypatch.setattr(clipboard_module, "_kernel32", kernel32)
+    monkeypatch.setattr(clipboard_module, "_user32", _FakeClipboardUser32(kernel32))
     # The fakes are plain callables: ctypes prototype binding is skipped (no-op needed).
-    monkeypatch.setattr(backend_module, "_CLIPBOARD_ARGTYPES_BOUND", True)
+    monkeypatch.setattr(clipboard_module, "_CLIPBOARD_ARGTYPES_BOUND", True)
     cases = [
         ("plain", (5 + 1) * 2),  # 5 BMP chars + NUL
         ("", (0 + 1) * 2),  # NUL only
@@ -594,11 +695,11 @@ def test_clipboard_alloc_size_counts_utf16_code_units_not_characters(
 
 
 @WINDOWS_ONLY
+@LIVE_CLIPBOARD
 def test_real_win32_clipboard_astral_roundtrip_byte_identical() -> None:
     """F-01 end-to-end: astral text round-trips write->read BYTE-identical (was lossy)."""
-    prior = _clipboard_read_text()
-    if prior is None:
-        pytest.skip("clipboard not readable as text right now (non-text content or locked)")
+    prior = _require_text_only_clipboard()  # P1: text-only or skip; user's text saved
+    restored = {"ok": False, "readback": None}
     cases = [
         "a\U0001F680b",  # the RED-1 proof shape: astral MIDDLE (tail 'b' was zeroed)
         "\U0001F680",  # astral tail: the last character was lost entirely
@@ -609,13 +710,16 @@ def test_real_win32_clipboard_astral_roundtrip_byte_identical() -> None:
     try:
         for text in cases:
             assert _clipboard_write_text(text) is True, text
-            assert _clipboard_read_text() == text, text  # the last char SURVIVES
+            assert _clipboard_read_verdict()[0] == text, text  # the last char SURVIVES
+        restored["ok"] = _clipboard_write_text(prior) is True
+        restored["readback"] = _clipboard_read_verdict()[0]
     finally:
-        assert _clipboard_write_text(prior) is True
-    assert _clipboard_read_text() == prior
+        _restore_user_clipboard(prior, restored)
+    assert restored["ok"] is True and restored["readback"] == prior
 
 
 @WINDOWS_ONLY
+@LIVE_CLIPBOARD
 def test_real_win32_clipboard_property_roundtrip_bmp_and_astral() -> None:
     """F-01 property row: N seeded random BMP+astral+combining strings all round-trip."""
     import random
@@ -623,9 +727,8 @@ def test_real_win32_clipboard_property_roundtrip_bmp_and_astral() -> None:
     rng = random.Random(0xF01)  # deterministic
     pool_bmp = list("abcXYZ 0189") + ["é", "世", "界", "e\u0301", "£", "\U0000FFFD"]
     pool_astral = ["\U0001F680", "\U00020000", "\U0001D54F", "\U0001F9D1\u200D\U0001F91D"]
-    prior = _clipboard_read_text()
-    if prior is None:
-        pytest.skip("clipboard not readable as text right now (non-text content or locked)")
+    prior = _require_text_only_clipboard()  # P1: text-only or skip; user's text saved
+    restored = {"ok": False, "readback": None}
     try:
         for _ in range(40):
             text = "".join(
@@ -633,19 +736,29 @@ def test_real_win32_clipboard_property_roundtrip_bmp_and_astral() -> None:
                 for _ in range(rng.randint(0, 24))
             )
             assert _clipboard_write_text(text) is True
-            assert _clipboard_read_text() == text, f"roundtrip corrupted {text!r}"
+            assert _clipboard_read_verdict()[0] == text, f"roundtrip corrupted {text!r}"
+        restored["ok"] = _clipboard_write_text(prior) is True
+        restored["readback"] = _clipboard_read_verdict()[0]
     finally:
-        assert _clipboard_write_text(prior) is True
-    assert _clipboard_read_text() == prior
+        _restore_user_clipboard(prior, restored)
+    assert restored["ok"] is True and restored["readback"] == prior
 
 
 @WINDOWS_ONLY
+@LIVE_CLIPBOARD
 def test_clipboard_transport_astral_paste_and_restore(
     real_backend: LocalComputerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """F-01 at transport level: an astral suffix survives the paste AND the restore."""
+    """F-01 at transport level: an astral suffix survives the paste AND the restore.
+
+    WP12e P1: the test first requires a TEXT-ONLY user clipboard (read-only format
+    enumeration — any rich format would be destroyed by the write+restore cycle),
+    saves the user's text, and restores it in a finally with a read-back
+    verification."""
     text = "console: a\U0001F680b"  # astral char mid-text, BMP tail (the lossy shape)
     prior = "prior \U00020000-content"  # astral content the restore must preserve
+    user_text = _require_text_only_clipboard()  # P1: text-only or skip; user's text saved
+    restored = {"ok": False, "readback": None}
     monkeypatch.setattr(backend_module, "TYPE_VERIFY_SETTLE_SECONDS", 0.0)
     engine = RecordingEngine()
     monkeypatch.setattr(real_backend, "_engine", engine)
@@ -655,24 +768,95 @@ def test_clipboard_transport_astral_paste_and_restore(
     real_chord = engine.chord
 
     def _chord(keys: list[str]) -> None:
-        captured.append(_clipboard_read_text())  # what the OS clipboard holds AT PASTE TIME
+        captured.append(_clipboard_read_verdict()[0])  # what the OS clipboard holds AT PASTE TIME
         real_chord(keys)
 
     monkeypatch.setattr(engine, "chord", _chord)
-    assert _clipboard_write_text(prior) is True  # pre-existing astral clipboard content
-    message = real_backend.execute(_type_action(text, "clipboard"))
-    assert message == f"Executed type. via=clipboard integrity=verified({len(text)}/{len(text)})"
-    assert engine.calls[-1] == ("chord", "ctrl", "v")
-    assert captured == [text], f"clipboard at paste time lost the astral tail: {captured}"
-    assert _clipboard_read_text() == prior  # the astral restore is byte-identical
+    try:
+        assert _clipboard_write_text(prior) is True  # pre-existing astral clipboard content
+        message = real_backend.execute(_type_action(text, "clipboard"))
+        assert message == f"Executed type. via=clipboard integrity=verified({len(text)}/{len(text)})"
+        assert engine.calls[-1] == ("chord", "ctrl", "v")
+        assert captured == [text], f"clipboard at paste time lost the astral tail: {captured}"
+        assert _clipboard_read_verdict()[0] == prior  # the astral restore is byte-identical
+        restored["ok"] = _clipboard_write_text(user_text) is True
+        restored["readback"] = _clipboard_read_verdict()[0]
+    finally:
+        _restore_user_clipboard(user_text, restored)
+    assert restored["ok"] is True and restored["readback"] == user_text
 
 
 @WINDOWS_ONLY
+@LIVE_CLIPBOARD
 def test_real_win32_refused_write_leaves_user_clipboard_intact() -> None:
     """A refused write (lone surrogate cannot be UTF-16 encoded) must not destroy the
-    user's current clipboard content: the encode runs BEFORE the clipboard is opened."""
-    prior = _clipboard_read_text()
-    if prior is None:
-        pytest.skip("clipboard not readable as text right now (non-text content or locked)")
+    user's current clipboard content: the encode runs BEFORE the clipboard is opened.
+    WP12e P1: text-only precondition (skip otherwise — rich formats must not even be
+    risk-adjacent)."""
+    prior = _require_text_only_clipboard()  # P1: text-only or skip; user's text saved
     assert _clipboard_write_text("x\ud800y") is False  # refused, never a corrupt block
-    assert _clipboard_read_text() == prior  # content untouched by the refused write
+    assert _clipboard_read_verdict()[0] == prior  # content untouched by the refused write
+
+
+# --- DELTA 1 (VAL-WP4b BLOCKER): offline stubbed equivalents for the gated live proofs ----
+#
+# The live tests above run only under CUMCP_RUN_E2E=1. What they pin that is testable
+# WITHOUT the OS is pinned here against the SAME recording fakes the F-01 sizing test
+# uses (an exact-size zeroed GlobalAlloc kernel32 and a last-Set-handle user32), so a
+# regression in code-unit sizing, encode-before-open ordering, or the astral roundtrip
+# itself fails OFFLINE. No real clipboard is reachable from any of these: both fakes
+# are plain classes and `_clipboard_open`'s only OS touch is through the patched
+# `_user32`/`_kernel32`.
+
+
+class _OpenCountingClipboardUser32(_FakeClipboardUser32):
+    """The stubbed-OS user32, plus a record of every OpenClipboard attempt."""
+
+    def __init__(self, kernel32: _FakeAllocKernel32) -> None:
+        super().__init__(kernel32)
+        self.open_calls = 0
+
+    def OpenClipboard(self, _owner: int | None) -> int:
+        self.open_calls += 1
+        return 1
+
+
+def _install_stubbed_os(monkeypatch: pytest.MonkeyPatch) -> tuple[_FakeAllocKernel32, _OpenCountingClipboardUser32]:
+    kernel32 = _FakeAllocKernel32()
+    user32 = _OpenCountingClipboardUser32(kernel32)
+    monkeypatch.setattr(clipboard_module, "_kernel32", kernel32)
+    monkeypatch.setattr(clipboard_module, "_user32", user32)
+    # The fakes are plain callables: ctypes prototype binding is skipped (no-op needed).
+    monkeypatch.setattr(clipboard_module, "_CLIPBOARD_ARGTYPES_BOUND", True)
+    return kernel32, user32
+
+
+def test_clipboard_write_read_roundtrip_astral_on_the_stubbed_os(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Offline twin of the gated live astral roundtrips: astral / BMP / combining text
+    round-trips write->read BYTE-identical through the stubbed OS (the exact-size
+    zeroed block + the terminating NUL are what the real clipboard reads back). The
+    RED-1 lossy shapes (astral MIDDLE and astral TAIL) are the cases that mattered."""
+    _kernel32, _user32 = _install_stubbed_os(monkeypatch)
+    cases = [
+        "a\U0001F680b",  # astral MIDDLE (the RED-1 shape: tail 'b' was zeroed)
+        "\U0001F680",  # astral TAIL: the last character was lost entirely
+        "script\U00020000ab",  # CJK Ext-B
+        "e\u0301\u0327",  # combining marks (BMP)
+        "héllo 世界 \U0001F680RED1",  # mixed BMP + astral
+        "",  # NUL-only block round-trips as ""
+    ]
+    for text in cases:
+        assert _clipboard_write_text(text) is True, text
+        assert _clipboard_read_verdict()[0] == text, text  # the last char SURVIVES
+
+
+def test_refused_write_never_opens_the_clipboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offline twin of the gated live refused-write pin: a lone surrogate cannot be
+    UTF-16 encoded, and the encode runs BEFORE the clipboard is opened — so a refused
+    write performs ZERO OpenClipboard calls (there is nothing to destroy)."""
+    _kernel32, user32 = _install_stubbed_os(monkeypatch)
+    assert _clipboard_write_text("x\ud800y") is False  # refused, never a corrupt block
+    assert user32.open_calls == 0  # the clipboard was NEVER opened by the refused write
+

@@ -36,11 +36,15 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp import backend as backend_module
-from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend, LocalComputerBackend
-from computer_use_mcp.models import GroundedAction, Observation, WindowInfo
-from computer_use_mcp.verification import (
+from computer_use_mcp.desktop import backend as backend_module
+import computer_use_mcp.server.replies as srv_server_replies
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.server.app as srv_server_app
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.core.models import GroundedAction, Observation, WindowInfo
+from computer_use_mcp.pipeline.verification import (
     ScreenshotDiffStrategy,
     VerificationEngine,
     VerificationIntent,
@@ -125,7 +129,7 @@ def _decode_image(data_b64: str) -> Image.Image:
 
 
 async def _run(session_id: str, spec: dict[str, Any]) -> dict[str, Any]:
-    return execute_payload(await server.computer_execute(session_id, **spec))
+    return execute_payload(await srv_server_execute.computer_execute(session_id, **spec))
 
 
 class ShiftingScreenBackend(ScriptedBackend):
@@ -396,7 +400,7 @@ async def test_r2_d10_photographic_gradient_default_response_under_100kb(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     backend.observe_override_png = _gradient_png_b64()
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     assert isinstance(result, list) and len(result) == 2
     text_block, image_block = result
     assert image_block.mimeType == "image/jpeg"
@@ -405,7 +409,7 @@ async def test_r2_d10_photographic_gradient_default_response_under_100kb(
     raw_bytes = len(base64.b64decode(image_block.data, validate=True))
     assert raw_bytes <= 100_000, raw_bytes
     payload = json.loads(text_block.text)
-    assert payload["image_scale"] == 0.5
+    assert payload["image_outbound_scale"] == 0.5  # §1.1 D-3: the measured key
     assert payload["image_format"] == "image/jpeg"
 
 
@@ -418,7 +422,7 @@ async def test_r2_d10_h7_budget_holds_on_every_path_even_tightened(
     deliberately tightened 64KB budget (the half-res q60 output itself gets laddered)."""
     monkeypatch.delenv(ACTION_IMAGE_FULL_ENV, raising=False)
     monkeypatch.setenv(RESULT_IMAGE_MAX_KB_ENV, "64")
-    budget = server._result_image_max_bytes()
+    budget = srv_server_replies._result_image_max_bytes()
     assert budget == 64 * 1024
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
@@ -427,7 +431,7 @@ async def test_r2_d10_h7_budget_holds_on_every_path_even_tightened(
     # Default path: half-res JPEG, bounded by the tightened budget. For this
     # pathological frame the q60 half-res output itself exceeds 64KB, so the H7
     # ladder engages and shrinks it further — the CONTRACT is the budget, held.
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     _text_block, image_block = result
     raw_bytes = len(base64.b64decode(image_block.data, validate=True))
     assert raw_bytes <= budget, (image_block.mimeType, raw_bytes)
@@ -435,7 +439,7 @@ async def test_r2_d10_h7_budget_holds_on_every_path_even_tightened(
     assert 0 < _decode_image(image_block.data).size[0] <= 960  # never up-scaled, bounded
     # Explicit full path with the same impossible frame: the ladder still governs.
     backend.observe_override_png = _noise_png_b64(seed=3)
-    result = await server.computer_execute(
+    result = await srv_server_execute.computer_execute(
         session_id, "click", x=20, y=20, include_screenshot_after=True
     )
     _text_block, image_block = result
@@ -455,9 +459,9 @@ async def test_r2_d10_full_env_plus_explicit_optin_no_double_encode(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     structured = _structured_png_b64()
-    assert len(base64.b64decode(structured, validate=True)) <= server._result_image_max_bytes()
+    assert len(base64.b64decode(structured, validate=True)) <= srv_server_replies._result_image_max_bytes()
     backend.observe_override_png = structured
-    result = await server.computer_execute(
+    result = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, include_screenshot_after=True
     )
     text_block, image_block = result
@@ -466,7 +470,12 @@ async def test_r2_d10_full_env_plus_explicit_optin_no_double_encode(
     assert _decode_image(image_block.data).size == (1920, 1080)
     payload = json.loads(text_block.text)
     assert payload["image_format"] == "image/png"
-    assert "image_scale" not in payload, "the half-res truth marker must not lie on the full path"
+    # §1.1 D-3 (ORVEX-2026-108): the deleted half-res marker is gone; the reply
+    # carries the MEASURED image_outbound_scale (1.0 — the PNG traveled untouched).
+    assert "image_scale" not in payload
+    # MINOR-b (Commander decision): an untouched PNG is a raw PASS-THROUGH — the
+    # honest report is None (no downscale applied), never 1.0.
+    assert payload["image_outbound_scale"] is None
 
 
 async def test_r2_d10_text_mode_with_explicit_optin_zero_image_blocks(
@@ -476,9 +485,9 @@ async def test_r2_d10_text_mode_with_explicit_optin_zero_image_blocks(
     images — the response stays the slim dict with zero image blocks and zero
     screenshot bytes even though the capture succeeded."""
     backend = ScriptedBackend()
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(
         dry_run=False, require_approval=False, limits=FAST_LIMITS, image_delivery="text",
     )
     session_id = str(response["session_id"])
@@ -678,12 +687,15 @@ async def test_r2_d11_drag_zero_diff_with_window_swap_is_uncertain(
     )
 
 
-async def test_r2_d11_real_change_with_stated_effect_drag_still_verified(
+async def test_r2_d11_real_change_with_stated_effect_drag_now_abstains_to_uncertain(
     monkeypatch: pytest.MonkeyPatch, fresh_server: Any
 ) -> None:
-    """The verified path is intact for the extended kinds: a stated-effect DRAG over a
-    REAL above-threshold change is verified (ok=True) exactly as before — the doctrine
-    degraded only the ABSENT-evidence case."""
+    """RE-PINNED by WP4a (E-03, the authorized verdict change): a stated-effect DRAG
+    over a REAL above-threshold change used to verify (ok=True) off the generic
+    "pixels changed" branch — a flip is not "the marquee stretches". The pixel tier
+    now abstains on ANY stated effect, so the honest verdict is ``uncertain`` (ok
+    False) with the change still reported (``changed=True``). The ABSENT-evidence
+    degrade and the BARE-expectation verified path are unchanged (the sibling pins)."""
     backend = ScriptedBackend(flip=True)  # every execute flips white -> black
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, backend=backend, provider=ScriptedProvider([]),
@@ -694,8 +706,10 @@ async def test_r2_d11_real_change_with_stated_effect_drag_still_verified(
         {"action": "drag", "x": 5, "y": 5, "x2": 40, "y2": 30,
          "expected_effect": "the marquee stretches", "include_screenshot_after": False},
     )
-    assert payload["ok"] is True, payload
-    assert payload["verification"]["outcome"] == "verified", payload.get("verification")
+    assert payload["ok"] is False, payload
+    assert payload["result"] == "uncertain", payload.get("result")
+    assert payload["verification"]["outcome"] == "uncertain", payload.get("verification")
+    assert payload["verification"]["changed"] is True, payload.get("verification")
 
 
 def test_r2_d11_subthreshold_diff_bare_fails_while_stated_degrades() -> None:
@@ -748,7 +762,7 @@ def _diff_magnitude_probe(before: Observation, after: Observation) -> tuple[floa
     """Direct probe of the diff tier's magnitudes (decoded frames, no stash)."""
     before_image = ScreenshotDiffStrategy._decode(before.image_base64)
     after_image = ScreenshotDiffStrategy._decode(after.image_base64)
-    from computer_use_mcp.verification import _diff_magnitude
+    from computer_use_mcp.pipeline.verification import _diff_magnitude
 
     return _diff_magnitude(before_image, after_image)
 
@@ -776,6 +790,11 @@ async def test_r2_d11_fault_injection_window_and_focus_change_must_not_verify_ty
 
 #: AMENDED (AL-002 Amendment A1, owner addendum 2026-09-18): ``computer_zoom`` joins
 #: as the sixth, observation-only tool; the wire-compat walk covers it identically.
+#: RESTATED (ORVEX-2026-108 WP6, decision D-1): the cancellable-wait family —
+#: ``computer_wait``, ``computer_cancel_wait`` and the NEW consumer
+#: ``computer_wait_status`` — joins as tools 7-9.
+#: RESTATED (ORVEX-2026-108 WP5): ``computer_fetch_image`` — the evidence store's
+#: retrieval tool — joins as the tenth.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
@@ -783,18 +802,22 @@ ALL_TOOLS = (
     "computer_screenshot",
     "computer_execute",
     "computer_zoom",
+    "computer_wait",
+    "computer_cancel_wait",
+    "computer_wait_status",
+    "computer_fetch_image",
 )
 
 
-async def test_r2_surface_is_exactly_six_plain_tools() -> None:
-    """Exactly 6 registered tools (AMENDED by AL-002 Amendment A1, owner addendum
-    2026-09-18: the observation-only ``computer_zoom`` joins the five deterministic
-    tools); every advertised inputSchema contains ZERO anyOf and ZERO $ref/$defs
-    (the wire-compat contract, re-walked independently)."""
-    tools = await server.mcp.list_tools()
+async def test_r2_surface_is_exactly_ten_plain_tools() -> None:
+    """Exactly 10 registered tools (AL-002 zoom was the sixth; ORVEX-2026-108 WP6
+    decision D-1 added the wait family as 7-9; WP5 added the evidence-retrieval
+    tool as the tenth); every advertised inputSchema contains ZERO anyOf and
+    ZERO $ref/$defs (the wire-compat contract, re-walked independently)."""
+    tools = await srv_server_app.mcp.list_tools()
     assert sorted(tool.name for tool in tools) == sorted(ALL_TOOLS)
     for name in ALL_TOOLS:
-        registered = server.mcp._tool_manager.get_tool(name)
+        registered = srv_server_app.mcp._tool_manager.get_tool(name)
         assert registered is not None, name
         schema_text = json.dumps(registered.fn_metadata.arg_model.model_json_schema())
         assert "anyOf" not in schema_text, name
@@ -805,7 +828,7 @@ def test_r2_served_computer_execute_text_teaches_d9_and_d10(fresh_server: Any) -
     """The SERVED computer_execute text (what a driving model actually reads) must
     teach BOTH fixes: the half-size JPEG default (action-image) and the
     queue-continues-while-the-attached-window-is-constant semantics (queue-premise)."""
-    doc = inspect.getdoc(server.computer_execute) or ""
+    doc = inspect.getdoc(srv_server_execute.computer_execute) or ""
     assert "HALF-SIZE JPEG" in doc, "served text must teach the action-image default weight"
     assert "0.5x" in doc and "60KB" in doc
     assert "include_screenshot_after=true" in doc  # the full-res opt-in is documented

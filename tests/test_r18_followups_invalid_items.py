@@ -30,10 +30,13 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.models import ActionSpec, ActionType, GroundedAction
-from computer_use_mcp.server import ACTION_VOCABULARY
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.core.models import ActionSpec, ActionType, GroundedAction
+from computer_use_mcp.server.schemas import ACTION_VOCABULARY
 
 
 @pytest.fixture
@@ -42,16 +45,18 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     bounded registry/bundles + per-test audit dir for full session isolation. Kept
     local so test signatures never shadow an imported name."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 async def _execute_with_followups(
     session_id: str, primary: dict[str, Any], follow_ups: list[dict[str, Any]]
 ) -> dict[str, Any]:
     return execute_payload(
-        await server.computer_execute(
+        await srv_server_execute.computer_execute(
             session_id,
             approved=True,
             follow_ups=follow_ups,
@@ -103,7 +108,7 @@ async def test_malformed_follow_up_returns_typed_invalid_action_with_hints(
         session_id, {"action": "click", "x": 10, "y": 10}, [follow_up]
     )
     assert payload["ok"] is False, payload
-    assert payload["error"] == "invalid_action", payload
+    assert payload["result"] == "rejected" and "invalid_action" in payload["reasons"], payload
     assert "ValidationError" not in payload["message"], payload
     assert hint_fragment in " ".join(payload["reasons"]), payload
     # the teach-in-text contract: the full valid vocabulary rides the rejection
@@ -133,7 +138,7 @@ async def test_malformed_follow_up_never_starts_the_queue(
         ],
     )
     assert payload["ok"] is False, payload
-    assert payload["error"] == "invalid_action", payload
+    assert payload["result"] == "rejected" and "invalid_action" in payload["reasons"], payload
     assert executed_summary(backend) == [], payload
 
 
@@ -156,7 +161,7 @@ async def test_move_and_ensure_app_grounded_invalid_classes_also_teach(
         payload = await _execute_with_followups(
             session_id, {"action": "click", "x": 10, "y": 10}, [follow_up]
         )
-        assert payload["error"] == "invalid_action", (follow_up, payload)
+        assert payload["result"] == "rejected" and "invalid_action" in payload["reasons"], (follow_up, payload)
         assert fragment in " ".join(payload["reasons"]), (follow_up, payload)
     assert executed_summary(backend) == [], payload
 

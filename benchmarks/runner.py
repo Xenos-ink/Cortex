@@ -72,10 +72,14 @@ from benchmarks.appwin import (
     window_text,
 )
 from benchmarks.fakeworld import FakeWorldBackend
-from computer_use_mcp import server
-from computer_use_mcp.backend import LocalComputerBackend
-from computer_use_mcp.models import GroundedAction
-from computer_use_mcp.state import SessionRegistry
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.core.models import GroundedAction
+from computer_use_mcp.core.state import SessionRegistry
 
 DISCLAIMER = "Harness validation output — NOT benchmark scores."
 CATEGORIES = (
@@ -316,8 +320,28 @@ class DirectCallDriver:
             )
             executed += 1
             if not ok:
-                # A refused/failed action ends the host script: map the typed outcome
-                # to the loop-era termination vocabulary the collector understands.
+                # ORVEX-2026-108 WP4a DELTA 1 (E-03 consequence; proof recorded in
+                # .orvex/mission/artifacts/gates/wp4a-notes.md): ``uncertain`` is the
+                # §1.2 "dispatched, unproven" token — the input DISPATCHED and the
+                # task's real assertion is its final predicate — so an uncertain step
+                # no longer ENDS the host script. Ending on it conflated unproven
+                # with failed: after the E-03 abstention, every stated effect that no
+                # deterministic tier can corroborate (t03's clicks into the
+                # already-focused window, t04's calculator display clicks — neither
+                # world produces any deterministic before/after identity delta) came
+                # back honestly uncertain, and the old stop discarded the rest of the
+                # script AND the predicate. The step's miss still rides the recorded
+                # result (ok False above) and the collector's verification_counts.
+                if payload.get("result") == "uncertain" and self.resolver.mode == "fake":
+                    # F3 (VAL-WP4a DELTA 2): the continue is FAKE-MODE ONLY. In fake
+                    # mode this is harness validation against a modeled world whose
+                    # task predicate (checked harness-side) is the task's real
+                    # assertion. A LIVE run keeps the conservative halt: it must never
+                    # keep dispatching real input after an unproven step.
+                    continue
+                # A refused/failed action still ends the host script: map the typed
+                # outcome to the loop-era termination vocabulary the collector
+                # understands.
                 termination = self._termination_for(payload)
                 break
         return {
@@ -332,9 +356,9 @@ class DirectCallDriver:
     def _observe(self, session_id: str) -> Any:
         import json as _json
 
-        from computer_use_mcp import server as srv
+        
 
-        response = srv.computer_observe(session_id)
+        response = srv_server_observe.computer_observe(session_id)
         if isinstance(response, list):  # [TextContent, ImageContent]
             return _json.loads(response[0].text).get("observation")
         if isinstance(response, dict):
@@ -344,7 +368,7 @@ class DirectCallDriver:
     async def _execute(self, session_id: str, action: GroundedAction, step: dict[str, Any]) -> dict[str, Any]:
         import json as _json
 
-        from computer_use_mcp import server as srv
+        
 
         kwargs: dict[str, Any] = {}
         if action.point is not None:
@@ -358,19 +382,61 @@ class DirectCallDriver:
             kwargs["delta"] = action.delta or 1
         if action.expected_effect:
             kwargs["expected_effect"] = action.expected_effect
-        response = await srv.computer_execute(session_id, str(getattr(action.action, "value", action.action)), **kwargs)
+        response = await srv_server_execute.computer_execute(session_id, str(getattr(action.action, "value", action.action)), **kwargs)
         if isinstance(response, list):  # executed shape: [TextContent, ImageContent]
             return _json.loads(response[0].text)
         return response
 
     @staticmethod
     def _termination_for(payload: dict[str, Any]) -> str:
-        """Map a refused direct call to the loop-era termination vocabulary."""
+        """Map a refused direct call to a termination class, by the §1 result TOKEN.
+
+        MINOR-d (VAL-WP1, Commander decision): the §1 ``result`` token classifies
+        FIRST; a ``rejected`` reply is then classified by its FIRST REASON prefix
+        (the shared helper names the gate: ``safety_denied: ...`` /
+        ``digest_surprise: ...`` / ``limit_exceeded: ...``). ``dry_run`` / ``stopped``
+        / ``uncertain`` / ``not_executed`` get their own honest classes and can NEVER
+        fall through to ``blocked_safety``.
+
+        Task-classification parity (stated, MINOR-d): every existing benchmark task
+        keeps its class — t09's safety block still maps to ``blocked_safety`` (the
+        safety gate names itself); limit/digest/approval/verification-failure classes
+        are unchanged; no shipped task ends on dry_run/stopped/uncertain/not_executed.
+        ``blocked_safety`` additionally requires ``safety_blocks > 0`` at the
+        collector (see ``_collect``), so the classification cannot be faked.
+        """
+        result_token = payload.get("result")
+        reasons = [str(reason) for reason in payload.get("reasons", [])]
+        if result_token == "rejected":
+            if any(reason.startswith("safety_denied") for reason in reasons):
+                return "blocked_safety"
+            if any(reason.startswith("limit_exceeded") for reason in reasons):
+                return "limit_exceeded"
+            if any(reason.startswith("digest_surprise") for reason in reasons):
+                return "digest_surprise"
+            return "rejected"
+        if result_token == "failed":
+            # MINOR-N2 (VAL-WP1-02): a failed VERIFICATION verdict (a dispatched
+            # action whose expectation provably failed) keeps the v0.7.5
+            # ``failed_verification`` class; only an operation error (the typed
+            # ``action_error`` code) is ``failed_execution``. All shipped benchmark
+            # task classifications are identical to v0.7.5 for unchanged behaviors.
+            if payload.get("error") == "action_error":
+                return "failed_execution"
+            return "failed_verification"
+        if result_token == "uncertain":
+            return "verification_uncertain"
+        if result_token == "dry_run":
+            return "dry_run"
+        if result_token == "stopped":
+            return "stopped"
+        if result_token == "not_executed":
+            # the only not_executed producer on this surface is the approval hold
+            if "requires_approval" in payload:
+                return "approval_required"
+            return "not_executed"
+        # legacy/defensive shapes (no §1 token): keep the historical mappings
         error = str(payload.get("error", "") or "")
-        # Safety denials carry {"ok": False, "message": <policy reason>} with no error
-        # field; requires_approval is a separate approval_required shape. The
-        # collector cross-checks blocked_safety against the safety_block COUNTER and
-        # zero execution events, so this mapping cannot fake a "blocked as expected".
         if error == "limit_exceeded":
             return "limit_exceeded"
         if error == "digest_surprise":
@@ -679,8 +745,8 @@ class BenchmarkRunner:
                 )
                 return result
             backend = world.backend if self.mode == "fake" else LocalComputerBackend()
-            server._backend_factory = lambda: backend  # type: ignore[method-assign]
-            response = server.start_session(
+            srv_server_lifecycle._backend_factory = lambda: backend  # type: ignore[method-assign]
+            response = srv_server_lifecycle.start_session(
                 dry_run=False,
                 require_approval=False,
                 max_steps=task.max_actions + 4,
@@ -691,24 +757,24 @@ class BenchmarkRunner:
                 return result
             session_id = str(response["session_id"])
             run_response = asyncio.run(driver.run(session_id))
-            bundle = server._get_bundle(session_id)
+            bundle = srv_server_lifecycle._get_bundle(session_id)
             # The real session metrics ride on the bundle (the loop response used to
             # carry them); hand them to the collector in the same shape.
             metrics_snapshot = bundle.metrics.snapshot()
             run_response["metrics"] = metrics_snapshot
             result.update(self._collect(task, run_response, bundle, session_id, world, scratch_dir))
-            server.stop_session(session_id)
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))
             return result
         except Exception as exc:  # noqa: BLE001 - harness failures are recorded, never raised
             result["error"] = f"{type(exc).__name__}: {exc}"
             return result
         finally:
-            (
-                server._registry,
-                server._bundles,
-                server._backend_factory,
-                server._provider_factory,
-            ) = saved_state
+            srv_server_lifecycle._registry = saved_state[0]
+            srv_server_lifecycle._bundles = saved_state[1]
+            srv_server_wait_machine._bundles = srv_server_lifecycle._bundles
+            srv_server_wait._bundles = srv_server_lifecycle._bundles
+            srv_server_lifecycle._backend_factory = saved_state[2]
+            srv_server_lifecycle._provider_factory = saved_state[3]
             if self.mode == "env":
                 world.teardown()
 
@@ -719,9 +785,11 @@ class BenchmarkRunner:
         Fresh registry/bundles per task also prevent the bounded session registry from
         exhausting across tasks (stop_session arms the kill path but never deregisters).
         """
-        snapshot = (server._registry, server._bundles, server._backend_factory, server._provider_factory)
-        server._registry = SessionRegistry(max_sessions=8)
-        server._bundles = {}
+        snapshot = (srv_server_lifecycle._registry, srv_server_lifecycle._bundles, srv_server_lifecycle._backend_factory, srv_server_lifecycle._provider_factory)
+        srv_server_lifecycle._registry = SessionRegistry(max_sessions=8)
+        srv_server_lifecycle._bundles = {}
+        srv_server_wait_machine._bundles = srv_server_lifecycle._bundles
+        srv_server_wait._bundles = srv_server_lifecycle._bundles
         return snapshot
 
     def _collect(
@@ -782,12 +850,29 @@ class BenchmarkRunner:
         termination = run_response.get("termination_reason")
         predicate = world.final_predicate(task, scratch_dir)
         if expected_block:
-            blocked_as_expected = termination == "blocked_safety" and execution_events == 0
+            # MINOR-d: the safety_block COUNTER must agree — a "blocked as expected"
+            # verdict additionally requires that the safety gate actually fired.
+            blocked_as_expected = (
+                termination == "blocked_safety"
+                and execution_events == 0
+                and safety_blocks > 0
+            )
             predicate["outcome"] = "verified" if blocked_as_expected else "failed"
             predicate["evidence"]["termination_reason"] = termination
             predicate["evidence"]["execution_events"] = execution_events
         completed = termination == "completed"
         predicate_ok = predicate["outcome"] in {"verified", "not_determined"}
+        # F3 (VAL-WP4a DELTA 2): once ANY step was uncertain (dispatched, unproven),
+        # the task may read ``completed`` only on a POSITIVELY satisfied predicate. A
+        # ``not_determined`` predicate after uncertain steps means nothing was proven,
+        # so ``completed`` would claim a success the evidence does not hold. The
+        # vocabulary is the runner's own existing non-completed one: ``failed`` is the
+        # honest record for an executed task that was not proven (the only other
+        # non-completed statuses, requires_env / safety_blocked_as_expected, are
+        # collector-level and inapplicable here).
+        uncertain_steps = verification_counts["uncertain"]
+        if uncertain_steps and predicate["outcome"] != "verified":
+            predicate_ok = False
         status = "completed" if completed and predicate_ok else "failed"
         if expected_block and predicate["outcome"] == "verified":
             status = "safety_blocked_as_expected"
@@ -802,6 +887,8 @@ class BenchmarkRunner:
             "executed_actions": executed_actions,
             "max_actions": task.max_actions,
             "verification_outcomes": verification_counts,
+            # F3 (VAL-WP4a DELTA 2): the per-task count of honestly-unproven steps.
+            "uncertain_steps": uncertain_steps,
             "grounding": {
                 "strategies": grounding_strategies,
                 "avg_confidence": (
@@ -839,6 +926,12 @@ class BenchmarkRunner:
             "tasks_requires_env": len(results) - len(actionable),
             "completed": completed,
             "failed": len(actionable) - completed,
+            # F3 (VAL-WP4a DELTA 2): unproven steps are counted, never laundered into
+            # completed or failed task statuses.
+            "uncertain_steps_total": sum(
+                (item.get("verification_outcomes") or {}).get("uncertain", 0)
+                for item in actionable
+            ),
             "recovery_events_total": sum(item.get("recovery_events", 0) for item in actionable),
             "safety_blocks_total": sum(item.get("safety_blocks", 0) for item in actionable),
             "false_safety_blocks_total": sum(item.get("false_safety_blocks", 0) for item in actionable),

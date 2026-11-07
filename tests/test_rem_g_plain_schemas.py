@@ -40,13 +40,20 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
-from computer_use_mcp.state import SessionRegistry
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.app as srv_server_app
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.core.state import SessionRegistry
 
 #: The deterministic MCP tools exposed on the stdio boundary (fixed contract).
 # AMENDED (loop removal): the internal-loop tool family is deleted from the surface.
 # AMENDED (AL-002 Amendment A1, owner addendum 2026-09-18): ``computer_zoom`` joins
 # as the sixth, observation-only tool; the no-anyOf walk covers it identically.
+# RESTATED (ORVEX-2026-108 WP6, decision D-1): the wait family — ``computer_wait``,
+# ``computer_cancel_wait``, ``computer_wait_status`` — joins as tools 7-9.
+# RESTATED (ORVEX-2026-108 WP5): ``computer_fetch_image`` joins as the tenth.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
@@ -54,6 +61,10 @@ ALL_TOOLS = (
     "computer_screenshot",
     "computer_execute",
     "computer_zoom",
+    "computer_wait",
+    "computer_cancel_wait",
+    "computer_wait_status",
+    "computer_fetch_image",
 )
 
 
@@ -61,9 +72,11 @@ ALL_TOOLS = (
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same as controller suite)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 # --- real-boundary harness (mirrors the FastMCP argument-validation surface) --------------------
@@ -76,7 +89,7 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
 
 def _meta(tool_name: str) -> Any:
     """Synchronous accessor for the registered tool metadata (list_tools registers)."""
-    tool = server.mcp._tool_manager.get_tool(tool_name)
+    tool = srv_server_app.mcp._tool_manager.get_tool(tool_name)
     assert tool is not None, f"tool {tool_name} not registered"
     return tool.fn_metadata
 
@@ -97,13 +110,13 @@ async def boundary_execute(session_id: str, **arguments: Any) -> Any:
     """computer_execute with the arguments re-validated through the FastMCP boundary."""
     arguments.setdefault("action", "click")
     return await _call_tool(
-        "computer_execute", server.computer_execute, {"session_id": session_id, **arguments}
+        "computer_execute", srv_server_execute.computer_execute, {"session_id": session_id, **arguments}
     )
 
 
 async def boundary_start(**arguments: Any) -> Any:
     """start_session with the arguments re-validated through the FastMCP boundary."""
-    return await _call_tool("start_session", server.start_session, dict(arguments))
+    return await _call_tool("start_session", srv_server_lifecycle.start_session, dict(arguments))
 
 
 async def _tolerant_session(
@@ -153,7 +166,7 @@ def test_pin_a_no_anyof_in_any_tool_input_schema(fresh_server: Any) -> None:
     live client-side validator rejected. This pin walks the FULL inputSchema of
     each tool (nested, including $defs) through the REAL FastMCP tool metadata.
     """
-    assert len(ALL_TOOLS) == 6  # the fixed surface: five deterministic tools + the A1 observation-only zoom
+    assert len(ALL_TOOLS) == 10  # six deterministic/observation + wait family (D-1) + fetch (WP5)
     total_hits: list[str] = []
     for name in ALL_TOOLS:
         schema = _meta(name).arg_model.model_json_schema()

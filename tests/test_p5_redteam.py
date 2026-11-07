@@ -12,6 +12,7 @@ fuzz, RT7 MCP contract fuzz + scorer flags, RT9 type-validator benign-text FPs.
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import json
 from typing import Any
@@ -31,25 +32,27 @@ from test_io_parity import METRICS, _ParityFakeUser32, _ParityPyautogui
 import benchmarks.score_task as score_task_module
 from benchmarks.score_task import append_run_log
 from benchmarks.score_task import main as score_main
-from computer_use_mcp import server
-from computer_use_mcp.backend import (
-    FakeComputerBackend,
-    InputBlockedError,
-    PyAutoGuiInputEngine,
-    SendInputEngine,
-)
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import parse_interference
-from computer_use_mcp.limits import LimitEnforcer, Limits
-from computer_use_mcp.models import (
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.errors import InputBlockedError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.input_engine import PyAutoGuiInputEngine, SendInputEngine
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import parse_interference
+from computer_use_mcp.core.limits import LimitEnforcer, Limits
+from computer_use_mcp.core.models import (
     MAX_FOLLOW_UPS,
     ActionSpec,
     GroundedAction,
     WindowInfo,
 )
-from computer_use_mcp.redaction import redact_text
-from computer_use_mcp.safety import SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.security.redaction import redact_text
+from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry
 
 TARGET = WindowInfo(
     hwnd=1, pid=100, process_name="excel.exe", window_class="XLMAIN", title="Book1 - Excel",
@@ -63,9 +66,11 @@ FOREIGN = WindowInfo(
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir for full session isolation."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 def _click(x: int = 10, y: int = 10) -> GroundedAction:
@@ -86,7 +91,7 @@ async def test_rt1_smuggled_privilege_fields_in_follow_up_spec_are_ignored(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -111,6 +116,10 @@ async def test_rt1_smuggled_privilege_fields_in_follow_up_spec_are_ignored(
     assert response["follow_ups_stopped_reason"] == "safety_denied"
     smuggled = response["follow_up_results"][1]
     assert smuggled["kind"] == "safety_denied" and smuggled["ok"] is False
+    # MAJOR-2 strengthening (VAL-WP1): identical field set as flat — result token plus
+    # the gate-named refusal reasons (typed code first, never empty).
+    assert smuggled["result"] == "rejected"
+    assert smuggled["reasons"] and smuggled["reasons"][0].startswith("safety_denied")
     # the third item was flushed: nothing after the denial dispatched
     assert len(executed_summary(backend)) == 1
     # the nested follow_ups key must NOT spawn a nested queue anywhere
@@ -126,7 +135,7 @@ async def test_rt1_critical_follow_up_never_authorized_by_call_level_approved(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -138,7 +147,11 @@ async def test_rt1_critical_follow_up_never_authorized_by_call_level_approved(
     )
     response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["follow_ups_stopped_reason"] == "safety_denied"
-    assert response["follow_up_results"][1]["ok"] is False
+    denied = response["follow_up_results"][1]
+    assert denied["ok"] is False
+    # MAJOR-2 strengthening (VAL-WP1): result token + non-empty gate-named reasons.
+    assert denied["result"] == "rejected"
+    assert denied["reasons"] and denied["reasons"][0].startswith("safety_denied")
     assert len(executed_summary(backend)) == 1
 
 
@@ -162,14 +175,14 @@ async def test_rt1_malformed_spec_matrix_fails_closed_before_any_dispatch(
         {"action": "ENSURE_APP", "target": "excel"},  # wrong case: not an enum value
     ]
     for index, item in enumerate(hostile_items):
-        response = await server.computer_execute(
+        response = await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, follow_ups=[{"action": "wait", "delta": 1}, item]
         )
         assert response["ok"] is False, f"item {index} accepted: {item!r}"
-        assert response["error"] == "invalid_action", f"item {index}: {response}"
+        assert response["result"] == "rejected" and "invalid_action" in response["reasons"], f"item {index}: {response}"
         assert backend.executed == [], f"item {index} dispatched: {item!r}"
     # a VALID follow-up after a malformed one must not rescue the call
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -205,15 +218,15 @@ async def test_rt1_finding_spec_valid_grounded_invalid_items_typed_rejection(
         ({"action": "drag", "x": 1, "y": 2}, "BOTH endpoints"),
         ({"action": "hotkey", "keys": ["a"]}, "2-12 key names"),
     ):
-        response = await server.computer_execute(
+        response = await srv_server_execute.computer_execute(
             session_id, "click", x=10, y=10, follow_ups=[spec]
         )
         assert response["ok"] is False, f"item accepted: {spec!r}"
-        assert response["error"] == "invalid_action", f"{spec!r}: {response}"
+        assert response["result"] == "rejected" and "invalid_action" in response["reasons"], f"{spec!r}: {response}"
         assert hint_fragment in " ".join(response["reasons"]), f"{spec!r}: {response}"
     # fail-closed preserved: nothing was dispatched, and the session is still usable
     assert backend.executed == []
-    response = await server.computer_execute(session_id, "click", x=10, y=10)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["ok"] is True
 
@@ -226,14 +239,14 @@ async def test_rt1_queue_cap_enforced_pre_dispatch_with_boundary_exact(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     five = [{"action": "wait", "delta": 1} for _ in range(MAX_FOLLOW_UPS)]
-    response = await server.computer_execute(session_id, "click", x=10, y=10, follow_ups=five)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, follow_ups=five)
     response = execute_payload(response)  # REM-A: executed -> content blocks
     assert response["ok"] is True and response["follow_ups_stopped_reason"] is None
     assert len(executed_summary(backend)) == 6  # primary + 5
     backend.executed.clear()
     six = five + [{"action": "wait", "delta": 1}]
-    response = await server.computer_execute(session_id, "click", x=10, y=10, follow_ups=six)
-    assert response["ok"] is False and response["error"] == "invalid_action"
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, follow_ups=six)
+    assert response["ok"] is False and response["result"] == "rejected" and "invalid_action" in response["reasons"]
     assert backend.executed == []  # whole call rejected, nothing dispatched
 
 
@@ -256,7 +269,7 @@ async def test_rt1_stop_token_fired_during_item2_execute_halts_queue(
     bundle.backend = backend
     bundle.agent.backend = backend
     bundle.agent.observation.backend = backend
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -280,7 +293,7 @@ async def test_rt1_dry_run_session_queue_stubs_without_dispatch(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -303,7 +316,7 @@ async def test_rt1_queue_entries_never_carry_image_payloads(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -318,7 +331,9 @@ async def test_rt1_queue_entries_never_carry_image_payloads(
     assert "screenshot_after_base64" not in payload
     for entry in payload["follow_up_results"]:
         assert "screenshot_after_base64" not in entry
-        assert "result" not in entry  # H6: slim per-item entries, no duplicated blobs
+        # §1 (ORVEX-2026-108): ``result`` IS on every entry — as the closed §1.2
+        # token string, never as a duplicated result blob.
+        assert isinstance(entry["result"], str)
         assert "image" not in json.dumps(entry, default=str)
 
 
@@ -342,7 +357,7 @@ async def test_rt1_run_single_direct_call_slices_oversized_queue(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     specs = [ActionSpec(action="wait", delta=1) for _ in range(50)]
     outcome = await bundle.agent.run_single(
         bundle.state, _click(), approved=False, follow_ups=specs
@@ -400,7 +415,7 @@ def test_rt2_refocus_policy_reattaches_only_to_the_bound_target() -> None:
     assert backend.query_foreground_window().hwnd == TARGET.hwnd
     # (b) refocus REFUSED (alive bound window, but the focus primitive refuses):
     # reject fail-closed, never touch the foreign window.
-    from computer_use_mcp.backend import WindowFocusError
+    from computer_use_mcp.desktop.errors import WindowFocusError
 
     class RefusingFocusBackend(GuardBackend):
         def focus_window_title(self, title: str) -> str:
@@ -625,11 +640,11 @@ async def test_rt3_fresh_loop_top_capture_still_trips_fail_closed(
     )
     provider = ScriptedProvider([])
     bundle.agent.provider = provider
-    first = server.computer_observe(session_id)
+    first = srv_server_observe.computer_observe(session_id)
     assert isinstance(first, list) and first[0].type == "text"
     # Burst captures inside a direct action refresh the timestamp (pacing truth,
     # pinned in test_perf004), so the NEXT fresh capture is gated fail-closed.
-    await server.computer_execute(session_id, "click", x=10, y=10)
+    await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     assert bundle.enforcer.can_screenshot() is False
 
 
@@ -647,7 +662,7 @@ async def test_rt3_direct_execute_path_captures_are_burst_bounded_per_action(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     for _ in range(3):
-        await server.computer_execute(session_id, "click", x=10, y=10)
+        await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     snapshot = bundle.enforcer.snapshot()
     # 3 calls x (validate burst + post_action burst), with the observe-reuse doctrine
     # replacing the first fresh capture after the opening one:
@@ -664,24 +679,24 @@ def test_rt4_sendinput_ret_zero_fails_closed_with_one_attempt() -> None:
     """SendInput returning 0 (UIPI/blocked) must raise InputBlockedError and deliver
     NOTHING — a single failed attempt, no retry storm (strictly stronger than
     pyautogui's silent swallow)."""
-    import computer_use_mcp.backend as backend_module
+    import computer_use_mcp.desktop.input_engine as input_engine_module
 
     fake = _ParityFakeUser32(send_results=[0])
-    original = backend_module._user32
-    backend_module._user32 = fake
+    original = input_engine_module._user32
+    input_engine_module._user32 = fake
     try:
         engine = SendInputEngine()
         with pytest.raises(InputBlockedError, match="blocked"):
             engine.click(30, 45)
         assert len(fake.batches) == 1  # one attempt, fail-closed, no retries
     finally:
-        backend_module._user32 = original
+        input_engine_module._user32 = original
 
 
 def test_rt4_failsafe_corner_blocks_both_engines_identically() -> None:
     """The failsafe corner maps to InputBlockedError on BOTH engines; the SendInput
     engine dispatches ZERO events when blocked."""
-    import computer_use_mcp.backend as backend_module
+    import computer_use_mcp.desktop.input_engine as input_engine_module
 
     pa = _ParityPyautogui(fail=True)  # emulates pyautogui's FailSafeException
     with pytest.raises(InputBlockedError):
@@ -689,14 +704,21 @@ def test_rt4_failsafe_corner_blocks_both_engines_identically() -> None:
     assert pa.calls == []  # nothing dispatched from the corner
 
     fake = _ParityFakeUser32(cursor=(0, 0))  # the REAL replicated corner check
-    original = backend_module._user32
-    backend_module._user32 = fake
+    # D3 dual patch: dispatch reads the input_engine binding, the corner check's
+    # get_cursor_position reads the windows binding — both must see the fake.
+    import computer_use_mcp.desktop.windows as windows_module
+
+    original = input_engine_module._user32
+    original_win = windows_module._user32
+    input_engine_module._user32 = fake
+    windows_module._user32 = fake
     try:
         with pytest.raises(InputBlockedError, match="failsafe"):
             SendInputEngine().click(30, 45)
         assert fake.batches == []  # blocked BEFORE any physical input
     finally:
-        backend_module._user32 = original
+        input_engine_module._user32 = original
+        windows_module._user32 = original_win
     assert METRICS == (0, 0, 1920, 1080)  # the corner math assumed this virtual screen
 
 
@@ -717,7 +739,7 @@ async def test_rt4_prestopped_token_blocks_every_action_type_on_the_host_path(
         ("move", {"x": 5, "y": 5}),
     ]
     for action_name, kwargs in hostile_actions:
-        response = await server.computer_execute(session_id, action_name, **kwargs)
+        response = await srv_server_execute.computer_execute(session_id, action_name, **kwargs)
         assert response.get("stopped") is True or response.get("ok") is False, response
     assert backend.executed == []
 
@@ -753,7 +775,7 @@ async def test_rt5_subtask_summaries_and_queue_results_are_payload_free(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, follow_ups=[{"action": "wait", "delta": 1}],
         include_screenshot_after=False,
     )
@@ -810,7 +832,7 @@ async def test_rt6_dry_run_fuzz_never_dispatches_and_always_banners(
         ("", {}),  # empty action name
     ]
     for action_name, kwargs in attempts:
-        response = await server.computer_execute(session_id, action_name, **kwargs)
+        response = await srv_server_execute.computer_execute(session_id, action_name, **kwargs)
         response = execute_payload(response)  # REM-A: unwrap blocks when executed
         assert isinstance(response, dict), (action_name, response)
         if response.get("ok") is True:
@@ -819,7 +841,7 @@ async def test_rt6_dry_run_fuzz_never_dispatches_and_always_banners(
         else:
             assert response.get("ok") is False, (action_name, response)
     # follow_ups batches in dry-run:
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10,
         follow_ups=[{"action": "type", "text": "format C: /fs:ntfs /y"}],
     )
@@ -849,10 +871,20 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
         # legacy byte-identical behavior (documented existing-test change; the tested
         # property "trailing optional, None == legacy" is unchanged and re-pinned for
         # visual_view in tests/test_avr_visual_views.py).
-        "computer_execute": {"via", "include_screenshot_after", "follow_ups", "visual_view"},
+        # CHANGED PIN (WP7b, §-reason: contract item (a)): plan/plan_action join the
+        # trailing set so every earlier addition stays trailing too.
+        "computer_execute": {
+            "via", "include_screenshot_after", "follow_ups", "visual_view", "plan", "plan_action",
+        },
     }
     for tool_name, new_params in expected_new.items():
-        signature = inspect.signature(getattr(server, tool_name))
+        # hand retarget (WP-R2b step-1): the two tools live in different modules;
+        # resolved by module NAME so the mechanical retarget stays alias-clean
+        tool_module = importlib.import_module(
+            "computer_use_mcp.server.lifecycle" if tool_name == "start_session"
+            else "computer_use_mcp.server.execute"
+        )
+        signature = inspect.signature(getattr(tool_module, tool_name))
         parameters = list(signature.parameters.values())
         for name in new_params:
             position = [p.name for p in parameters].index(name)
@@ -862,14 +894,20 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
             param = parameters[position]
             assert param.default is None, f"{tool_name}.{name} default {param.default!r}"
     # legacy: computer_execute keeps the pre-perf-004 parameter order up front
-    params = list(inspect.signature(server.computer_execute).parameters)
+    params = list(inspect.signature(srv_server_execute.computer_execute).parameters)
     assert params[:12] == [
         "session_id", "action", "x", "y", "text", "keys", "delta", "approved",
         "expected_effect", "x2", "y2", "target",
     ]
     # v0.7.1: via is the ONLY new addition (trailing optional, None == legacy sendinput).
     # AL-002 (W2, 2026-09-17): visual_view joins as the next trailing optional.
-    assert params[12:] == ["via", "include_screenshot_after", "follow_ups", "visual_view"]
+    # CHANGED PIN (WP7b, §-reason: contract item (a) — `plan` and `plan_action` join
+    # the trailing set; the tested property "trailing optional, None == legacy" is
+    # unchanged and is re-pinned behaviorally by the flat-byte-identical node in
+    # tests/test_wp7b_plan_surface.py):
+    assert params[12:] == [
+        "via", "include_screenshot_after", "follow_ups", "visual_view", "plan", "plan_action",
+    ]
 
 
 async def test_rt7_old_client_shapes_accepted_on_the_tool_surface(
@@ -883,10 +921,10 @@ async def test_rt7_old_client_shapes_accepted_on_the_tool_surface(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    observe_response = server.computer_observe(session_id)
+    observe_response = srv_server_observe.computer_observe(session_id)
     assert observe_response and observe_response[0].type == "text"
-    assert server.computer_screenshot(session_id)[0].type == "text"
-    response = await server.computer_execute(session_id, "click", x=10, y=10)
+    assert srv_server_observe.computer_screenshot(session_id)[0].type == "text"
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     # REM-A H3: executed responses are content blocks — legacy call shapes still work
     # end-to-end; the image rides the ImageContent block (never the text channel).
     assert isinstance(response, list) and len(response) == 2
@@ -895,7 +933,7 @@ async def test_rt7_old_client_shapes_accepted_on_the_tool_surface(
     assert payload["ok"] is True
     assert "screenshot_after_base64" not in payload
     assert backend.executed  # the legacy calls really executed
-    stopped = server.stop_session(session_id)  # legacy shape, no new params
+    stopped = await srv_server_lifecycle.stop_session(session_id)  # legacy shape, no new params
     assert stopped.get("ok") is False or stopped.get("stopped") is True or "session_id" in stopped
 
 
@@ -904,20 +942,27 @@ def test_rt7_unknown_extra_fields_fail_closed() -> None:
     silently ignored) — the designed extra=forbid surface; no session is created by a
     rejected call."""
     registry = SessionRegistry(max_sessions=2)
-    original_registry, original_bundles = server._registry, server._bundles
-    server._registry, server._bundles = registry, {}
+    original_registry = srv_server_lifecycle._registry
+    original_bundles = srv_server_lifecycle._bundles
+    srv_server_lifecycle._registry = registry
+    srv_server_lifecycle._bundles = {}
+    srv_server_wait_machine._bundles = srv_server_lifecycle._bundles
+    srv_server_wait._bundles = srv_server_lifecycle._bundles
     try:
-        response = server.start_session(limits={"max_actions": 5, "bogus_field": 1})
+        response = srv_server_lifecycle.start_session(limits={"max_actions": 5, "bogus_field": 1})
         assert response["ok"] is False and response["error"] == "invalid_limits"
-        response = server.start_session(interference={"focus_guard": {"bogus": True}})
+        response = srv_server_lifecycle.start_session(interference={"focus_guard": {"bogus": True}})
         assert response["ok"] is False and response["error"] == "invalid_interference"
-        response = server.start_session(limits={"max_actions": "not-a-number"})
+        response = srv_server_lifecycle.start_session(limits={"max_actions": "not-a-number"})
         assert response["ok"] is False and response["error"] == "invalid_limits"
-        response = server.start_session(interference={"no_such_section": {}})
+        response = srv_server_lifecycle.start_session(interference={"no_such_section": {}})
         assert response["ok"] is False and response["error"] == "invalid_interference"
-        assert len(server._bundles) == 0  # nothing was created by the rejected calls
+        assert len(srv_server_lifecycle._bundles) == 0  # nothing was created by the rejected calls
     finally:
-        server._registry, server._bundles = original_registry, original_bundles
+        srv_server_lifecycle._registry = original_registry
+        srv_server_lifecycle._bundles = original_bundles
+        srv_server_wait_machine._bundles = srv_server_lifecycle._bundles
+        srv_server_wait._bundles = srv_server_lifecycle._bundles
 
 
 def test_rt7_scorer_seed_never_logs_and_model_label_cannot_corrupt_prior_rows(

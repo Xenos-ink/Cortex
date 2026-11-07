@@ -19,16 +19,21 @@ from PIL import Image
 from pydantic import ValidationError
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp import server
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.backend import FakeComputerBackend, InputBlockedError
-from computer_use_mcp.grounding import GroundingRouter
-from computer_use_mcp.models import ActionType, GroundedAction, SessionState
-from computer_use_mcp.provider import ProviderParseError, parse_decision
-from computer_use_mcp.safety import RiskLevel, SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry, StopToken, TaskStopped
-from computer_use_mcp.validator import GroundingValidator
+import computer_use_mcp.desktop.backend as backend_module
+from computer_use_mcp.desktop.backend import DEFAULT_HOTKEY_HOLD_MS
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.desktop.errors import InputBlockedError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.pipeline.grounding import GroundingRouter
+from computer_use_mcp.core.models import ActionType, GroundedAction, SessionState
+from computer_use_mcp.pipeline.provider import ProviderParseError, parse_decision
+from computer_use_mcp.security.safety import RiskLevel, SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry, StopToken, TaskStopped
+from computer_use_mcp.pipeline.validator import GroundingValidator
 
 WINDOWS_ONLY = pytest.mark.skipif(not backend_module.IS_WINDOWS, reason="requires Windows")
 
@@ -67,10 +72,15 @@ def test_hotkey_more_than_twelve_keys_rejected() -> None:
 
 
 def test_hotkey_empty_or_blank_key_names_rejected() -> None:
+    # D12-1 (VAL-WP13-09): "" is still rejected at the model — but a
+    # whitespace-ONLY name like "   " is NO LONGER a model rejection, because a
+    # single " " IS a real static-table key (VK_SPACE); the backend refuses a
+    # non-key blank name as unsupported_key instead (see
+    # test_real_hotkey_bad_chord_value_error_at_backend).
     with pytest.raises(ValidationError, match="2 to 12"):
         GroundedAction(action="hotkey", keys=["ctrl", ""])
-    with pytest.raises(ValidationError, match="2 to 12"):
-        GroundedAction(action="hotkey", keys=["ctrl", "   "])
+    accepted = GroundedAction(action="hotkey", keys=["ctrl", " "])
+    assert accepted.keys == ["ctrl", " "]
 
 
 # --- FakeComputerBackend: hotkey execution contract -----------------------------------------------
@@ -107,11 +117,23 @@ def test_fake_hotkey_input_blocked_records_nothing() -> None:
 def test_real_hotkey_calls_chord_with_key_names_verbatim(
     real_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """K1 (LIVE-WP13-02): a PLAIN hotkey uses the held path — key names still
+    pass verbatim, but as key-down alt/s-key-down, hold, key-up in reverse."""
     engine = RecordingEngine()
     monkeypatch.setattr(real_backend, "_engine", engine)
+    holds: list[float] = []
+    monkeypatch.setattr(
+        backend_module, "_wait_for_hold", lambda seconds, stop: holds.append(seconds)
+    )
     message = real_backend.execute(hotkey(["ctrl", "s"]))
     assert message == "Executed hotkey."
-    assert engine.calls == [("chord", "ctrl", "s")]
+    assert holds == [DEFAULT_HOTKEY_HOLD_MS / 1000.0]
+    assert engine.calls == [
+        ("key_down", "ctrl"),
+        ("key_down", "s"),
+        ("key_up", "s"),
+        ("key_up", "ctrl"),
+    ]
 
 
 @WINDOWS_ONLY
@@ -137,8 +159,12 @@ def test_real_hotkey_bad_chord_value_error_at_backend(
     single = GroundedAction.model_construct(action=ActionType.HOTKEY, keys=["ctrl"])
     with pytest.raises(ValueError, match="2 to 12"):
         real_backend.execute(single)
+    # D12-1 (VAL-WP13-09): a whitespace-ONLY multi-char name is not a real
+    # key — the backend now refuses it as UnsupportedKeyError (a typed
+    # ValueError naming the key with the type-escape teaching), not the "2 to
+    # 12" chord-shape error; nothing is dispatched either way.
     blank = GroundedAction.model_construct(action=ActionType.HOTKEY, keys=["ctrl", "  "])
-    with pytest.raises(ValueError, match="2 to 12"):
+    with pytest.raises(ValueError, match="unsupported keyboard character"):
         real_backend.execute(blank)
     assert engine.calls == []
 
@@ -288,15 +314,17 @@ FAST_LIMITS = {"min_screenshot_interval_ms": 0}
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (mirrors integration suites)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 def _make_session(monkeypatch: pytest.MonkeyPatch, backend: Any, **start_kwargs: Any) -> str:
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: object())
-    response = server.start_session(**start_kwargs)
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: object())
+    response = srv_server_lifecycle.start_session(**start_kwargs)
     assert response.get("session_id"), response
     return str(response["session_id"])
 
@@ -315,7 +343,7 @@ async def test_computer_execute_hotkey_executes_and_records(
     session_id = _make_session(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "hotkey", keys=["ctrl", "s"])
+    result = await srv_server_execute.computer_execute(session_id, "hotkey", keys=["ctrl", "s"])
     result = _execute_payload(result)  # REM-A: executed -> content blocks
     assert result["ok"] is True, result
     assert result["message"] == "Simulated hotkey."
@@ -333,7 +361,7 @@ async def test_computer_execute_hotkey_single_key_fails_closed(
     session_id = _make_session(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = await server.computer_execute(session_id, "hotkey", keys=["ctrl"])
+    result = await srv_server_execute.computer_execute(session_id, "hotkey", keys=["ctrl"])
     assert result["ok"] is False
-    assert result["error"] == "invalid_action"
+    assert result["result"] == "rejected" and "invalid_action" in result["reasons"]
     assert backend.executed == []

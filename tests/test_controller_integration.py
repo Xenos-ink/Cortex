@@ -32,18 +32,23 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp import server
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.backend import DisplayUnavailableError, FakeComputerBackend
-from computer_use_mcp.limits import LimitExceeded
-from computer_use_mcp.models import (
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.desktop.errors import DisplayUnavailableError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.core.limits import LimitExceeded
+from computer_use_mcp.core.models import (
     AgentDecision,
     GroundedAction,
     SessionState,
     TextRegion,
     WindowInfo,
 )
-from computer_use_mcp.state import SessionRegistry
+from computer_use_mcp.core.state import SessionRegistry
 
 # --- fakes ---------------------------------------------------------------------------------
 
@@ -206,9 +211,11 @@ def audit_types(events: list[dict[str, Any]]) -> set[str]:
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir for full session isolation."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 def make_session(
@@ -221,12 +228,12 @@ def make_session(
     """Start one session through the tool with injected fake backend/provider."""
     backend = backend if backend is not None else ScriptedBackend()
     provider = provider if provider is not None else ScriptedProvider([])
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: provider)
-    response = server.start_session(**start_kwargs)
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: provider)
+    response = srv_server_lifecycle.start_session(**start_kwargs)
     assert response.get("session_id"), response
     session_id = str(response["session_id"])
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     return session_id, bundle, backend, provider
 
 
@@ -259,7 +266,7 @@ async def test_happy_path_click_verified_with_phase_audit_and_metrics(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(session_id, "click", x=100, y=100, approved=True)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=100, y=100, approved=True)
     first = execute_payload(response)
 
     assert first["ok"] is True, first
@@ -300,7 +307,7 @@ async def test_type_action_verified_via_expected_text(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(session_id, "type", text="hello world")
+    response = await srv_server_execute.computer_execute(session_id, "type", text="hello world")
     first = execute_payload(response)
 
     assert first["ok"] is True, first
@@ -310,7 +317,7 @@ async def test_type_action_verified_via_expected_text(
 
 
 async def test_wait_action_uncertain_verification_is_tolerated(
-    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+    fresh_server: Any, monkeypatch: PatchMonkey
 ) -> None:
     # Identical screenshots: the wait's visual-change check is uncertain. Documented
     # carve-out: a wait makes no semantic claim, so uncertain continues (never success).
@@ -322,17 +329,21 @@ async def test_wait_action_uncertain_verification_is_tolerated(
         require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(session_id, "wait", delta=0)
+    response = await srv_server_execute.computer_execute(session_id, "wait", delta=0)
     first = execute_payload(response)
 
-    # Direct-path semantics (unchanged from the queue contract, REM-B H2b): an
-    # UNCERTAIN verdict keeps ok=False on the direct single-action response —
-    # uncertain is honest "cannot determine", never success; the loop used to
-    # tolerate it because a wait makes no semantic claim (the same carve-out the
-    # QUEUE applies: uncertain does not stop the queue).
-    assert first["ok"] is False
-    assert first["verification"]["outcome"] == "uncertain"
+    # §1.4.2 (ORVEX-2026-108): ``wait`` is a MARKER, not a screen claim — the old pin
+    # (ok=False + structurally-guaranteed ``uncertain`` from the pixel ladder over a
+    # screen nothing touched) is replaced by the marker contract: ok=True,
+    # verification_method="no_op_marker", top-level result="marker", confidence 1.0,
+    # ONE capture (no premise/validate captures — nothing to ground or staleness-check).
+    assert first["ok"] is True
+    assert first["result"] == "marker"
+    assert first["verification"]["outcome"] == "verified"
+    assert first["verification"]["verification_method"] == "no_op_marker"
+    assert first["verification"]["confidence"] == 1.0
     assert executed_summary(backend) == [("wait", None, None)]
+    assert len(backend.observed) == 1  # one capture: the marker's own post-action frame
 
 # --- recovery paths --------------------------------------------------------------------------
 # REMOVED (loop removal): the four in-loop recovery scenarios below exercised the
@@ -392,14 +403,16 @@ async def test_max_actions_limit_trips_cleanly(
         require_approval=False,
         limits={**FAST_LIMITS, "max_actions": 1},
     )
-    first = await server.computer_execute(session_id, "click", x=10, y=10)
+    first = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     first = execute_payload(first)
     assert first["ok"] is True, first
     assert len(backend.executed) == 1
 
-    second = await server.computer_execute(session_id, "click", x=20, y=20)
+    second = await srv_server_execute.computer_execute(session_id, "click", x=20, y=20)
     assert second["ok"] is False
-    assert second["error"] == "limit_exceeded"
+    # §1.4 delta (ORVEX-2026-108): rejection envelope, typed limit as first reason.
+    assert second["result"] == "rejected"
+    assert second["reasons"] == ["limit_exceeded: max_actions"]
     assert len(backend.executed) == 1  # the over-budget action executed NOTHING
     events = audit_events(bundle, session_id)
     assert "limit_exceeded" in audit_types(events)
@@ -443,16 +456,22 @@ async def test_screenshot_rate_limit_trips_cleanly(
         require_approval=False,
         limits={"min_screenshot_interval_ms": 60_000},
     )
-    first = await server.computer_execute(session_id, "click", x=10, y=10)
+    first = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     first = execute_payload(first)
     assert first["ok"] is True, first
     assert len(executed_summary(backend)) == 1
 
     # The next host-driven direct_request capture arrives within the 60s interval
-    # and trips fail-closed.
-    stopped = await server.computer_execute(session_id, "wait", delta=1)
+    # and trips fail-closed. RETARGETED (§1.4.2, ORVEX-2026-108): ``wait`` used to
+    # drive this call, but a wait is now a MARKER whose single capture is the
+    # rate-exempt post_action phase — the marker capture economy means a marker can
+    # no longer stand in for a gated host-driven capture, so the second action is a
+    # click (the same direct_request path the pin protects).
+    stopped = await srv_server_execute.computer_execute(session_id, "click", x=20, y=20)
     assert stopped["ok"] is False
-    assert stopped["error"] == "limit_exceeded"
+    # §1.4 delta (ORVEX-2026-108): rejection envelope, typed limit as first reason.
+    assert stopped["result"] == "rejected"
+    assert stopped["reasons"] == ["limit_exceeded: min_screenshot_interval_ms"]
     assert stopped["limit"] == "min_screenshot_interval_ms"
     events = audit_events(bundle, session_id)
     limit_events = [event for event in events if event["event_type"] == "limit_exceeded"]
@@ -478,9 +497,9 @@ async def test_step_count_persists_across_direct_calls(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    first = await server.computer_execute(session_id, "click", x=10, y=10)
+    first = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     first = execute_payload(first)
-    second = await server.computer_execute(session_id, "click", x=30, y=30)
+    second = await srv_server_execute.computer_execute(session_id, "click", x=30, y=30)
     second = execute_payload(second)
 
     assert first["ok"] is True and second["ok"] is True, (first, second)
@@ -509,8 +528,8 @@ async def test_concurrent_sessions_are_isolated(
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
     results = await asyncio.gather(
-        server.computer_execute(sid_one, "click", x=10, y=10),
-        server.computer_execute(sid_two, "click", x=40, y=40),
+        srv_server_execute.computer_execute(sid_one, "click", x=10, y=10),
+        srv_server_execute.computer_execute(sid_two, "click", x=40, y=40),
     )
     result_one, result_two = execute_payload(results[0]), execute_payload(results[1])
 
@@ -532,16 +551,18 @@ async def test_computer_execute_confidence_semantics_and_expected_effect(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
     # Legacy approval shape preserved: unapproved interactive action requires approval.
-    denied = await server.computer_execute(session_id, "click", x=10, y=10)
+    # §1.4 (ORVEX-2026-108): the approval reply carries result="not_executed".
+    denied = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     assert denied == {
         "ok": False,
+        "result": "not_executed",
         "requires_approval": True,
         "message": denied["message"],
     }
     assert denied["message"]  # contextual reason, never an opaque coordinate-only ask
     assert backend.executed == []
 
-    approved = await server.computer_execute(session_id, "click", x=10, y=10, approved=True)
+    approved = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, approved=True)
     approved = execute_payload(approved)  # REM-A: executed -> content blocks
     assert approved["ok"] is True
     assert approved["verification"]["outcome"] == "verified"
@@ -563,7 +584,7 @@ async def test_computer_execute_expected_effect_and_failure_shapes(
         require_approval=False,
         limits=FAST_LIMITS,
     )
-    effect = await server.computer_execute(
+    effect = await srv_server_execute.computer_execute(
         session_id, "hotkey", keys=["ctrl", "a"], approved=False, expected_effect="the screen changes"
     )
     effect = execute_payload(effect)  # REM-A: executed -> content blocks
@@ -576,26 +597,29 @@ async def test_computer_execute_expected_effect_and_failure_shapes(
     assert effect["ok"] is False
     assert effect["verification"]["outcome"] == "uncertain"
     assert effect["verification"]["verified"] is False
-    deterministic = await server.computer_execute(
+    deterministic = await srv_server_execute.computer_execute(
         session_id, "keypress", keys=["enter"], approved=False, expected_effect="open Calculator"
     )
     deterministic = execute_payload(deterministic)
     assert deterministic["ok"] is False
     assert deterministic["verification"]["outcome"] == "failed"  # real failure stays failed
 
-    rejected = await server.computer_execute(session_id, "click", x=8000, y=10)
+    rejected = await srv_server_execute.computer_execute(session_id, "click", x=8000, y=10)
     assert rejected["ok"] is False
     # W-2 (057): the message names the REAL gate (grounding) instead of the generic
     # "Grounding rejected." stamp.
     assert rejected["message"].startswith("Action rejected by grounding:")
     assert rejected["reasons"]
 
-    invalid = await server.computer_execute(session_id, "teleport")
+    invalid = await srv_server_execute.computer_execute(session_id, "teleport")
     assert invalid["ok"] is False
-    assert invalid["error"] == "invalid_action"
+    # §1.4 (ORVEX-2026-108): invalid actions are REJECTED with the typed code as the
+    # first reason — the rejection envelope carries reasons, never an ``error`` key.
+    assert invalid["result"] == "rejected"
+    assert "invalid_action" in invalid["reasons"]
 
-    server.stop_session(session_id)
-    stopped = await server.computer_execute(session_id, "wait", delta=1)
+    await srv_server_lifecycle.stop_session(session_id)
+    stopped = await srv_server_execute.computer_execute(session_id, "wait", delta=1)
     assert stopped["ok"] is False
     assert "stopped" in stopped["message"].lower()
     assert executed_summary(backend) == [
@@ -610,9 +634,14 @@ async def test_computer_execute_dry_run_never_executes(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
-    dry = await server.computer_execute(session_id, "wait", delta=1)
+    dry = await srv_server_execute.computer_execute(session_id, "wait", delta=1)
     dry = execute_payload(dry)  # REM-A: executed (dry-run stub) -> content blocks
-    assert dry["ok"] is True
+    # §1.4.3 (ORVEX-2026-108): a dry run is NOT an execution — ok=False with the
+    # top-level ``dry_run`` result token and the dry_run verification_method.
+    assert dry["ok"] is False
+    assert dry["result"] == "dry_run"
+    assert dry["dry_run"] is True
+    assert dry["verification"]["verification_method"] == "dry_run"
     # PERF-004 C5: dry-run results are UNMISTAKABLE — the message must start with the
     # banner so no host can misread a no-op as execution.
     assert dry["message"].startswith("DRY-RUN (no input dispatched):")
@@ -639,28 +668,31 @@ async def test_stop_session_removes_bundle_and_blocks_tools(
     session_id, _bundle, _backend, _provider = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    stop_response = server.stop_session(session_id)
+    stop_response = await srv_server_lifecycle.stop_session(session_id)
     assert stop_response["ok"] is True
-    assert session_id not in server._bundles  # memory freed
-    assert server._registry.get(session_id) is None  # registry consistent
+    assert session_id not in srv_server_lifecycle._bundles  # memory freed
+    assert srv_server_lifecycle._registry.get(session_id) is None  # registry consistent
 
-    observe = server.computer_observe(session_id)
+    observe = srv_server_observe.computer_observe(session_id)
     assert observe["ok"] is False
     assert observe["error"] == "session_stopped"
-    screenshot = server.computer_screenshot(session_id)
+    screenshot = srv_server_observe.computer_screenshot(session_id)
     assert screenshot["ok"] is False
     assert screenshot["error"] == "session_stopped"
-    execute = await server.computer_execute(session_id, "wait", delta=1)
+    execute = await srv_server_execute.computer_execute(session_id, "wait", delta=1)
     assert execute["ok"] is False
-    assert execute["error"] == "session_stopped"
+    # §1.4 delta (ORVEX-2026-108): on the EXECUTE surface a stopped-session refusal
+    # is a rejection (typed code as first reason); read-only tools keep the error.
+    assert execute["result"] == "rejected"
+    assert execute["reasons"] == ["session_stopped"]
     # AMENDED (loop removal): the removed loop tool's stopped-session shape check
     # died with the loop; every surviving tool fails closed with session_stopped.
 
-    again = server.stop_session(session_id)  # idempotent, shape preserved
+    again = await srv_server_lifecycle.stop_session(session_id)  # idempotent, shape preserved
     assert again["ok"] is True
     assert "already" in again["message"]
 
-    unknown = server.computer_observe("never-existed")
+    unknown = srv_server_observe.computer_observe("never-existed")
     assert unknown["ok"] is False
     assert unknown["error"] == "unknown_session"
 
@@ -677,7 +709,7 @@ async def test_computer_observe_returns_image_content_block(
     """
     session_id, _bundle, _backend, _provider = make_session(monkeypatch)
 
-    result = server.computer_observe(session_id)
+    result = srv_server_observe.computer_observe(session_id)
     assert isinstance(result, list) and len(result) == 2
     text_block, image_block = result
     assert text_block.type == "text"
@@ -695,7 +727,7 @@ async def test_computer_observe_returns_image_content_block(
     assert payload["digest"]
     assert payload["observation_id"] == payload["observation"]["observation_id"]
 
-    alias = server.computer_screenshot(session_id)
+    alias = srv_server_observe.computer_screenshot(session_id)
     assert isinstance(alias, list) and len(alias) == 2
     assert alias[0].type == "text"
     assert alias[1].type == "image" and alias[1].mimeType == "image/png"
@@ -742,7 +774,7 @@ async def test_observe_failure_classified_as_app_crash_and_recovers(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(session_id, "click", x=20, y=20)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=20, y=20)
 
     assert response["ok"] is False
     assert response["error"] == "action_error"
@@ -766,7 +798,7 @@ async def test_persistent_observe_failure_terminates_unrecoverable(
         limits=FAST_LIMITS,
     )
     for _ in range(3):
-        response = await server.computer_execute(session_id, "click", x=10, y=10)
+        response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
         assert response["ok"] is False
         assert response["error"] == "action_error"
     assert backend.executed == []
@@ -788,7 +820,7 @@ async def test_ground_phase_failure_emits_failed_grounding_audit(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )  # point (5000, 10) is outside the fake 1280x720 screenshot: grounding refuses
-    response = await server.computer_execute(session_id, "click", x=5000, y=10)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=5000, y=10)
 
     assert response["ok"] is False
     # W-2 (057): the rejection names the real gate (grounding) in the message.
@@ -804,7 +836,7 @@ def test_start_session_limits_conflict_and_precedence(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """D9: explicit retry-limit conflict raises; single-source values apply."""
-    conflict = server.start_session(
+    conflict = srv_server_lifecycle.start_session(
         dry_run=False,
         require_approval=False,
         max_retries_per_action=2,
@@ -849,9 +881,10 @@ async def test_response_path_redacts_secret_shaped_text(
     note/evidence — and is REDACTED at the response sink. (A secret-shaped ``type``
     payload is now stopped even earlier, at the safety gate — defense in depth.)"""
     session_id, bundle, _backend, _ = make_session(
-        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch, backend=ScriptedBackend(flip=False), dry_run=False,
+        require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -859,7 +892,16 @@ async def test_response_path_redacts_secret_shaped_text(
         expected_effect="window shows API_KEY=supersecretvalue123 after click",
     )
     response = execute_payload(response)
-    assert response["ok"] is True, response
+    # WP4a (E-03) re-pin: the honest verdict for a stated effect over a static screen
+    # is ``uncertain`` (ok False); flip=False keeps the effect prose on the
+    # absent-evidence NOTE path ("No pixel evidence of the stated expectation: …") —
+    # the exact surface the response-sink redaction below must catch. (F5, VAL-WP4a:
+    # on a flipping screen the abstention NOTE never echoes the effect, but the
+    # digest-arm EVIDENCE channel does — pinned by
+    # tests/test_audit_compliance.py::test_redaction_enforced_on_the_flip_screen_
+    # evidence_channel.)
+    assert response["ok"] is False, response
+    assert response["result"] == "uncertain", response.get("result")
 
     # The response's MESSAGE/verification surfaces are redacted at the sink; the
     # action dict echoes the caller's own expected_effect verbatim (same-party
@@ -893,19 +935,22 @@ async def test_internal_kill_path_bundle_hygiene(
     )
     bundle.context.stop.stop()  # simulate an internal safety path arming the kill path
 
-    observe = server.computer_observe(session_id)
+    observe = srv_server_observe.computer_observe(session_id)
     assert observe["ok"] is False
     assert observe["error"] == "session_stopped"
-    screenshot = server.computer_screenshot(session_id)
+    screenshot = srv_server_observe.computer_screenshot(session_id)
     assert screenshot["ok"] is False
     assert screenshot["error"] == "session_stopped"
-    execute = await server.computer_execute(session_id, "wait", delta=1)
+    execute = await srv_server_execute.computer_execute(session_id, "wait", delta=1)
     assert execute["ok"] is False
-    assert execute["error"] == "session_stopped"
+    # §1.4 delta (ORVEX-2026-108): on the EXECUTE surface a stopped-session refusal
+    # is a rejection (typed code as first reason); read-only tools keep the error.
+    assert execute["result"] == "rejected"
+    assert execute["reasons"] == ["session_stopped"]
     # AMENDED (loop removal): the removed loop tool's tail check died with the loop.
 
-    assert session_id not in server._bundles  # same cleanup as stop_session
-    assert server._registry.get(session_id) is None
+    assert session_id not in srv_server_lifecycle._bundles  # same cleanup as stop_session
+    assert srv_server_lifecycle._registry.get(session_id) is None
     events = audit_events(bundle, session_id)
     assert any(
         event["event_type"] == "stop"

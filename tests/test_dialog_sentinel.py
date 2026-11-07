@@ -23,10 +23,10 @@ from typing import Any
 
 from PIL import Image
 
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import MODAL_DIALOG, parse_interference
-from computer_use_mcp.models import FailureClass, GroundedAction, Observation, WindowInfo
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import MODAL_DIALOG, parse_interference
+from computer_use_mcp.core.models import FailureClass, GroundedAction, Observation, WindowInfo
 
 TARGET = WindowInfo(
     hwnd=1, pid=100, process_name="EXCEL.EXE", window_class="XLMAIN", title="Book1 - Excel",
@@ -129,7 +129,7 @@ def test_sentinel_never_dispatches_input_negative_control() -> None:
 
 
 def test_queue_halts_with_named_modal_dialog_reason() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent, SingleActionOutcome
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent, SingleActionOutcome
 
     outcome = SingleActionOutcome(
         kind="executed",
@@ -145,11 +145,11 @@ def test_queue_halts_with_named_modal_dialog_reason() -> None:
 
 
 def test_single_action_path_annotates_and_maps_failure_class() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     class DialogAfterExecute(FakeComputerBackend):
         def __init__(self, **kwargs: Any) -> None:

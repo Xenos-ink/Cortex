@@ -43,7 +43,7 @@ import base64
 import io
 from typing import Any
 
-from computer_use_mcp.models import WindowInfo
+from computer_use_mcp.core.models import WindowInfo
 
 import pytest
 from PIL import Image
@@ -255,7 +255,7 @@ async def test_allowlist_rejection_message_names_the_real_gate(
     process allowlist) and the offending foreground process, exactly the turn-burning
     confusion the live session paid for (it read "grounding" and started decoding
     coordinate semantics)."""
-    from computer_use_mcp.models import WindowInfo
+    from computer_use_mcp.core.models import WindowInfo
 
     backend = ScriptedBackend(
         active_window=WindowInfo(hwnd=1, pid=4242, process_name="zcode.exe", title="driver console")
@@ -285,6 +285,6 @@ async def test_allowlist_rejection_message_names_the_real_gate(
 
 async def server_execute(session_id: str, spec: dict[str, Any]) -> Any:
     """Thin indirection over ``server.computer_execute`` (keeps the test body readable)."""
-    from computer_use_mcp import server
+    import computer_use_mcp.server.execute as srv_server_execute
 
-    return await server.computer_execute(session_id, **spec)
+    return await srv_server_execute.computer_execute(session_id, **spec)

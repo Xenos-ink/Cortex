@@ -46,7 +46,9 @@ import helpers_runtime as rt
 import helpers_win32 as w32
 import pytest
 
-from computer_use_mcp import server
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.execute as srv_server_execute
 
 pytestmark = pytest.mark.e2e
 
@@ -57,27 +59,33 @@ STALE_MARKER = "stale-reject-marker-7391"
 
 @contextmanager
 def notepad_app(deadline: w32.Deadline, file_path: Path):
-    """Launch Notepad with a marker-carrying scratch file; kill ONLY our process tree.
+    """Launch Notepad with a marker-carrying scratch file; D6-safe teardown.
 
     D6: ``file_path.name`` MUST embed the run-unique window token (the caller builds
-    it via ``w32.unique_window_token()``); the wait matches pid AND that unique
-    title needle, so it can never latch onto the user's own Notepad window.
+    it via ``w32.unique_window_token()``); the wait is marker-only
+    (:func:`w32.launch_marked_notepad`), so it can never latch onto the user's own
+    Notepad window. Teardown goes through :func:`w32.release_notepad`: close ONLY
+    the marker hwnd; kill a process only when the test spawned it or it hosts no
+    non-marker window (packaged Notepad shares ONE process with the user's windows).
     """
     token = file_path.stem
     assert "cumcp-e2e-" in token, (
         f"notepad scratch file must embed the run-unique window token: {file_path}"
     )
-    proc, hwnd = w32.launch_gui(
-        deadline, ["notepad.exe", str(file_path)], title_contains=file_path.name, timeout_s=30.0
-    )
-    # D6 pin at launch time: the hwnd we got REALLY carries our marker (and belongs
-    # to our pid) — the user's same-app window without the marker is not a match.
-    assert w32.window_pid(hwnd) == proc.pid, (hwnd, proc.pid)
+    proc, hwnd = w32.launch_marked_notepad(deadline, file_path, timeout_s=30.0)
+    # D6 pin at launch time: the hwnd we got REALLY carries our marker and belongs
+    # to a REAL Notepad process. WP12 finding C: on Windows 11 the packaged
+    # Notepad's window is NOT owned by the launcher-stub pid — identity is the
+    # run-unique marker plus the real owning pid's executable.
+    real_pid = w32.window_pid(hwnd)
+    assert real_pid == proc.pid or (w32.process_exe(real_pid) or "").casefold().endswith(
+        "notepad.exe"
+    ), (proc.pid, real_pid)
     assert token.casefold() in w32.window_text(hwnd).casefold(), w32.window_text(hwnd)
     try:
         yield proc, hwnd
     finally:
-        w32.kill_process_tree(proc.pid)
+        w32.release_notepad(proc, hwnd, token)
 
 
 @contextmanager
@@ -95,7 +103,7 @@ def attach_notepad(deadline: w32.Deadline, token: str):
 
 def observe(evidence: Any, session_id: str, when: str) -> dict[str, Any]:
     """Capture an observation through the MCP tool and save it as evidence."""
-    response = w32.observe_tool_metadata(server.computer_observe(session_id))
+    response = w32.observe_tool_metadata(srv_server_observe.computer_observe(session_id))
     observation = response["observation"]
     if evidence is not None:
         evidence.save_observation(when, observation)
@@ -109,14 +117,20 @@ def observe(evidence: Any, session_id: str, when: str) -> dict[str, Any]:
     return observation
 
 
-def window_identity_ok(observation: dict[str, Any], proc: Any, file_name: str) -> dict[str, Any]:
-    """Assert strong window/process identity (P0-G) on a dumped observation."""
+def window_identity_ok(observation: dict[str, Any], real_pid: int, file_name: str) -> dict[str, Any]:
+    """Assert strong window/process identity (P0-G) on a dumped observation.
+
+    WP12 live-run-2: process names are compared CASEFOLDED (the packaged Notepad
+    reports ``Notepad.exe`` from its WindowsApps path; Windows process names are
+    case-insensitive), and the pid is compared against the REAL owning pid
+    (``w32.window_pid(hwnd)``) — never the launcher-stub pid.
+    """
     info = observation.get("active_window_info")
     assert info, "observation carries no active_window_info"
-    assert info["process_name"] == "notepad.exe", info
+    assert str(info["process_name"]).casefold() == "notepad.exe", info
     assert info["exe_path"] and info["exe_path"].casefold().endswith("notepad.exe"), info
     assert info["hwnd"], info
-    assert info["pid"] == proc.pid, (info["pid"], proc.pid)
+    assert info["pid"] == real_pid, (info["pid"], real_pid)
     assert info["window_class"] == "Notepad", info
     assert file_name.casefold() in info["title"].casefold(), info
     assert info["bounds"] and info["bounds"][2] > 0 and info["bounds"][3] > 0, info
@@ -140,7 +154,7 @@ def test_notepad_window_identity_observation(
                 assert attached_hwnd == hwnd, (attached_hwnd, hwnd)
                 assert w32.focus_window(hwnd), "could not focus Notepad for the identity check"
             observation = observe(evidence, session_id, "before")
-            info = window_identity_ok(observation, proc, file_path.name)
+            info = window_identity_ok(observation, w32.window_pid(hwnd), file_path.name)
             # D6 pin: the observed title carries OUR unique token — proof the runtime
             # is looking at the window we launched, not the user's same-app window.
             assert token.casefold() in info["title"].casefold(), info["title"]
@@ -152,18 +166,20 @@ def test_notepad_window_identity_observation(
             )
             assert monitor["dpi_scale_x"] == pytest.approx(1.25), monitor
             assert monitor["is_primary"] is True, monitor
-            assert w32.window_pid(hwnd) == proc.pid
+            # End-state pin: the window's REAL owning pid is unchanged since the
+            # observation (never compared to the launcher-stub pid — WP12 live-run 2).
+            assert w32.window_pid(hwnd) == info["pid"]
             if evidence is not None:
-                evidence.assert_that("process_name == notepad.exe", True)
+                evidence.assert_that("process_name == notepad.exe (casefolded)", True)
                 evidence.assert_that("exe_path populated", True, info["exe_path"])
-                evidence.assert_that("hwnd/pid match the launched process", True, info["pid"])
+                evidence.assert_that("hwnd/pid match the window's REAL owning pid", True, info["pid"])
                 evidence.assert_that("window_class/title/bounds populated", True, info["title"])
                 evidence.assert_that("coordinate_space verified_passthrough @ 125% DPI", True)
                 evidence.add_extra("window_identity", info)
                 evidence.add_extra("monitor", monitor)
                 evidence.save_audit(bundle, session_id)
         finally:
-            server.stop_session(session_id)
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))
 
 
 def test_notepad_type_semantic_verification(
@@ -186,13 +202,15 @@ def test_notepad_type_semantic_verification(
         try:
             assert w32.focus_window(hwnd), "could not focus Notepad before typing"
             observation = observe(evidence, session_id, "before")
-            window_identity_ok(observation, proc, file_path.name)
+            window_identity_ok(observation, w32.window_pid(hwnd), file_path.name)
 
             # expected_effect carries the typed text: the injected window-text strategy
             # reads the REAL Edit control (WM_GETTEXT) and verifies semantically.
-            response = asyncio.run(
-                server.computer_execute(session_id, "type", text=TYPED_MARKER,
-                                        expected_effect=TYPED_MARKER)
+            response = rt.execute_payload(
+                asyncio.run(
+                    srv_server_execute.computer_execute(session_id, "type", text=TYPED_MARKER,
+                                                    expected_effect=TYPED_MARKER)
+                )
             )
             # D6: right-window proof BEFORE anything else — the window that now holds
             # the input is OUR marker window (title carries this run's token), not
@@ -227,18 +245,21 @@ def test_notepad_type_semantic_verification(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            server.stop_session(session_id)
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))
 
 
 def test_notepad_moved_window_verification_failure_returns_to_host(
     deadline: w32.Deadline, e2e_scratch: Path, make_session: Any, with_verifier: Any, evidence: Any
 ) -> None:
-    """P0-B (RETARGETED, loop removal): the target window MOVES after the grounding
-    capture; the stale click's semantic verification FAILS (wrong window text) and the
-    FAILED outcome is returned to the host in the response — the host, not a loop, sees
-    the miss and re-drives. The loop's bounded auto-re-decide died with the loop; this
-    pins the surviving contract on real Windows: execute → semantic verification → the
-    failure is typed, evidenced, and never silently swallowed."""
+    """P0-B (RETARGETED, loop removal; verdict retargeted in WP12 live-run 2): the
+    target window MOVES after the grounding capture; the stale click lands in the
+    decoy, the stated target-file effect is NOT established, and the host receives
+    ok:false with a NON-SUCCESS outcome (0.7.6: `uncertain` — the post-action
+    identity names nothing the effect named, and an identity change is never proof
+    the transition occurred; `failed` requires positive proof of not-achievement).
+    The host, not a loop, sees the miss and re-drives. This pins the surviving
+    contract on real Windows: execute → verification → the not-verified verdict is
+    typed, evidenced, and never silently swallowed."""
     token_a = w32.unique_window_token("moved")
     token_b = w32.unique_window_token("decoy-b")
     target_path = e2e_scratch / f"{token_a}.txt"
@@ -273,15 +294,22 @@ def test_notepad_moved_window_verification_failure_returns_to_host(
             if evidence is not None:
                 evidence.record("fault_move_window", ok=True, **moved)
 
-            # expected_effect names the TARGET marker file: the window-text strategy
-            # reads the real Edit/foreground window and finds the decoy instead ->
-            # typed failure. (D6: expected_effect carries our unique token filename.)
-            response = asyncio.run(
-                server.computer_execute(
+            # expected_effect names the TARGET marker file (our unique token filename).
+            # WP12 live-run-2: a direct click's intent is VISUAL_CHANGE
+            # (pipeline/agent.py:2511 builds the intent with hint=None; :1069-1070
+            # map only TYPE/KEYPRESS/FOCUS_WINDOW/... to deterministic kinds), so the
+            # injected window-text strategy never claims it — and after the move the
+            # post-action identity names nothing the effect named, which 0.7.6 treats
+            # as UNCERTAIN (E-03: an identity change is not evidence the described
+            # transition occurred; uncertain is never success; `failed` requires
+            # positive proof of not-achievement). The honest host-facing verdict for
+            # this miss is therefore ok:false + a non-success outcome — asserted below.
+            response = rt.execute_payload(asyncio.run(
+                srv_server_execute.computer_execute(
                     session_id, "click", x=center[0], y=center[1],
                     expected_effect=target_path.name,
                 )
-            )
+            ))
             verification = response.get("verification") or {}
             if evidence is not None:
                 evidence.record(
@@ -291,10 +319,10 @@ def test_notepad_moved_window_verification_failure_returns_to_host(
                 )
 
             assert moved["after"] == (1200, 600, 420, 380), moved
-            assert response["ok"] is False, response  # verification FAILED -> ok False
-            assert verification["outcome"] == "failed", verification
-            assert verification["verification_method"] == "window_text", verification
-            assert strategy.calls and strategy.calls[-1]["matched"] is False, strategy.calls
+            assert response["ok"] is False, response  # a miss is NEVER success
+            assert response.get("result") in {"uncertain", "failed"}, response
+            assert verification["outcome"] in {"uncertain", "failed"}, verification
+            assert verification["outcome"] != "verified", verification
             # The stale click physically hit the decoy: proof from the real controls.
             assert RECOVERY_MARKER not in w32.read_edit_text(hwnd_a)
             assert w32.read_edit_text(hwnd_a) == "", w32.read_edit_text(hwnd_a)
@@ -303,7 +331,8 @@ def test_notepad_moved_window_verification_failure_returns_to_host(
                 evidence.assert_that("window actually moved between capture and execute", True,
                                      moved)
                 evidence.assert_that(
-                    "stale click's semantic verification FAILED and returned to the host", True,
+                    "stale click's NOT-VERIFIED verdict (uncertain/failed) returned to the host",
+                    True,
                     verification["note"],
                 )
                 evidence.assert_that("host-driven surface: the miss is typed, never silent", True)
@@ -317,7 +346,7 @@ def test_notepad_moved_window_verification_failure_returns_to_host(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            server.stop_session(session_id)
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))
 
 
 def test_notepad_window_switch_stale_observation(
@@ -366,20 +395,20 @@ def test_notepad_window_switch_stale_observation(
 
             # expected_effect names the TARGET marker file: the fresh capture sees the
             # decoy foreground, the window_state verification fails the title match typed.
-            response = asyncio.run(
-                server.computer_execute(
+            response = rt.execute_payload(asyncio.run(
+                srv_server_execute.computer_execute(
                     session_id, "click", x=center[0], y=center[1],
                     expected_effect=target_path.name,
                 )
-            )
+            ))
             if evidence is not None:
                 evidence.record(
                     "computer_execute(click grounded on target, foreground switched)",
-                    ok=response.get("ok") if isinstance(response, dict) else None,
+                    ok=response.get("ok"),
                 )
+            verification = response.get("verification") or {}
 
             assert fault["focus_decoy_ok"] is True, fault
-            verification = (response.get("verification") if isinstance(response, dict) else None) or {}
             outcome = verification.get("outcome")
             if outcome == "failed":
                 # The verification layer caught the wrong window (semantic, not pixel).
@@ -387,7 +416,7 @@ def test_notepad_window_switch_stale_observation(
                 if evidence is not None:
                     evidence.assert_that("switched foreground failed target-title verification typed", True,
                                          verification.get("note", ""))
-            elif isinstance(response, dict) and response.get("ok") is False:
+            elif response.get("ok") is False:
                 # The grounding/validation layer refused the click against the decoy
                 # window before execution (typed stale/allowlist refusal).
                 if evidence is not None:
@@ -404,4 +433,4 @@ def test_notepad_window_switch_stale_observation(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            server.stop_session(session_id)
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))

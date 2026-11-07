@@ -38,15 +38,15 @@ def ms(xs):
             "mean": sum(xs)/len(xs), "max": xs[-1]}
 
 async def run_config():
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.audit import AuditLogger, Metrics
-    from computer_use_mcp.backend import LocalComputerBackend
-    from computer_use_mcp.limits import LimitEnforcer, Limits
-    from computer_use_mcp.models import GroundedAction, SessionState
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
-    from computer_use_mcp.validator import GroundingValidator
-    from computer_use_mcp.verification import VerificationEngine
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.security.audit import AuditLogger, Metrics
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
+    from computer_use_mcp.core.limits import LimitEnforcer, Limits
+    from computer_use_mcp.core.models import GroundedAction, SessionState
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.validator import GroundingValidator
+    from computer_use_mcp.pipeline.verification import VerificationEngine
 
     if capture_env == "-":
         os.environ.pop("CORTEX_CAPTURE", None)

@@ -44,17 +44,23 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
-from computer_use_mcp.models import (
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.state as srv_server_state
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.schemas as srv_server_schemas
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.core.models import (
     MAX_FOLLOW_UPS,
     ActionSpec,
     AgentDecision,
     GroundedAction,
     WindowInfo,
 )
-from computer_use_mcp.observation import observation_text_summary
-from computer_use_mcp.state import SessionRegistry
-from computer_use_mcp.verification import VerificationIntent, VerificationKind
+from computer_use_mcp.vision.observation import observation_text_summary
+from computer_use_mcp.core.state import SessionRegistry
+from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
 
 def done() -> AgentDecision:
@@ -122,14 +128,17 @@ class ShiftingScreenBackend(ScriptedBackend):
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (full session isolation)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_stopped_sessions", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_lifecycle, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_state, "_stopped_sessions", srv_server_lifecycle._stopped_sessions)
+    return None
 
 
 def _observe_metadata(session_id: str) -> dict[str, Any]:
-    response = server.computer_observe(session_id)
+    response = srv_server_observe.computer_observe(session_id)
     return json.loads(response[0].text)
 
 
@@ -149,7 +158,7 @@ async def test_run_loop_reuses_post_action_capture_as_next_loop_top(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, follow_ups=[{"action": "click", "x": 20, "y": 20}]
     )
     payload = execute_payload(response)
@@ -179,7 +188,7 @@ async def test_validation_audits_digest_staleness_proof(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(session_id, "click", x=15, y=15)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=15, y=15)
     response = execute_payload(response)
     assert response["ok"] is True
     events = audit_events(bundle, session_id)
@@ -196,10 +205,10 @@ async def test_run_single_audits_staleness_proof(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(session_id, "click", x=15, y=15)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=15, y=15)
     response = execute_payload(response)
     assert response["ok"] is True
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     events = audit_events(bundle, session_id)
     validations = [event for event in events if event["event_type"] == "validation"]
     assert any("staleness_proof" in event["metadata"] for event in validations)
@@ -238,7 +247,7 @@ async def test_deterministic_tier_skips_model_judge(
         monkeypatch, backend=backend, provider=provider, dry_run=False,
         require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(session_id, "focus_window", target="App")
+    response = await srv_server_execute.computer_execute(session_id, "focus_window", target="App")
     response = execute_payload(response)
     assert response["ok"] is True, response
     assert response["verification"]["outcome"] == "verified"
@@ -255,7 +264,7 @@ async def test_ladder_deterministic_tier_returns_before_the_judge(
 
     RETARGETED (loop removal): this is the old in-loop pin moved to the agent
     seam (``_verify_judge_ladder``), the exact method the loop used to call."""
-    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+    from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
     backend = ScriptedBackend(
         active_window=WindowInfo(hwnd=1, pid=10, process_name="app.exe", title="App Window")
@@ -265,7 +274,7 @@ async def test_ladder_deterministic_tier_returns_before_the_judge(
         monkeypatch, backend=backend, provider=provider, dry_run=False,
         require_approval=False, limits=FAST_LIMITS,
     )
-    agent = server._get_bundle(session_id).agent
+    agent = srv_server_lifecycle._get_bundle(session_id).agent
     before = backend.observe()
     after = backend.observe()
     intent = VerificationIntent(
@@ -287,7 +296,7 @@ async def test_zero_diff_stated_effect_defers_to_judge_bare_change_fails_before_
         monkeypatch, backend=backend, provider=provider, dry_run=False,
         require_approval=False, limits=FAST_LIMITS,
     )
-    agent = server._get_bundle(session_id).agent
+    agent = srv_server_lifecycle._get_bundle(session_id).agent
     before = backend.observe()
     after = backend.observe()
     # RC-D11 (058): a STATED effect is no longer falsified by a zero diff — the
@@ -308,7 +317,7 @@ async def test_zero_diff_stated_effect_defers_to_judge_bare_change_fails_before_
         monkeypatch, backend=ScriptedBackend(flip=False), provider=provider2, dry_run=False,
         require_approval=False, limits=FAST_LIMITS,
     )
-    agent2 = server._get_bundle(session_id2).agent
+    agent2 = srv_server_lifecycle._get_bundle(session_id2).agent
     before2, after2 = backend2.observe(), backend2.observe()
     bare = VerificationIntent(kind=VerificationKind.MODEL_JUDGE, expected_change=True)
     bare_result = await agent2._verify(bare, before2, after2)
@@ -325,14 +334,14 @@ async def test_judge_tier_runs_when_cheap_tiers_uncertain(
     RETARGETED (loop removal): the old in-loop pin, moved to the exact method
     (``_verify_judge_ladder``) the loop used to call. Pixels differ (ShiftingScreen),
     no deterministic criteria -> the judge runs ONCE and its verdict wins."""
-    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+    from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
     provider = JudgingProvider([], verdict="verified")
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, backend=ShiftingScreenBackend(), provider=provider,
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
     )
-    agent = server._get_bundle(session_id).agent
+    agent = srv_server_lifecycle._get_bundle(session_id).agent
     before = agent._observe("probe_before")
     after = agent._observe("probe_after")  # ShiftingScreenBackend: pixels differ
     intent = VerificationIntent(
@@ -361,7 +370,7 @@ async def test_include_screenshot_after_false_omits_image_default_is_half_res_jp
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    default = await server.computer_execute(session_id, "click", x=15, y=15)
+    default = await srv_server_execute.computer_execute(session_id, "click", x=15, y=15)
     # REM-A H3: executed responses are content blocks (TextContent + ImageContent)
     # in parity with computer_observe - the image never rides the text channel.
     assert isinstance(default, list) and len(default) == 2
@@ -372,8 +381,8 @@ async def test_include_screenshot_after_false_omits_image_default_is_half_res_jp
     # Half-resolution JPEG by default (JPEG SOI marker) + the additive truth marker.
     assert base64.b64decode(default[1].data, validate=True)[:2] == bytes([0xFF, 0xD8])
     assert default[1].mimeType == "image/jpeg"
-    assert default_payload["image_scale"] == 0.5
-    trimmed = await server.computer_execute(
+    assert default_payload["image_outbound_scale"] == 0.5  # §1.1 D-3: measured, single key
+    trimmed = await srv_server_execute.computer_execute(
         session_id, "click", x=25, y=25, include_screenshot_after=False
     )
     # Opt-out keeps the plain-dict legacy shape minus the blob (no image at all).
@@ -382,7 +391,7 @@ async def test_include_screenshot_after_false_omits_image_default_is_half_res_jp
     assert "screenshot_after_base64" not in trimmed  # omitted entirely
     # Everything else survives the opt-out.
     assert trimmed["verification"]["outcome"] in {"verified", "uncertain", "failed"}
-    full = await server.computer_execute(
+    full = await srv_server_execute.computer_execute(
         session_id, "click", x=35, y=35, include_screenshot_after=True
     )
     # The explicit opt-in is the documented FULL-image path: in-budget bytes keep
@@ -399,15 +408,18 @@ def test_computer_execute_signature_additions_are_trailing_optional() -> None:
     # optional (None == byte-identical legacy behavior; documented existing-test
     # change — the tested property is unchanged and re-pinned in
     # tests/test_avr_visual_views.py). The pre-AL-002 pins below are otherwise intact.
-    parameters = list(inspect.signature(server.computer_execute).parameters.values())
-    assert [p.name for p in parameters][-3:] == [
+    # CHANGED PIN (WP7b, §-reason: contract item (a) — `plan`/`plan_action` join as
+    # trailing optionals AFTER visual_view; the pinned property "the perf-004
+    # additions stay trailing optionals with None defaults" is unchanged)
+    parameters = list(inspect.signature(srv_server_execute.computer_execute).parameters.values())
+    assert [p.name for p in parameters][-5:] == [
         "include_screenshot_after",
         "follow_ups",
         "visual_view",
+        "plan",
+        "plan_action",
     ]
-    assert parameters[-3].default is None
-    assert parameters[-2].default is None
-    assert parameters[-1].default is None
+    assert all(p.default is None for p in parameters[-5:])
 
 
 # --- C5: dry-run default flip + unmistakable banner ------------------------------------------------
@@ -416,9 +428,9 @@ def test_computer_execute_signature_additions_are_trailing_optional() -> None:
 def test_start_session_defaults_to_live_with_approval(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(server, "_backend_factory", ScriptedBackend)
-    monkeypatch.setattr(server, "_provider_factory", ScriptedProvider)
-    response = server.start_session()
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", ScriptedBackend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", ScriptedProvider)
+    response = srv_server_lifecycle.start_session()
     assert response.get("session_id"), response
     assert response["dry_run"] is False  # the sanctioned PERF-004 C5 default flip
     assert response["require_approval"] is True  # untouched
@@ -430,7 +442,7 @@ async def test_dry_run_results_carry_unmistakable_banner(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=True, require_approval=False, limits=FAST_LIMITS
     )
-    execute_response = await server.computer_execute(session_id, "wait", delta=1)
+    execute_response = await srv_server_execute.computer_execute(session_id, "wait", delta=1)
     execute_response = execute_payload(execute_response)
     assert execute_response["message"].startswith("DRY-RUN (no input dispatched):")
     # AMENDED (loop removal): the loop's second banner check is gone;
@@ -446,9 +458,10 @@ async def test_invalid_action_key_teaches_keypress(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id, _bundle, _backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)
-    response = await server.computer_execute(session_id, "key", keys=["a"])
+    response = await srv_server_execute.computer_execute(session_id, "key", keys=["a"])
     assert response["ok"] is False
-    assert response["error"] == "invalid_action"
+    assert response["result"] == "rejected"  # §1.4: rejection envelope, no error key
+    assert "invalid_action" in response["reasons"]
     assert "keypress" in response["message"]
     assert "Valid actions" in response["message"]
     assert any("keypress" in hint for hint in response["reasons"])
@@ -458,8 +471,9 @@ async def test_invalid_action_triple_click_teaches_alternative(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id, _bundle, _backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)
-    response = await server.computer_execute(session_id, "triple_click", x=5, y=5)
-    assert response["error"] == "invalid_action"
+    response = await srv_server_execute.computer_execute(session_id, "triple_click", x=5, y=5)
+    assert response["result"] == "rejected"  # §1.4: rejection envelope, no error key
+    assert "invalid_action" in response["reasons"]
     assert "double_click" in response["message"]
     assert any("triple_click" in hint for hint in response["reasons"])
 
@@ -469,12 +483,13 @@ async def test_hotkey_word_payload_teaches_key_names(
 ) -> None:
     session_id, _bundle, _backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)
     # The Session-1 failure mode: a WORD passed as a hotkey payload (1-key hotkey).
-    response = await server.computer_execute(session_id, "hotkey", keys=["hello"])
+    response = await srv_server_execute.computer_execute(session_id, "hotkey", keys=["hello"])
     assert response["ok"] is False
-    assert response["error"] == "invalid_action"
+    assert response["result"] == "rejected"  # §1.4: rejection envelope, no error key
+    assert "invalid_action" in response["reasons"]
     assert "keypress" in response["message"]  # the closest valid shape is taught
     assert any("KEY NAMES" in hint for hint in response["reasons"])
-    assert server.ACTION_VOCABULARY.startswith("Valid actions")
+    assert srv_server_schemas.ACTION_VOCABULARY.startswith("Valid actions")
 
 
 # --- C7: queued follow_ups (full pipeline per item, zero bypass) ------------------------------------
@@ -486,7 +501,7 @@ async def test_follow_ups_run_full_pipeline_and_verify_each_item(
     session_id, bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -498,10 +513,20 @@ async def test_follow_ups_run_full_pipeline_and_verify_each_item(
         ],
     )
     response = execute_payload(response)  # REM-A: executed -> content blocks
-    assert response["ok"] is True
+    # RE-PINNED by WP4a (E-03): the two stated-effect clicks over a generic flip can no
+    # longer answer ok=True off "pixels changed" — they are honest ``uncertain``
+    # entries; the wait item stays a marker (ok True). Uncertain never stops the
+    # batch, so every item still ran the full pipeline exactly once.
+    assert response["result"] == "uncertain"
+    assert response["ok"] is False
     assert response["follow_ups_stopped_reason"] is None
     assert len(response["follow_up_results"]) == 3
-    assert all(item["ok"] for item in response["follow_up_results"])
+    assert response["follow_up_results"][0]["result"] == "uncertain"
+    assert response["follow_up_results"][0]["ok"] is False
+    assert response["follow_up_results"][1]["result"] == "uncertain"
+    assert response["follow_up_results"][1]["ok"] is False
+    assert response["follow_up_results"][2]["result"] == "marker"
+    assert response["follow_up_results"][2]["ok"] is True
     assert len(executed_summary(backend)) == 3
     events = audit_events(bundle, session_id)
     assert len([e for e in events if e["event_type"] == "execution"]) == 3
@@ -516,7 +541,7 @@ async def test_unsafe_follow_up_rejected_individually_and_stops_queue(
     session_id, _bundle, backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -531,6 +556,9 @@ async def test_unsafe_follow_up_rejected_individually_and_stops_queue(
     assert response["follow_ups_stopped_reason"] == "safety_denied"
     unsafe_entry = response["follow_up_results"][1]
     assert unsafe_entry["kind"] == "safety_denied" and unsafe_entry["ok"] is False
+    # MAJOR-2 strengthening (VAL-WP1): result token + non-empty gate-named reasons.
+    assert unsafe_entry["result"] == "rejected"
+    assert unsafe_entry["reasons"] and unsafe_entry["reasons"][0].startswith("safety_denied")
     assert len(executed_summary(backend)) == 1  # the unsafe item AND item 3 never ran
 
 
@@ -567,7 +595,7 @@ async def test_verification_failure_stops_queue_before_later_items(
         monkeypatch, backend=backend, provider=provider, dry_run=False,
         require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -601,7 +629,7 @@ async def test_executed_failed_verdict_no_longer_stops_queue_by_default(
         monkeypatch, backend=backend, provider=provider, dry_run=False,
         require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -627,7 +655,7 @@ async def test_post_action_digest_surprise_stops_queue(
         monkeypatch, backend=backend, provider=provider, dry_run=False,
         require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -653,7 +681,7 @@ async def test_approval_required_mid_queue_stops_queue(
         monkeypatch, backend=backend, provider=provider, dry_run=False,
         require_approval=False, limits=FAST_LIMITS,
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -697,7 +725,7 @@ async def test_stop_session_halts_a_running_queue(
     bundle.backend = stopping_backend
     bundle.agent.backend = stopping_backend
     bundle.agent.observation.backend = stopping_backend  # the engine holds its own ref
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id,
         "click",
         x=10,
@@ -718,18 +746,19 @@ async def test_follow_ups_cap_and_malformed_items_fail_closed(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     too_many = [{"action": "wait", "delta": 1} for _ in range(MAX_FOLLOW_UPS + 1)]
-    response = await server.computer_execute(session_id, "click", x=10, y=10, follow_ups=too_many)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10, follow_ups=too_many)
     assert response["ok"] is False
-    assert response["error"] == "invalid_action"
+    assert response["result"] == "rejected"  # §1.4: rejection envelope, no error key
+    assert "invalid_action" in response["reasons"]
     assert "5" in response["message"]
-    malformed = await server.computer_execute(
+    malformed = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, follow_ups=[{"not_an_action": True}]
     )
-    assert malformed["error"] == "invalid_action"
-    non_list = await server.computer_execute(
+    assert malformed["result"] == "rejected" and "invalid_action" in malformed["reasons"]
+    non_list = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, follow_ups="click x=1"
     )
-    assert non_list["error"] == "invalid_action"
+    assert non_list["result"] == "rejected" and "invalid_action" in non_list["reasons"]
     assert backend.executed == []  # fail-closed BEFORE anything was dispatched
 
 
@@ -772,7 +801,7 @@ def test_text_summary_changed_note_on_screen_change(
 
 
 def test_text_summary_control_hint_and_graceful_omission() -> None:
-    from computer_use_mcp.models import Observation
+    from computer_use_mcp.core.models import Observation
 
     base = {"image_base64": _png(), "width": 64, "height": 48}
     with_hint = Observation(
@@ -819,7 +848,7 @@ async def test_screenshot_opt_out_keeps_verification_fresh_and_diff_verified(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, provider=provider, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(
+    response = await srv_server_execute.computer_execute(
         session_id, "click", x=25, y=25, include_screenshot_after=False
     )
     # The opt-out strips the payload from the RESPONSE...
@@ -843,10 +872,10 @@ async def test_starved_after_capture_routes_past_the_diff_tier(
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch, provider=provider, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    agent = server._get_bundle(session_id).agent
+    agent = srv_server_lifecycle._get_bundle(session_id).agent
     backend = ScriptedBackend(flip=False)
     frozen = backend.observe()  # the SAME observation object: starved self-comparison
-    from computer_use_mcp.verification import VerificationIntent, VerificationKind
+    from computer_use_mcp.pipeline.verification import VerificationIntent, VerificationKind
 
     intent = VerificationIntent(
         kind=VerificationKind.MODEL_JUDGE,

@@ -24,9 +24,13 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
-from computer_use_mcp.limits import LimitEnforcer, LimitExceeded, Limits
-from computer_use_mcp.state import SessionRegistry, TaskState
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.state as srv_server_state
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.core.limits import LimitEnforcer, LimitExceeded, Limits
+from computer_use_mcp.core.state import SessionRegistry, TaskState
 
 
 @pytest.fixture
@@ -38,10 +42,13 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     the reset that dict leaks across tests and makes results order-dependent).
     """
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    monkeypatch.setattr(server, "_stopped_sessions", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_lifecycle, "_stopped_sessions", {})
+    monkeypatch.setattr(srv_server_state, "_stopped_sessions", srv_server_lifecycle._stopped_sessions)
+    return None
 
 
 def limit_events(bundle: Any, session_id: str) -> list[dict[str, Any]]:
@@ -86,13 +93,15 @@ async def test_max_actions_limit_trips_cleanly(
         monkeypatch, dry_run=False, require_approval=False,
         limits={**FAST_LIMITS, "max_actions": 1},
     )
-    first = await server.computer_execute(session_id, "click", x=10, y=10)
+    first = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     first = _payload(first)
     assert first["ok"] is True, first
-    response = await server.computer_execute(session_id, "click", x=20, y=20)
+    response = await srv_server_execute.computer_execute(session_id, "click", x=20, y=20)
 
     assert response["ok"] is False
-    assert response["error"] == "limit_exceeded"
+    # §1.4 delta (ORVEX-2026-108): rejection envelope, typed limit as first reason.
+    assert response["result"] == "rejected"
+    assert response["reasons"] == ["limit_exceeded: max_actions"]
     assert response["limit"] == "max_actions"
     assert len(executed_summary(backend)) == 1  # the first action ran, nothing further
     events = limit_events(bundle, session_id)
@@ -133,16 +142,21 @@ async def test_screenshot_rate_gate_trips_after_controller_wait_ceiling(
         monkeypatch, dry_run=False, require_approval=False,
         limits={"min_screenshot_interval_ms": 60_000},
     )
-    first = await server.computer_execute(session_id, "click", x=10, y=10)
+    first = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     first = _payload(first)
     assert first["ok"] is True, first
     assert len(executed_summary(backend)) == 1
 
     # The host-driven observe path is STILL gated: this capture is far inside the
     # 60s interval, waits past the 2s ceiling, and fails closed.
-    limited = await server.computer_execute(session_id, "wait", delta=1)
+    # RETARGETED (§1.4.2, ORVEX-2026-108): ``wait`` used to drive this call, but a
+    # wait is now a MARKER whose single capture is the rate-exempt post_action
+    # phase — a click drives the gated direct_request path instead.
+    limited = await srv_server_execute.computer_execute(session_id, "click", x=20, y=20)
     assert limited["ok"] is False
-    assert limited["error"] == "limit_exceeded"
+    # §1.4 delta (ORVEX-2026-108): rejection envelope, typed limit as first reason.
+    assert limited["result"] == "rejected"
+    assert limited["reasons"] == ["limit_exceeded: min_screenshot_interval_ms"]
     assert limited["limit"] == "min_screenshot_interval_ms"
     events = limit_events(bundle, session_id)
     assert events and events[-1]["metadata"]["limit"] == "min_screenshot_interval_ms"
@@ -182,14 +196,14 @@ def test_task_state_histories_are_bounded() -> None:
 def test_concurrent_session_cap_fail_closed(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=2))
-    first = server.start_session(dry_run=True)
-    second = server.start_session(dry_run=True)
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=2))
+    first = srv_server_lifecycle.start_session(dry_run=True)
+    second = srv_server_lifecycle.start_session(dry_run=True)
     assert "session_id" in first
     assert "session_id" in second
 
-    third = server.start_session(dry_run=True)
+    third = srv_server_lifecycle.start_session(dry_run=True)
     assert third["ok"] is False
     assert third["error"] == "session_limit_exceeded"
     assert third["max_sessions"] == 2
-    assert len(server._registry) == 2  # fail closed: no live session was evicted
+    assert len(srv_server_lifecycle._registry) == 2  # fail closed: no live session was evicted

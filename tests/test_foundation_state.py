@@ -7,8 +7,8 @@ import time
 
 import pytest
 
-from computer_use_mcp.models import GroundedAction, TerminationReason
-from computer_use_mcp.state import (
+from computer_use_mcp.core.models import GroundedAction, TerminationReason
+from computer_use_mcp.core.state import (
     ACTION_HISTORY_CAP,
     OBSERVATION_HISTORY_CAP,
     PLAN_NOTES_CAP,

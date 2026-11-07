@@ -28,10 +28,10 @@ from test_controller_integration import fresh_server as _shared_fresh_server_fix
 
 fresh_server = _shared_fresh_server_fixture
 
-from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.focus_guard import InterferenceGuard
-from computer_use_mcp.interference import (
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard
+from computer_use_mcp.desktop.interference import (
     AMBIGUOUS_INSTANCE,
     DEFAULT_DIALOG_TITLE_TABLE,
     DEFAULT_TRANSIENT_LAUNCH_PROCESSES,
@@ -53,7 +53,7 @@ from computer_use_mcp.interference import (
     format_stuck_modifier,
     parse_interference,
 )
-from computer_use_mcp.models import GroundedAction, WindowInfo
+from computer_use_mcp.core.models import GroundedAction, WindowInfo
 
 # --- defaults (A12 section 4 policy surface) -------------------------------------------------
 
@@ -139,7 +139,7 @@ def test_auto_handle_spec_shape_is_validated() -> None:
 def test_start_session_interference_param_is_trailing_optional() -> None:
     import inspect
 
-    parameters = list(inspect.signature(server.start_session).parameters.values())
+    parameters = list(inspect.signature(srv_server_lifecycle.start_session).parameters.values())
     # D1 (ORVEX-CORTEX-056-LIVEFIX): ``image_delivery`` is now the newest
     # trailing-optional parameter; ``interference`` stays trailing-optional behind it.
     assert [p.name for p in parameters][-1] == "image_delivery"
@@ -150,16 +150,16 @@ def test_start_session_interference_param_is_trailing_optional() -> None:
 
 
 def test_start_session_rejects_malformed_interference_fail_closed() -> None:
-    response = server.start_session(interference={"bogus_section": {}})
+    response = srv_server_lifecycle.start_session(interference={"bogus_section": {}})
     assert response["ok"] is False
     assert response["error"] == "invalid_interference"
     assert "bogus_section" in str(response["message"])
 
 
 def test_start_session_legacy_callers_get_protective_defaults(fresh_server: Any) -> None:
-    response = server.start_session(dry_run=True)
+    response = srv_server_lifecycle.start_session(dry_run=True)
     assert "session_id" in response  # success shape (no ok key on legacy success payloads)
-    bundle = server._get_bundle(str(response["session_id"]))
+    bundle = srv_server_lifecycle._get_bundle(str(response["session_id"]))
     policy = bundle.agent.interference
     assert isinstance(policy, InterferencePolicy)
     assert policy.focus_guard.policy == "abort"
@@ -168,11 +168,11 @@ def test_start_session_legacy_callers_get_protective_defaults(fresh_server: Any)
 
 
 def test_start_session_custom_policy_reaches_the_agent(fresh_server: Any) -> None:
-    response = server.start_session(
+    response = srv_server_lifecycle.start_session(
         dry_run=True, interference={"focus_guard": {"policy": "observe_only"}}
     )
     assert "session_id" in response
-    bundle = server._get_bundle(str(response["session_id"]))
+    bundle = srv_server_lifecycle._get_bundle(str(response["session_id"]))
     assert bundle.agent.interference.focus_guard.policy == "observe_only"
     assert bundle.extra["interference_policy"] is bundle.agent.interference
 
@@ -245,7 +245,7 @@ def test_event_payload_formatters() -> None:
 
 
 def test_ensure_app_probe_outcomes_are_recognized_by_the_agent_helper() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
 
     assert ComputerUseAgent._ensure_app_probe_outcome("NO_INSTANCE target='excel.exe' launch=driver")
     assert ComputerUseAgent._ensure_app_probe_outcome("AMBIGUOUS_INSTANCE candidates=[...]")
@@ -253,7 +253,7 @@ def test_ensure_app_probe_outcomes_are_recognized_by_the_agent_helper() -> None:
 
 
 def test_guard_rejection_maps_to_named_queue_stop_reasons() -> None:
-    from computer_use_mcp.agent import ComputerUseAgent, SingleActionOutcome
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent, SingleActionOutcome
 
     def _rejected(reasons: list[str]) -> SingleActionOutcome:
         return SingleActionOutcome(kind="rejected", reasons=reasons)
@@ -283,12 +283,12 @@ def test_full_queue_with_a_focus_steal_between_items_stops_named() -> None:
 
     from PIL import Image as PILImage
 
-    from computer_use_mcp.agent import ComputerUseAgent
-    from computer_use_mcp.limits import Limits
-    from computer_use_mcp.models import ActionSpec, WindowInfo
-    from computer_use_mcp.observation import ObservationEngine
-    from computer_use_mcp.safety import SafetyPolicy
-    from computer_use_mcp.state import StopToken, TaskState
+    from computer_use_mcp.pipeline.agent import ComputerUseAgent
+    from computer_use_mcp.core.limits import Limits
+    from computer_use_mcp.core.models import ActionSpec, WindowInfo
+    from computer_use_mcp.vision.observation import ObservationEngine
+    from computer_use_mcp.security.safety import SafetyPolicy
+    from computer_use_mcp.core.state import StopToken, TaskState
 
     class StealAfterFirstClick(FakeComputerBackend):
         """The screen flips once after the first execute (so item 0 verifies) and a

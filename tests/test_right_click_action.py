@@ -22,18 +22,35 @@ from PIL import Image
 from pydantic import ValidationError
 from recording_engine import RecordingEngine
 
-import computer_use_mcp.backend as backend_module
-from computer_use_mcp import server
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.backend import (
-    CoordinateSpaceError,
-    FakeComputerBackend,
-    InputBlockedError,
-    PyAutoGuiInputEngine,
-    SendInputEngine,
+import computer_use_mcp.desktop.backend as backend_module
+import computer_use_mcp.desktop.input_engine as input_engine_module
+import computer_use_mcp.server.app as srv_server_app
+import computer_use_mcp.server.schemas as srv_server_schemas
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.desktop.errors import CoordinateSpaceError, InputBlockedError
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.input_engine import PyAutoGuiInputEngine, SendInputEngine, _MOUSE_BUTTON_FLAGS
+from computer_use_mcp.desktop.win32 import (
+    _KEYEVENTF_KEYUP,
+    _MOUSEEVENTF_ABSOLUTE,
+    _MOUSEEVENTF_LEFTDOWN,
+    _MOUSEEVENTF_LEFTUP,
+    _MOUSEEVENTF_MOVE,
+    _MOUSEEVENTF_RIGHTDOWN,
+    _MOUSEEVENTF_RIGHTUP,
+    _MOUSEEVENTF_VIRTUALDESK,
+    _MOUSEEVENTF_WHEEL,
+    _SM_CXVIRTUALSCREEN,
+    _SM_CYVIRTUALSCREEN,
+    _SM_XVIRTUALSCREEN,
+    _SM_YVIRTUALSCREEN,
 )
-from computer_use_mcp.grounding import GroundingRouter, UnsupportedGroundingError
-from computer_use_mcp.models import (
+from computer_use_mcp.pipeline.grounding import GroundingRouter, UnsupportedGroundingError
+from computer_use_mcp.core.models import (
     ActionSpec,
     ActionType,
     GroundedAction,
@@ -43,10 +60,10 @@ from computer_use_mcp.models import (
     SessionState,
     WindowInfo,
 )
-from computer_use_mcp.provider import ProviderParseError, parse_decision
-from computer_use_mcp.safety import RiskLevel, SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry, StopToken, TaskStopped
-from computer_use_mcp.validator import (
+from computer_use_mcp.pipeline.provider import ProviderParseError, parse_decision
+from computer_use_mcp.security.safety import RiskLevel, SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry, StopToken, TaskStopped
+from computer_use_mcp.pipeline.validator import (
     GroundingValidator,
     MissingObservationBindingError,
     StaleObservationError,
@@ -256,10 +273,10 @@ class _FakeUser32:
         mapping = {0: 1920, 1: 1080}
         mapping.update(
             {
-                backend_module._SM_XVIRTUALSCREEN: 0,
-                backend_module._SM_YVIRTUALSCREEN: 0,
-                backend_module._SM_CXVIRTUALSCREEN: 1920,
-                backend_module._SM_CYVIRTUALSCREEN: 1080,
+                _SM_XVIRTUALSCREEN: 0,
+                _SM_YVIRTUALSCREEN: 0,
+                _SM_CXVIRTUALSCREEN: 1920,
+                _SM_CYVIRTUALSCREEN: 1080,
             }
         )
         return mapping[index]
@@ -277,7 +294,7 @@ class _FakeUser32:
 @pytest.fixture
 def fake_user32(monkeypatch: pytest.MonkeyPatch) -> _FakeUser32:
     fake = _FakeUser32()
-    monkeypatch.setattr(backend_module, "_user32", fake)
+    monkeypatch.setattr(input_engine_module, "_user32", fake)
     return fake
 
 
@@ -288,11 +305,11 @@ def test_sendinput_engine_right_click_sends_rightdown_rightup(fake_user32: _Fake
     assert len(fake_user32.batches) == 1
     flags = [event["flags"] for event in fake_user32.batches[0]]
     assert flags == [
-        backend_module._MOUSEEVENTF_MOVE
-        | backend_module._MOUSEEVENTF_ABSOLUTE
-        | backend_module._MOUSEEVENTF_VIRTUALDESK,
-        backend_module._MOUSEEVENTF_RIGHTDOWN,
-        backend_module._MOUSEEVENTF_RIGHTUP,
+        _MOUSEEVENTF_MOVE
+        | _MOUSEEVENTF_ABSOLUTE
+        | _MOUSEEVENTF_VIRTUALDESK,
+        _MOUSEEVENTF_RIGHTDOWN,
+        _MOUSEEVENTF_RIGHTUP,
     ]
 
 
@@ -301,8 +318,8 @@ def test_sendinput_engine_default_click_stays_left(fake_user32: _FakeUser32) -> 
     SendInputEngine().click(30, 45)
     flags = [event["flags"] for event in fake_user32.batches[0]]
     assert flags[1:] == [
-        backend_module._MOUSEEVENTF_LEFTDOWN,
-        backend_module._MOUSEEVENTF_LEFTUP,
+        _MOUSEEVENTF_LEFTDOWN,
+        _MOUSEEVENTF_LEFTUP,
     ]
 
 
@@ -317,12 +334,12 @@ def test_sendinput_engine_click_rejects_unknown_button_before_dispatch(
 
 def test_mouse_button_flags_pin_right_vocabulary() -> None:
     """The Win32 plumbing right_click relies on: typed right down/up flag pair."""
-    assert backend_module._MOUSE_BUTTON_FLAGS["right"] == (
-        backend_module._MOUSEEVENTF_RIGHTDOWN,
-        backend_module._MOUSEEVENTF_RIGHTUP,
+    assert _MOUSE_BUTTON_FLAGS["right"] == (
+        _MOUSEEVENTF_RIGHTDOWN,
+        _MOUSEEVENTF_RIGHTUP,
     )
-    assert backend_module._MOUSEEVENTF_RIGHTDOWN == 0x0008
-    assert backend_module._MOUSEEVENTF_RIGHTUP == 0x0010
+    assert _MOUSEEVENTF_RIGHTDOWN == 0x0008
+    assert _MOUSEEVENTF_RIGHTUP == 0x0010
 
 
 # --- grounding: right_click is a spatial coordinate action (single point) ------------------------
@@ -355,7 +372,7 @@ def test_grounding_right_click_scaled_space_validates_and_records_scale() -> Non
 
 def test_grounding_right_click_is_never_non_spatial() -> None:
     """right_click stays OFF the non-spatial set: without a point it cannot ground."""
-    from computer_use_mcp.grounding import NON_SPATIAL_ACTIONS
+    from computer_use_mcp.pipeline.grounding import NON_SPATIAL_ACTIONS
 
     assert ActionType.RIGHT_CLICK not in NON_SPATIAL_ACTIONS
 
@@ -407,7 +424,7 @@ def test_validator_right_click_bound_and_in_bounds_is_valid() -> None:
 
 
 def test_validator_right_click_is_a_coordinate_action() -> None:
-    from computer_use_mcp.validator import COORDINATE_ACTIONS
+    from computer_use_mcp.pipeline.validator import COORDINATE_ACTIONS
 
     assert ActionType.RIGHT_CLICK in COORDINATE_ACTIONS
 
@@ -511,7 +528,7 @@ def test_verification_right_click_stated_effect_requires_change_without_focus_fl
     intent = _intent_agent()._build_intent(right_click((50, 30)), None, "context menu opens")
     assert intent.kind == "visual_change"
     assert intent.expected_change is True
-    from computer_use_mcp.agent import FOCUS_CHANGE_INTENT_FLAG
+    from computer_use_mcp.pipeline.agent import FOCUS_CHANGE_INTENT_FLAG
 
     assert FOCUS_CHANGE_INTENT_FLAG not in (intent.metadata or {})
 
@@ -520,14 +537,14 @@ def test_verification_right_click_stated_effect_requires_change_without_focus_fl
 
 
 def _tool_meta(tool_name: str) -> Any:
-    tool = server.mcp._tool_manager.get_tool(tool_name)
+    tool = srv_server_app.mcp._tool_manager.get_tool(tool_name)
     assert tool is not None, f"tool {tool_name} not registered"
     return tool.fn_metadata
 
 
 def test_served_computer_execute_schema_advertises_right_click() -> None:
     """The WIRE contract: the served description lists right_click; the schema is plain."""
-    tool = server.mcp._tool_manager.get_tool("computer_execute")
+    tool = srv_server_app.mcp._tool_manager.get_tool("computer_execute")
     description = tool.description or ""
     assert "right_click" in description
     schema = _tool_meta("computer_execute").arg_model.model_json_schema()
@@ -538,7 +555,7 @@ def test_served_computer_execute_schema_advertises_right_click() -> None:
 
 
 def test_teaching_invalid_action_hints_right_click_for_context_menu_misnomers() -> None:
-    result = server._teaching_invalid_action(ValueError("bad"), "context_menu")
+    result = srv_server_schemas._teaching_invalid_action(ValueError("bad"), "context_menu")
     hints = " ".join(str(reason) for reason in result["reasons"])
     assert 'action="right_click"' in hints
 
@@ -547,15 +564,17 @@ def test_teaching_invalid_action_hints_right_click_for_context_menu_misnomers() 
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (mirrors integration suites)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 def _make_session(monkeypatch: pytest.MonkeyPatch, backend: Any, **start_kwargs: Any) -> str:
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: object())
-    response = server.start_session(**start_kwargs)
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: object())
+    response = srv_server_lifecycle.start_session(**start_kwargs)
     assert response.get("session_id"), response
     return str(response["session_id"])
 
@@ -599,7 +618,7 @@ async def test_server_execute_right_click_through_full_pipeline(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     result = _execute_payload(
-        await server.computer_execute(session_id, "right_click", x=400, y=300)
+        await srv_server_execute.computer_execute(session_id, "right_click", x=400, y=300)
     )
     assert result["ok"] is True, result
     assert result["action"]["action"] == "right_click"
@@ -618,7 +637,7 @@ async def test_server_rejects_right_click_out_of_bounds_typed(
         monkeypatch, backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     result = _execute_payload(
-        await server.computer_execute(session_id, "right_click", x=8000, y=10)
+        await srv_server_execute.computer_execute(session_id, "right_click", x=8000, y=10)
     )
     assert result["ok"] is False
     assert backend.executed == []
@@ -635,7 +654,7 @@ async def test_server_right_click_respects_approval_gate(
         monkeypatch, backend, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
     result = _execute_payload(
-        await server.computer_execute(session_id, "right_click", x=400, y=300)
+        await srv_server_execute.computer_execute(session_id, "right_click", x=400, y=300)
     )
     assert result["ok"] is False
     assert result.get("requires_approval") is True

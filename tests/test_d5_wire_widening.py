@@ -33,22 +33,29 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
-from computer_use_mcp.state import SessionRegistry
+import computer_use_mcp.server.state as srv_server_state
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.app as srv_server_app
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.core.state import SessionRegistry
 
 
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same as controller suite)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.delenv(server.IMAGE_DELIVERY_ENV, raising=False)
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.delenv(srv_server_state.IMAGE_DELIVERY_ENV, raising=False)
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 def _meta(tool_name: str) -> Any:
-    tool = server.mcp._tool_manager.get_tool(tool_name)
+    tool = srv_server_app.mcp._tool_manager.get_tool(tool_name)
     assert tool is not None, f"tool {tool_name} not registered"
     return tool.fn_metadata
 
@@ -67,12 +74,12 @@ async def _call_tool(tool_name: str, fn: Any, arguments: dict[str, Any]) -> Any:
 async def boundary_execute(session_id: str, **arguments: Any) -> Any:
     arguments.setdefault("action", "click")
     return await _call_tool(
-        "computer_execute", server.computer_execute, {"session_id": session_id, **arguments}
+        "computer_execute", srv_server_execute.computer_execute, {"session_id": session_id, **arguments}
     )
 
 
 async def boundary_start(**arguments: Any) -> Any:
-    return await _call_tool("start_session", server.start_session, dict(arguments))
+    return await _call_tool("start_session", srv_server_lifecycle.start_session, dict(arguments))
 
 
 class _FakeProvider:
@@ -172,12 +179,12 @@ def test_d5_schema_limits_and_interference_stay_strict(
     assert props["interference"].get("type") == ["object", "null"], props["interference"]
     # Fake factories throughout: both calls fail BEFORE construction, but keep the
     # process free of a real LocalComputerBackend (DPI state, conftest.py).
-    monkeypatch.setattr(server, "_backend_factory", lambda: ScriptedBackend())
-    monkeypatch.setattr(server, "_provider_factory", lambda: _FakeProvider())
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: ScriptedBackend())
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: _FakeProvider())
     # Runtime strictness is untouched (pin E of REM-G, re-asserted).
-    response = server.start_session(limits={"bogus": 1})
+    response = srv_server_lifecycle.start_session(limits={"bogus": 1})
     assert response["ok"] is False and response["error"] == "invalid_limits"
-    response = server.start_session(interference={"focus_guard": {"banana": 1}})
+    response = srv_server_lifecycle.start_session(interference={"focus_guard": {"banana": 1}})
     assert response["ok"] is False and response["error"] == "invalid_interference"
 
 
@@ -233,14 +240,14 @@ async def test_d5_boundary_allowlist_string_forms(
 ) -> None:
     """A comma/space string allowlist and a JSON-array string both normalize to
     the same list the matcher consumes (allowlist logic byte-identical)."""
-    monkeypatch.setattr(server, "_backend_factory", lambda: ScriptedBackend())
-    monkeypatch.setattr(server, "_provider_factory", lambda: _FakeProvider())
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: ScriptedBackend())
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: _FakeProvider())
     comma = await boundary_start(allowed_processes="mspaint.exe, notepad.exe")
     assert comma.get("session_id"), comma
     assert comma["allowed_processes"] == ["mspaint.exe", "notepad.exe"]
-    bundle = server._get_bundle(str(comma["session_id"]))
+    bundle = srv_server_lifecycle._get_bundle(str(comma["session_id"]))
     assert bundle.extra["allowed_processes"] == ["mspaint.exe", "notepad.exe"]
-    server.stop_session(str(comma["session_id"]))
+    await srv_server_lifecycle.stop_session(str(comma["session_id"]))
 
     json_form = await boundary_start(allowed_processes='["mspaint.exe"]')
     assert json_form["allowed_processes"] == ["mspaint.exe"]  # pre_parse_json normalizes
@@ -327,11 +334,11 @@ def test_d3_no_outputschema_on_tools_list_for_three_tools(fresh_server: Any) -> 
     """tools/list carries NO outputSchema for the three list-returning tools
     (the dict-annotated seven MAY publish one — start_session does today)."""
     for name in ("computer_execute", "computer_observe", "computer_screenshot"):
-        schema = server.mcp._tool_manager.get_tool(name).parameters
+        schema = srv_server_app.mcp._tool_manager.get_tool(name).parameters
         # parameters is the inputSchema; the registered Tool carries fn_metadata —
         # the wire outputSchema comes from fn_metadata.output_schema (pinned above).
         # Belt-and-braces: the tool annotation is Any.
-        tool = server.mcp._tool_manager.get_tool(name)
+        tool = srv_server_app.mcp._tool_manager.get_tool(name)
         assert tool.fn_metadata.output_schema is None, name
 
 

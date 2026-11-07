@@ -39,11 +39,14 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp import backend as backend_module
-from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend, LocalComputerBackend
-from computer_use_mcp.models import WindowInfo
-from computer_use_mcp.verification import (
+from computer_use_mcp.desktop import backend as backend_module
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.replies as srv_server_replies
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.desktop.backend import LocalComputerBackend
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.core.models import WindowInfo
+from computer_use_mcp.pipeline.verification import (
     ScreenshotDiffStrategy,
     VerificationEngine,
     VerificationIntent,
@@ -131,7 +134,7 @@ def _decode_image(data_b64: str) -> Image.Image:
 
 
 async def _run(session_id: str, spec: dict[str, Any]) -> dict[str, Any]:
-    return execute_payload(await server.computer_execute(session_id, **spec))
+    return execute_payload(await srv_server_execute.computer_execute(session_id, **spec))
 
 
 # --- queue-premise: queue batching that works on real desktops -----------------------------------------
@@ -173,7 +176,9 @@ async def test_d9_batch_survives_per_item_pixel_changes_window_constant(
     (the premise of each queued item no longer matches the screen pixel-for-pixel)
     completes while the attached window's identity stays constant — all 3 items
     execute, ``follow_ups_stopped_reason`` is None, and each item carries an honest
-    verdict (the screen change is real and above threshold -> verified)."""
+    verdict (F9, VAL-WP4a: since the WP4a/E-03 abstention, all three items STATE an
+    effect, so all three resolve ``uncertain`` — the assertions below are the
+    authority, not the historical "verified" wording this docstring once carried)."""
     monkeypatch.delenv(QUEUE_STRICT_DIGEST_ENV, raising=False)
     backend = LagRenderBackend(
         active_window=WindowInfo(hwnd=1, pid=10, process_name="mspaint.exe", title="Untitled - Paint")
@@ -205,14 +210,15 @@ async def test_d9_batch_survives_per_item_pixel_changes_window_constant(
         "click",
     ]
     # Honest per-item verdicts with a lagging canvas: item 0's own before/after are
-    # pixel-identical (its render lands late), so its stated effect degrades to
-    # uncertain (verdict-honesty, ok=False — never the old false "failed"); items 1-2 SEE the
-    # landed changes (their before/after straddle a render) and verify honestly.
+    # pixel-identical (its render lands late), and items 1-2 SEE the landed changes —
+    # but all three STATE an effect, and F1 fix 1.1 (decision D-1(a), WP4a/E-03 port)
+    # made a stated effect unsatisfiable by pixel movement, so all three abstain.
+    # What this test pins — the batch SURVIVES the first uncertain verdict and runs
+    # all three items — is unchanged (that is why ``follow_ups_stopped_reason`` is
+    # still None).
     outcomes = [item["verification_outcome"] for item in payload["follow_up_results"]]
-    assert outcomes == ["uncertain", "verified", "verified"], outcomes
-    assert payload["follow_up_results"][0]["ok"] is False
-    assert payload["follow_up_results"][1]["ok"] is True
-    assert payload["follow_up_results"][2]["ok"] is True
+    assert outcomes == ["uncertain", "uncertain", "uncertain"], outcomes
+    assert all(item["ok"] is False for item in payload["follow_up_results"])
 
 
 async def test_d9_window_title_change_between_items_stops_batch(
@@ -374,7 +380,7 @@ async def test_d10_default_executed_image_is_half_res_jpeg_within_budget(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     backend.observe_override_png = _busy_desktop_png_b64()
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     assert isinstance(result, list) and len(result) == 2
     text_block, image_block = result
     assert image_block.mimeType == "image/jpeg"
@@ -385,12 +391,14 @@ async def test_d10_default_executed_image_is_half_res_jpeg_within_budget(
     # Worst case: pure noise (no real screen looks like this; no lossy codec can
     # shrink entropy). Still bounded and far under the legacy per-action weight.
     backend.observe_override_png = _noisy_png_b64()
-    result = await server.computer_execute(session_id, "click", x=20, y=20)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=20, y=20)
     _text_block, image_block = result
     noise_bytes = len(base64.b64decode(image_block.data, validate=True))
     assert noise_bytes <= 150_000, noise_bytes
     payload = json.loads(text_block.text)
-    assert payload["image_scale"] == 0.5
+    # §1.1 D-3 (ORVEX-2026-108): the single MEASURED scale key (the legacy
+    # ``image_scale`` constant marker is deleted).
+    assert payload["image_outbound_scale"] == 0.5
 
 
 async def test_d10_include_screenshot_after_true_returns_full_resolution(
@@ -404,7 +412,7 @@ async def test_d10_include_screenshot_after_true_returns_full_resolution(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     backend.observe_override_png = _structured_png_b64()
-    result = await server.computer_execute(
+    result = await srv_server_execute.computer_execute(
         session_id, "click", x=10, y=10, include_screenshot_after=True
     )
     _text_block, image_block = result
@@ -422,12 +430,12 @@ async def test_d10_action_image_full_env_restores_full_res_default(
         monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
     backend.observe_override_png = _structured_png_b64()
-    result = await server.computer_execute(session_id, "click", x=10, y=10)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=10, y=10)
     _text_block, image_block = result
     assert _decode_image(image_block.data).size == (1920, 1080)
     monkeypatch.delenv(ACTION_IMAGE_FULL_ENV, raising=False)
     backend.observe_override_png = _structured_png_b64()
-    result = await server.computer_execute(session_id, "click", x=20, y=20)
+    result = await srv_server_execute.computer_execute(session_id, "click", x=20, y=20)
     _text_block, image_block = result
     assert _decode_image(image_block.data).size == (960, 540)  # lazy re-read: default again
 
@@ -439,16 +447,16 @@ async def test_d10_text_mode_still_ships_no_images(
     ``image_delivery="text"`` mode is the slim dict with NO image block and NO
     screenshot bytes — the half-res default must not leak images into text mode."""
     backend = ScriptedBackend()
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(
         dry_run=False,
         require_approval=False,
         limits=FAST_LIMITS,
         image_delivery="text",
     )
     session_id = str(response["session_id"])
-    payload = execute_payload(await server.computer_execute(session_id, "click", x=10, y=10))
+    payload = execute_payload(await srv_server_execute.computer_execute(session_id, "click", x=10, y=10))
     assert isinstance(payload, dict)  # slim dict — never content blocks in text mode
     assert payload["ok"] is True
     assert "screenshot_after_base64" not in json.dumps(payload)
@@ -460,14 +468,15 @@ def test_d10_half_res_encoder_unit_contract() -> None:
     outbound budget still governs the result; a failed encode falls back to the
     full-resolution budget ladder (never no image)."""
     noisy = _noisy_png_b64()
-    halved = server._half_res_action_image(noisy)
+    halved = srv_server_replies._half_res_action_image(noisy)
     assert halved is not None
-    data_b64, mime = halved
+    data_b64, mime, applied_scale = halved
     assert mime == "image/jpeg"
+    assert applied_scale == 0.5  # §1.1 D-3: the measured applied downscale
     assert _decode_image(data_b64).size == (960, 540)
-    assert len(base64.b64decode(data_b64, validate=True)) <= server._result_image_max_bytes()
+    assert len(base64.b64decode(data_b64, validate=True)) <= srv_server_replies._result_image_max_bytes()
     # Garbage input degrades to the budget ladder (None here), never raises.
-    assert server._half_res_action_image("not-base64-###") is None
+    assert srv_server_replies._half_res_action_image("not-base64-###") is None
 
 
 # --- alias-launch: ensure_app bare-name alias resolution ------------------------------------------------
@@ -505,9 +514,9 @@ async def test_d8_bare_name_resolves_through_store_alias_and_launches(
     monkeypatch.delenv("CORTEX_ATTACH_OR_LAUNCH", raising=False)
     backend = _LaunchRecordingBackend(flip=False)  # app_windows empty -> NO_INSTANCE
     backend.store_aliases.add("mspaint")
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
         allowed_processes=["mspaint.exe"],
     )
@@ -515,7 +524,12 @@ async def test_d8_bare_name_resolves_through_store_alias_and_launches(
     payload = await _run(session_id, {"action": "ensure_app", "target": "mspaint"})
     assert payload["ok"] is True, payload
     message = str(payload["message"])
-    assert message.startswith("NO_INSTANCE"), message
+    # WP4b (C8 / dev F3 fix 5.1): the leading token of a REAL launch is now
+    # ``LAUNCHED`` (the old ``NO_INSTANCE`` was chosen before the spawn attempt and
+    # never revised, so the first word said the opposite of what happened). ``ok`` is
+    # UNCHANGED: a launch is a screen-claim-free probe outcome, so it still verifies.
+    # The payload still records the REAL executable name, which is this test's subject.
+    assert message.startswith("LAUNCHED"), message
     assert "launch=server" in message, message
     assert "launched=mspaint.exe" in message, message  # the ALIAS's real name
     assert backend.ensure_app_calls == ["mspaint"]
@@ -531,15 +545,18 @@ async def test_d8_unresolvable_target_never_claims_launched(
     monkeypatch.delenv("CORTEX_ATTACH_OR_LAUNCH", raising=False)
     backend = _LaunchRecordingBackend(flip=False)
     backend.launch_unresolvable.add("nosuchapp")
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(
         dry_run=False, require_approval=False, limits=FAST_LIMITS,
         allowed_processes=["nosuchapp.exe"],
     )
     session_id = str(response["session_id"])
     payload = await _run(session_id, {"action": "ensure_app", "target": "nosuchapp"})
-    assert payload["ok"] is True
+    # §1.3 MAJOR-4 (VAL-WP1): not_found is a launch FAILURE — ok False, result
+    # "failed"; the probe's honest payload below is unchanged.
+    assert payload["ok"] is False
+    assert payload["result"] == "failed"
     message = str(payload["message"])
     assert message.startswith("NO_INSTANCE"), message
     assert "launched=" not in message, message  # never a false launch claim
@@ -624,13 +641,22 @@ async def test_d11_stated_effect_keypress_zero_diff_degrades_to_uncertain(
     assert backend.executed, "the input still dispatched (the verdict is about verification)"
 
 
-async def test_d11_stated_effect_genuine_change_still_verified(
+async def test_d11_stated_effect_genuine_change_degrades_to_uncertain(
     monkeypatch: pytest.MonkeyPatch, fresh_server: Any
 ) -> None:
-    """The verified path is unchanged: a stated effect with a REAL above-threshold
-    screen change is ``verified`` (ok=True) exactly as before."""
+    """F1 fix 1.1 (decision D-1(a), WP4a/E-03 port) — this pin is INVERTED and
+    renamed on purpose.
+
+    Before: "a stated effect with a REAL above-threshold screen change is
+    ``verified`` (ok=True) exactly as before".  That IS claim A1: the pixel tier
+    never compares the effect string, so a full-screen inversion satisfied any
+    stated effect.  Now the tier abstains, and the input is still dispatched.
+
+    The D-1(a) carve-out — a host that states NO effect keeps the pixel proxy —
+    is pinned by ``test_d11_bare_change_expectation_*`` and by
+    ``tests/test_expected_effect_not_satisfied.py``."""
     backend = ScriptedBackend(flip=True)  # every execute flips white -> black
-    session_id, _bundle, _backend, _ = make_session(
+    session_id, _bundle, backend, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False,
         limits=FAST_LIMITS,
     )
@@ -643,8 +669,16 @@ async def test_d11_stated_effect_genuine_change_still_verified(
             "include_screenshot_after": False,
         },
     )
-    assert payload["ok"] is True, payload
-    assert payload["verification"]["outcome"] == "verified", payload.get("verification")
+    assert payload["ok"] is False, payload
+    assert payload["verification"]["outcome"] == "uncertain", payload.get("verification")
+    assert payload["verification"]["changed"] is True  # the redraw was observed
+    assert executed_summary(backend), "the input still dispatched"
+    # the same world WITHOUT a stated effect keeps verifying (the carve-out)
+    bare = await _run(
+        session_id,
+        {"action": "keypress", "keys": ["enter"], "include_screenshot_after": False},
+    )
+    assert bare["verification"]["outcome"] == "verified", bare.get("verification")
 
 
 def test_d11_bare_change_expectation_keeps_legacy_definitive_failed() -> None:
@@ -663,7 +697,7 @@ def test_d11_bare_change_expectation_keeps_legacy_definitive_failed() -> None:
     class _Obs:
         pass
 
-    from computer_use_mcp.models import Observation
+    from computer_use_mcp.core.models import Observation
 
     def _obs(png: str) -> Observation:
         return Observation(

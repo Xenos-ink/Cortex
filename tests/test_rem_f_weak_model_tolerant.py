@@ -54,18 +54,24 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
-from computer_use_mcp.models import MAX_FOLLOW_UPS
-from computer_use_mcp.state import SessionRegistry
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.app as srv_server_app
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.core.models import MAX_FOLLOW_UPS
+from computer_use_mcp.core.state import SessionRegistry
 
 
 @pytest.fixture
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same as controller suite)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 # --- real-boundary harness --------------------------------------------------------------------
 # The live failures happened in FastMCP's ARGUMENT VALIDATION, before the tool body
@@ -77,7 +83,7 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
 
 def _meta(tool_name: str) -> Any:
     """Synchronous accessor for the registered tool metadata (list_tools registers)."""
-    tool = server.mcp._tool_manager.get_tool(tool_name)
+    tool = srv_server_app.mcp._tool_manager.get_tool(tool_name)
     assert tool is not None, f"tool {tool_name} not registered"
     return tool.fn_metadata
 
@@ -103,12 +109,12 @@ async def _call_tool(tool_name: str, fn: Any, arguments: dict[str, Any]) -> Any:
 async def boundary_execute(session_id: str, **arguments: Any) -> Any:
     """computer_execute with the arguments re-validated through the FastMCP boundary."""
     arguments.setdefault("action", "click")
-    return await _call_tool("computer_execute", server.computer_execute, {"session_id": session_id, **arguments})
+    return await _call_tool("computer_execute", srv_server_execute.computer_execute, {"session_id": session_id, **arguments})
 
 
 async def boundary_start(**arguments: Any) -> Any:
     """start_session with the arguments re-validated through the FastMCP boundary."""
-    return await _call_tool("start_session", server.start_session, dict(arguments))
+    return await _call_tool("start_session", srv_server_lifecycle.start_session, dict(arguments))
 
 
 async def _tolerant_session(
@@ -351,7 +357,7 @@ async def test_follow_ups_garbage_string_fails_with_existing_style(
         # If the boundary passed it through (it must NOT for non-JSON), the body's
         # structured invalid_action teaching shape is required.
         assert response["ok"] is False
-        assert response["error"] == "invalid_action"
+        assert response["result"] == "rejected" and "invalid_action" in response["reasons"]
     except Exception as exc:  # noqa: BLE001 - boundary rejection: clean typed error, no crash
         assert "json" in str(exc).lower() or "follow_ups" in str(exc).lower()
 
@@ -388,7 +394,7 @@ async def test_follow_ups_cap_still_enforced(
             session_id, action="click", x=10, y=10, approved=True, follow_ups=too_many_json
         )
         assert response["ok"] is False
-        assert response["error"] == "invalid_action"
+        assert response["result"] == "rejected" and "invalid_action" in response["reasons"]
         assert str(MAX_FOLLOW_UPS) in response["message"]
     except Exception as exc:  # noqa: BLE001 - boundary cap: equally fail-closed
         assert str(MAX_FOLLOW_UPS) in str(exc) or "follow_ups" in str(exc).lower()
@@ -495,6 +501,6 @@ def test_start_session_limits_string_value_strict_contract_direct(
     strings inside ``dict[str, float]`` — pre-existing pydantic behavior, untouched;
     this pin guards the fail-closed body contract itself).
     """
-    response = server.start_session(limits={"max_actions": "three"})
+    response = srv_server_lifecycle.start_session(limits={"max_actions": "three"})
     assert response["ok"] is False
     assert response["error"] == "invalid_limits"

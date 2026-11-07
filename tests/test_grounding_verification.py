@@ -19,7 +19,7 @@ import io
 import pytest
 from PIL import Image
 
-from computer_use_mcp.grounding import (
+from computer_use_mcp.pipeline.grounding import (
     AccessibilityGroundingStrategy,
     CoordinateGroundingStrategy,
     GroundingRouter,
@@ -27,7 +27,7 @@ from computer_use_mcp.grounding import (
     TextAnchorGroundingStrategy,
     UnsupportedGroundingError,
 )
-from computer_use_mcp.models import (
+from computer_use_mcp.core.models import (
     CoordinateSpace,
     GroundedAction,
     MonitorInfo,
@@ -36,12 +36,12 @@ from computer_use_mcp.models import (
     TextRegion,
     WindowInfo,
 )
-from computer_use_mcp.validator import (
+from computer_use_mcp.pipeline.validator import (
     GroundingValidator,
     ProcessNotAllowedError,
     StaleObservationError,
 )
-from computer_use_mcp.verification import (
+from computer_use_mcp.pipeline.verification import (
     DEFAULT_STRATEGY_CHAIN,
     DeterministicPredicateStrategy,
     ModelVisualStrategy,
@@ -686,14 +686,14 @@ def test_model_visual_strategy_degrades_without_judge_and_never_trusts_garbage()
 
     class UncertainJudge:
         def judge(self, intent: VerificationIntent, before_img: object, after_img: object) -> object:
-            from computer_use_mcp.models import VerificationResult
+            from computer_use_mcp.core.models import VerificationResult
 
             return VerificationResult(outcome="uncertain", changed=True, note="judge unsure", confidence=0.4)
 
     result = ModelVisualStrategy(UncertainJudge()).verify(intent, before, after)
     assert result.outcome == "uncertain" and result.verified is False
 
-    from computer_use_mcp.models import VerificationResult
+    from computer_use_mcp.core.models import VerificationResult
 
     class RealJudge:
         def judge(self, intent: VerificationIntent, before_img: object, after_img: object) -> VerificationResult:
@@ -710,9 +710,15 @@ def test_model_visual_strategy_degrades_without_judge_and_never_trusts_garbage()
 def test_engine_compare_is_backward_compatible_with_legacy_expectations() -> None:
     engine = VerificationEngine()
     before, after = _observation("white"), _observation("black")
-    result = engine.compare(before, after, expected_change="window changes")
-    assert result.changed is True
-    assert result.verified is True  # mirrors tests/test_reliability.py expectations
+    # F1 fix 1.1 (decision D-1(a), WP4a/E-03 port): the legacy STRING form states a
+    # DESCRIBED effect (it lands in ``expected_effect``), so pixels alone can no
+    # longer satisfy it and the facade abstains. The BOOLEAN form states no effect
+    # and is untouched.
+    stated = engine.compare(before, after, expected_change="window changes")
+    assert stated.changed is True
+    assert stated.verified is False  # uncertain: pixels are not the described effect
+    bare_change = engine.compare(before, after, expected_change=True)
+    assert bare_change.verified is True
     legacy_none_changed = engine.compare(before, after)
     assert legacy_none_changed.verified is True
     identical = engine.compare(before, _observation("white"))
@@ -974,7 +980,12 @@ def test_engine_expected_text_falls_through_to_diff_tier(
         before,
         after,
     )
-    assert fallback.outcome == "verified"
+    # F1 fix 1.1 (decision D-1(a), WP4a/E-03 port): the fallback re-verification
+    # states a DESCRIBED effect, and a real pixel change is not that effect — the
+    # pixel tier now abstains (``uncertain``, method unchanged) instead of upgrading
+    # "something changed" into proof of "invisible text".  The bare-change case at
+    # the end is the carve-out.
+    assert fallback.outcome == "uncertain"
     assert fallback.verification_method == "screenshot_diff"
     # Pixel-identical screen: RC-D11 (058) — a stated effect with zero pixel
     # evidence degrades to ``uncertain`` (absent pixels are not proof of absence);

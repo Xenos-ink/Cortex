@@ -5,11 +5,11 @@ import io
 
 from PIL import Image
 
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.models import GroundedAction, Observation, SessionState
-from computer_use_mcp.validator import GroundingValidator
-from computer_use_mcp.verification import VerificationEngine
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.core.models import GroundedAction, Observation, SessionState
+from computer_use_mcp.pipeline.validator import GroundingValidator
+from computer_use_mcp.pipeline.verification import VerificationEngine
 
 
 class ChangingBackend(FakeComputerBackend):
@@ -64,7 +64,11 @@ def test_verification_detects_visual_change() -> None:
     after = backend.observe()
     result = VerificationEngine().compare(before, after, expected_change="window changes")
     assert result.changed is True
-    assert result.verified is True
+    # F1 fix 1.1 (decision D-1(a), WP4a/E-03 port): the string form DESCRIBES an
+    # effect, and a changed screen is not that effect — the legacy facade now
+    # abstains. The boolean form (a bare change expectation) still verifies.
+    assert result.verified is False
+    assert VerificationEngine().compare(before, after, expected_change=True).verified is True
 
 
 async def test_dry_run_reports_not_verified_and_never_executes() -> None:
@@ -78,9 +82,15 @@ async def test_dry_run_reports_not_verified_and_never_executes() -> None:
         GroundedAction(action="wait", delta=1, confidence=1.0),
     )
     assert outcome.kind == "executed"
-    assert outcome.result is not None and outcome.result.ok is True
+    # §1.4.3 (ORVEX-2026-108): a dry run is NOT an execution — ok=False, the
+    # dry_run marker is on the row, and the verification is the honest
+    # cannot-determine (uncertain) at the dry_run tier, never a phantom failed.
+    assert outcome.result is not None and outcome.result.ok is False
+    assert outcome.result.dry_run is True
     assert outcome.result.verification is not None
     assert outcome.result.verification.verified is False
+    assert outcome.result.verification.outcome == "uncertain"
+    assert outcome.result.verification.verification_method == "dry_run"
     assert backend.executed == []
 
 

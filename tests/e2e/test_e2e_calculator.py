@@ -30,7 +30,9 @@ import helpers_runtime as rt
 import helpers_win32 as w32
 import pytest
 
-from computer_use_mcp import server
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.execute as srv_server_execute
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
 
 pytestmark = pytest.mark.e2e
 
@@ -67,7 +69,7 @@ def calculator_app(deadline: w32.Deadline):
 
 
 def observe(evidence: Any, session_id: str, when: str) -> dict[str, Any]:
-    response = w32.observe_tool_metadata(server.computer_observe(session_id))
+    response = w32.observe_tool_metadata(srv_server_observe.computer_observe(session_id))
     observation = response["observation"]
     if evidence is not None:
         evidence.save_observation(when, observation)
@@ -101,7 +103,7 @@ def test_calculator_clicks_and_display_verification(
         try:
             observation = observe(evidence, session_id, "before")
             info = observation["active_window_info"]
-            assert info["process_name"] == "win32calc.exe", info
+            assert str(info["process_name"]).casefold() == "win32calc.exe", info
             assert info["hwnd"] == hwnd, (info["hwnd"], hwnd)
             assert info["pid"] == proc.pid, (info["pid"], proc.pid)
             assert observation["coordinate_space"] == "verified_passthrough", observation
@@ -112,8 +114,8 @@ def test_calculator_clicks_and_display_verification(
             # of ~0.2, far below the legacy diff threshold (1.0), so pixel diff alone
             # cannot verify Calculator input; the injected display-predicate strategy
             # reads the REAL display control instead (deterministic, evidence-based).
-            direct = asyncio.run(
-                server.computer_execute(
+            direct = rt.execute_payload(asyncio.run(
+                srv_server_execute.computer_execute(
                     session_id,
                     "click",
                     x=grid["7"][0],
@@ -121,7 +123,7 @@ def test_calculator_clicks_and_display_verification(
                     approved=True,
                     expected_effect="calc_display_equals:7",
                 )
-            )
+            ))
             assert direct.get("ok") is True, direct
             assert direct["verification"]["outcome"] == "verified", direct["verification"]
             assert direct["verification"]["verification_method"] == "calc_display", direct["verification"]
@@ -131,8 +133,8 @@ def test_calculator_clicks_and_display_verification(
             # RETARGETED (loop removal): the loop died with the loop; each scripted
             # step below is now a direct computer_execute click, verified per call by
             # the injected display-predicate strategy (the same verification pipeline).
-            cleared = asyncio.run(
-                server.computer_execute(
+            cleared = rt.execute_payload(asyncio.run(
+                srv_server_execute.computer_execute(
                     session_id,
                     "click",
                     x=grid["C"][0],
@@ -140,7 +142,7 @@ def test_calculator_clicks_and_display_verification(
                     approved=True,
                     expected_effect="calc_display_equals:0",
                 )
-            )
+            ))
             assert cleared.get("ok") is True, cleared
             assert w32.calc_display_value(hwnd) == "0", w32.calc_display_values(hwnd)
 
@@ -150,8 +152,8 @@ def test_calculator_clicks_and_display_verification(
                 ("6", "6", "calc_display_equals:6"),
                 ("=", "=", "calc_display_equals:42"),
             ):
-                clicked = asyncio.run(
-                    server.computer_execute(
+                clicked = rt.execute_payload(asyncio.run(
+                    srv_server_execute.computer_execute(
                         session_id,
                         "click",
                         x=grid[key][0],
@@ -159,7 +161,7 @@ def test_calculator_clicks_and_display_verification(
                         approved=True,
                         expected_effect=expected,
                     )
-                )
+                ))
                 if evidence is not None:
                     evidence.record(
                         f"computer_execute(click {label})",
@@ -192,7 +194,7 @@ def test_calculator_clicks_and_display_verification(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            server.stop_session(session_id)
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))
 
 
 def test_calculator_division_precision(
@@ -222,8 +224,8 @@ def test_calculator_division_precision(
                 ("8", "8", "calc_display_equals:8"),
                 ("=", "=", "calc_display_equals:0.125"),
             ):
-                clicked = asyncio.run(
-                    server.computer_execute(
+                clicked = rt.execute_payload(asyncio.run(
+                    srv_server_execute.computer_execute(
                         session_id,
                         "click",
                         x=grid[key][0],
@@ -231,7 +233,7 @@ def test_calculator_division_precision(
                         approved=True,
                         expected_effect=expected,
                     )
-                )
+                ))
                 assert clicked.get("ok") is True, (label, clicked)
                 verification = clicked["verification"]
                 assert verification["outcome"] == "verified", (label, verification)
@@ -245,4 +247,4 @@ def test_calculator_division_precision(
                 evidence.save_audit(bundle, session_id)
                 observe(evidence, session_id, "after")
         finally:
-            server.stop_session(session_id)
+            asyncio.run(srv_server_lifecycle.stop_session(session_id))

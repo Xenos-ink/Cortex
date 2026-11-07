@@ -1,6 +1,6 @@
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.models import GroundedAction, SessionState
-from computer_use_mcp.safety import SafetyPolicy
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.core.models import GroundedAction, SessionState
+from computer_use_mcp.security.safety import SafetyPolicy
 
 
 def test_click_requires_approval_by_default() -> None:

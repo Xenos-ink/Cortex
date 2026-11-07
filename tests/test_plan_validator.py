@@ -10,7 +10,7 @@ Pure domain tests — no network, no provider, no execution.
 
 from __future__ import annotations
 
-from computer_use_mcp.plan_validator import contains_control_characters, find_cycle
+from computer_use_mcp.planning.plan_validator import contains_control_characters, find_cycle
 
 # --- shared cycle finder ------------------------------------------------------------------
 

@@ -41,8 +41,12 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from computer_use_mcp import server
-from computer_use_mcp.models import Observation
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.observe as srv_server_observe
+import computer_use_mcp.server.replies as srv_server_replies
+from computer_use_mcp.core.models import Observation
 
 from test_controller_integration import (
     FAST_LIMITS,
@@ -56,11 +60,13 @@ from test_controller_integration import (
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same as controller suite)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", __import__(
-        "computer_use_mcp.state", fromlist=["SessionRegistry"]
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", __import__(
+        "computer_use_mcp.core.state", fromlist=["SessionRegistry"]
     ).SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 # --- DEFECT 1: Store execution-alias resolution in _launch_process ----------------------------
@@ -78,7 +84,7 @@ def test_d1_alias_exists_which_none_popen_gets_alias_path(
 ) -> None:
     """Pin (a): which=None + the Store alias exists -> Popen receives the ALIAS
     PATH (plain one-element argv, no shell) — the mspaint.exe live-launch case."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     localappdata, windows_apps = _alias_dir(tmp_path)
     alias_path = str(windows_apps / "mspaint.exe")
@@ -107,7 +113,7 @@ def test_d1_alias_missing_which_none_keeps_raw_name_fallback(
 ) -> None:
     """Pin (b): which=None + NO alias file -> the raw-name Popen fallback is
     unchanged (Windows CreateProcess PATH search, soft contract preserved)."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     localappdata, windows_apps = _alias_dir(tmp_path)
     monkeypatch.setenv("LOCALAPPDATA", str(localappdata))
@@ -133,7 +139,7 @@ def test_d1_which_resolves_beats_alias(
 ) -> None:
     """Pin (c): when ``shutil.which`` resolves the needle, the which path wins —
     the alias dir is never consulted as a substitute for PATH resolution."""
-    from computer_use_mcp.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
 
     localappdata, windows_apps = _alias_dir(tmp_path)
     windows_apps.joinpath("notepad.exe").write_bytes(b"")  # alias ALSO exists
@@ -161,7 +167,8 @@ def test_d1_needle_validation_rejects_smuggle_before_alias_construction(
     """Pin (d): the charset gate fires BEFORE any alias path is constructed — a
     smuggle needle (path separator / quote / metachar) raises the typed rejection
     and NOTHING is spawned, even with a hostile alias dir lying around."""
-    from computer_use_mcp.backend import LaunchTargetError, LocalComputerBackend
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
+    from computer_use_mcp.desktop.errors import LaunchTargetError
 
     # A hostile LOCALAPPDATA whose WindowsApps "alias" is a smuggle name — the
     # gate must reject the NEEDLE before this dir is ever joined or read.
@@ -218,7 +225,7 @@ def _observe_with(monkeypatch: pytest.MonkeyPatch, png_b64: str) -> Any:
     session_id, _bundle, _b, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    return server.computer_observe(session_id)
+    return srv_server_observe.computer_observe(session_id)
 
 
 async def test_d2_oversized_observe_png_is_bounded_and_format_truthful(
@@ -231,7 +238,7 @@ async def test_d2_oversized_observe_png_is_bounded_and_format_truthful(
     assert isinstance(result, list) and len(result) == 2, result
     text_block, image_block = result
     decoded = base64.b64decode(image_block.data, validate=True)
-    budget = server._result_image_max_bytes()
+    budget = srv_server_replies._result_image_max_bytes()
     assert len(decoded) <= budget, (
         f"outbound observe image is {len(decoded)} bytes > budget {budget}"
     )
@@ -285,7 +292,7 @@ async def test_d2_internal_observation_stays_original_png(
     session_id, bundle, _b, _ = make_session(
         monkeypatch, backend=backend, dry_run=False, require_approval=False, limits=FAST_LIMITS
     )
-    result = server.computer_observe(session_id)
+    result = srv_server_observe.computer_observe(session_id)
     assert isinstance(result, list) and len(result) == 2, result
     _text_block, image_block = result
     assert image_block.mimeType == "image/jpeg"  # outbound was re-encoded...
@@ -303,8 +310,8 @@ def test_d2_observe_and_execute_docstrings_mention_both_paths(
     fresh_server: Any,
 ) -> None:
     """Docstring truthfulness: the REM-A knob comment bounds observe AND execute."""
-    source = server.__doc__ or ""
-    with open(server.__file__, encoding="utf-8") as handle:
+    source = srv_server_replies.__doc__ or ""
+    with open(srv_server_replies.__file__, encoding="utf-8") as handle:
         source = handle.read()
     assert "bounds the OUTBOUND image only" in source  # REM-A invariant kept
     assert "CORTEX_RESULT_IMAGE_MAX_KB" in source

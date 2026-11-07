@@ -65,10 +65,10 @@ def main() -> int:
     iters = max(3, args.iterations)
 
     # import server for _bound_outbound_image (importable; no server start)
-    from computer_use_mcp.backend import LocalComputerBackend
-    from computer_use_mcp.limits import LimitEnforcer, Limits
-    from computer_use_mcp.observation import observation_digest
-    from computer_use_mcp.verification import (
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
+    from computer_use_mcp.core.limits import LimitEnforcer, Limits
+    from computer_use_mcp.vision.observation import observation_digest
+    from computer_use_mcp.pipeline.verification import (
         ScreenshotDiffStrategy,
         VerificationEngine,
         VerificationIntent,
@@ -204,7 +204,7 @@ def main() -> int:
     # ---------------------------------------------------------------- stage E: outbound bound (REM-E)
     bound_ms = []
     enc_counts = []
-    import computer_use_mcp.server as srv
+    import computer_use_mcp.server.fetch as srv_server_fetch
 
     orig_save = Image.Image.save
 
@@ -215,7 +215,7 @@ def main() -> int:
     for _ in range(iters):
         enc_counts.clear()
         t0 = time.perf_counter()
-        bounded, mime = srv._bound_outbound_image(before.image_base64)
+        bounded, mime = srv_server_fetch._bound_outbound_image(before.image_base64)[:2]
         bound_ms.append((time.perf_counter() - t0) * 1000.0)
     report["bound_outbound_image"] = {**_ms(bound_ms), "jpeg_encodes_per_call": len(enc_counts)}
     report["bound_outbound_mime"] = {"n": 1, "p50": 1.0 if mime == "image/jpeg" else 0.0,
@@ -225,7 +225,8 @@ def main() -> int:
     enc_counts.clear()
     Image.Image.save = counting_save
     try:
-        _b, _m = srv._bound_outbound_image(before.image_base64)
+        _bound_probe = srv_server_fetch._bound_outbound_image(before.image_base64)
+        del _bound_probe  # WP11: 2-tuple on <=0.7.5, 3-tuple (WP5 H7 scale) on 0.7.6
     finally:
         Image.Image.save = orig_save
     report["bound_outbound_encodes"] = {"n": 1, "p50": float(len(enc_counts)), "p95": float(len(enc_counts)),
@@ -260,7 +261,7 @@ def main() -> int:
     report["composite_action_two_observes_plus_verify"] = _ms(comp_ms)
 
     # composite with digest comparisons (validator staleness + strict digest)
-    from computer_use_mcp.observation import digest_matches
+    from computer_use_mcp.vision.observation import digest_matches
 
     comp2 = []
     for _ in range(iters):

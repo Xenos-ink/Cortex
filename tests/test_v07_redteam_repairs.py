@@ -62,15 +62,18 @@ from test_controller_integration import (
     make_session,
 )
 
-from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.focus_guard import InterferenceGuard, _launcher_seed_tokens
-from computer_use_mcp.interference import parse_interference
-from computer_use_mcp.models import GroundedAction, SessionState, WindowInfo
-from computer_use_mcp.redaction import contains_secret, redact_text
-from computer_use_mcp.safety import SafetyContext, SafetyPolicy
-from computer_use_mcp.state import SessionRegistry
-from computer_use_mcp.textnorm import canonical_views
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.wait_machine as srv_server_wait_machine
+import computer_use_mcp.server.wait as srv_server_wait
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.focus_guard import InterferenceGuard, _launcher_seed_tokens
+from computer_use_mcp.desktop.interference import parse_interference
+from computer_use_mcp.core.models import GroundedAction, SessionState, WindowInfo
+from computer_use_mcp.security.redaction import contains_secret, redact_text
+from computer_use_mcp.security.safety import SafetyContext, SafetyPolicy
+from computer_use_mcp.core.state import SessionRegistry
+from computer_use_mcp.core.textnorm import canonical_views
 
 LEGACY_GATE_REASON = "Text resembles a secret, credential, or destructive command."
 
@@ -198,9 +201,11 @@ def test_s3_copula_then_colon_detected_and_redacted(text: str, raw_value: str) -
 def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     """Fresh bounded registry/bundles + per-test audit dir (same isolation as test_r21)."""
     monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
-    monkeypatch.setattr(server, "_registry", SessionRegistry(max_sessions=8))
-    monkeypatch.setattr(server, "_bundles", {})
-    return server
+    monkeypatch.setattr(srv_server_lifecycle, "_registry", SessionRegistry(max_sessions=8))
+    monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
+    monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
+    monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    return None
 
 
 async def test_s3_copula_colon_secret_never_reaches_the_served_sinks(
@@ -214,7 +219,7 @@ async def test_s3_copula_colon_secret_never_reaches_the_served_sinks(
     session_id, bundle, _backend, _ = make_session(
         monkeypatch, dry_run=False, require_approval=True, limits=FAST_LIMITS
     )
-    response = await server.computer_execute(session_id, "type", text=raw)
+    response = await srv_server_execute.computer_execute(session_id, "type", text=raw)
     payload = execute_payload(response)
     message = str(payload.get("message", ""))
     assert "[REDACTED:" in message, message
@@ -551,8 +556,8 @@ def test_rt2_fusion_rows_blocked_only_by_legacy_markers() -> None:
     ASCII forms ("restart" and "del" are standalone token markers), independently of
     any fusion — weakening that vocabulary is forbidden, so these stay blocked. The
     fusion machinery itself is verified INACTIVE on them (zero virtual joins)."""
-    from computer_use_mcp.safety import _fusion_scan_marked
-    from computer_use_mcp.textnorm import fold_marked
+    from computer_use_mcp.security.safety import _fusion_scan_marked
+    from computer_use_mcp.core.textnorm import fold_marked
 
     for plain in (
         "restart the server after the api key meeting",
@@ -710,7 +715,7 @@ def test_rt5_bridge_continuation_consumes_the_whole_run() -> None:
     value — every token of the run is redacted and the sink/checkpoint gate sees a
     clean result. Prose-only sequences still never match (anchors are
     secret-shaped)."""
-    from computer_use_mcp.checkpoint_manager import _redact_and_gate
+    from computer_use_mcp.planning.checkpoint_manager import _redact_and_gate
 
     for text, secrets in (
         ("password is ABCDEF and supersecret123", ("ABCDEF", "supersecret123")),
@@ -730,7 +735,7 @@ def test_rt3_decoy_continuation_bounded_to_two_prose_tokens() -> None:
     """RT3-D1-01 as refined by RT4: the bound is TWO prose tokens (evidence-forced —
     see the constraint table), the FP rows are clean BYTE-IDENTICAL including the
     checkpoint gate, and the single-decoy attack shape is still caught."""
-    from computer_use_mcp.checkpoint_manager import _redact_and_gate
+    from computer_use_mcp.planning.checkpoint_manager import _redact_and_gate
 
     for text in (
         "the password is stored in the Database",

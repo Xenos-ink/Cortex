@@ -25,14 +25,14 @@ from typing import Any
 
 from PIL import Image
 
-from computer_use_mcp.agent import ComputerUseAgent
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.interference import parse_interference
-from computer_use_mcp.limits import Limits
-from computer_use_mcp.models import GroundedAction, WindowInfo
-from computer_use_mcp.observation import ObservationEngine
-from computer_use_mcp.safety import SafetyPolicy
-from computer_use_mcp.state import StopToken, TaskState
+from computer_use_mcp.pipeline.agent import ComputerUseAgent
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.desktop.interference import parse_interference
+from computer_use_mcp.core.limits import Limits
+from computer_use_mcp.core.models import GroundedAction, WindowInfo
+from computer_use_mcp.vision.observation import ObservationEngine
+from computer_use_mcp.security.safety import SafetyPolicy
+from computer_use_mcp.core.state import StopToken, TaskState
 
 SHELL = WindowInfo(hwnd=10, pid=6964, process_name="explorer.exe", window_class="Progman", title="Program Manager")
 RUN = WindowInfo(hwnd=11, pid=6964, process_name="explorer.exe", window_class="#32770", title="Run")

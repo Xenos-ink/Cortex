@@ -185,13 +185,18 @@ below. Per the changelog note these entries move to VERSIONS.md at release time.
 
 ### R-11 UIA hybrid control detection + UIA precondition validation
 
-- **Status:** RESEARCH-DEFERRED.
-- **Problem:** OCR/UIA are extension-point stubs; grounding and preconditions rely on
-  pixels and window identity only. The cycle's research studied a ctypes-legal UIA
-  hybrid: +9.86% failure recovery at < 1 s overhead.
-- **Approach:** populate the existing `ui_elements` observation field from UIA
-  snapshots and add UIA-based precondition validation to the pipeline (fail-closed
-  when UIA data is absent, as today).
+- **Status:** PARTIALLY DELIVERED (the `ui_elements` population half shipped:
+  the UIA semantic read is live by default in the current release and populates
+  `Observation.ui_elements` / focused-control text, with the optional
+  `cortex_text_ocr` substrate for OCR). The REMAINING half — UIA-backed
+  *grounding* and *precondition validation* in the pipeline — stays
+  RESEARCH-DEFERRED.
+- **Problem:** (remaining half) grounding and preconditions still rely on
+  pixels and window identity only. The cycle's research studied a ctypes-legal
+  UIA hybrid: +9.86% failure recovery at < 1 s overhead.
+- **Approach:** build UIA-based precondition validation on top of the live
+  `ui_elements` observation field (fail-closed when UIA data is absent, as
+  today).
 - **Evidence:** (QA: perf-004 evidence — architecture research digest).
 - **Accept:** UIA-backed grounding/preconditions demonstrably improve failure
   recovery without regressing the fail-closed guarantees.
@@ -212,8 +217,8 @@ below. Per the changelog note these entries move to VERSIONS.md at release time.
 - **Problem:** the provider's reasoning-effort and model knobs are fixed in code; the
   host cannot tune the cost/quality point per deployment.
 - **Approach:** expose the knobs through server configuration (environment variables
-  consistent with the existing `VISION_*` scheme) and document them in the README
-  environment table.
+  consistent with the existing `VISION_*` scheme) and document them in
+  `docs/CONFIGURATION.md` (the environment-variable reference).
 - **Evidence:** (QA: perf-004 evidence — architecture research digest).
 - **Accept:** knobs are settable from the host config and take effect on the next
   model call without code changes.

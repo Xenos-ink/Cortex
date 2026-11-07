@@ -46,6 +46,12 @@ SKIPPED_NOT_FOUND = "SKIPPED-NOT-FOUND"
 #: The exact registered tool surface the probe must observe (server invariant).
 #: AL-002 Amendment A1 (owner addendum 2026-09-18) added the sixth, observation-only
 #: ``computer_zoom``; any tool NOT in this set is still refused.
+#: RESTATED (ORVEX-2026-108 WP6, decision D-1): the seventh through ninth are the
+#: cancellable-wait family — ``computer_wait``, ``computer_cancel_wait`` and the NEW
+#: consumer ``computer_wait_status`` (finding S-02: dev's wait was fire-and-forget with
+#: no completion signal). ``computer_fetch_image`` (WP5) is the evidence store's
+#: retrieval tool. The constant is what the live ``probe`` compares the served surface
+#: against; the drift guard test fails when this set and the registered surface diverge.
 EXPECTED_TOOLS = {
     "start_session",
     "stop_session",
@@ -55,6 +61,17 @@ EXPECTED_TOOLS = {
     # AL-002 Amendment A1 (owner addendum 2026-09-18): the sixth, observation-only
     # tool. Additive; the probe still refuses any tool NOT in this set.
     "computer_zoom",
+    # ORVEX-2026-108 WP6 (decision D-1 / finding S-02): the long cancellable wait,
+    # its early-cancel tool, and the blocking-segment status/consumer tool that
+    # TELLS the agent when the wait is over. Additive.
+    "computer_wait",
+    "computer_cancel_wait",
+    "computer_wait_status",
+    # ORVEX-2026-108 WP5: the evidence store's retrieval tool — re-serves by
+    # ``image_id`` a frame one of this session's replies already carried, within the
+    # 16 frames / 24 MB / 3600 s retention bounds. Additive; the probe still refuses
+    # any tool NOT in this set.
+    "computer_fetch_image",
 }
 
 SERVER_MODULE = "computer_use_mcp.server"

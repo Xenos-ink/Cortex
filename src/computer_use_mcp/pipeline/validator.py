@@ -1,0 +1,595 @@
+"""Action validation: grounding sanity, staleness/observation binding, allowlists.
+
+Public entry point (backward compatible): :class:`GroundingValidator.validate` keeps the
+legacy positional shape ``validate(action, observation, state)`` and the legacy
+:class:`~computer_use_mcp.models.GroundingValidation` result contract (``valid`` +
+human-readable ``reasons``), so the current ``agent.py``/``server.py`` call sites and the
+existing suite work unchanged. New capabilities are additive keyword parameters.
+
+Failure-reporting pattern (single pattern, per Wave-2 contract): validate() NEVER raises
+for rejection candidates — it returns a structured :class:`ValidationOutcome` (a
+``GroundingValidation`` subclass) carrying machine-readable ``codes`` plus the typed
+rejection instance in ``outcome.error`` (a non-serialized private attribute). The
+controller (E5/Wave 3) reads ``outcome.codes`` / ``outcome.error`` and maps
+:class:`StaleObservationError` to ``FailureClass.STALE_COORDINATES`` before re-observing.
+
+Staleness doctrine (P0-H): coordinate actions must carry ``source_observation_id`` and the
+fresh pre-execution observation must match the source observation on active-window HWND,
+monitor identity/bounds, screenshot dimensions, coordinate space, and active process
+identity. Any drift is a typed :class:`StaleObservationError` — the action is rejected and
+the controller re-observes instead of blindly executing stale coordinates.
+
+Allowlist doctrine (P0-G): ``allowed_processes`` is authoritative when the observation
+carries process identity (process name / exe path); a process outside the list is a
+violation even when the window title matches. The legacy title substring allowlist is kept
+verbatim as a fallback for observations without window identity; when
+``WindowInfo`` is available, exact-title and process matching are preferred (the substring
+check is retained additively for compatibility).
+
+REM-D bootstrap exemption: an ``ensure_app`` whose TARGET process is allowlisted skips the
+ACTIVE-process check (fresh-session takeover: the foreground is by definition not yet the
+target). The security property is preserved — the agent's target-side launch gate
+(attached/launched only for allowlisted targets) remains the real gate; every other action
+keeps the foreground check fail-closed.
+"""
+
+from __future__ import annotations
+
+from pydantic import ConfigDict, Field, PrivateAttr
+
+from ..core.models import (
+    MAX_DURATION_MS,
+    MAX_HOLD_MS,
+    ActionType,
+    CoordinateSpace,
+    GroundedAction,
+    GroundingValidation,
+    Observation,
+    SessionState,
+)
+
+__all__ = [
+    "GroundingRejection",
+    "GroundingValidator",
+    "MissingObservationBindingError",
+    "ObservationBindingMismatchError",
+    "ProcessIdentityUnavailableError",
+    "ProcessNotAllowedError",
+    "StaleObservationError",
+    "ValidationOutcome",
+    "WindowIdentityUnavailableError",
+]
+
+#: Actions whose execution consumes a screen point and therefore require observation binding.
+#: Drag consumes two points (start ``point`` + end ``to_point``) and binds like click;
+#: MOVE consumes one point (a cursor reposition) and binds like click too.
+#: RIGHT_CLICK consumes one point (a right-button press) and binds exactly like click.
+COORDINATE_ACTIONS: frozenset[ActionType] = frozenset(
+    {
+        ActionType.CLICK,
+        ActionType.DOUBLE_CLICK,
+        ActionType.RIGHT_CLICK,
+        ActionType.DRAG,
+        ActionType.MOVE,
+    }
+)
+
+#: Legacy confidence-floor exemptions, preserved verbatim from the prototype.
+_CONFIDENCE_EXEMPT: frozenset[str] = frozenset({"wait", "done"})
+
+
+class GroundingRejection(Exception):
+    """Base type for structured validation rejections attached to a ``ValidationOutcome``.
+
+    Instances are data, not control flow: ``validate()`` attaches them to the outcome
+    instead of raising, keeping one reporting pattern for all callers.
+    """
+
+    code: str = "grounding_rejected"
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(f"{self.code}: {detail}")
+        self.detail = detail
+
+
+class MissingObservationBindingError(GroundingRejection):
+    """A coordinate action lacks ``source_observation_id`` (P0-H fail-closed)."""
+
+    code = "missing_observation_binding"
+
+
+class ObservationBindingMismatchError(GroundingRejection):
+    """The action's ``source_observation_id`` does not match the source observation."""
+
+    code = "observation_binding_mismatch"
+
+
+class StaleObservationError(GroundingRejection):
+    """The fresh observation drifted from the action's source observation (P0-H).
+
+    Attributes:
+        detail: Which identity check drifted (e.g. ``active_window_hwnd``,
+            ``monitor_identity``, ``monitor_bounds``, ``screenshot_dimensions``,
+            ``coordinate_space``, ``active_process``).
+        reason: Stable machine reason code, always ``"STALE_OBSERVATION"``.
+    """
+
+    code = "STALE_OBSERVATION"
+
+    def __init__(self, detail: str, reason: str = "STALE_OBSERVATION") -> None:
+        super().__init__(detail)
+        self.reason = reason
+
+
+class ProcessNotAllowedError(GroundingRejection):
+    """The active process is outside ``allowed_processes`` (P0-G)."""
+
+    code = "process_not_allowed"
+
+
+class ProcessIdentityUnavailableError(GroundingRejection):
+    """Process identity is unknown while a process allowlist is configured (fail-closed)."""
+
+    code = "process_identity_unavailable"
+
+
+class WindowIdentityUnavailableError(GroundingRejection):
+    """The focus_window target window could not be resolved while a window-title
+    allowlist is configured (fail-closed)."""
+
+    code = "window_identity_unavailable"
+
+
+def _title_matches_allowlist(title: str, allowed_windows: list[str]) -> bool:
+    """Casefolded exact-or-substring title allowlist match for a single candidate title.
+
+    Mirrors :meth:`GroundingValidator._window_allowed` for the agent's focus_window
+    gate: that check accepts the active window on an exact ``WindowInfo.title`` match
+    with a substring fallback on the best available active title; for ONE candidate
+    title the two branches collapse to exact-or-substring over it. An empty title
+    never matches (fail closed).
+    """
+    folded = (title or "").casefold()
+    if not folded:
+        return False
+    return any(pattern.casefold() in folded for pattern in allowed_windows)
+
+
+class ValidationOutcome(GroundingValidation):
+    """Structured validation result: legacy fields plus machine-readable codes.
+
+    ``valid``/``reasons`` behave exactly like the legacy ``GroundingValidation``.
+    ``codes`` holds one stable reason code per rejection
+    (``missing_observation_binding``, ``observation_binding_mismatch``,
+    ``STALE_OBSERVATION``, ``process_not_allowed``, ``process_identity_unavailable``,
+    ``confidence_below_floor``, ``coordinate_space_unverifiable``,
+    ``window_not_allowed``, ``window_identity_unavailable``, ``point_out_of_bounds``,
+    ``missing_point``, ``missing_text``, ``missing_keys``, ``missing_target``,
+    ``via_not_allowed``, ``via_invalid``, ``hold_ms_not_allowed``, ``hold_ms_invalid``,
+    ``duration_ms_not_allowed``, ``duration_ms_invalid``).
+    ``error`` (private, never serialized) carries the first typed rejection instance
+    for controllers that branch on exception type.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    codes: list[str] = Field(default_factory=list)
+    _error: GroundingRejection | None = PrivateAttr(default=None)
+
+    @property
+    def ok(self) -> bool:
+        """Alias for ``valid`` (structured-outcome naming used by the Wave-2 contract)."""
+        return self.valid
+
+    @property
+    def error(self) -> GroundingRejection | None:
+        """The first typed rejection attached to this outcome, if any."""
+        return self._error
+
+
+def _normalize_process(name: str) -> str:
+    """Casefold and strip a trailing ``.exe`` so ``Notepad`` matches ``notepad.exe``."""
+    return name.strip().casefold().removesuffix(".exe")
+
+
+def _process_matches(candidate: str, allowed: str) -> bool:
+    cand = _normalize_process(candidate)
+    want = _normalize_process(allowed)
+    if not cand or not want:
+        return False
+    if cand == want:
+        return True
+    # Tolerate executable paths on either side: fall back to basename comparison.
+    cand_base = cand.replace("\\", "/").rsplit("/", 1)[-1]
+    want_base = want.replace("\\", "/").rsplit("/", 1)[-1]
+    return cand_base == want_base
+
+
+def _exe_matches(exe_path: str, allowed: str) -> bool:
+    return _process_matches(exe_path, allowed)
+
+
+class GroundingValidator:
+    """Validates a grounded action against the observation it will be executed on."""
+
+    def validate(
+        self,
+        action: GroundedAction,
+        observation: Observation,
+        state: SessionState | None = None,
+        current_observation: Observation | None = None,
+        *,
+        allowed_windows: list[str] | None = None,
+        allowed_processes: list[str] | None = None,
+        min_confidence: float | None = None,
+        enforce_observation_binding: bool | None = None,
+    ) -> ValidationOutcome:
+        """Validate ``action`` against ``observation`` and return a structured outcome.
+
+        Args:
+            action: The proposed action.
+            observation: The source observation the action was grounded from.
+            state: Legacy third positional parameter (``SessionState``). May be ``None``
+                for stateless callers; when an :class:`~computer_use_mcp.models.Observation`
+                is passed positionally here it is re-interpreted as
+                ``current_observation`` for call-shape tolerance.
+            current_observation: Fresh pre-execution observation; when provided, staleness
+                enforcement (P0-H) runs against it.
+            allowed_windows: Window-title allowlist; defaults to ``state.allowed_windows``.
+            allowed_processes: Process name/exe allowlist (authoritative when window
+                identity is available; fail-closed when identity is unknown).
+            min_confidence: Confidence floor; defaults to ``state.min_confidence``.
+            enforce_observation_binding: Force the ``source_observation_id`` requirement
+                for coordinate actions; defaults to auto (enabled when
+                ``current_observation`` is provided).
+        """
+        if isinstance(state, Observation):  # tolerate new-style positional current_observation
+            if current_observation is None:
+                current_observation = state
+            state = None
+
+        reasons: list[str] = []
+        codes: list[str] = []
+        first_error: GroundingRejection | None = None
+
+        def reject(code: str, reason: str, error: GroundingRejection | None = None) -> None:
+            nonlocal first_error
+            reasons.append(reason)
+            codes.append(code)
+            if error is not None and first_error is None:
+                first_error = error
+
+        floor = min_confidence if min_confidence is not None else (state.min_confidence if state else 0.0)
+        if action.confidence < floor and action.action not in _CONFIDENCE_EXEMPT:
+            reject(
+                "confidence_below_floor",
+                f"Confidence {action.confidence:.2f} is below {floor:.2f}.",
+            )
+
+        if not observation.coordinate_space_verified or observation.coordinate_space is CoordinateSpace.UNVERIFIABLE:
+            reject(
+                "coordinate_space_unverifiable",
+                "Screenshot and input coordinate spaces differ; refusing to execute until DPI mapping "
+                "is verified.",
+            )
+
+        # --- allowlists (P0-G) -------------------------------------------------------------
+        effective_windows = allowed_windows if allowed_windows is not None else (
+            list(state.allowed_windows) if state else []
+        )
+        if effective_windows and not self._window_allowed(observation, effective_windows):
+            reject("window_not_allowed", "Active window is not in the configured allowlist.")
+        if allowed_processes:
+            # REM-D: ensure_app makes no screen claim (its outcome is a probe —
+            # REATTACHED/AMBIGUOUS_INSTANCE/NO_INSTANCE), so on a FRESH session the
+            # foreground is by definition not yet the target (chicken-and-egg). Skip
+            # the ACTIVE-process check when the ensure_app TARGET itself is
+            # allowlisted (same matcher semantics as the agent's launch gate: the
+            # process part of 'process|doc-token', case-insensitive, .exe-tolerant).
+            # The agent's target-side gate (``_ensure_app_allow_launch`` — launch
+            # allowed only for allowlisted targets) remains the real security gate.
+            ensure_app_exempt = (
+                action.action is ActionType.ENSURE_APP
+                and self._ensure_app_target_allowed(action, allowed_processes)
+            )
+            violation = (
+                None
+                if ensure_app_exempt
+                else self._process_allowlist_violation(observation, allowed_processes)
+            )
+            if violation is not None:
+                error: GroundingRejection
+                if violation == "process_identity_unavailable":
+                    error = ProcessIdentityUnavailableError(
+                        "Active process identity is unavailable; cannot verify the process allowlist."
+                    )
+                    reject(
+                        "process_identity_unavailable",
+                        "Active process identity is unavailable; the process allowlist cannot be verified.",
+                        error,
+                    )
+                else:
+                    # REM-B (H2a messaging) / REM-D (truthful after the bootstrap
+                    # exemption): the rejection still fails closed (P0-G
+                    # untouched), but now NAMES the active process, states that the
+                    # gate checks the FOREGROUND (not the action's target), and
+                    # teaches the concrete remedies: bring/focus an allowlisted app
+                    # (ensure_app on an ALLOWLISTED target now works even from a
+                    # fresh session with a foreign foreground — it can also launch
+                    # the target server-side under the default launch="server"
+                    # policy) or extend allowed_processes at session start
+                    # (start_session(allowed_processes=[...])).
+                    reason = (
+                        f"Active (foreground) process {violation!r} is not in the "
+                        "configured process allowlist. This gate checks the CURRENT "
+                        "foreground process, not the action's intended target. "
+                        "Remedy: bring/focus an allowlisted app into the foreground "
+                        "first — e.g. ensure_app on an allowlisted target process "
+                        "(allowed from a fresh session, and able to launch it "
+                        "server-side under the default launch=\"server\" policy) — "
+                        "or extend allowed_processes at session start "
+                        "(start_session(allowed_processes=[...]))."
+                    )
+                    error = ProcessNotAllowedError(
+                        f"Active process {violation!r} is not in the configured process allowlist."
+                    )
+                    reject("process_not_allowed", reason, error)
+
+        # --- staleness / observation binding (P0-H) ----------------------------------------
+        enforce_binding = enforce_observation_binding if enforce_observation_binding is not None else (
+            current_observation is not None
+        )
+        if enforce_binding and action.action in COORDINATE_ACTIONS:
+            if not action.source_observation_id:
+                reject(
+                    "missing_observation_binding",
+                    "Coordinate action is missing source_observation_id; refusing to execute against a "
+                    "possibly stale screen.",
+                    MissingObservationBindingError(
+                        "Coordinate action has no source_observation_id binding."
+                    ),
+                )
+            elif (
+                observation.observation_id
+                and action.source_observation_id != observation.observation_id
+            ):
+                reject(
+                    "observation_binding_mismatch",
+                    "Action's source_observation_id does not match the observation it is validated against.",
+                    ObservationBindingMismatchError(
+                        f"Action bound to {action.source_observation_id!r} but validated against "
+                        f"{observation.observation_id!r}."
+                    ),
+                )
+        if current_observation is not None:
+            drift = self._staleness_drift(observation, current_observation)
+            if drift is not None:
+                reject(
+                    "STALE_OBSERVATION",
+                    f"Stale observation detected ({drift}); re-observe before executing.",
+                    StaleObservationError(drift),
+                )
+
+        # --- action-shape checks (legacy, verbatim) -----------------------------------------
+        if action.action in COORDINATE_ACTIONS:
+            if action.point is None:
+                reject("missing_point", "Click actions require a grounded point.")
+            else:
+                max_x, max_y = self._point_bounds(action, observation)
+                if action.point.x >= max_x or action.point.y >= max_y:
+                    reject(
+                        "point_out_of_bounds",
+                        "Grounded point is outside the current screenshot bounds.",
+                    )
+                if action.to_point is not None and (
+                    action.to_point.x >= max_x or action.to_point.y >= max_y
+                ):
+                    reject(
+                        "point_out_of_bounds",
+                        "Drag end point is outside the current screenshot bounds.",
+                    )
+        if action.action == ActionType.TYPE and not action.text:
+            reject("missing_text", "Type actions require non-empty text.")
+        # --- v0.7.1 (Defect C): ``via`` transport selector is type-only, known values ---
+        # Defense in depth: GroundedAction construction already fails closed on a via
+        # misuse (models.GroundedAction._via_type_only_known_values); this pipeline-side
+        # check catches model_construct-style bypasses so an invalid via can never reach
+        # the backend through any path. No new gate exceptions: sendinput/clipboard differ
+        # ONLY after the identical safety/approval decision.
+        if action.via is not None:
+            if action.action is not ActionType.TYPE:
+                reject(
+                    "via_not_allowed",
+                    f'via is only valid on type actions; received via="{action.via}" '
+                    f'on action="{action.action.value if hasattr(action.action, "value") else action.action}".',
+                )
+            elif action.via not in GroundedAction.VIA_TRANSPORTS:
+                allowed = " or ".join(f'"{value}"' for value in GroundedAction.VIA_TRANSPORTS)
+                reject(
+                    "via_invalid",
+                    f"via must be {allowed}; received {action.via!r}.",
+                )
+        # --- WP2 (ORVEX-2026-101 Batch 1, P1.2): hold_ms legal on the HOLD_ACTIONS
+        # --- family, int, in range ----------------------------------------------------------
+        # Defense in depth: GroundedAction construction already fails closed on a
+        # hold_ms misuse (models.GroundedAction._hold_ms_hold_family_only) and pydantic
+        # ge/le bounds the value; this pipeline-side check catches model_construct-style
+        # bypasses so an invalid hold_ms can never reach the backend through any path.
+        # A held dispatch differs from a legacy dispatch ONLY after the identical
+        # safety/approval decision; hold_ms=None rides the legacy path untouched.
+        # ORVEX-2026-107 widened the legal set to the click family plus keypress/hotkey.
+        # The ``hold_ms_not_allowed``/``hold_ms_invalid`` codes are UNCHANGED (D7: the
+        # typed vocabulary is additive-only, so a client matching on them keeps working).
+        if action.hold_ms is not None:
+            if action.action not in GroundedAction.HOLD_ACTIONS:
+                reject(
+                    "hold_ms_not_allowed",
+                    f"hold_ms is only valid on click/right_click/keypress/hotkey actions; "
+                    f"received hold_ms={action.hold_ms} on action=\""
+                    f'{action.action.value if hasattr(action.action, "value") else action.action}".',
+                )
+            elif (
+                not isinstance(action.hold_ms, int)
+                or isinstance(action.hold_ms, bool)
+                or not 0 <= action.hold_ms <= MAX_HOLD_MS
+            ):
+                reject(
+                    "hold_ms_invalid",
+                    f"hold_ms must be an integer between 0 and {MAX_HOLD_MS}; "
+                    f"received {action.hold_ms!r}.",
+                )
+        # --- WP2 DELTA 1 (VAL-WP2 F4): duration_ms move-only, int, in range --------------
+        # The validator-side gate SYMMETRIC to the hold gate (the backend defense gate
+        # stays as the last line): a model_construct-style bypass carrying duration_ms
+        # on a non-move action, or a non-int/out-of-band value, is rejected here so it
+        # can never reach the backend through any path. duration_ms=None (the legacy
+        # jump) is never rejected. The codes are additive-only vocabulary like the
+        # hold pair.
+        if action.duration_ms is not None:
+            if action.action is not ActionType.MOVE:
+                reject(
+                    "duration_ms_not_allowed",
+                    f"duration_ms is only valid on move actions; received "
+                    f'duration_ms={action.duration_ms} on action="'
+                    f'{action.action.value if hasattr(action.action, "value") else action.action}".',
+                )
+            elif (
+                not isinstance(action.duration_ms, int)
+                or isinstance(action.duration_ms, bool)
+                or not 0 <= action.duration_ms <= MAX_DURATION_MS
+            ):
+                reject(
+                    "duration_ms_invalid",
+                    f"duration_ms must be an integer between 0 and {MAX_DURATION_MS}; "
+                    f"received {action.duration_ms!r}.",
+                )
+        if action.action in {ActionType.KEYPRESS, ActionType.HOTKEY} and not action.keys:
+            reject("missing_keys", "Keypress/hotkey actions require at least one key.")
+        if action.action == ActionType.FOCUS_WINDOW and not (action.target or "").strip():
+            reject(
+                "missing_target",
+                "focus_window actions require a non-empty target window title.",
+            )
+        if action.action == ActionType.ENSURE_APP and not (action.target or "").strip():
+            # T8 mechanism ii: the identity string gates the attach decision, so a bare
+            # ensure_app is malformed (fail closed like a target-less focus_window).
+            reject(
+                "missing_target",
+                "ensure_app actions require a non-empty target: 'process' or "
+                "'process|doc-token' (e.g. 'excel|book1').",
+            )
+
+        outcome = ValidationOutcome(valid=not reasons, reasons=reasons, codes=codes)
+        outcome._error = first_error
+        return outcome
+
+    @staticmethod
+    def _point_bounds(action: GroundedAction, observation: Observation) -> tuple[int, int]:
+        """Effective upper bounds for the action point, honoring normalized input space.
+
+        When a grounding strategy normalized the point into input space (scaled coordinate
+        space), bounds are the input dimensions; otherwise the screenshot dimensions (the
+        legacy behavior, preserved verbatim for ungrounded actions).
+        """
+        grounding = action.grounding
+        if grounding is not None and grounding.normalized and observation.coordinate_space_verified:
+            input_width = observation.input_width or round(
+                observation.width * observation.coordinate_scale_x
+            )
+            input_height = observation.input_height or round(
+                observation.height * observation.coordinate_scale_y
+            )
+            return input_width, input_height
+        return observation.width, observation.height
+
+    @staticmethod
+    def _window_allowed(observation: Observation, allowed_windows: list[str]) -> bool:
+        """Title allowlist: exact/preferred match via WindowInfo, legacy substring fallback."""
+        info = observation.active_window_info
+        if info is not None and info.title:
+            title_fold = info.title.casefold()
+            if any(pattern.casefold() == title_fold for pattern in allowed_windows):
+                return True
+        active = observation.active_window or (info.title if info is not None else "") or ""
+        return any(pattern.casefold() in active.casefold() for pattern in allowed_windows)
+
+    @staticmethod
+    def _ensure_app_target_allowed(
+        action: GroundedAction, allowed_processes: list[str]
+    ) -> bool:
+        """REM-D: whether an ``ensure_app`` action's TARGET process is allowlisted.
+
+        Same semantics as the agent's launch gate (``_process_matches_pattern``):
+        the process part of the ``process|doc-token`` identity is matched against
+        each allowlist entry case-insensitively with ``.exe`` tolerance (via
+        :func:`_process_matches`, which also tolerates executable paths).
+        """
+        process = (action.target or "").split("|", 1)[0].strip()
+        if not process:
+            return False
+        return any(_process_matches(process, pattern) for pattern in allowed_processes)
+
+    @staticmethod
+    def _process_allowlist_violation(
+        observation: Observation, allowed_processes: list[str]
+    ) -> str | None:
+        """Return the offending process identity, or None when the allowlist is satisfied.
+
+        Fail-closed: when the observation carries no process identity at all, the violation
+        is reported as the sentinel ``"process_identity_unavailable"``.
+        """
+        info = observation.active_window_info
+        identity: str | None = None
+        if info is not None:
+            if info.process_name:
+                identity = info.process_name
+            elif info.exe_path:
+                identity = info.exe_path
+        if identity is None:
+            return "process_identity_unavailable"
+        for allowed in allowed_processes:
+            if info.process_name and _process_matches(info.process_name, allowed):
+                return None
+            if info.exe_path and _exe_matches(info.exe_path, allowed):
+                return None
+        return identity
+
+    @staticmethod
+    def _staleness_drift(source: Observation, current: Observation) -> str | None:
+        """Return which identity dimension drifted, or None when the screen identity holds."""
+        if (source.width, source.height) != (current.width, current.height):
+            return "screenshot_dimensions"
+        if source.coordinate_space != current.coordinate_space:
+            return "coordinate_space"
+
+        source_info = source.active_window_info
+        current_info = current.active_window_info
+        if source_info is not None and current_info is not None:
+            if source_info.hwnd is not None and current_info.hwnd is not None and source_info.hwnd != current_info.hwnd:
+                return "active_window_hwnd"
+            if (
+                source_info.pid is not None
+                and current_info.pid is not None
+                and source_info.pid != current_info.pid
+            ):
+                return "active_process"
+            source_process = source_info.process_name or (
+                source_info.exe_path.rsplit("\\", 1)[-1] if source_info.exe_path else None
+            )
+            current_process = current_info.process_name or (
+                current_info.exe_path.rsplit("\\", 1)[-1] if current_info.exe_path else None
+            )
+            if source_process and current_process and not _process_matches(source_process, current_process):
+                return "active_process"
+        elif source.active_window is not None and current.active_window is not None:
+            if source.active_window.casefold() != current.active_window.casefold():
+                return "active_window_title"
+
+        source_monitor = source.monitor
+        current_monitor = current.monitor
+        if source_monitor is not None and current_monitor is not None:
+            if (source_monitor.id, source_monitor.index) != (current_monitor.id, current_monitor.index):
+                return "monitor_identity"
+            if tuple(source_monitor.bounds) != tuple(current_monitor.bounds):
+                return "monitor_bounds"
+        return None

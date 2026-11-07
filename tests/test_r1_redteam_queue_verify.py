@@ -38,9 +38,10 @@ from typing import Any
 
 import pytest
 
-from computer_use_mcp import server
-from computer_use_mcp.backend import FakeComputerBackend
-from computer_use_mcp.models import WindowInfo
+import computer_use_mcp.server.lifecycle as srv_server_lifecycle
+import computer_use_mcp.server.execute as srv_server_execute
+from computer_use_mcp.desktop.fake_backend import FakeComputerBackend
+from computer_use_mcp.core.models import WindowInfo
 
 from test_controller_integration import (
     FAST_LIMITS,
@@ -89,13 +90,13 @@ class _EnsureAppRecordingBackend(ScriptedBackend):
 
 async def _run(session_id: str, spec: dict[str, Any]) -> dict[str, Any]:
     """computer_execute + payload unwrap (executed responses arrive as MCP blocks)."""
-    return execute_payload(await server.computer_execute(session_id, **spec))
+    return execute_payload(await srv_server_execute.computer_execute(session_id, **spec))
 
 
 def _session(monkeypatch: pytest.MonkeyPatch, backend: Any, **start: Any) -> str:
-    monkeypatch.setattr(server, "_backend_factory", lambda: backend)
-    monkeypatch.setattr(server, "_provider_factory", lambda: ScriptedProvider([]))
-    response = server.start_session(
+    monkeypatch.setattr(srv_server_lifecycle, "_backend_factory", lambda: backend)
+    monkeypatch.setattr(srv_server_lifecycle, "_provider_factory", lambda: ScriptedProvider([]))
+    response = srv_server_lifecycle.start_session(
         dry_run=False, require_approval=False, limits=FAST_LIMITS, **start
     )
     return str(response["session_id"])
@@ -513,7 +514,7 @@ async def test_attack5b_staleness_rejection_names_the_staleness_gate(
     monkeypatch.delenv(QUEUE_ENV, raising=False)
     backend = _DriftingForegroundBackend()
     session_id = _session(monkeypatch, backend)
-    bundle = server._get_bundle(session_id)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     original_ground = bundle.agent._ground
     ground_calls = {"n": 0}
 
@@ -562,7 +563,12 @@ async def test_attack6_default_policy_dispatches_server_side_launch(
     payload = await _run(session_id, {"action": "ensure_app", "target": "mspaint"})
     assert payload["ok"] is True, payload
     message = str(payload["message"])
-    assert message.startswith("NO_INSTANCE"), message
+    # WP4b (C8 / dev F3 fix 5.1): a REAL spawn now leads with ``LAUNCHED``. The old
+    # ``NO_INSTANCE`` token was chosen BEFORE the launch attempt and never revised,
+    # so the first word of a successful spawn said the opposite of what happened.
+    # Every assertion below about the launch itself (``launch=server``,
+    # ``launched=<exe>``, the recorded process) is UNCHANGED.
+    assert message.startswith("LAUNCHED"), message
     assert "launch=server" in message, message
     assert "launched=mspaint" in message, message
     assert backend.ensure_app_calls == ["mspaint"]
@@ -581,7 +587,10 @@ async def test_attack6b_driver_policy_restores_never_launch(
     backend = _EnsureAppRecordingBackend(flip=False)
     session_id = _session(monkeypatch, backend, allowed_processes=["mspaint.exe"])
     payload = await _run(session_id, {"action": "ensure_app", "target": "mspaint"})
-    assert payload["ok"] is True
+    # §1.3 MAJOR-4 (VAL-WP1): not_found under the never-launch policy is a launch
+    # FAILURE — ok False, result "failed"; the payload pins below are unchanged.
+    assert payload["ok"] is False
+    assert payload["result"] == "failed"
     message = str(payload["message"])
     assert message.startswith("NO_INSTANCE"), message
     assert "launch=driver" in message, message
@@ -597,10 +606,14 @@ async def test_attack6b_driver_policy_restores_never_launch(
 async def test_attack7_flagged_degrade_adds_no_extra_captures(
     monkeypatch: pytest.MonkeyPatch, fresh_server: Any, flagged: bool
 ) -> None:
-    """A single click performs exactly 3 captures (direct_request + validate +
-    post_action) whether the intent is focus-flagged or not: the W-1 uncertain
-    degrade reuses the diff computed from the ALREADY-captured frames
-    (verification.py:382-391,448-454) — no new capture anywhere."""
+    """Capture-floor pin, RE-ADAPTED by WP4a per the E-02 spec (the only approved
+    re-adaptation). UNFLAGGED (no stated effect): a single click on the static fake
+    performs exactly 3 captures (direct_request + validate + post_action) — the
+    E-02-conditioned late-repaint re-capture never fires (no stated effect, click is
+    not repaint-prone), so the WP0 baseline holds. FLAGGED (a stated effect): the
+    identical-frame uncertain earns EXACTLY ONE bounded late-repaint re-capture
+    (F2-3/E-02: a described transition may still be proven by a frame taken past the
+    repaint), so the count is 4 with a second ``post_action`` phase and never more."""
     monkeypatch.delenv(QUEUE_ENV, raising=False)
     backend = ScriptedBackend(flip=False)
     spec: dict[str, Any] = {
@@ -613,11 +626,17 @@ async def test_attack7_flagged_degrade_adds_no_extra_captures(
         spec["expected_effect"] = "Hex input focused"
     session_id = _session(monkeypatch, backend)
     await _run(session_id, spec)
-    assert len(backend.observed) == 3, len(backend.observed)
-    bundle = server._get_bundle(session_id)
+    expected_captures = 4 if flagged else 3
+    assert len(backend.observed) == expected_captures, len(backend.observed)
+    bundle = srv_server_lifecycle._get_bundle(session_id)
     phases = [
         (event.get("metadata") or {}).get("phase")
         for event in audit_events(bundle, session_id)
         if event["event_type"] == "observation"
     ]
-    assert phases == ["direct_request", "validate", "post_action"], phases
+    expected_phases = (
+        ["direct_request", "validate", "post_action", "post_action"]
+        if flagged
+        else ["direct_request", "validate", "post_action"]
+    )
+    assert phases == expected_phases, phases

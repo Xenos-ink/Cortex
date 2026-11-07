@@ -64,8 +64,8 @@ def _observe_frames(capture_env: str | None) -> tuple[Any, Any, dict[str, Any]]:
         os.environ["CORTEX_CAPTURE"] = capture_env
     else:
         os.environ.pop("CORTEX_CAPTURE", None)
-    from computer_use_mcp.backend import LocalComputerBackend
-    from computer_use_mcp.verification import ScreenshotDiffStrategy
+    from computer_use_mcp.desktop.backend import LocalComputerBackend
+    from computer_use_mcp.pipeline.verification import ScreenshotDiffStrategy
 
     backend = LocalComputerBackend()
     first = backend.observe()
@@ -93,7 +93,7 @@ def _set_patch(img: Image.Image, x0: int, y0: int, width: int, height: int, rgb:
 
 
 def record_corpus() -> int:
-    from computer_use_mcp.verification import (
+    from computer_use_mcp.pipeline.verification import (
         STRONG_CHANGE_MIN_PIXELS,
         STRONG_PIXEL_DELTA,
     )
@@ -232,7 +232,7 @@ def load_corpus() -> list[tuple[str, Image.Image, Image.Image]]:
 # =====================================================================================
 
 def _current_magnitude(before: Image.Image, after: Image.Image) -> tuple[float, int]:
-    from computer_use_mcp.verification import _diff_magnitude
+    from computer_use_mcp.pipeline.verification import _diff_magnitude
 
     return _diff_magnitude(before, after)
 
@@ -242,13 +242,13 @@ def _current_magnitude(before: Image.Image, after: Image.Image) -> tuple[float, 
 # =====================================================================================
 
 def profile_corpus() -> int:
-    from computer_use_mcp.verification import (
+    from computer_use_mcp.pipeline.verification import (
         ScreenshotDiffStrategy,
         VerificationEngine,
         VerificationIntent,
         VerificationKind,
     )
-    from computer_use_mcp.models import Observation
+    from computer_use_mcp.core.models import Observation
 
     pairs = load_corpus()
     print(f"\n=== corpus loaded: {len(pairs)} pairs ===")
@@ -327,7 +327,7 @@ def profile_corpus() -> int:
         print(f"  {name:28s} avg_p50={st['p50']/n_pairs:7.2f}ms avg_mean={st['mean']/n_pairs:7.2f}ms max={st['max']:7.2f}ms")
 
     # full verify path profile on the largest pair
-    from computer_use_mcp.verification import FocusChangeStrategy
+    from computer_use_mcp.pipeline.verification import FocusChangeStrategy
 
     big = max(pairs, key=lambda p: p[1].width * p[1].height)
     label, before, after = big
