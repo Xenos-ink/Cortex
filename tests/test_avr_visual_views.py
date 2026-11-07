@@ -1055,17 +1055,18 @@ def test_registry_matches_models_constant() -> None:
 
 def test_visual_view_is_trailing_optional_none_default_on_both_tools() -> None:
     """Regression pin for the documented signature changes (AL-002 Component 4 + A1.2
-    + A2): ``visual_view`` (Component 4), ``visual_view_density`` (A1.2), and
-    ``pixel_evidence`` (A2, observe/zoom only) join computer_observe /
-    computer_execute as trailing optionals with None defaults (None == byte-identical
-    legacy behavior). The pre-AL-002 signature pins (test_p5_redteam RT7,
-    test_perf004) pin only computer_execute and only through ``visual_view``, so they
-    stay untouched by the observe-side additions."""
+    + A2 + WP-C): ``visual_view`` (Component 4), ``visual_view_density`` (A1.2),
+    ``pixel_evidence`` (A2, observe/zoom only) and ``show_pointer`` (ORVEX-2026-109
+    WP-C3, observe only) join computer_observe / computer_execute as trailing
+    optionals with None defaults (None == the session-default / legacy behavior).
+    The pre-AL-002 signature pins (test_p5_redteam RT7, test_perf004) pin only
+    computer_execute and only through ``visual_view``, so they stay untouched by
+    the observe-side additions."""
     import inspect
 
     observe_params = list(inspect.signature(srv_server_observe.computer_observe).parameters.values())
     assert [p.name for p in observe_params] == [
-        "session_id", "visual_view", "visual_view_density", "pixel_evidence",
+        "session_id", "visual_view", "visual_view_density", "pixel_evidence", "show_pointer",
     ]
     assert all(p.default is None for p in observe_params[1:])
     zoom_params = list(inspect.signature(srv_server_observe.computer_zoom).parameters.values())

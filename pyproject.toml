@@ -32,10 +32,22 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# WP-C1 (ORVEX-2026-109): the pointer sprites ship in the wheel. Explicit
+# package-data (setuptools' VCS-driven include-package-data alone does not
+# reliably cover a newly added assets/ tree on every build backend invocation).
+[tool.setuptools.package-data]
+"computer_use_mcp" = [
+  "assets/cursor/*.png",
+  "assets/cursor/cursor.json",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+  "slow: long-running smoke test (e.g. a real wheel build); skipped or gated in fast runs",
+]
 pythonpath = ["src"]

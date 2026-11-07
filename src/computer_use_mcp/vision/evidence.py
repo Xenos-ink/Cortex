@@ -166,6 +166,21 @@ class StoredFrame:
     crop_region: tuple[int, int, int, int] | None = None
     visual_view: str | None = None
     redactions_applied: bool = False
+    # WP-C3 (ORVEX-2026-109): the pointer position/state AT CAPTURE TIME, in
+    # canonical screenshot coordinates. The stored pixels stay CLEAN (the sprite
+    # is an outbound-only decoration); ``computer_fetch_image`` composites from
+    # these fields onto ITS outbound copy.
+    pointer_x: float | None = None
+    pointer_y: float | None = None
+    pointer_state: str | None = None
+    # DELTA 1 (M4): the CANONICAL last_click SNAPSHOT at capture time — the
+    # click the frame itself reflects — with ``last_click_age_ms`` measured
+    # from the capture, so fetch describes the FRAME (never the ring "now",
+    # never physical coordinates).
+    last_click_x: float | None = None
+    last_click_y: float | None = None
+    last_click_button: str | None = None
+    last_click_age_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -321,6 +336,10 @@ class EvidenceStore:
         crop_region: Iterable[int] | None = None,
         visual_view: str | None = None,
         redactions_applied: bool = False,
+        pointer_x: float | None = None,
+        pointer_y: float | None = None,
+        pointer_state: str | None = None,
+        last_click: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Retain one captured frame and return the ADDITIVE reply block.
 
@@ -374,6 +393,17 @@ class EvidenceStore:
                 crop_region=tuple(int(v) for v in crop_region) if crop_region else None,
                 visual_view=visual_view,
                 redactions_applied=redactions_applied,
+                pointer_x=pointer_x,
+                pointer_y=pointer_y,
+                pointer_state=pointer_state,
+                last_click_x=last_click.get("x") if isinstance(last_click, dict) else None,
+                last_click_y=last_click.get("y") if isinstance(last_click, dict) else None,
+                last_click_button=(
+                    last_click.get("button") if isinstance(last_click, dict) else None
+                ),
+                last_click_age_ms=(
+                    last_click.get("age_ms") if isinstance(last_click, dict) else None
+                ),
             )
             self._frames[image_id] = frame
             self._bytes += byte_size
@@ -530,6 +560,10 @@ def register_frame(
     crop_region: Iterable[int] | None = None,
     visual_view: str | None = None,
     redactions_applied: bool = False,
+    pointer_x: float | None = None,
+    pointer_y: float | None = None,
+    pointer_state: str | None = None,
+    last_click: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Retain one frame and return the additive reply block (``{}`` when there is
     nothing to do: no payload means no capture, and a missing store means the session
@@ -541,6 +575,11 @@ def register_frame(
     (observe/zoom/execute all accept it) stores ``None``, never the string. A
     derived view keeps its id (``"grid"``, ...), so a fetched frame is
     self-describing about derivations only.
+
+    WP-C3: ``pointer_x``/``pointer_y``/``pointer_state`` record the pointer AT
+    CAPTURE TIME (canonical screenshot coordinates); the payload itself stays clean.
+    DELTA 1 (M4): ``last_click`` is the canonical click snapshot ({x, y, button,
+    age_ms} at capture) stored alongside so fetch describes the frame.
     """
     store = evidence_store(extra)
     if store is None or not payload:
@@ -559,4 +598,8 @@ def register_frame(
         crop_region=crop_region,
         visual_view=None if visual_view == "raw" else visual_view,
         redactions_applied=redactions_applied,
+        pointer_x=pointer_x,
+        pointer_y=pointer_y,
+        pointer_state=pointer_state,
+        last_click=last_click,
     )

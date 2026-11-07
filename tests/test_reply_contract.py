@@ -901,9 +901,12 @@ def test_half_res_one_by_one_source_reports_pass_through_none() -> None:
     png = _b64.b64encode(buffer.getvalue()).decode("ascii")
     result = srv_server_replies._half_res_action_image(png)
     assert result is not None
-    _data, mime, scale = result
+    # DELTA 1 (ORVEX-2026-109 WP-C): the tuple gained the pointer's honest
+    # ``in_image`` verdict as its fourth member (False — no pointer requested).
+    _data, mime, scale, pointer_in_image = result
     assert mime == "image/jpeg"
     assert scale is None  # 1x1 -> half-res is a no-op: no downscale applied
+    assert pointer_in_image is False
     # and the scalar helper agrees for the identity case
     assert srv_server_replies._outbound_image_scale(1, 1, 1, 1) is None
 

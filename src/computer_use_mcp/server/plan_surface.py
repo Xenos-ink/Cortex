@@ -17,6 +17,7 @@ from ..vision.visual_views import (
     encode_png_b64,
     observation_for_payload,
 )
+from .pointer_reply import executed_pointer_fields
 from .replies import (
     IMAGE_OUTBOUND_SCALE_KEY,
     _action_image_full,
@@ -939,6 +940,18 @@ def _plan_response(
     # WP5 retention rule: THIS reply carries the post-action image, so the frame is
     # retained HERE — the bytes kept are EXACTLY the bytes the reply carries (the
     # derived view when one was served, otherwise the raw capture), both pre-ladder.
+    # DELTA 1 M7 / DELTA 2 N1+N2 (ORVEX-2026-109): the plan step's pointer uses the
+    # SAME rule as the flat surface — ``executed_pointer_fields`` on item 0 (the
+    # step's grounded primary, the transition move). The step image is the
+    # post-MOVE frame, captured BEFORE the point's click, so Pressed from the
+    # declared click would lie (the click may even have been rejected); the step
+    # therefore shows Normal at the captured cursor, and ``last_click`` still
+    # reports the click from the ring. There is no override and no
+    # show_pointer-independent branch: on a show_pointer=False session the reply
+    # carries no pointer/last_click keys and the stored frame keeps neither.
+    pointer_xy, pointer_state, pointer, pointer_fields = executed_pointer_fields(
+        bundle, outcome.result, getattr(outcome.result, "action", None)
+    )
     carried_b64 = (
         str(view_payload[0]) if view_payload is not None else str(response["screenshot_after_base64"])
     )
@@ -949,8 +962,16 @@ def _plan_response(
             source="computer_execute(plan_step)",
             attached=True,
             visual_view=view_id,
+            pointer_x=pointer_xy[0] if pointer is not None else None,
+            pointer_y=pointer_xy[1] if pointer is not None else None,
+            pointer_state=pointer_state if pointer is not None else None,
+            last_click=pointer_fields.get("last_click") if pointer_fields else None,
         )
     )
+    if pointer_fields is not None:
+        # DELTA 1 M7: the additive pointer/last_click keys ride the image-bearing
+        # step reply (the in_image placeholder is fixed by the blocks builder).
+        response.update(pointer_fields)
     # S-03: the evidence block is (re)built AFTER this reply's own frame was
     # retained, so ``captures`` includes the capture THIS reply carries — the same
     # truth the dev block reported from the backend's observation list.
@@ -961,6 +982,7 @@ def _plan_response(
         full_resolution=full_resolution,
         view_id=view_id,
         view_payload=view_payload,
+        pointer=pointer,
     )
 
 

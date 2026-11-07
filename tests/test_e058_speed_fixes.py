@@ -470,7 +470,10 @@ def test_d10_half_res_encoder_unit_contract() -> None:
     noisy = _noisy_png_b64()
     halved = srv_server_replies._half_res_action_image(noisy)
     assert halved is not None
-    data_b64, mime, applied_scale = halved
+    # DELTA 1 (ORVEX-2026-109 WP-C): fourth member = the pointer's honest
+    # ``in_image`` verdict (False — no pointer requested on this unit path).
+    data_b64, mime, applied_scale, pointer_in_image = halved
+    assert pointer_in_image is False
     assert mime == "image/jpeg"
     assert applied_scale == 0.5  # §1.1 D-3: the measured applied downscale
     assert _decode_image(data_b64).size == (960, 540)

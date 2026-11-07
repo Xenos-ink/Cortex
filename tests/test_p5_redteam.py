@@ -864,7 +864,11 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
     default (legacy behavior), across the whole tool surface."""
     expected_new: dict[str, set[str]] = {
         # D1 (ORVEX-CORTEX-056-LIVEFIX): image_delivery joins the trailing set.
-        "start_session": {"interference", "image_delivery"},
+        # CHANGED PIN (ORVEX-2026-109 WP-C3, §-reason): show_pointer joins the
+        # trailing set as the newest start_session optional (None default keeps
+        # the legacy behavior); the tested property "trailing optional,
+        # None == legacy" is unchanged.
+        "start_session": {"interference", "image_delivery", "show_pointer"},
         # v0.7.1 (Defect C): via joins the trailing set (type-transport selector).
         # AL-002 (MISSION-CRF-AVR-008 W2, 2026-09-17): visual_view joins the trailing
         # set — a per-call observation view selector whose None default keeps the

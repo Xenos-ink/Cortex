@@ -133,6 +133,7 @@ from .input_engine import (
     _SENDINPUT_FACTORY_DRAG_STEP_PIXELS,
 )
 from .errors import UnsupportedKeyError
+from .pointer_ring import PointerRing
 from .launch import _launch_unresolved_suffix, _mapped_launch_path, validate_launch_needle
 from .motion import (
     WAIT_MAX_SECONDS,
@@ -847,6 +848,10 @@ class LocalComputerBackend(ComputerBackend):
         self._engine = self._build_input_engine(
             input_engine, type_interval, pyautogui_pause, drag_interpolate
         )
+        # WP-C2 (ORVEX-2026-109): the per-backend pointer-event ring. Pure Python,
+        # written at the dispatch choke points in ``_execute_dispatched`` AFTER each
+        # engine call returns — no new syscall, dispatch timing/order unchanged.
+        self.pointer_ring = PointerRing()
         self.png_optimize: bool = (
             _env_bool(PNG_OPTIMIZE_ENV, False) if png_optimize is None else png_optimize
         )
@@ -1464,6 +1469,14 @@ class LocalComputerBackend(ComputerBackend):
             time.sleep(_plan_point_settle_seconds(action))
         return message
 
+    def last_click(self) -> dict[str, object] | None:
+        """WP-C2: the most recent completed press from the pointer ring.
+
+        ``{x, y, button, t}`` in PHYSICAL virtual-screen coordinates (``t`` is the
+        down edge's ``time.monotonic``), or ``None`` when nothing was pressed yet.
+        """
+        return self.pointer_ring.last_click()
+
     def _ensure_keys_dispatchable(self, keys: list[str]) -> dict[str, tuple[int, bool]]:
         """Z2 (LIVE-WP13-02 sess_138fbd60): map EVERY key BEFORE any input.
 
@@ -1543,6 +1556,10 @@ class LocalComputerBackend(ComputerBackend):
                         stop.ensure_live()  # before mouse_down
                     engine.mouse_down(button)
                     button_down = True
+                    # WP-C2 DELTA 1 MINOR 1: recorded AFTER ``button_down = True``
+                    # (and record itself never raises), so a recording failure
+                    # can never skip ``mouse_up`` in the ``finally`` below.
+                    self.pointer_ring.record("down", physical[0], physical[1], button)
                     _wait_for_hold(hold_seconds, stop)
                     if stop is not None:
                         stop.ensure_live()  # before mouse_up
@@ -1557,11 +1574,21 @@ class LocalComputerBackend(ComputerBackend):
                     if button_down:
                         try:
                             engine.mouse_up(button)
+                            self.pointer_ring.record("up", physical[0], physical[1], button)
                         except Exception:
                             if hold_error is None:
                                 raise
             else:
+                # WP-C2 DELTA 1 MINOR 2: the DOWN edge's timestamp is taken
+                # BEFORE ``engine.click`` dispatches, so ``pressed_at`` covers
+                # the real press window (up is recorded after the return).
+                click_down_at = time.monotonic()
                 engine.click(physical[0], physical[1], clicks=clicks, button=button)
+                # WP-C2: the completed click lands in the ring as one down/up pair
+                # (a double_click batch records as one press; the ring is a
+                # pointer-EDGES log, not a click counter).
+                self.pointer_ring.record("down", physical[0], physical[1], button, at=click_down_at)
+                self.pointer_ring.record("up", physical[0], physical[1], button)
                 _mark_action_dispatched(action)
         elif action.action == "drag":
             if action.point is None or action.to_point is None:
@@ -1579,6 +1606,10 @@ class LocalComputerBackend(ComputerBackend):
             try:
                 engine.mouse_down("left")
                 button_down = True
+                # WP-C2 DELTA 1 MINOR 1/3: recorded AFTER ``button_down = True``,
+                # tagged source="drag" — a drag press never surfaces in
+                # ``last_click()`` (click-type presses only).
+                self.pointer_ring.record("down", start[0], start[1], "left", source="drag")
                 for segment_x, segment_y in self._drag_waypoints(start, end):
                     if stop is not None:
                         stop.ensure_live()  # before every stroke segment
@@ -1597,6 +1628,7 @@ class LocalComputerBackend(ComputerBackend):
                 if button_down:
                     try:
                         engine.mouse_up("left")
+                        self.pointer_ring.record("up", end[0], end[1], "left", source="drag")
                     except Exception:
                         if drag_error is None:
                             raise

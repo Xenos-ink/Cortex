@@ -31,7 +31,8 @@ from ..security.safety import SafetyPolicy
 from ..vision.evidence import EVIDENCE_STORE_KEY, dispose_store, new_store
 from .instance import logger, mcp
 from .plan_surface import _audit_plan_terminal, _plan_guard, _plan_terminal_audit_lock
-from .schemas import NullableNumberMap, NullableStr, NullableStrList, NullableStrMap, _coerce_tolerant_str_list
+from .pointer_reply import resolve_show_pointer
+from .schemas import NullableBool, NullableNumberMap, NullableStr, NullableStrList, NullableStrMap, _coerce_tolerant_str_list
 
 if TYPE_CHECKING:
     from .wait_machine import _WaitHandle
@@ -565,6 +566,7 @@ def start_session(
     resume_from_checkpoint: NullableStr = None,
     interference: NullableStrMap = None,
     image_delivery: NullableStr = None,
+    show_pointer: NullableBool = None,
 ) -> dict[str, object]:
     """Start a guarded session; per-action approval is enabled by default.
 
@@ -617,6 +619,16 @@ def start_session(
     Precedence: param > env ``CORTEX_IMAGE_DELIVERY`` ("text"/"image") > default
     "image"; invalid values are rejected fail-closed (``invalid_image_delivery``).
 
+    Pointer sprite (ORVEX-2026-109 WP-C3, trailing optional): ``show_pointer``
+    (default ON; env ``CORTEX_SHOW_POINTER`` is the default source, param > env >
+    default with a fallback-not-clamp boolean parse) draws the Cortex cursor
+    sprite INTO every image-bearing reply (observe/zoom/execute/fetch) at the
+    real pointer position — outbound decoration only: captures, digests,
+    verification diffs and the stored evidence frames keep the clean pixels.
+    Additive ``pointer`` / ``last_click`` keys ride image-bearing replies; pass
+    ``show_pointer=False`` here (or ``show_pointer=false`` per computer_observe
+    call) for the pre-WP-C byte-identical images.
+
     Idle-session reaper (WP-S, trailing behavior): sessions idle for more than 15
     minutes (env ``CORTEX_SESSION_IDLE_TIMEOUT_SECONDS``, band 60..86400, ``0`` =
     disabled) with no tool call in flight are STOPPED automatically through the same
@@ -660,6 +672,18 @@ def start_session(
         image_mode = _resolve_image_delivery(_normalize_image_delivery_param(image_delivery))
     except ValueError as exc:
         return {"ok": False, "error": "invalid_image_delivery", "message": str(exc)}
+    # DELTA 1 MINOR 5: ``show_pointer`` is a STRICT boolean or None — rejected
+    # fail-closed before any session exists (the ``invalid_image_delivery``
+    # precedent; the MCP boundary already rejects non-bools for MCP callers).
+    if show_pointer is not None and not isinstance(show_pointer, bool):
+        return {
+            "ok": False,
+            "error": "invalid_show_pointer",
+            "message": (
+                "show_pointer must be a boolean or null (null = the env/default); "
+                f"got {show_pointer!r} ({type(show_pointer).__name__})."
+            ),
+        }
     # REM-F: normalize the tolerant allowlist shapes for DIRECT callers too (the
     # boundary coercion already produced lists for MCP callers — idempotent here).
     try:
@@ -772,6 +796,9 @@ def start_session(
                 "max_retries_per_action": max_retries_per_action,
                 "interference_policy": interference_policy,
                 "image_delivery": image_mode,
+                # WP-C3 (ORVEX-2026-109): the session's pointer-sprite default —
+                # param > env CORTEX_SHOW_POINTER > True (fallback-not-clamp parse).
+                "show_pointer": resolve_show_pointer(show_pointer),
                 # WP5: the evidence store is created HERE, once, next to the
                 # image_delivery key — never lazily on first use.  ``extra`` is an
                 # unsynchronised dict that is never copied, so a lazily-created key

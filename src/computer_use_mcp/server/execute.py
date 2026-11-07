@@ -30,6 +30,7 @@ from .plan_surface import (
     _plan_guard,
     _plan_lease_refusal,
 )
+from .pointer_reply import executed_pointer_fields
 from .replies import (
     IMAGE_OUTBOUND_SCALE_KEY,
     _action_image_full,
@@ -696,6 +697,16 @@ async def computer_execute(
         # the half-res JPEG; CORTEX_ACTION_IMAGE_FULL=1 restores full-res defaults.
         frame = getattr(result, "_frame", None) if result is not None else None
         full_resolution = include_screenshot_after is True or _action_image_full()
+        # WP-C3 (ORVEX-2026-109; DELTA 1 M8): the pointer on THIS reply's
+        # outbound image — the whole decision (Pressed from the FLAT action at
+        # its click point, Normal at the capture-time cursor, honest in_image
+        # placeholder fixed by ``_execute_response_blocks``) lives in
+        # ``executed_pointer_fields``; ``last_click`` still comes from the ring
+        # and MAY name a later follow-up click — reported separately with its
+        # own coordinates, which is acceptable.
+        pointer_xy, pointer_state, pointer, pointer_fields = executed_pointer_fields(
+            bundle, result, grounded
+        )
         # AL-002 (additive): honor an explicit visual_view on the RETURNED image —
         # derived ONCE per response, then the UNCHANGED stock bounding branch. Raw is
         # the pass-through (stock bytes + additive keys). If the view cannot be
@@ -748,13 +759,22 @@ async def computer_execute(
                 source="computer_execute",
                 attached=True,
                 visual_view=view_id,
+                pointer_x=pointer_xy[0] if pointer is not None else None,
+                pointer_y=pointer_xy[1] if pointer is not None else None,
+                pointer_state=pointer_state if pointer is not None else None,
+                last_click=pointer_fields.get("last_click") if pointer_fields else None,
             )
         )
+        if pointer_fields is not None:
+            # WP-C3: the additive pointer/last_click keys ride the image-bearing
+            # reply only (the payload JSON of the TextContent block).
+            response.update(pointer_fields)
         return _execute_response_blocks(
             response,
             frame=frame,
             full_resolution=full_resolution,
             view_id=view_id,
             view_payload=view_payload,
+            pointer=pointer,
         )
     return response

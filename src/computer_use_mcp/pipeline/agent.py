@@ -111,6 +111,7 @@ from ..desktop.backend import (
     type_action_deadline_seconds,
 )
 from ..desktop.client_budget import semantic_read_timeout_seconds
+from ..desktop.coordinates import CoordinateTransform
 from ..desktop.errors import FocusDriftError, UnsupportedKeyError
 from ..desktop.motion import WAIT_MAX_SECONDS
 from ..desktop.focus_guard import GuardVerdict, InterferenceGuard
@@ -2843,6 +2844,16 @@ class ComputerUseAgent:
             )
             try:  # R-5 (W4): the post-action frame rides along for outbound bounding
                 outcome.result._frame = getattr(after, "_frame", None)
+            except Exception:  # noqa: BLE001 - never break the executed path
+                pass
+            try:  # WP-C3: the capture-time pointer (canonical) + transform for the
+                # additive pointer sprite / reply fields (never serialized; absent
+                # for legacy results and for consumers that never read it).
+                outcome.result._pointer = (
+                    after.cursor_x,
+                    after.cursor_y,
+                )
+                outcome.result._pointer_transform = CoordinateTransform.from_observation(after)
             except Exception:  # noqa: BLE001 - never break the executed path
                 pass
             return outcome, after

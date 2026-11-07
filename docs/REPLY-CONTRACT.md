@@ -156,9 +156,9 @@ interference-label tables.
 ## Error-code cheat sheet (typed `error` / `reasons` tokens)
 
 `invalid_action` (malformed action, teach-in message) · `invalid_limits` ·
-`invalid_interference` · `invalid_image_delivery` · `invalid_visual_view` ·
-`invalid_region` (zoom crop outside the frame) · `invalid_pixel_evidence` ·
-`view_derive_failed` · `session_stopped` · `session_limit_exceeded` (with
+`invalid_interference` · `invalid_image_delivery` · `invalid_show_pointer` ·
+`invalid_visual_view` · `invalid_region` (zoom crop outside the frame) ·
+`invalid_pixel_evidence` · `view_derive_failed` · `session_stopped` · `session_limit_exceeded` (with
 `live_sessions` + `idle_timeout_seconds`) · `invalid_wait_duration` ·
 `wait_duration_exceeds_max` · `too_many_waits` · `unknown_wait` · `wait_failed` ·
 `image_expired` · `image_not_found` · `frame_too_large` · `store_disposed` ·

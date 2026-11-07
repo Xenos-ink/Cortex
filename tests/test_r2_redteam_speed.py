@@ -455,8 +455,15 @@ async def test_r2_d10_full_env_plus_explicit_optin_no_double_encode(
     full-res path wins, and an in-budget PNG travels BYTE-IDENTICAL (no re-encode,
     no double-compress weirdness, no image_scale marker on the full path)."""
     monkeypatch.setenv(ACTION_IMAGE_FULL_ENV, "1")
+    # WP-C3: show_pointer=False pins the PRE-pointer ladder property — the tested
+    # guarantee is "an in-budget PNG travels untouched", which the pointer sprite
+    # (an intentional outbound decoration, default ON) would otherwise change.
     session_id, _bundle, backend, _ = make_session(
-        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch,
+        dry_run=False,
+        require_approval=False,
+        limits=FAST_LIMITS,
+        show_pointer=False,
     )
     structured = _structured_png_b64()
     assert len(base64.b64decode(structured, validate=True)) <= srv_server_replies._result_image_max_bytes()
@@ -476,6 +483,36 @@ async def test_r2_d10_full_env_plus_explicit_optin_no_double_encode(
     # MINOR-b (Commander decision): an untouched PNG is a raw PASS-THROUGH — the
     # honest report is None (no downscale applied), never 1.0.
     assert payload["image_outbound_scale"] is None
+
+
+async def test_r2_d10_pointer_on_ladder_still_governs(
+    monkeypatch: pytest.MonkeyPatch, fresh_server: Any
+) -> None:
+    """DELTA 1 M6 (the pointer-on twin of the d10 variant above): with the
+    pointer sprite ON (the default), an OVER-budget capture still runs the
+    ladder on the composited copy — the delivered image stays JPEG and within
+    the budget, with the pointer drawn and the REAL in_image verdict."""
+    monkeypatch.setenv(ACTION_IMAGE_FULL_ENV, "1")
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    noisy = _noise_png_b64()
+    assert len(base64.b64decode(noisy, validate=True)) > srv_server_replies._result_image_max_bytes()
+    backend.observe_override_png = noisy
+    result = await srv_server_execute.computer_execute(
+        session_id, "click", x=10, y=10, include_screenshot_after=True
+    )
+    text_block, image_block = result
+    raw_bytes = len(base64.b64decode(image_block.data, validate=True))
+    assert raw_bytes <= srv_server_replies._result_image_max_bytes(), (
+        image_block.mimeType,
+        raw_bytes,
+    )
+    assert image_block.mimeType == "image/jpeg", "an over-budget composited PNG flips to JPEG"
+    payload = json.loads(text_block.text)
+    pointer = payload["pointer"]
+    assert pointer["in_image"] is True, "the click point (10, 10) is inside the frame"
+    assert pointer["state"] == "pressed" and pointer["x"] == 10 and pointer["y"] == 10
 
 
 async def test_r2_d10_text_mode_with_explicit_optin_zero_image_blocks(

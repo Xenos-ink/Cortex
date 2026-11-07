@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import time
 from typing import TYPE_CHECKING, Any
 
 from mcp.types import ImageContent, TextContent
+from PIL import Image
 
 from ..core.models import CoordinateSpace
+from ..desktop.coordinates import CoordinateTransform
 from ..vision.evidence import register_frame
 from ..vision.observation import observation_text_summary
+from ..vision.pointer_sprite import composite
 from ..vision.visual_views import (
     DEFAULT_GRID_DENSITY,
     InvalidVisualViewError,
@@ -27,7 +32,14 @@ from ..vision.visual_views import (
 from .instance import logger, mcp
 from .lifecycle import _get_live_bundle, _session_scoped
 from .plan_surface import _active_plan_tool_rejection
-from .replies import IMAGE_OUTBOUND_SCALE_KEY, OBSERVE_METADATA_ELEMENT_CAP, _bound_outbound_image
+from .pointer_reply import call_show_pointer, pointer_reply_fields
+from .replies import (
+    IMAGE_OUTBOUND_SCALE_KEY,
+    OBSERVE_METADATA_ELEMENT_CAP,
+    _base64_decoded_byte_size,
+    _bound_outbound_image,
+    _result_image_max_bytes,
+)
 from .schemas import NullableBool, NullableRegion, NullableStr
 from .state import (
     IMAGE_DELIVERY_TEXT_NOTE,
@@ -151,6 +163,65 @@ def _invalid_pixel_evidence(value: Any) -> dict[str, object]:
     }
 
 
+# --- WP-C3 (ORVEX-2026-109; DELTA 1): the pointer sprite on OUTBOUND copies only ------------
+
+
+def _invalid_show_pointer(value: Any) -> dict[str, object]:
+    """The typed ``invalid_show_pointer`` boundary error (DELTA 1 MINOR 5; the
+    same fail-closed family as ``invalid_pixel_evidence``).
+
+    ``show_pointer`` is a STRICT boolean-or-None: non-bool values are rejected
+    here rather than coerced — direct callers bypass MCP validation, so the
+    tool re-checks at the boundary (defense in depth, the ``pixel_evidence``
+    precedent).
+    """
+    return {
+        "ok": False,
+        "error": "invalid_show_pointer",
+        "message": (
+            "show_pointer must be a boolean or null (true = draw the Cortex "
+            "pointer sprite on this reply's image; false = the clean image; "
+            f"null = the session default); got {value!r} ({type(value).__name__})."
+        ),
+    }
+
+
+def _composited_capture_frame(
+    data_b64: str, frame_stash: Any, x: float, y: float, state: str
+) -> tuple[Image.Image | None, bool]:
+    """Composite the pointer sprite onto ONE copy of the capture.
+
+    DELTA 1 M6: prefers the capture-time RGB ``_frame`` stash (a COPY — the
+    verification/diff pixels are never touched) and decodes the PNG exactly
+    once only when there is no stash. DELTA 2 NIT: the hotspot is checked
+    BEFORE the frame is copied (the copy in ``composite`` never happens for an
+    off-image pointer). Returns ``(composited_pil | None, in_image)``;
+    ``None`` means "serve the clean capture" (hotspot outside the image, or
+    any composite failure — the sprite is additive and must never break a
+    reply). The caller runs the outbound ladder ONCE on the result.
+    """
+    try:
+        if isinstance(frame_stash, Image.Image):
+            # DELTA 2 NIT: the hotspot check BEFORE copying the frame — an
+            # off-image pointer never pays for the copy (composite re-checks).
+            if not (
+                0 <= round(float(x)) < frame_stash.width
+                and 0 <= round(float(y)) < frame_stash.height
+            ):
+                return None, False
+            base = frame_stash.copy()
+        else:
+            base = Image.open(io.BytesIO(base64.b64decode(data_b64, validate=True)))
+            base.load()
+        composited, in_image = composite(base, x, y, state, 1.0)
+        if not in_image:
+            return None, False
+        return composited, True
+    except Exception:  # noqa: BLE001 - additive decoration, never a reply-breaker
+        logger.debug("pointer composite failed; serving the clean capture", exc_info=True)
+        return None, False
+
+
 def _zoom_region_shape_error(region: Any) -> str | None:
     """Pre-capture shape validation for a zoom region (A1.3 item 2, fail-closed economy).
 
@@ -258,6 +329,7 @@ def computer_observe(
     visual_view: NullableStr = None,
     visual_view_density: NullableStr = None,
     pixel_evidence: NullableBool = None,
+    show_pointer: NullableBool = None,
 ) -> Any:
     """Return the current observation state used for grounding: screenshot, dimensions, window, and cursor.
 
@@ -304,6 +376,14 @@ def computer_observe(
     fail-closed (``invalid_pixel_evidence``) before any capture. The OCR-once cache
     semantics are unchanged (H21'): the flag shapes WHAT the single per-observation
     build computes, never the computation count.
+
+    ``show_pointer`` (ORVEX-2026-109 WP-C3, trailing optional): ``None`` (the
+    default) means the session default (``start_session(show_pointer=...)``, env
+    ``CORTEX_SHOW_POINTER``, default ON). ON draws the Cortex cursor sprite INTO
+    the served image at the capture-time pointer position — an OUTBOUND-only
+    decoration: the capture, digest, verification diff, and the stored evidence
+    frame keep the clean pixels. The additive ``pointer`` /
+    ``last_click`` keys ride image-bearing replies only.
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -342,6 +422,11 @@ def computer_observe(
     if pixel_evidence is not None and not isinstance(pixel_evidence, bool):
         return _invalid_pixel_evidence(pixel_evidence)
     evidence_requested = pixel_evidence is True
+    # DELTA 1 MINOR 5 (observe surface): ``show_pointer`` is a STRICT boolean
+    # or None — rejected fail-closed BEFORE any capture (the pixel_evidence
+    # precedent; direct callers bypass MCP validation).
+    if show_pointer is not None and not isinstance(show_pointer, bool):
+        return _invalid_show_pointer(show_pointer)
     try:
         observation, digest = bundle.agent.observation.capture_with_digest()
     except Exception as exc:  # noqa: BLE001 - structured error, no traceback
@@ -415,15 +500,73 @@ def computer_observe(
     # an explicit derived-view request (grid) → render + one PNG encode, then the
     # UNCHANGED stock ladder.
     view_scale: float | None = None
+    # WP-C3: the per-call show_pointer resolution (None = session default). The
+    # sprite is drawn on a COPY of the served image only — the capture bytes,
+    # the digest, the verification diff, and the stored evidence frame stay clean.
+    show = call_show_pointer(bundle, show_pointer)
+    cursor_xy: tuple[int, int] | None = None
+    if observation.cursor_x is not None and observation.cursor_y is not None:
+        cursor_xy = (int(observation.cursor_x), int(observation.cursor_y))
+    pointer_fields: dict[str, Any] | None = None
     if view_provider is None or view_provider.passthrough:
-        # WP5 (VAL-WP5 F1): the RAW capture is what this reply carries — exactly the
-        # bytes the evidence store keeps (pre-ladder, so a fetch re-runs the ladder).
+        # WP5 (VAL-WP5 F1): the RAW capture is what this reply carries — the
+        # bytes the evidence store keeps (pre-ladder, so a fetch re-runs the
+        # ladder). DELTA 1 M6: with the pointer ON the ladder runs EXACTLY
+        # ONCE — on the composited copy — never on the clean capture too.
+        # DELTA 2 N4: when the clean capture is ALREADY over the outbound
+        # budget, the full-res PNG encode is SKIPPED entirely (the ladder
+        # replaces it with JPEG anyway) and the JPEG ladder runs straight from
+        # the composited frame; the PNG path is kept only for captures that can
+        # still be delivered as PNG within the budget.
         carried_b64 = observation.image_base64
-        outbound_b64, outbound_mime, image_scale = _bound_outbound_image(
-            # R-5 (W4): the capture-time frame (backend stash) skips the PNG re-decode on
-            # the JPEG ladder; absent (fakes/legacy) the path decodes exactly as before.
-            observation.image_base64, frame=getattr(observation, "_frame", None)
-        )
+        frame_stash = getattr(observation, "_frame", None)
+        composited: Image.Image | None = None
+        pointer_in_image = False
+        # DELTA 3 (blocking fix): compare DECODED bytes against the byte budget
+        # — the base64 LENGTH is ~4/3 of the decoded size, so the old
+        # ``len(carried_b64)`` check classed captures at 0.75x-1x of the budget
+        # as over budget and silently served the clean PNG (dropping the
+        # sprite) while reporting in_image true. The helper computes the same
+        # measure the ladder's own under-budget check uses, without a decode.
+        clean_over_budget = _base64_decoded_byte_size(carried_b64) > _result_image_max_bytes()
+        if show and cursor_xy is not None:
+            composited, pointer_in_image = _composited_capture_frame(
+                carried_b64, frame_stash, cursor_xy[0], cursor_xy[1], "normal"
+            )
+        if composited is not None and pointer_in_image and not clean_over_budget:
+            serving_b64 = encode_png_b64(composited)
+            outbound_b64, outbound_mime, image_scale = _bound_outbound_image(
+                serving_b64, frame=composited if composited.mode in ("RGB", "L") else None
+            )
+        elif composited is not None and pointer_in_image:
+            # DELTA 2 N4: over-budget capture — the ladder's JPEG comes straight
+            # from the composited frame (data can never pass through: its
+            # DECODED size is over budget, so the ladder always encodes from
+            # the frame). DELTA 3: a non-RGB/L composited copy is CONVERTED to
+            # RGB — falling back to the clean stash here would drop the sprite
+            # while reporting in_image true.
+            frame_arg = composited
+            if composited.mode not in ("RGB", "L"):
+                frame_arg = composited.convert("RGB")
+            outbound_b64, outbound_mime, image_scale = _bound_outbound_image(
+                carried_b64, frame=frame_arg
+            )
+        else:
+            outbound_b64, outbound_mime, image_scale = _bound_outbound_image(
+                # R-5 (W4): the capture-time frame (backend stash) skips the PNG
+                # re-decode on the JPEG ladder; absent (fakes/legacy) the path
+                # decodes exactly as before.
+                observation.image_base64, frame=frame_stash
+            )
+        if show and cursor_xy is not None:
+            pointer_fields = pointer_reply_fields(
+                bundle,
+                x=cursor_xy[0],
+                y=cursor_xy[1],
+                state="normal",
+                in_image=pointer_in_image,
+                transform=CoordinateTransform.from_observation(observation),
+            )
     else:
         try:
             started = time.perf_counter()
@@ -433,7 +576,27 @@ def computer_observe(
             bundle.metrics.record_latency(
                 "view_derive_ms", (time.perf_counter() - started) * 1000.0
             )
-            outbound_b64, outbound_mime, image_scale = _bound_outbound_image(encoded_b64, frame=derived.image)
+            serving_b64 = encoded_b64
+            serving_image = derived.image
+            in_image = False
+            if show and cursor_xy is not None:
+                composited, in_image = composite(
+                    derived.image, cursor_xy[0], cursor_xy[1], "normal", 1.0
+                )
+                if in_image:
+                    # WP-C3: the GRID view (labels and all) is what the sprite is
+                    # drawn ON — composite after the grid, never into the store.
+                    serving_image = composited
+                    serving_b64 = encode_png_b64(composited)
+                pointer_fields = pointer_reply_fields(
+                    bundle,
+                    x=cursor_xy[0],
+                    y=cursor_xy[1],
+                    state="normal",
+                    in_image=in_image,
+                    transform=CoordinateTransform.from_observation(observation),
+                )
+            outbound_b64, outbound_mime, image_scale = _bound_outbound_image(serving_b64, frame=serving_image)
             view_scale = outbound_view_scale(derived.image, outbound_b64)
         except VisualViewError as exc:  # fail-closed: typed error, never a raw substitution
             return _view_derive_failed(str(exc))
@@ -441,6 +604,9 @@ def computer_observe(
             return _view_derive_failed(f"{type(exc).__name__}: {exc}")
         # WP5 (VAL-WP5 F1): the DERIVED view (grid labels and all) is what this reply
         # carries — the store keeps exactly these bytes, never the raw capture.
+        # WP-C3 exception: the STORE keeps the CLEAN grid bytes (the pointer sprite
+        # is an outbound-only decoration; a fetch re-composites from the stored
+        # pointer metadata), so ``carried_b64`` stays the pre-sprite encode.
         carried_b64 = encoded_b64
     metadata = {
         # §1.1 (ORVEX-2026-108): ok + message on EVERY reply — here ok means "served
@@ -458,6 +624,10 @@ def computer_observe(
         # PERF-004 C8 (additive): bounded one-line grounding text for weak models.
         "text_summary": text_summary,
     }
+    # WP-C3: the additive pointer block rides ONLY image-bearing replies (never
+    # text mode, never a refusal), and only when the pointer layer is ON.
+    if pointer_fields is not None:
+        metadata.update(pointer_fields)
     if view_provider is not None:
         # AL-002 (explicit request): the spatial text layer accompanies EVERY selected
         # representation (raw or grid — owner directive Phase 5, Commander correction
@@ -487,6 +657,10 @@ def computer_observe(
             digest=digest,
             payload=carried_b64,
             visual_view=view_provider.id if view_provider is not None else None,
+            pointer_x=cursor_xy[0] if show and cursor_xy else None,
+            pointer_y=cursor_xy[1] if show and cursor_xy else None,
+            pointer_state="normal" if show and cursor_xy else None,
+            last_click=pointer_fields.get("last_click") if pointer_fields else None,
         )
     )
     return [
@@ -668,6 +842,14 @@ def computer_zoom(
     # A1.3 item 3: native-resolution crop (stash or ONE recorded payload decode);
     # item 4: grid views render ON the crop with canonical-value labels. The UNCHANGED
     # stock ladder then governs the served bytes exactly as for full-frame views.
+    # WP-C3: the pointer sprite is composited into the CROP copy (crop-local
+    # coordinates) on the outbound copy only — the stored crop stays clean and a
+    # fetch re-composites from the stored pointer metadata.
+    show = call_show_pointer(bundle, None)
+    cursor_xy: tuple[int, int] | None = None
+    if observation.cursor_x is not None and observation.cursor_y is not None:
+        cursor_xy = (int(observation.cursor_x), int(observation.cursor_y))
+    pointer_fields: dict[str, Any] | None = None
     try:
         started = time.perf_counter()
         crop, _crop_provenance = crop_observation_frame(observation, left, top, width, height)
@@ -676,11 +858,32 @@ def computer_zoom(
             served = render_crop_grid(
                 crop, origin_x=left, origin_y=top, density=density or DEFAULT_GRID_DENSITY
             )
+        serving_image = served
+        in_image = False
+        if show and cursor_xy is not None:
+            composited, in_image = composite(
+                served,
+                cursor_xy[0] - left,
+                cursor_xy[1] - top,
+                "normal",
+                1.0,
+            )
+            if in_image:
+                serving_image = composited
+            pointer_fields = pointer_reply_fields(
+                bundle,
+                x=cursor_xy[0],
+                y=cursor_xy[1],
+                state="normal",
+                in_image=in_image,
+                transform=CoordinateTransform.from_observation(observation),
+            )
         encoded_b64 = encode_png_b64(served)
+        serving_b64 = encode_png_b64(serving_image) if in_image else encoded_b64
         bundle.metrics.record_latency(
             "view_derive_ms", (time.perf_counter() - started) * 1000.0
         )
-        outbound_b64, outbound_mime, image_scale = _bound_outbound_image(encoded_b64, frame=served)
+        outbound_b64, outbound_mime, image_scale = _bound_outbound_image(serving_b64, frame=serving_image)
         view_scale = outbound_view_scale(served, outbound_b64)
     except VisualViewError as exc:  # fail-closed: typed error, never a raw substitution
         return _view_derive_failed(str(exc))
@@ -705,6 +908,9 @@ def computer_zoom(
         "visual_view_scale": view_scale,
         "spatial_text": zoom_block,
     }
+    # WP-C3: the additive pointer block rides ONLY image-bearing replies.
+    if pointer_fields is not None:
+        metadata.update(pointer_fields)
     # WP5: the CROP this reply carries is what is retained (pre-ladder, so a later
     # fetch re-runs the outbound ladder honestly), and the crop region rides along so
     # the frame's own coordinates are never mistaken for full-screen coordinates.
@@ -718,6 +924,10 @@ def computer_zoom(
             payload=encoded_b64,
             crop_region=(left, top, width, height),
             visual_view=view_id,
+            pointer_x=cursor_xy[0] if show and cursor_xy else None,
+            pointer_y=cursor_xy[1] if show and cursor_xy else None,
+            pointer_state="normal" if show and cursor_xy else None,
+            last_click=pointer_fields.get("last_click") if pointer_fields else None,
         )
     )
     if zoom_block is None:
@@ -737,6 +947,10 @@ def _record_observation_evidence(
     payload: str | None = None,
     crop_region: Any = None,
     visual_view: str | None = None,
+    pointer_x: int | float | None = None,
+    pointer_y: int | float | None = None,
+    pointer_state: str | None = None,
+    last_click: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Retain the freshly captured frame an observe-family reply carries.
 
@@ -749,6 +963,12 @@ def _record_observation_evidence(
     crop region so its coordinates are never mistaken for full-screen ones, and
     ``visual_view`` records the derived view the frame shows (a fetched image is
     self-describing).
+
+    WP-C3 (ORVEX-2026-109), a DELIBERATE refinement of the byte-equality rule: the
+    stored payload is the CLEAN capture (the pointer sprite is an outbound-only
+    decoration and is never stored), and the pointer position/state AT CAPTURE TIME
+    ride the StoredFrame so ``computer_fetch_image`` composites them onto ITS
+    outbound copy.
     """
     return register_frame(
         bundle.extra,
@@ -765,4 +985,8 @@ def _record_observation_evidence(
         crop_region=crop_region,
         visual_view=visual_view,
         redactions_applied=observation.redactions_applied,
+        pointer_x=pointer_x,
+        pointer_y=pointer_y,
+        pointer_state=pointer_state,
+        last_click=last_click,
     )
