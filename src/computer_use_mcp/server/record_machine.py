@@ -155,6 +155,9 @@ class _RecordHandle:
     # DELTA 2 n1: True while the worker's post-capture encode runs — the
     # reply's status is "encoding" (never "recording, 0.0 s remaining").
     encoding: bool = False
+    #: WP-E E2: the start call's video delivery ("file" default | "inline"),
+    #: persisted onto the finished Recording like include_video/save (B2).
+    video_delivery: str = "file"
     # The session's recording pool + a best-effort audit emitter, captured at
     # start (the worker may outlive the bundle).
     pool: "RecordingEvidenceStore | None" = None
@@ -245,6 +248,9 @@ def _record_worker(handle: _RecordHandle) -> None:
         # later result call honours them after the handle is gone.
         recording.want_video = handle.include_video
         recording.save = handle.save
+        # WP-E E2: the delivery flag persists the same way (a late result call
+        # honours the START call's choice when it passes none of its own).
+        recording.video_delivery = str(getattr(handle, "video_delivery", "file") or "file")
         if recording.error:
             # B3(a): the capture failed — the product is untrustworthy.
             outcome_kind = "capture_failed"

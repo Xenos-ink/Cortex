@@ -562,14 +562,16 @@ def test_the_recording_teachings_are_derived_from_the_code() -> None:
         assert f"`{status}`" in flat, f"the skill never names the status {status!r}"
     for reason in VIDEO_OMISSION_REASONS:
         assert f"`{reason}`" in flat, f"the skill never names omission reason {reason!r}"
-    # VAL-WP-D-01 L6/M4: the retried set derives from the code's reuse rule —
-    # final omissions are reused EXCEPT an `encode_failed` carrying
-    # `aborted: true` (server/record.py's abort check in front of the
-    # final-reuse gate); `not_requested` is never a retry candidate.
+    # VAL-WP-D-01 L6/M4 + WP-E CHANGED PIN (ORVEX-2026-109): the retried set
+    # derives from the code's reuse rule — final omissions are reused EXCEPT an
+    # `encode_failed` carrying `aborted: true` (server/record.py's abort check
+    # in front of the final-reuse gate) and the new `write_failed` (the default
+    # file delivery's failed MP4 write — retried on a later collect while the
+    # video is retained); `not_requested` is never a retry candidate.
     retried = set(VIDEO_OMISSION_REASONS) - set(VIDEO_FINAL_OMISSIONS) - {
         VIDEO_OMITTED_NOT_REQUESTED,
     }
-    assert retried == {"over_budget"}
+    assert retried == {"over_budget", "write_failed"}
     assert VIDEO_OMITTED_ENCODE_FAILED in VIDEO_FINAL_OMISSIONS
     import inspect as _inspect
 
@@ -580,7 +582,7 @@ def test_the_recording_teachings_are_derived_from_the_code() -> None:
         "the aborted-encode retry rule moved; restate the skill's retried set"
     )
     assert "Retried on a later collect" in flat
-    assert "`over_budget`, or an `encode_failed` carrying `aborted: true`" in flat
+    assert "`over_budget`, `write_failed`, or an `encode_failed` carrying `aborted: true`" in flat
     assert "`frame_to_canonical`" in flat
     # VAL-WP-D-01 L6: the caps the skill states are the code's constants.
     from computer_use_mcp.server.record_machine import (

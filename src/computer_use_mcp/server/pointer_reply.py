@@ -17,9 +17,9 @@ Pillow; this module is the SERVER-side policy around it:
   plus the backend ring's ``last_click`` mapped through the capture transform;
   the capture sites store ``pointer_fields["last_click"]`` as the StoredFrame's
   canonical snapshot (DELTA 1 M4), which fetch serves;
-* ``executed_click_point`` — the FLAT action's click point (DELTA 1 M8: the
-  reply image is item 0's post-action frame, so Pressed is decided from the
-  flat action alone; follow-ups never touch it).
+* ``executed_click_point`` — the click point of the action whose frame the
+  reply shows (WP-E E3: the LAST executed item of a batch; the flat action on
+  a single-action call).
 
 Nothing here touches the OS cursor. Text-mode replies and every image-less
 reply never call into it.
@@ -157,13 +157,14 @@ def action_value(action: Any) -> str:
 
 
 def executed_click_point(flat_action: Any) -> tuple[int, int] | None:
-    """The click point of one click-family action, or ``None`` (DELTA 1 M8).
+    """The click point of one click-family action, or ``None``.
 
-    The reply image is item 0's post-action frame, so Pressed is decided from
-    the flat action ONLY — follow-ups (and their rejections) never touch it.
-    The point is canonical screenshot coordinates. Accepts BOTH shapes the
+    The caller passes the action WHOSE FRAME the reply shows (WP-E E3: the
+    last executed batch item; the flat action on a single-action call), so
+    Pressed is decided for exactly the item the image is from. The point is
+    canonical screenshot coordinates. Accepts BOTH shapes the
     surface uses: GroundedAction (``point``) and ActionSpec (``x``/``y`` — the
-    plan-step slices hold specs, DELTA 1 M8a).
+    plan-step slices hold specs).
     """
     if flat_action is None:
         return None
@@ -187,13 +188,15 @@ def executed_pointer_fields(
     """The whole execute/plan-step pointer decision in one place (DELTA 1 M7/M8).
 
     Returns ``(pointer_xy, pointer_state, pointer, pointer_fields)``:
-    Pressed at the FLAT action's click point when it is a click-family action
-    (the reply image is item 0's post-action frame), Normal at the capture-time
-    cursor (``result._pointer``, stashed by the pipeline) otherwise; ``None``
-    everywhere when the pointer is unknown or the session default is off. The
-    ``pointer_fields["pointer"]["in_image"]`` value is the honest ``False``
-    placeholder — ``_execute_response_blocks`` overwrites it with composite()'s
-    real verdict for the served copy. Canonical coordinates (ints) throughout.
+    Pressed at the shown action's click point when it is a click-family action
+    (the reply image is THAT action's post-action frame — WP-E E3: the last
+    executed batch item; the flat action on a single-action call), Normal at
+    the capture-time cursor (``result._pointer``, stashed by the pipeline)
+    otherwise; ``None`` everywhere when the pointer is unknown or the session
+    default is off. The ``pointer_fields["pointer"]["in_image"]`` value is the
+    honest ``False`` placeholder — ``_execute_response_blocks`` overwrites it
+    with composite()'s real verdict for the served copy. Canonical coordinates
+    (ints) throughout.
     """
     show = session_show_pointer(bundle)
     click_point = executed_click_point(flat_action)

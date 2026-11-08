@@ -877,8 +877,11 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
         # visual_view in tests/test_avr_visual_views.py).
         # CHANGED PIN (WP7b, §-reason: contract item (a)): plan/plan_action join the
         # trailing set so every earlier addition stays trailing too.
+        # CHANGED PIN again (WP-E, ORVEX-2026-109): `record` joins the trailing
+        # set as the newest computer_execute optional — same property.
         "computer_execute": {
             "via", "include_screenshot_after", "follow_ups", "visual_view", "plan", "plan_action",
+            "record",
         },
     }
     for tool_name, new_params in expected_new.items():
@@ -908,9 +911,12 @@ def test_rt7_new_params_are_trailing_optional_none_equals_legacy() -> None:
     # CHANGED PIN (WP7b, §-reason: contract item (a) — `plan` and `plan_action` join
     # the trailing set; the tested property "trailing optional, None == legacy" is
     # unchanged and is re-pinned behaviorally by the flat-byte-identical node in
-    # tests/test_wp7b_plan_surface.py):
+    # tests/test_wp7b_plan_surface.py).
+    # CHANGED PIN again (WP-E, ORVEX-2026-109): `record` joins as the newest
+    # trailing optional after plan_action — same property.
     assert params[12:] == [
         "via", "include_screenshot_after", "follow_ups", "visual_view", "plan", "plan_action",
+        "record",
     ]
 
 

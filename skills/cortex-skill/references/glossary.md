@@ -113,11 +113,13 @@ The recording family answers with its own small closed vocabulary. A peek carrie
 `status` `recording` (capture running) or `encoding` (the video encode still
 running). A missing video names one omission reason — `not_requested`,
 `too_large`, `encoder_unavailable`, `encode_failed`, `over_budget` (retried on a
-later collection: `over_budget` itself, or an `encode_failed` carrying
-`aborted: true` — a stop/cancel aborted the encode and the frames are still
-held), `frames_released`
+later collection: `over_budget` itself, `write_failed`, or an `encode_failed`
+carrying `aborted: true` — a stop/cancel aborted the encode and the frames are
+still held), `frames_released`
 (the held frames were evicted under the recording pool's byte cap, so video can no
-longer be produced for this recording). `unknown_record` answers a wrong or
+longer be produced for this recording), `write_failed` (the default file
+delivery could not write the MP4 — retried on a later collect while the video is
+retained). `unknown_record` answers a wrong or
 foreign `record_id`, `record_expired` a recording that fell out of the retention
 ring, and `recording_limit` the 1-per-session / 2-per-process caps. The
 `pointer` / `last_click` fields ride recording keyframe fetches exactly as the

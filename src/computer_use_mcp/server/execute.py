@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -44,6 +45,7 @@ from .schemas import (
     NullableFollowUps,
     NullableKeys,
     NullablePlan,
+    NullableRecord,
     NullableStr,
     _coerce_follow_up_entry,
     _coerce_tolerant_follow_ups,
@@ -79,6 +81,7 @@ async def computer_execute(
     visual_view: NullableStr = None,
     plan: NullablePlan = None,
     plan_action: NullableStr = None,
+    record: NullableRecord = None,
 ) -> Any:
     """Validate and execute one grounded action; approval applies only to this action call.
 
@@ -298,6 +301,66 @@ async def computer_execute(
     ending (stop_session, the idle timeout, an internal kill). An idle lease with
     no call in flight does NOT keep the session alive: after the idle timeout the
     session is reaped and the lease released with it.
+
+    Record around the action (WP-E, ORVEX-2026-109, trailing optional
+    ``record``): a background screen recording started JUST BEFORE this call's
+    first input is dispatched — the F1 field fix (a recording started in a
+    SEPARATE call always ended 15-30 s before the model's next tool call, so
+    every recording finished before anything happened). Shape:
+    {"duration_s": 4, "region": null, "fps": null, "max_keyframes": null,
+    "include_video": null, "save": null, "video_delivery": null} — the SAME
+    bands and validation as computer_record (duration 0.5..10 s; fps 1..10,
+    default 5; max_keyframes 2..12, default 8; region [l,t,w,h] canonical or
+    null = the session monitor; video_delivery "file" | "inline"), through the
+    SAME code path with the SAME typed rejections. An INVALID record argument
+    (out of band, malformed region, an UNKNOWN KEY) is a typed rejection of
+    the whole call BEFORE any input — consistent with unknown-argument
+    rejection. ONE coercion rule for BOTH tools (DELTA 2, the tolerant
+    decision): fps/max_keyframes go through exactly the same
+    `_coerce_tolerant_int` coercion as computer_record's boundary —
+    non-integral floats and numeric strings ROUND the same way (2.7 → 3,
+    "5.0" → 5, "1e1" → 10); duration_s accepts numeric strings like "4" (the
+    lax-float shapes pydantic accepts for computer_record); booleans, lists,
+    dicts and non-numeric strings give the typed
+    invalid_record_fps / invalid_record_keyframes / invalid_record_duration.
+    Band checks run AFTER coercion, for both tools, with the same codes. A
+    short pre-roll
+    (``RECORD_PRE_ROLL_SECONDS``, 0.3 s, part of the window — never added on
+    top of ``duration_s``) captures the "before" state. computer_execute
+    returns as it does today plus an additive ``record`` block {started,
+    record_id, status:"recording", ends_at, duration_s, fps, region,
+    message}; collect with computer_record_result(record_id) — it blocks
+    until the recording ends and its change timeline CONTAINS this call's own
+    actions. Works with flat actions, follow_ups batches and plan steps
+    (accepted on the plan submission call and on plan_action="continue"
+    calls; the recording starts just before the step's input;
+    plan_action="stop" and a continue past the walk's end answer
+    {"started": false, "reason": "no_action"}). Caps/lease/idle/audit/
+    stop_session behave exactly as for computer_record (same registry): if a
+    cap is reached the action STILL runs and the block says {"started": false,
+    "reason": "recording_limit"} — a recording problem NEVER refuses the
+    action (the closed started:false reason set: recording_limit /
+    text_session_no_screen / invalid_region / session_stopped /
+    record_start_failed / no_action). If the call dies after the recording
+    started (CancelledError, any exception) the recording is CANCELLED before
+    the error propagates, so the slot frees; if the call is refused BEFORE any
+    input (safety denial, approval hold, a zero-effect rejection) the
+    recording is cancelled too and the block gains ``cancelled:
+    "action_refused"``.
+
+    Batch replies (WP-E E3): when a call carries follow_ups, the reply's
+    attached image — and its image_id, pointer and last_click, and the frame
+    registered in the evidence store — is the post-action frame of the LAST
+    item that executed (a trailing wait counts: click + click + wait 8 shows
+    the board after the opponent replied). If the batch stopped early it is
+    the last item that actually executed. The verdict fields
+    (result/verification/ok) keep their item-0 meaning; the additive
+    ``image_after_item`` key names the item whose frame is shown — ALWAYS
+    present on a multi-item batch's image-bearing reply (including the value
+    0, when item 0 is the last executed one), absent on single-action calls
+    (byte-identical to before) and on replies that serve no image. Pressed/
+    Normal follows the same rule applied to the shown item: Pressed if it was
+    a click type and the frame is its own post-click frame.
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -319,12 +382,97 @@ async def computer_execute(
             "reasons": [code],
             "session_id": str(exc.args[0]) if exc.args else "",
         }
+    # WP-E E1: the record helpers are imported HERE (function-local, the
+    # plan_surface precedent): a module-level import would make execute.py
+    # import record.py, and record's tools would register BEFORE execute's —
+    # breaking the pinned monolith registration order (test_server_import_order
+    # A2: ... zoom -> execute -> fetch -> record).
+    from .record import (
+        EXECUTE_RECORD_ALLOWED_KEYS,
+        RECORD_PRE_ROLL_SECONDS,
+        _resolve_recording_space,
+        _text_session_record_block,
+        _validate_record_arguments,
+        cancel_execute_recording,
+        execute_record_input_dispatched,
+        start_execute_recording,
+    )
     # D1: text mode dominates every executed response shape — include_screenshot_after
     # can only REMOVE bytes, never re-enable an image (a non-vision model passing
     # True must not be able to kill its own session).
     image_mode = _session_image_delivery(bundle)
-    # ORVEX-2026-101 decision 1 (WP7b): the lease gate is the FIRST operation after
-    # session lookup. A flat/follow-up call, a second plan, or a plan payload
+    # WP-E E1: validate the ``record`` object FIRST (fail-closed, zero-effect) —
+    # the SAME bands/validation as computer_record through the SAME code path,
+    # with the SAME typed rejection codes; a region also pre-resolves through
+    # ``_resolve_recording_space`` so an out-of-bounds/UNVERIFIABLE region is
+    # rejected BEFORE any input (consistent with unknown-argument rejection).
+    # The launch itself happens later, just before the first dispatch.
+    record_to_launch: Any | None = None
+    record_text_blocked = False
+    if record is not None:
+        if not isinstance(record, dict):
+            return {
+                "ok": False,
+                "result": "rejected",
+                "message": "record must be an object of recording parameters.",
+                "reasons": ["invalid_record_param"],
+            }
+        # DELTA 1 n4/m3: an unknown key inside ``record`` is a typed rejection
+        # (consistent with the unknown-argument rule), naming the allowed keys —
+        # never a silent ignore.
+        unknown_keys = sorted(set(record) - set(EXECUTE_RECORD_ALLOWED_KEYS))
+        if unknown_keys:
+            return {
+                "ok": False,
+                "result": "rejected",
+                "message": (
+                    "Unknown key(s) in the record object: "
+                    + ", ".join(unknown_keys)
+                    + ". Allowed keys: "
+                    + ", ".join(EXECUTE_RECORD_ALLOWED_KEYS)
+                    + "."
+                ),
+                "reasons": ["invalid_record_param"],
+            }
+        # DELTA 2 N1/N2: the validator COERCES (the shared TolerantInt /
+        # lax-float rule computer_record goes through) and RETURNS the
+        # resolved values — the launch consumes those, never raw input.
+        code, message, resolved_args = _validate_record_arguments(
+            record.get("duration_s"),
+            record.get("fps"),
+            record.get("max_keyframes"),
+            record.get("include_video"),
+            record.get("save"),
+            record.get("video_delivery"),
+            record.get("region"),
+        )
+        if code is not None or resolved_args is None:
+            return {
+                "ok": False,
+                "result": "rejected",
+                "message": message or "invalid record arguments.",
+                "reasons": [code or "invalid_record_param"],
+            }
+        resolved_space = _resolve_recording_space(bundle, record.get("region"))
+        if isinstance(resolved_space, dict):
+            return {
+                "ok": False,
+                "result": "rejected",
+                "message": str(resolved_space.get("message", "invalid recording region.")),
+                "reasons": [str(resolved_space.get("error", "invalid_region"))],
+            }
+        # A text-mode session has no screen images: the recording reports
+        # {"started": false} in the reply — the ACTION still runs (never a
+        # refusal).
+        if image_mode == "text":
+            record_text_blocked = True
+        else:
+            record_to_launch = resolved_args
+    # ORVEX-2026-101 decision 1 (WP7b): the lease gate is the FIRST INPUT-RELEVANT
+    # operation after session lookup — DELTA 1 n5: the ``record`` band/region
+    # validation above runs BEFORE it (a malformed parameter is a zero-effect
+    # rejection with zero input, the same fail-closed class as a bad
+    # visual_view). A flat/follow-up call, a second plan, or a plan payload
     # without an explicit continuation decision is refused before visual-view
     # resolution, validation, capture, or backend dispatch: zero-effect handshake
     # rejection. A plan lease is released only by continue/stop/replace, the
@@ -374,6 +522,8 @@ async def computer_execute(
             include_screenshot_after=include_screenshot_after,
             image_mode=image_mode,
             view_provider=None,
+            record=record_to_launch,
+            record_text_blocked=record_text_blocked,
         )
     if plan_action is not None:
         # WP13 (field e5): teach the driver HOW to start — the pre-fix message did
@@ -487,6 +637,8 @@ async def computer_execute(
             include_screenshot_after=include_screenshot_after,
             image_mode=image_mode,
             view_provider=view_provider,
+            record=record_to_launch,
+            record_text_blocked=record_text_blocked,
         )
     if follow_ups is not None:
         # REM-F: normalize the tolerant shapes for DIRECT callers too (the boundary
@@ -545,7 +697,24 @@ async def computer_execute(
             except Exception as exc:  # noqa: BLE001 - grounded-shape failure: teach
                 return _teaching_invalid_action(exc, spec.action.value)
             specs.append(spec)
+    # WP-E E1: start the recording JUST BEFORE the first input of this call is
+    # dispatched — a launch problem (cap reached, ...) NEVER refuses the
+    # action; the reply's ``record`` block reports it honestly.  The pre-roll
+    # (a bounded sleep, part of the recording window) lets the recorder
+    # capture the "before" state first.  DELTA 1 m4: the pre-roll AND the
+    # whole action are covered — a call that dies after the recording started
+    # (asyncio.CancelledError, a stop, any exception) CANCELS the recording
+    # before propagating (the cancel flag + the loop wake, exactly like
+    # cancel=true), so the session's recording slot frees immediately instead
+    # of holding for up to ``duration_s``.
+    record_block: dict[str, Any] | None = None
+    if record_text_blocked:
+        record_block = _text_session_record_block()
+    elif record_to_launch is not None:
+        record_block = start_execute_recording(bundle, session_id, record_to_launch)
     try:
+        if record_block is not None and record_block.get("started"):
+            await asyncio.sleep(RECORD_PRE_ROLL_SECONDS)
         outcome = await bundle.agent.run_single(
             bundle.state,
             grounded,
@@ -557,25 +726,40 @@ async def computer_execute(
         # §1.2: a host-requested stop is the ``stopped`` token — nothing verified,
         # ok=False by the shared ok-rule.
         stopped_token = "stopped"
-        return {
+        stopped_response: dict[str, object] = {
             "ok": ok_from_result(stopped_token),
             "result": stopped_token,
             "stopped": True,
             "message": str(exc),
         }
+        # WP-E E1: the recording may already run around this call — the agent
+        # gets its id even on the stopped envelope.
+        if record_block is not None:
+            stopped_response["record"] = record_block
+        return stopped_response
     except LimitExceeded as exc:
         # §1.1/§1.4: a limit trip is a GATE REFUSAL — verified pre-dispatch (the
         # observation-phase rate ceiling and ``check_action`` both fire BEFORE the
         # triggering action dispatches any input), so this is a rejection: the typed
         # limit named as the first reason, the additive ``limit`` key kept, no
         # ``error`` key.
-        return {
+        limit_response: dict[str, object] = {
             "ok": False,
             "result": "rejected",
             "message": str(exc),
             "reasons": [f"limit_exceeded: {exc.limit_name}"],
             "limit": exc.limit_name,
         }
+        # WP-E E1: the recording may already run around this call.
+        if record_block is not None:
+            limit_response["record"] = record_block
+        return limit_response
+    except BaseException:
+        # DELTA 1 m4: nothing below will run for this call — cancel the
+        # recording it started (best-effort) so the slot frees, then propagate
+        # unchanged (asyncio.CancelledError included).
+        cancel_execute_recording(session_id, record_block)
+        raise
     # §1 (ORVEX-2026-108 unified reply contract): every reply carries a ``result``
     # token from the closed §1.2 set, and ``ok`` is derived from that token through
     # the ONE shared ok-rule (ok is True iff result ∈ {verified, marker}) — never a
@@ -631,12 +815,17 @@ async def computer_execute(
     else:
         result = outcome.result
         if result is None:  # defensive: executed outcomes always carry a result
-            return {
+            # DELTA 1 m4: the defensive envelope carries the record block too —
+            # the agent must never lose the record_id.
+            no_result_response: dict[str, object] = {
                 "ok": False,
                 "result": "failed",
                 "error": "action_error",
                 "message": "Execution produced no result.",
             }
+            if record_block is not None:
+                no_result_response["record"] = record_block
+            return no_result_response
         payload = result.model_dump()
         # F2: the response path is redacted too (defense in depth).
         payload = _redact_result_payload(payload)
@@ -656,6 +845,32 @@ async def computer_execute(
     # redaction only, no shape/field changes.
     if outcome.kind in {"rejected", "safety_denied", "approval_required", "digest_surprise", "error"}:
         response = _redact_result_payload(response)
+    # DELTA 1 n6 + DELTA 2 n6: when the call was refused BEFORE any input was
+    # dispatched, the recording it started would otherwise hold the session's
+    # recording slot for up to ``duration_s`` for a screen nothing changed —
+    # cancel it immediately (the cancel flag + the loop wake, exactly like
+    # cancel=true) and MARK the block so the agent knows the timeline will not
+    # materialize.  The zero-input test is the EXACT dispatch-ring check (DELTA
+    # 2): no action stamped in the session's ring between the recording's
+    # start and now means nothing was dispatched — the cancel can NEVER fire
+    # after input left the process (the unsupported-key-after-dispatch
+    # envelope included; the ring is stamped at the ONE dispatch choke point
+    # before ``_backend_execute``).
+    if (
+        record_block is not None
+        and record_block.get("started")
+        and outcome.kind in {"safety_denied", "approval_required", "digest_surprise", "rejected"}
+        and outcome.partial_delivery is None
+        and not execute_record_input_dispatched(session_id, record_block)
+    ):
+        if cancel_execute_recording(session_id, record_block):
+            record_block["cancelled"] = "action_refused"
+    # WP-E E1: the reply's additive ``record`` block rides EVERY response shape
+    # (started marker facts or {"started": false, reason}) — the agent collects
+    # the timeline with computer_record_result(record_id), which blocks until
+    # the end and whose actions/timeline contain THIS call's items.
+    if record_block is not None:
+        response["record"] = record_block
     # PERF-004 C4: host-payload opt-out (additive, off by default) — omit the heavy
     # image from the response entirely when the caller asked for it.
     if include_screenshot_after is False:
@@ -698,14 +913,21 @@ async def computer_execute(
         frame = getattr(result, "_frame", None) if result is not None else None
         full_resolution = include_screenshot_after is True or _action_image_full()
         # WP-C3 (ORVEX-2026-109; DELTA 1 M8): the pointer on THIS reply's
-        # outbound image — the whole decision (Pressed from the FLAT action at
-        # its click point, Normal at the capture-time cursor, honest in_image
+        # outbound image — the whole decision (Pressed from the shown item's
+        # click point, Normal at the capture-time cursor, honest in_image
         # placeholder fixed by ``_execute_response_blocks``) lives in
         # ``executed_pointer_fields``; ``last_click`` still comes from the ring
         # and MAY name a later follow-up click — reported separately with its
-        # own coordinates, which is acceptable.
+        # own coordinates, which is acceptable.  WP-E E3: the shown item IS the
+        # last executed one (its frame rides the reply), so its Pressed/Normal
+        # rule applies — a trailing wait shows Normal.
+        shown_action = (
+            outcome.image_after_action
+            if outcome.image_after_action is not None
+            else grounded
+        )
         pointer_xy, pointer_state, pointer, pointer_fields = executed_pointer_fields(
-            bundle, result, grounded
+            bundle, result, shown_action
         )
         # AL-002 (additive): honor an explicit visual_view on the RETURNED image —
         # derived ONCE per response, then the UNCHANGED stock bounding branch. Raw is
@@ -769,6 +991,15 @@ async def computer_execute(
             # WP-C3: the additive pointer/last_click keys ride the image-bearing
             # reply only (the payload JSON of the TextContent block).
             response.update(pointer_fields)
+        # WP-E E3 / DELTA 1 m1: ``image_after_item`` attaches HERE — after the
+        # text-mode return and the view-derive-failed returns above — so the
+        # key rides ONLY replies that really carry the image (and its
+        # registered frame).  When the call ran a batch, the attached image is
+        # the post-action frame of the LAST executed item and the reply names
+        # it (``image_after_item`` is ALWAYS present on a multi-item batch's
+        # image-bearing reply, including the value 0 — DELTA 1 m2).
+        if outcome.image_after_item is not None:
+            response["image_after_item"] = outcome.image_after_item
         return _execute_response_blocks(
             response,
             frame=frame,

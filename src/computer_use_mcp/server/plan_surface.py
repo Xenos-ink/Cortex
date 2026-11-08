@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from typing import Any
@@ -677,6 +678,7 @@ def _plan_response(
     image_mode: str,
     view_provider: Any | None,
     complete_walk: bool = False,
+    record_block: dict[str, Any] | None = None,
 ) -> Any:
     """Assemble the §1.3 plan-step reply around the per-item pipeline payload.
 
@@ -842,6 +844,9 @@ def _plan_response(
         # item), not only the first outcome's.
         current_events=_step_interference_events(outcome),
     )
+    # WP-E E1: the execute call's ``record`` block rides the step reply payload.
+    if record_block is not None:
+        response["record"] = record_block
     if cutoff is not None:
         response["plan"]["cutoff"] = dict(cutoff)
         response["plan"]["stopped_reason"] = "limit_exceeded"
@@ -946,16 +951,21 @@ def _plan_response(
     # retained HERE — the bytes kept are EXACTLY the bytes the reply carries (the
     # derived view when one was served, otherwise the raw capture), both pre-ladder.
     # DELTA 1 M7 / DELTA 2 N1+N2 (ORVEX-2026-109): the plan step's pointer uses the
-    # SAME rule as the flat surface — ``executed_pointer_fields`` on item 0 (the
-    # step's grounded primary, the transition move). The step image is the
-    # post-MOVE frame, captured BEFORE the point's click, so Pressed from the
-    # declared click would lie (the click may even have been rejected); the step
-    # therefore shows Normal at the captured cursor, and ``last_click`` still
-    # reports the click from the ring. There is no override and no
-    # show_pointer-independent branch: on a show_pointer=False session the reply
-    # carries no pointer/last_click keys and the stored frame keeps neither.
+    # SAME rule as the flat surface — ``executed_pointer_fields`` on the SHOWN
+    # item.  WP-E E3: the shown item is the LAST executed one (its frame rides
+    # the reply), so a step ending on a click shows Pressed at that click; a
+    # step ending on a wait (or a rejected later item) shows Normal at the
+    # captured cursor. ``last_click`` still reports the click from the ring.
+    # There is no override and no show_pointer-independent branch: on a
+    # show_pointer=False session the reply carries no pointer/last_click keys
+    # and the stored frame keeps neither.
+    shown_action = (
+        outcome.image_after_action
+        if outcome.image_after_action is not None
+        else getattr(outcome.result, "action", None)
+    )
     pointer_xy, pointer_state, pointer, pointer_fields = executed_pointer_fields(
-        bundle, outcome.result, getattr(outcome.result, "action", None)
+        bundle, outcome.result, shown_action
     )
     carried_b64 = (
         str(view_payload[0]) if view_payload is not None else str(response["screenshot_after_base64"])
@@ -977,6 +987,14 @@ def _plan_response(
         # DELTA 1 M7: the additive pointer/last_click keys ride the image-bearing
         # step reply (the in_image placeholder is fixed by the blocks builder).
         response.update(pointer_fields)
+    # WP-E E3 / DELTA 1 m1: ``image_after_item`` attaches HERE — after the
+    # text-mode return and the view-derive-failed returns above — so the key
+    # rides ONLY step replies that really carry the image.  When the step ran
+    # several items, the attached image is the LAST executed item's
+    # post-action frame and the reply names it (always present on a
+    # multi-item step's image-bearing reply, including the value 0 — m2).
+    if outcome.image_after_item is not None:
+        response["image_after_item"] = outcome.image_after_item
     # S-03: the evidence block is (re)built AFTER this reply's own frame was
     # retained, so ``captures`` includes the capture THIS reply carries — the same
     # truth the dev block reported from the backend's observation list.
@@ -1123,11 +1141,34 @@ async def _execute_plan_step(
     include_screenshot_after: bool | None,
     image_mode: str,
     view_provider: Any | None,
+    record: Any | None = None,
+    record_text_blocked: bool = False,
 ) -> Any:
-    """Execute exactly one waypoint step and retain the lease unless terminal."""
+    """Execute exactly one waypoint step and retain the lease unless terminal.
+
+    WP-E E1: ``record`` (the band-validated record object accepted on the plan
+    submission call and on ``plan_action="continue"``) starts the background
+    recording JUST BEFORE the step's first input is dispatched (with the same
+    0.3 s pre-roll); a launch problem NEVER refuses the step — the reply's
+    ``record`` block reports {"started": false, reason} instead.  A text-mode
+    session (``record_text_blocked``) reports the same without launching."""
+    from .record import (
+        RECORD_PRE_ROLL_SECONDS,
+        _no_action_record_block,
+        cancel_execute_recording,
+        execute_record_input_dispatched,
+        start_execute_recording,
+    )
+
     session_id = str(bundle.context.session_id)
     if lease.cursor >= len(lease.steps):
-        return _plan_terminal_walk_reply(bundle, lease)
+        # DELTA 1 n7: a continue past the walk's end dispatches no input — a
+        # valid ``record`` object is answered honestly with the closed
+        # ``no_action`` reason instead of being silently ignored.
+        reply = _plan_terminal_walk_reply(bundle, lease)
+        if (record is not None or record_text_blocked) and isinstance(reply, dict):
+            reply.setdefault("record", _no_action_record_block())
+        return reply
     step_index = lease.cursor
     step_specs = lease.steps[step_index]
     lease.remainder = []
@@ -1155,6 +1196,26 @@ async def _execute_plan_step(
             blocked=False,
             failure_reason="invalid_action",
         )
+    # WP-E E1: the recording starts JUST BEFORE the step's first input is
+    # dispatched (after the structural validation — a pre-dispatch structural
+    # refusal never starts one).  A launch problem NEVER refuses the step; the
+    # reply's ``record`` block reports it honestly.
+    record_block: dict[str, Any] | None = None
+    if record_text_blocked:
+        from .record import _text_session_record_block
+
+        record_block = _text_session_record_block()
+    elif record is not None:
+        record_block = start_execute_recording(bundle, session_id, record)
+
+    def _with_record(reply: Any) -> Any:
+        """WP-E E1: attach the ``record`` block to this step's reply (plain
+        dict replies here; the block-carrying step replies get it via
+        ``_plan_response``'s payload before serialization)."""
+        if record_block is not None and isinstance(reply, dict):
+            reply.setdefault("record", record_block)
+        return reply
+
     # O-03: approval was evaluated ONCE on the FIRST plan call and is inherited
     # by every step and by replace — ``continue`` never re-asks.
     # DELTA 4 (VAL-WP8-04): ONE structure for the in-flight marker. The funnel
@@ -1165,6 +1226,13 @@ async def _execute_plan_step(
     # after the merge and after the point, with the final prefix counts.
     lease.step_in_flight = True
     try:
+        if record_block is not None and record_block.get("started"):
+            # The pre-roll: part of the recording window (never added on top
+            # of duration_s) — it captures the "before" state.  DELTA 1 m4:
+            # INSIDE the guarded region, so a call that dies after the
+            # recording started (CancelledError, any exception) cancels it
+            # before propagating.
+            await asyncio.sleep(RECORD_PRE_ROLL_SECONDS)
         outcome = await bundle.agent.run_single(
             bundle.state,
             grounded,
@@ -1208,7 +1276,7 @@ async def _execute_plan_step(
             bundle, lease, reply_result="stopped", reason="cancelled",
             failure_reason="cancelled",
         )
-        return _plan_exception_response(
+        return _with_record(_plan_exception_response(
             bundle,
             lease,
             step_index=step_index,
@@ -1220,7 +1288,7 @@ async def _execute_plan_step(
             blocked=False,
             stopped=True,
             failure_reason="cancelled",
-        )
+        ))
     except LimitExceeded as exc:
         step_entries = list(step_context.get("partial_results") or [])
         plan_layer.merge_plan_step_prefix(
@@ -1246,7 +1314,7 @@ async def _execute_plan_step(
             failure_reason="limit_exceeded",
             **_plan_counts(lease),
         )
-        return _plan_exception_response(
+        return _with_record(_plan_exception_response(
             bundle,
             lease,
             step_index=step_index,
@@ -1257,10 +1325,13 @@ async def _execute_plan_step(
             # F6: EVERY limit carries its name — error / limit / cutoff agree with
             # failure_reason whatever limit tripped, not only the max_* ones.
             limit_name=exc.limit_name,
-        )
+        ))
     except BaseException:
         # Structural/unexpected failures release the lease in this path; the outer
         # server teardown cannot accidentally leave a caller stuck behind a dead plan.
+        # DELTA 2 NIT: the recording cancel runs FIRST — before the prefix merge
+        # and the lease release — so a raise in either can never skip it.
+        cancel_execute_recording(session_id, record_block)
         plan_layer.merge_plan_step_prefix(
             lease,
             list(step_context.get("partial_results") or []),
@@ -1286,6 +1357,22 @@ async def _execute_plan_step(
         # pre-dispatch refusal (rejected/approval/safety) keeps the cursor so
         # ``continue`` re-executes the same step.
         lease.cursor = plan_layer.plan_cursor_after(lease.cursor, step_index, step_entries)
+        # DELTA 2 n6: the plan step has the SAME zero-input detect-and-cancel as
+        # the flat path — when the step was refused BEFORE any input (safety
+        # denial, approval hold, digest surprise, or a rejection), the dispatch
+        # ring between the recording's start and now is EMPTY (agent.py stamps
+        # the ring at the ONE dispatch choke point before ``_backend_execute``),
+        # so the cancel can never fire after input left the process.  The block
+        # rides the step reply via ``_plan_response`` (same object).
+        if (
+            record_block is not None
+            and record_block.get("started")
+            and outcome.kind in {"safety_denied", "approval_required", "digest_surprise", "rejected"}
+            and outcome.partial_delivery is None
+            and not execute_record_input_dispatched(session_id, record_block)
+        ):
+            if cancel_execute_recording(session_id, record_block):
+                record_block["cancelled"] = "action_refused"
         if outcome.kind == "error":
             # A backend/agent error is a structural failure, not a repairable step
             # verdict: release the lease in the guaranteed path so no caller is
@@ -1296,7 +1383,7 @@ async def _execute_plan_step(
                 bundle, lease, reply_result="failed", reason="execution_error",
                 failure_reason="execution_error",
             )
-            return _plan_exception_response(
+            return _with_record(_plan_exception_response(
                 bundle,
                 lease,
                 step_index=step_index,
@@ -1304,7 +1391,7 @@ async def _execute_plan_step(
                 reason=outcome.message or "action_error",
                 blocked=False,
                 failure_reason="execution_error",
-            )
+            ))
         # DELTA 1 #1 + DELTA 2 N3 (§1.3 "retry = replace"): the walk ends in THIS call
         # only when the LAST STEP ITSELF verified — and then the reply is the terminal
         # reply whose verdict comes from the whole-plan aggregate over the retained
@@ -1336,6 +1423,7 @@ async def _execute_plan_step(
                 image_mode=image_mode,
                 view_provider=view_provider,
                 complete_walk=True,
+                record_block=record_block,
             )
         return _plan_response(
             bundle,
@@ -1346,6 +1434,7 @@ async def _execute_plan_step(
             include_screenshot_after=include_screenshot_after,
             image_mode=image_mode,
             view_provider=view_provider,
+            record_block=record_block,
         )
     finally:
         # DELTA 4 (VAL-WP8-04): the ONE clear + deferred-kill close, on EVERY exit
@@ -1378,8 +1467,14 @@ async def _handle_plan_action(
     include_screenshot_after: bool | None,
     image_mode: str,
     view_provider: Any | None,
+    record: Any | None = None,
+    record_text_blocked: bool = False,
 ) -> Any:
-    """Validate and service the additive continue/stop/replace handshake."""
+    """Validate and service the additive continue/stop/replace handshake.
+
+    WP-E E1: ``record``/``record_text_blocked`` ride through to the step
+    execution (continue / replace) — the recording starts just before the
+    step's input; a ``stop`` dispatches nothing and starts none."""
     session_id = str(bundle.context.session_id)
     if not isinstance(plan_action, str) or plan_action not in {"continue", "stop", "replace"}:
         return {
@@ -1397,7 +1492,15 @@ async def _handle_plan_action(
         }
     if plan_action == "stop":
         _plan_guard.release(session_id, bundle)
-        return _plan_terminal_response(bundle, lease, result="stopped", reason="stop")
+        # DELTA 1 n7: a stop dispatches no input — a valid ``record`` object is
+        # answered honestly with the closed ``no_action`` reason (never
+        # silently ignored, never started).
+        stop_reply = _plan_terminal_response(bundle, lease, result="stopped", reason="stop")
+        if (record is not None or record_text_blocked) and isinstance(stop_reply, dict):
+            from .record import _no_action_record_block
+
+            stop_reply.setdefault("record", _no_action_record_block())
+        return stop_reply
     if plan_action == "replace":
         if plan is None:
             return {
@@ -1460,6 +1563,8 @@ async def _handle_plan_action(
             include_screenshot_after=include_screenshot_after,
             image_mode=image_mode,
             view_provider=view_provider,
+            record=record,
+            record_text_blocked=record_text_blocked,
         )
         # F11 (VAL-WP8-01): the replace disclosure rides ONLY the replace call's
         # own reply. The dict arm covers exception-shaped replies (the payload
@@ -1478,5 +1583,7 @@ async def _handle_plan_action(
         include_screenshot_after=include_screenshot_after,
         image_mode=image_mode,
         view_provider=view_provider,
+        record=record,
+        record_text_blocked=record_text_blocked,
     )
 

@@ -77,6 +77,27 @@ def _coerce_tolerant_int(value: Any, *, field: str = "value") -> int:
 TolerantInt = Annotated[int, BeforeValidator(_coerce_tolerant_int)]
 
 
+def _reject_bool_duration(value: Any) -> Any:
+    """DELTA 3 NIT boundary: pydantic's LAX float coerces ``True`` to 1.0
+    (verified live through the instance gate), so ``computer_record(
+    duration_s=True)`` would silently start a 1-second recording while the
+    record object rejects bools — this boundary validator rejects a boolean
+    BEFORE the coercion, keeping ONE rule for both tools (the typed
+    ``invalid_record_duration`` message)."""
+    if isinstance(value, bool):
+        raise ValueError(
+            f"duration_s must be a number of seconds; got {value!r} "
+            "(a boolean is not a duration)."
+        )
+    return value
+
+
+#: ``computer_record``'s ``duration_s`` — lax float for every number and
+#: numeric string (the parity the record object matches), booleans rejected
+#: at the boundary.
+RecordDuration = Annotated[float, BeforeValidator(_reject_bool_duration)]
+
+
 def _coerce_tolerant_str_list(value: Any) -> list[str] | None:
     """Boundary coercion for allowlist parameters (``allowed_processes``/windows).
 
@@ -231,6 +252,47 @@ _PLAIN_NULLABLE_STRING_MAP = _PlainJsonSchema(
 _PLAIN_NULLABLE_REGION = _PlainJsonSchema(
     {"type": ["array", "null"], "items": {"type": "integer"}, "minItems": 4, "maxItems": 4}
 )
+#: WP-E E1: the ``computer_execute`` ``record`` object — start a background
+#: screen recording AROUND this call's input (same bands/validation as
+#: computer_record, one code path, same typed rejections; an out-of-band value
+#: is a typed rejection of the whole call BEFORE any input).
+_RECORD_PARAM_PLAIN_SCHEMA = _PlainJsonSchema(
+    {
+        "type": ["object", "null"],
+        "properties": {
+            "duration_s": {"type": "number"},
+            "region": {
+                "type": ["array", "null"],
+                "items": {"type": "integer"},
+                "minItems": 4,
+                "maxItems": 4,
+            },
+            "fps": {"type": ["integer", "null"]},
+            "max_keyframes": {"type": ["integer", "null"]},
+            "include_video": {"type": ["boolean", "null"]},
+            "save": {"type": ["boolean", "null"]},
+            # DELTA 3 NIT: NO enum — no other Cortex tool schema uses one, and
+            # some hosts' schema subsets reject a null inside enum (which
+            # could make the whole tool fail to register).  The allowed
+            # values ("file" default | "inline"; null = the default) are
+            # documented here and enforced by the runtime typed rejection
+            # (``invalid_video_delivery``).
+            "video_delivery": {
+                "type": ["string", "null"],
+                "description": (
+                    'video delivery: "file" (the default — the MP4 is written '
+                    'under the recordings folder and the entry carries its '
+                    'path) or "inline" (the legacy embedded video/mp4 '
+                    "resource); null = the default \"file\""
+                ),
+            },
+        },
+        # DELTA 1 n4/m3: unknown keys are rejected — at the schema level here,
+        # and (for direct callers) at runtime with the typed
+        # ``invalid_record_param`` rejection naming the allowed keys.
+        "additionalProperties": False,
+    }
+)
 _PLAIN_NULLABLE_NUMBER_MAP = _PlainJsonSchema(
     {"type": ["object", "null"], "additionalProperties": {"type": "number"}}
 )
@@ -332,6 +394,9 @@ NullableNumberMap = Annotated[dict[str, float] | None, _PLAIN_NULLABLE_NUMBER_MA
 NullableKeys = Annotated[TolerantKeys | None, _PLAIN_WIDENED_NULLABLE_STRING_ARRAY]
 # A1.3: the zoom region [left, top, width, height] (canonical screenshot space).
 NullableRegion = Annotated[list[Any] | None, _PLAIN_NULLABLE_REGION]
+#: WP-E E1: the execute surface's ``record`` object (plain object schema, no
+#: anyOf/$ref — the REM-G rule).
+NullableRecord = Annotated[dict[str, Any] | None, _RECORD_PARAM_PLAIN_SCHEMA]
 
 
 def _coerce_follow_up_entry(item: dict[str, Any]) -> dict[str, Any]:

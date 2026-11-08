@@ -81,10 +81,14 @@ recording this is NOT the terminal-plan meaning) / failed (`capture_failed` /
   `effective_fps`, `dropped_frames`, `region`, the timeline segments, the window's
   `actions`, `keyframes` (each with a fetchable `image_id`), the contact sheet image,
   and a per-reply `video` entry: `included` (`bytes` / `width` / `height` / `fps` /
-  `codec` / `encoder`) or `omitted` naming one closed reason — `not_requested` /
+  `codec` / `encoder` — with the DEFAULT `video_delivery="file"` the entry carries
+  `delivery: "file"` plus the absolute `path` of the MP4 written under the
+  recordings folder and attaches NO blob; `"inline"` keeps the embedded resource
+  for hosts known to pass video to the model) or `omitted` naming one closed
+  reason — `not_requested` /
   `too_large` / `encoder_unavailable` / `encode_failed` / `over_budget` (retried
-  on a later collection: `over_budget`, or an `encode_failed` carrying
-  `aborted: true`) / `frames_released`.
+  on a later collection: `over_budget`, `write_failed`, or an `encode_failed`
+  carrying `aborted: true`) / `frames_released` / `write_failed`.
 - Fetched recording keyframes publish `frame_to_canonical` (`{"scale", "origin"}`),
   which maps the STORED keyframe pixels to canonical screenshot coordinates (a copy
   served downscaled must first be divided by its `image_outbound_scale`); the

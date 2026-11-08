@@ -42,6 +42,16 @@ from test_controller_integration import (  # noqa: F401 - pytest fixture import
 )
 
 
+@pytest.fixture(autouse=True)
+def _recordings_under_tmp_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """DELTA 1 M1: NO test in this file may write outside tmp_path — the
+    data-dir resolver (``COMPUTER_USE_MCP_LOG_DIR``) points at the per-test
+    tmp audit dir, so even a test that forgets the override (the default
+    "file" delivery writes MP4s on collect) can never touch the real user
+    dir."""
+    monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
+
+
 # --- harness ---------------------------------------------------------------------------------
 
 
@@ -105,7 +115,10 @@ async def test_one_record_id_end_to_end(
     record_id = str(start["record_id"])
     assert record_id.startswith("rec_")
     await asyncio.sleep(0.9)
-    result = await _collect(session_id, record_id)
+    # WP-E E2 CHANGED PIN: the DEFAULT delivery is now "file" (no blob); this
+    # test pins the one-id-end-to-end contract including the resource URI, so
+    # it requests the "inline" delivery explicitly.
+    result = await _collect(session_id, record_id, video_delivery="inline")
     payload = payload_of(result)
     # The payload id is the id the agent was given (B1 — it used to differ).
     assert payload["record_id"] == record_id
@@ -337,7 +350,11 @@ async def test_aborted_encode_is_not_a_final_omission(
     # held) produces the video.
     monkeypatch.setattr(srv_record_machine, "_encode_video", real_worker_encode)
     monkeypatch.setattr(srv_server_record, "encode_video", real_reply_encode)
-    second = await _collect(session_id, record_id, include_video=True)
+    # WP-E E2 CHANGED PIN: the DEFAULT delivery is now "file" (no blob); this
+    # test pins the abort-then-retry contract, so it requests "inline".
+    second = await _collect(
+        session_id, record_id, include_video=True, video_delivery="inline"
+    )
     second_payload = payload_of(second)
     assert second_payload["video"]["included"] is True
     assert len(resource_blocks(second)) == 1
@@ -412,7 +429,9 @@ async def test_start_flags_survive_until_a_late_collection(
     srv_server_observe.computer_observe(session_id)
     srv_server_observe.computer_observe(session_id)
     srv_server_observe.computer_observe(session_id)
-    result = await _collect(session_id, record_id)
+    # WP-E E2 CHANGED PIN: the DEFAULT delivery is now "file" (no blob); this
+    # test pins the start-flags-persist contract, so it requests "inline".
+    result = await _collect(session_id, record_id, video_delivery="inline")
     payload = payload_of(result)
     assert payload["result"] == "verified"
     assert payload["video"]["included"] is True
@@ -432,7 +451,11 @@ async def test_video_requested_only_on_the_result_call_after_end(
     start = await _start(session_id, duration_s=0.6)  # NO video at start
     record_id = str(start["record_id"])
     await asyncio.sleep(0.9)  # the recording ended
-    result = await _collect(session_id, record_id, include_video=True)
+    # WP-E E2 CHANGED PIN: the DEFAULT delivery is now "file" (no blob); this
+    # test pins the result-call-alone video contract, so it requests "inline".
+    result = await _collect(
+        session_id, record_id, include_video=True, video_delivery="inline"
+    )
     payload = payload_of(result)
     assert payload["result"] == "verified"
     assert payload["video"]["included"] is True
@@ -448,7 +471,11 @@ async def test_video_requested_only_on_the_result_call_while_running(
     start = await _start(session_id, duration_s=0.6)  # NO video at start
     record_id = str(start["record_id"])
     # The blocking collect starts while the recording runs and blocks past it.
-    result = await _collect(session_id, record_id, include_video=True)
+    # WP-E E2 CHANGED PIN: the DEFAULT delivery is now "file" (no blob); this
+    # test pins the blocking-collect video contract, so it requests "inline".
+    result = await _collect(
+        session_id, record_id, include_video=True, video_delivery="inline"
+    )
     payload = payload_of(result)
     assert payload["video"]["included"] is True
     assert len(resource_blocks(result)) == 1
@@ -583,7 +610,9 @@ async def test_collect_while_still_running_then_collect(
     peek = await _collect(session_id, record_id, block=False)
     assert peek["status"] == "recording"
     await asyncio.sleep(2.3)
-    result = await _collect(session_id, record_id)
+    # WP-E E2 CHANGED PIN: the DEFAULT delivery is now "file" (no blob); this
+    # test pins the peek-then-collect contract, so it requests "inline".
+    result = await _collect(session_id, record_id, video_delivery="inline")
     payload = payload_of(result)
     assert payload["video"]["included"] is True
     assert len(resource_blocks(result)) == 1
@@ -837,9 +866,11 @@ async def test_double_collection_encodes_once_in_the_worker(
     record_id = str(start["record_id"])
     await asyncio.sleep(0.9)
     assert counter["encodes"] == 1  # encoded in the worker, once
+    # WP-E E2 CHANGED PIN: the DEFAULT delivery is now "file" (no blob); this
+    # test pins the encode-once contract, so it requests "inline".
     results = await asyncio.gather(
-        _collect(session_id, record_id),
-        _collect(session_id, record_id),
+        _collect(session_id, record_id, video_delivery="inline"),
+        _collect(session_id, record_id, video_delivery="inline"),
     )
     for result in results:
         payload = payload_of(result)

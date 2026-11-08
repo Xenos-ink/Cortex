@@ -1016,14 +1016,15 @@ async def test_fetch_of_a_pressed_execute_frame_shows_pressed(
     assert 60 - 13 <= bbox[0] <= 60 - 5
 
 
-async def test_plan_step_shows_normal_at_the_captured_cursor_and_fetch_matches(
+async def test_plan_step_shows_pressed_for_its_own_final_click_and_fetch_matches(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DELTA 2 N1: a plan step's image is the post-MOVE frame (captured BEFORE
-    the point's click), so the step shows NORMAL at the captured cursor — never
-    Pressed for the declared click (which may have been rejected). The ring
-    still reports the click through ``last_click`` (from the ring), and a fetch
-    of that step's image shows the same normal pointer."""
+    """WP-E E3 (CHANGED PIN): a plan step's image is the LAST executed item's
+    post-action frame — a point whose final action is a click now shows
+    PRESSED at that click (the frame is the click's own post-click capture).
+    The ring still reports the click through ``last_click`` (from the ring),
+    the reply names ``image_after_item``, and a fetch of that step's image
+    shows the same pressed pointer."""
     from plan_explicitness import complete_plan
 
     # ONE point whose declared action is a click: the whole point runs as ONE
@@ -1055,11 +1056,15 @@ async def test_plan_step_shows_normal_at_the_captured_cursor_and_fetch_matches(
         f"blocked={step.get('blocked')} next_step={step.get('next_step')} "
         f"follow_up_results={json.dumps(step.get('follow_up_results'))[:400]}"
     )
-    assert pointer["state"] == "normal", (
-        "the step image is the post-MOVE frame — Pressed for the declared "
-        "click would lie (DELTA 2 N1)"
+    assert step.get("image_after_item") == 1, (
+        "the step reply names the LAST executed item (item 0 is the transition "
+        "move; item 1 is the click whose frame is shown)"
     )
-    assert pointer["x"] == 60 and pointer["y"] == 40  # the cursor after the move
+    assert pointer["state"] == "pressed", (
+        "the step image is the final click's own post-click frame (WP-E E3), "
+        "so Pressed at the click point is the honest state"
+    )
+    assert pointer["x"] == 60 and pointer["y"] == 40
     assert pointer["in_image"] is True
     last_click = step.get("last_click")
     assert last_click is not None, "the click still reports through last_click (the ring)"
@@ -1069,7 +1074,7 @@ async def test_plan_step_shows_normal_at_the_captured_cursor_and_fetch_matches(
     fetched = await srv_server_fetch.computer_fetch_image(session_id, image_id)
     fetched_meta = _metadata(fetched)
     fetched_pointer = fetched_meta["pointer"]
-    assert fetched_pointer["state"] == "normal" and fetched_pointer["in_image"] is True
+    assert fetched_pointer["state"] == "pressed" and fetched_pointer["in_image"] is True
     assert fetched_pointer["x"] == 60 and fetched_pointer["y"] == 40
     assert fetched_meta["last_click"] is not None
     await srv_server_execute.computer_execute(session_id, "done", plan_action="stop")

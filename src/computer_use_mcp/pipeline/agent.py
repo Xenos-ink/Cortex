@@ -672,6 +672,16 @@ class SingleActionOutcome:
     # publishing ``interference_events`` (item 0's) unchanged, while the plan-step
     # machinery publishes the merged list. ``None`` = the queue path did not run.
     follow_up_interference_events: list[str] | None = None
+    #: WP-E E3 (ORVEX-2026-109): when the batch ran, the reply's ATTACHED IMAGE
+    #: is the post-action frame of the LAST item that executed (a trailing wait
+    #: counts — click + click + wait 8 shows the board after the opponent
+    #: replied), not item 0's.  ``image_after_item`` is that item's queue index
+    #: (``None`` = the single-action path, byte-identical to before); the
+    #: verdict fields (``result``/``verification``/``ok``) stay item 0's.
+    image_after_item: int | None = None
+    #: The GroundedAction of the item whose frame the reply shows (E3: the
+    #: Pressed/Normal pointer rule applies to THAT item).
+    image_after_action: Any | None = None
 
 
 class ComputerUseAgent:
@@ -1812,6 +1822,11 @@ class ComputerUseAgent:
         source_observation: Observation | None = None
         executed_count = 0
         first_outcome: SingleActionOutcome | None = None
+        # WP-E E3: the LAST item that actually executed (with a post-action
+        # frame) — its frame rides the reply instead of item 0's.
+        last_frame_outcome: SingleActionOutcome | None = None
+        last_frame_index: int | None = None
+        last_frame_action: GroundedAction | None = None
         # WP13 A (field e1/e2): ONE wall-clock budget per call, DERIVED from the
         # host's client timeout (60 -> 45 as shipped; a 30 s ZCode host -> 15 s).
         # Checked at the TOP of every queue item (never mid-item): when the budget
@@ -1933,6 +1948,16 @@ class ComputerUseAgent:
             # counted as executed.
             if limit_trip is None:
                 executed_count += 1
+                # WP-E E3: track the LAST executed item with a post-action frame —
+                # its frame (and its Pressed/Normal pointer rule) rides the reply.
+                if (
+                    outcome.kind == "executed"
+                    and outcome.result is not None
+                    and outcome.result.screenshot_after_base64
+                ):
+                    last_frame_outcome = outcome
+                    last_frame_index = index
+                    last_frame_action = item
             follow_up_results.append(self._queue_entry(index, item, outcome))
             if limit_trip is not None:
                 stopped_reason = "limit_exceeded"
@@ -2062,6 +2087,33 @@ class ComputerUseAgent:
         # for the plan-step machinery; the flat reply's ``interference_events`` key
         # keeps publishing item 0's list (byte-identical flat contract).
         first_outcome.follow_up_interference_events = step_events
+        # WP-E E3 / DELTA 1 m2: on a batch with MORE THAN ONE item the reply
+        # ALWAYS names the item whose frame it shows — including the value 0
+        # (item 0 is the last executed item, e.g. item 1 was rejected).  Only
+        # the image FIELDS move when the shown item is not item 0; the verdict
+        # fields keep item 0's meaning either way.  A single-item queue (the
+        # single-action path, a one-action plan point) never sets the key —
+        # byte-identical to before.
+        if len(queue_items) > 1:
+            first_outcome.image_after_item = (
+                last_frame_index if last_frame_index is not None else 0
+            )
+        if (
+            last_frame_outcome is not None
+            and last_frame_index is not None
+            and last_frame_index != 0
+            and first_outcome.result is not None
+            and last_frame_outcome.result is not None
+        ):
+            last_result = last_frame_outcome.result
+            first_outcome.result.screenshot_after_base64 = last_result.screenshot_after_base64
+            first_outcome.result._frame = getattr(last_result, "_frame", None)
+            first_outcome.result._pointer = getattr(last_result, "_pointer", None)
+            first_outcome.result._pointer_transform = getattr(
+                last_result, "_pointer_transform", None
+            )
+            first_outcome.image_after_item = last_frame_index
+            first_outcome.image_after_action = last_frame_action
         return first_outcome
 
     @staticmethod

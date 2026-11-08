@@ -77,6 +77,29 @@ timestamped keyframe contact sheet and, on request, the full MP4.
   tests (`test_skill_truth.py`, `test_docs_truth.py`) derive every new taught
   value (bands, encoder names, omission reasons, statuses, reply fields) from
   the code at test time.
+- **Record around the action (WP-E E1)** — `computer_execute` gains a trailing
+  optional `record` object (`{"duration_s", "region", "fps", "max_keyframes",
+  "include_video", "save"}`) that starts the background recording JUST BEFORE
+  the call's first input is dispatched — the F1 field fix (a recording started
+  in a separate call always ended 15–30 s before the model's next tool call, so
+  every recording finished before anything happened). Same bands and validation
+  as `computer_record` through the same code path (same typed rejections; an
+  out-of-band value rejects the whole call before any input), a documented
+  0.3 s pre-roll captures the "before" state, and the reply carries an additive
+  `record` block with the collect hint. Works with flat actions, `follow_ups`
+  batches and plan steps (submission and `plan_action="continue"`); a
+  recording problem NEVER refuses the action (the block says
+  `{"started": false, "reason": ...}`), and caps/lease/idle/audit/stop_session
+  behave exactly as for `computer_record` (same registry).
+- **Video delivered as a file path by default (WP-E E2)** — both recording
+  tools gain `video_delivery`: `"file"` (the DEFAULT) writes the MP4 under the
+  recordings folder (the same place `save=true` uses; one file, no double
+  write) and the video entry carries its absolute `path` with NO blob; most
+  hosts truncate large tool results (the field session cut every video result
+  at 49,998 characters and the 196–562 KB blob was lost), so `"inline"` (the
+  legacy embedded `video/mp4` resource) is only for hosts known to pass video
+  to the model. A failed file write answers the new closed omission reason
+  `write_failed` (retryable on a later collect).
 
 ### Changed
 
@@ -90,6 +113,15 @@ timestamped keyframe contact sheet and, on request, the full MP4.
 - **Dependencies** — new dependency `av` (PyAV) `>=18.1.0,<19`, lazily
   imported by the recorder; about 30 MB of wheel (bundled FFmpeg). Everything
   else is unchanged.
+- **Batch replies show the state after the batch (WP-E E3)** — when a
+  `computer_execute` call carries `follow_ups`, the reply's attached image (and
+  its `image_id`, `pointer`, `last_click` and the registered evidence frame) is
+  the post-action frame of the LAST executed item — a trailing `wait` counts,
+  so click + click + wait 8 shows the board after the opponent replied. The
+  additive `image_after_item` key names the item; the verdict fields
+  (`result`/`verification`/`ok`) keep their item-0 meaning; single-action
+  calls are byte-identical to before. Pressed/Normal follows the shown item
+  (a plan step ending on a click now shows Pressed at that click).
 
 ### Fixed
 
@@ -167,6 +199,21 @@ Measured on the reference Windows box; machine-relative, not guarantees.
 - **New env vars**: `CORTEX_SHOW_POINTER` (pointer composite default source),
   `CORTEX_RECORD_ENCODER` (encoder preference list),
   `CORTEX_RECORD_VIDEO_MAX_MB` (video blob cap, band 1..8 MiB).
+- **Batch replies now attach the frame after the last executed item** (WP-E
+  E3): a host that compared a batch reply's image against item 0's post-action
+  frame must read `image_after_item` instead — the frame (and its registered
+  evidence entry) is now the LAST executed item's, with a trailing wait
+  counting; single-action calls and opt-out replies are unchanged.
+- **Video delivered as a file path by default** (WP-E E2): `video_delivery`
+  defaults to `"file"` — the MP4 arrives as an absolute `path` on disk, not as
+  an embedded resource blob. Hosts that pass video blobs to the model must pass
+  `video_delivery="inline"` on the start or the result call; the contact sheet
+  image stays inline either way. The closed omission set gained `write_failed`
+  (retryable). **On-disk honesty (WP-E DELTA 1):** whenever `include_video` is
+  requested under the default file delivery, the screen video is SAVED TO DISK
+  under the Cortex recordings folder (the audit dir's `recordings/` — the same
+  folder `save=true` uses) and there is NO automatic cleanup; the write is
+  atomic and happens once per recording.
 
 ## v0.7.6 (2026-11-01, ORVEX-2026-108 — the unified-contract port; Addendum 4 field fixes WP13, 2026-11-06)
 

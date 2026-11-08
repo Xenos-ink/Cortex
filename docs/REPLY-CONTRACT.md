@@ -63,6 +63,32 @@ contract checks).
   out — executed items keep their entries, nothing new was dispatched, and the
   driver RESENDS the remaining items in a new call); an `uncertain` or `failed`
   verdict on an item that already dispatched does NOT stop the batch.
+- Batch replies (WP-E E3) carry `image_after_item`: the attached image (and its
+  `image_id`, `pointer`, `last_click`, the registered evidence frame) is the
+  post-action frame of the LAST executed item, not item 0's; a trailing `wait`
+  counts. The verdict fields keep item 0's meaning; the key is ABSENT on
+  single-action calls (byte-identical to before) and on opt-out replies (no
+  image served).
+- An execute call with `record` (WP-E E1) carries an additive `record` block on
+  every response shape: `{"started": true, "record_id", "status": "recording",
+  "ends_at", "duration_s", "fps", "region", "message"}` (the message names the
+  collect hint — "collect with computer_record_result(record_id)"), or
+  `{"started": false, "reason": ...}` when no recording started (the action
+  still runs; it is NEVER refused for a recording). The closed `started:false`
+  reason set (derived from `EXECUTE_RECORD_NOT_STARTED_REASONS` in
+  `server/record.py`): `recording_limit` | `text_session_no_screen` |
+  `invalid_region` | `session_stopped` | `record_start_failed` | `no_action`
+  (a `plan_action="stop"` or a continue past the walk's end dispatches no
+  input, so nothing is recorded). When the call is refused BEFORE any input
+  (a safety denial, an approval hold, or a zero-effect rejection) the
+  recording it started is cancelled immediately and the started block gains
+  `cancelled: "action_refused"`; when the call dies after the recording
+  started (a cancellation or any exception), the recording is cancelled
+  before the error propagates. An out-of-band `record` argument —
+  out-of-band values, a malformed region, an UNKNOWN KEY inside the object —
+  is a typed `rejected` reply (`invalid_record_duration` /
+  `invalid_record_fps` / `invalid_record_keyframes` / `invalid_record_param`
+  / `invalid_video_delivery` / `invalid_region`) BEFORE any input.
 
 ## The `result` token set (closed)
 
@@ -127,17 +153,31 @@ The screen recorder follows the same envelope:
   `message` and the frames captured before the failure. Never a silent empty
   `verified`.
 - The `video` entry on a finished payload ALWAYS says what happened, from a
-  closed omission set: `included` (a blob is attached to THIS reply), or
+  closed omission set: `included` (the video is attached to THIS reply — as a
+  written file path for the `"file"` delivery default, as an embedded
+  `video/mp4` resource blob for `"inline"`), or
   `omitted` = `not_requested` | `too_large` | `encoder_unavailable` |
   `encode_failed` | `over_budget` | `frames_released` (the held frames were
-  evicted under the recording pool's byte cap before any video was stored).
-  `included` appears only when a blob is attached to THIS reply; the encoder
+  evicted under the recording pool's byte cap before any video was stored) |
+  `write_failed` (WP-E: the default file delivery could not write the MP4).
+  With the DEFAULT `video_delivery="file"` `included` carries NO blob — the
+  entry carries `delivery: "file"` and the absolute `path` of the MP4 written
+  under the recordings folder (`video_path` rides the payload too); most hosts
+  truncate large tool results, so the file path is the default and `"inline"`
+  (the embedded `video/mp4` resource) is only for hosts known to pass video to
+  the model. DELTA 1 (m7, on-disk honesty): whenever `include_video` is
+  requested under the default file delivery, the screen video is SAVED TO DISK
+  under the Cortex recordings folder (the audit dir's `recordings/` — the same
+  folder `save=true` uses) and there is NO automatic cleanup; the write is
+  atomic and happens once per recording (later collects reuse the path). The encoder
   actually used rides as `encoder` (`h264_mf` or `libx264`).  `too_large` /
   `encoder_unavailable` / `encode_failed` / `frames_released` are FINAL for
-  the recording (later calls reuse them), with two retried cases:
-  `over_budget` (a later call has a fresh budget) and an `encode_failed`
-  carrying `aborted: true` (a stop/cancel aborted the encode; a later collect
-  retries while the frames are held).  Video may be requested on EITHER call.
+  the recording (later calls reuse them), with retried cases:
+  `over_budget` (a later call has a fresh budget), `write_failed` (a later
+  collect retries the write while the video is retained) and an
+  `encode_failed` carrying `aborted: true` (a stop/cancel aborted the encode;
+  a later collect retries while the frames are held).  Video may be requested
+  on EITHER call.
 - Recording keyframes fetch through `computer_fetch_image` like observation
   frames.  The fetch publishes `frame_to_canonical` —
   `{"scale": <canonical px per frame px>, "origin": [x, y]}` (the canonical

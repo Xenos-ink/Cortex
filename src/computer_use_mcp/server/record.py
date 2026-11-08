@@ -4,8 +4,10 @@ WP-R (ORVEX-2026-109) + DELTA 1 (VAL-WP-R-01): the agent records 0.5–10 s of
 the screen IN THE BACKGROUND while it keeps calling any tool, then collects
 the result in three forms — a change timeline plus the window's Cortex
 actions, a contact sheet of timestamped keyframes (each fetchable at full
-size by ``image_id``), and on request the FULL video as an MP4
-``EmbeddedResource``.
+size by ``image_id``), and on request the FULL video — as a written MP4 file
+path (the ``"file"`` delivery default, WP-E E2) or as an MP4
+``EmbeddedResource`` (``"inline"``, only for hosts known to pass video to
+the model).
 
 Both tools dispatch NO input, so they stay ALLOWED while a plan lease is
 active (recording a plan's effect is a main use — see ``plan_surface``'s
@@ -48,6 +50,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +72,7 @@ from ..vision.recorder import (
     VIDEO_FINAL_OMISSIONS,
     VIDEO_OMITTED_FRAMES_RELEASED,
     VIDEO_OMITTED_NOT_REQUESTED,
+    VIDEO_OMITTED_WRITE_FAILED,
     RECORD_STATUS_ENCODING,
     encode_video,
 )
@@ -90,7 +94,14 @@ from .record_machine import (
     _session_alive,
 )
 from .replies import IMAGE_OUTBOUND_SCALE_KEY, _bound_outbound_image
-from .schemas import NullableBool, NullableInt, NullableRegion
+from .schemas import (
+    NullableBool,
+    NullableInt,
+    NullableRegion,
+    NullableStr,
+    RecordDuration,
+    _coerce_tolerant_int,
+)
 from .state import _error_response, _lock, _StoppedSession, _UnknownSession
 from .wait_machine import (
     _await_wait_wake,
@@ -101,6 +112,63 @@ from .wait_machine import (
 #: M3: the safety margin subtracted from the client budget for the fallback
 #: encode deadline (on top of the elapsed time of the call itself).
 RECORD_RESULT_SAFETY_MARGIN_SECONDS = 5.0
+
+#: WP-E E1: the PRE-ROLL captured before the execute call's first input is
+#: dispatched.  The ``record`` object on ``computer_execute`` starts the
+#: recorder thread just before the action runs; this bounded sleep (part of the
+#: recording window, never added on top of ``duration_s``) guarantees the
+#: "before" state reaches the frames, so the timeline shows what the action
+#: CHANGED rather than only its aftermath.  Field evidence (sess_a59fef27,
+#: chess on Chess.com): a recording started in a SEPARATE call always ended
+#: 15–30 s before the model's next tool call — recording around the action, in
+#: the same call, is the only shape that works with real models.
+RECORD_PRE_ROLL_SECONDS = 0.3
+
+#: WP-E E2: the closed ``video_delivery`` set ("file" is the DEFAULT — most
+#: hosts truncate large tool results, so the MP4 travels as a written file
+#: path; "inline" is the legacy embedded-resource blob, only for hosts known
+#: to pass video to the model).
+VIDEO_DELIVERY_CHOICES = ("file", "inline")
+VIDEO_DELIVERY_DEFAULT = "file"
+
+#: WP-E DELTA 1 (m7): the closed set of ``started: false`` reasons the execute
+#: surface's ``record`` block can carry.  docs/REPLY-CONTRACT.md lists exactly
+#: this set (the truth test derives it from here):
+#: - ``recording_limit``: a recording cap (1 per session / 2 per process) was
+#:   already occupied — the ACTION still ran.
+#: - ``text_session_no_screen``: image_delivery=text has no screen to record.
+#: - ``invalid_region``: the region could not be resolved at launch time (a
+#:   monitor/coordinate race after the pre-validation).
+#: - ``session_stopped``: the session stopped while the recording was starting.
+#: - ``record_start_failed``: any unexpected launch error (m5: the action still
+#:   ran — the launch is guarded end to end).
+#: - ``no_action`` (n7): ``plan_action="stop"`` or a continue past the walk's
+#:   end — the call dispatches no input, so nothing is recorded.
+EXECUTE_RECORD_NOT_STARTED_REASONS = (
+    "recording_limit",
+    "text_session_no_screen",
+    "invalid_region",
+    "session_stopped",
+    "record_start_failed",
+    "no_action",
+)
+
+#: The allowed keys inside the execute surface's ``record`` object (DELTA 1
+#: n4/m3: an unknown key is a typed rejection — consistent with the
+#: unknown-argument rule — instead of a silent ignore).
+EXECUTE_RECORD_ALLOWED_KEYS = (
+    "duration_s",
+    "region",
+    "fps",
+    "max_keyframes",
+    "include_video",
+    "save",
+    "video_delivery",
+)
+
+
+def _valid_video_delivery(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and value in VIDEO_DELIVERY_CHOICES)
 
 
 def recordings_root() -> Path:
@@ -289,11 +357,13 @@ def _resolve_flags(
     recording: Any,
     handle: "_RecordHandle | None",
     include_video: bool | None,
-) -> tuple[bool, bool]:
-    """B2: the result call's explicit ``include_video`` wins; otherwise the
-    flags persisted from the START call (on the handle while in flight, on the
+    video_delivery: str | None = None,
+) -> tuple[bool, bool, str]:
+    """B2 + WP-E E2: the result call's explicit ``include_video`` wins; otherwise
+    the flags persisted from the START call (on the handle while in flight, on the
     finished Recording afterwards) decide.  ``save`` has no result-call
-    parameter — it always comes from the start call."""
+    parameter — it always comes from the start call.  ``video_delivery``
+    resolves the same way (explicit > start call > the "file" default)."""
     if include_video is not None:
         want_video = bool(include_video)
     elif handle is not None:
@@ -304,7 +374,13 @@ def _resolve_flags(
         save = bool(handle.save)
     else:
         save = bool(getattr(recording, "save", False))
-    return want_video, save
+    if video_delivery in VIDEO_DELIVERY_CHOICES:
+        delivery = video_delivery
+    elif handle is not None and getattr(handle, "video_delivery", None) in VIDEO_DELIVERY_CHOICES:
+        delivery = str(handle.video_delivery)
+    else:
+        delivery = str(getattr(recording, "video_delivery", VIDEO_DELIVERY_DEFAULT) or VIDEO_DELIVERY_DEFAULT)
+    return want_video, save, delivery
 
 
 def _video_entry(
@@ -331,6 +407,7 @@ def _video_entry(
         "encode_failed",
         "over_budget",
         "frames_released",
+        "write_failed",
     ):
         return info
     return {"omitted": "encode_failed", "bytes": 0}
@@ -379,23 +456,136 @@ def _stop_check_for(bundle: Any, recording: Any) -> Callable[[], bool]:
     return _check
 
 
-def _save_recording(recording: Any, video_bytes: bytes | None) -> dict[str, Any]:
-    """``save=True``: write the MP4 + the contact-sheet PNG under the Cortex
-    recordings directory (runs in the to_thread worker — M4)."""
-    saved: dict[str, Any] = {"saved": True}
+def _write_video_file(path: Path, data: bytes) -> None:
+    """WP-E E2 seam: write the delivered MP4 file.  DELTA 1 m6: the write is
+    ATOMIC — a temp file in the SAME folder, then ``os.replace`` — so a host
+    reading the path can never observe a truncated MP4.  Tests patch THIS to
+    force the closed ``write_failed`` omission without touching the real
+    filesystem semantics."""
+    tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex[:8]}")
     try:
-        root = recordings_root()
-        root.mkdir(parents=True, exist_ok=True)
-        if video_bytes is not None:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _sweep_stale_tmp_files(root: Path, *, max_age_seconds: float = 3600.0) -> int:
+    """DELTA 2 NIT + DELTA 3 NIT: best-effort remove stale ``.tmp-*``
+    leftovers of a hard kill in the recordings folder (older than
+    ``max_age_seconds``).  The pattern is narrowed to CORTEX'S OWN temp names
+    — ``rec_*.mp4.tmp-*``, exactly how :func:`_write_video_file` names them —
+    so a foreign ``*.tmp-*`` file is never touched; never raises."""
+    removed = 0
+    try:
+        now = time.time()
+        for candidate in root.glob("rec_*.mp4.tmp-*"):
+            try:
+                if now - candidate.stat().st_mtime > max_age_seconds:
+                    candidate.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001 - best-effort housekeeping
+        return removed
+    return removed
+
+
+#: DELTA 3 NIT: the fallback lock for a non-``Recording`` object (production
+#: always passes a Recording whose lock is created at build time — this only
+#: keeps the defensive ``getattr`` path from ever raising).
+_FALLBACK_VIDEO_FILE_LOCK = threading.Lock()
+
+
+def _write_delivered_video_once(recording: Any, video_bytes: bytes) -> str | None:
+    """DELTA 1 m6 + DELTA 2 N3/N4: write the delivered MP4 ONCE per recording
+    and reuse the path on every later collect.
+
+    Concurrency (N3): the lock is the Recording's OWN ``_video_file_lock``,
+    created WHEN THE RECORDING IS BUILT (``vision/recorder.py``) — never a
+    check-then-set inside this worker, where two concurrent collects could
+    each create their own lock and both write.  The memo
+    (``recording._written_video_path``) is read and written under that lock;
+    before reusing a memo path its file is checked to still EXIST — a deleted
+    file is written again (NIT).  The first write also best-effort sweeps
+    stale ``.tmp-*`` leftovers older than one hour (never any other file).
+    Returns the absolute path, or ``None`` when the write failed (the caller
+    answers ``write_failed``; a later collect may retry because the memo
+    stays unset)."""
+    # DELTA 3 NIT: defensive attribute access — production always passes a
+    # Recording (whose lock is created at build time), but a non-Recording
+    # must never raise here; a module-level lock is the fallback.
+    file_lock = getattr(recording, "_video_file_lock", None) or _FALLBACK_VIDEO_FILE_LOCK
+    with file_lock:
+        written = getattr(recording, "_written_video_path", None)
+        if written is not None and Path(str(written)).exists():
+            return str(written)
+        try:
+            root = recordings_root()
+            root.mkdir(parents=True, exist_ok=True)
+            _sweep_stale_tmp_files(root)
             video_path = root / f"{recording.record_id}.mp4"
-            video_path.write_bytes(video_bytes)
-            saved["video_path"] = str(video_path)
-        if recording.sheet_png_b64:
+            _write_video_file(video_path, video_bytes)
+        except Exception as exc:  # noqa: BLE001 - the write failure is the honest omission
+            logger.debug("recording MP4 file write failed", exc_info=True)
+            recording._written_video_error = f"{type(exc).__name__}: {exc}"
+            return None
+        recording._written_video_path = str(video_path)
+        return str(video_path)
+
+
+def _save_recording(
+    recording: Any,
+    video_bytes: bytes | None,
+    *,
+    written_video_path: str | None = None,
+    delivery_write_error: str | None = None,
+) -> dict[str, Any]:
+    """``save=True``: write the MP4 + the contact-sheet PNG under the Cortex
+    recordings directory (runs in the to_thread worker — M4).
+
+    WP-E E2: with the default file delivery the MP4 was ALREADY written at the
+    shared path — ``written_video_path`` reports it without a second write (one
+    MP4 on disk, no double write).  DELTA 2 N4: EVERY MP4 write goes through
+    the SAME write-once path (:func:`_write_delivered_video_once`) in every
+    case — an ``inline``/``include_video=false`` save collect reuses the memo
+    instead of re-running ``os.replace`` over a file a reader may hold open.
+    The sheet write has its OWN try: a video failure keeps ``sheet_path`` and
+    a sheet failure keeps ``video_path``.  DELTA 3 M-A: ``delivery_write_error``
+    (the worker's file-delivery failure) lands as ``save_error`` here, and
+    ``saved`` is honestly False whenever ``save_error`` or ``sheet_error`` is
+    present — never ``saved: true`` without the file."""
+    saved: dict[str, Any] = {}
+    root = recordings_root()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001 - a failed save is reported, never a crash
+        return {"saved": False, "save_error": f"{type(exc).__name__}: {exc}"}
+    if written_video_path is not None:
+        saved["video_path"] = written_video_path
+    elif video_bytes is not None:
+        video_written = _write_delivered_video_once(recording, video_bytes)
+        if video_written is not None:
+            saved["video_path"] = video_written
+        else:
+            saved["save_error"] = str(
+                getattr(recording, "_written_video_error", "") or "the MP4 write failed"
+            )
+    if delivery_write_error is not None:
+        saved["save_error"] = delivery_write_error
+    if recording.sheet_png_b64:
+        try:
             sheet_path = root / f"{recording.record_id}_sheet.png"
             sheet_path.write_bytes(base64.b64decode(recording.sheet_png_b64))
             saved["sheet_path"] = str(sheet_path)
-    except Exception as exc:  # noqa: BLE001 - a failed save is reported, never a crash
-        saved = {"saved": False, "save_error": f"{type(exc).__name__}: {exc}"}
+        except Exception as exc:  # noqa: BLE001 - a sheet failure never drops video_path
+            saved["sheet_error"] = f"{type(exc).__name__}: {exc}"
+    # DELTA 3 M-A: the honest verdict — any error in the save means NOT saved.
+    saved["saved"] = not ({"save_error", "sheet_error"} & saved.keys())
     return saved
 
 
@@ -407,16 +597,62 @@ def _finished_reply_worker(
     want_video: bool,
     save: bool,
     video_bytes: bytes | None,
+    delivery: str = VIDEO_DELIVERY_DEFAULT,
 ) -> tuple[dict[str, Any], tuple[str, str, float | None] | None, str | None]:
     """M4: EVERY heavy piece of the finished reply in ONE synchronous worker —
     the payload build, the sheet's outbound ladder, the sheet PNG's outbound
     re-encode, the MP4's base64 blob and the ``save`` file writes.  Returns
     ``(payload, (sheet_b64, mime, scale), blob_b64)``; the caller assembles the
-    MCP blocks on the loop (cheap dict/argument work only)."""
-    video_entry = _video_entry(recording, blob_attached=blob_attached, want_video=want_video)
+    MCP blocks on the loop (cheap dict/argument work only).
+
+    WP-E E2: with the DEFAULT ``delivery="file"`` a produced MP4 is WRITTEN
+    under the recordings folder (the same place save=true uses — one file, no
+    double write) and the video entry carries its absolute ``path``; NO blob is
+    attached and the video never enters the tool result.  Most hosts truncate
+    large tool results, so "file" is the default; "inline" (the legacy
+    EmbeddedResource) is only for hosts known to pass video to the model.  A
+    failed file write answers the closed ``write_failed`` omission (retryable
+    on a later collect).  DELTA 1 m6: the write goes through
+    :func:`_write_delivered_video_once` (atomic, once per recording, later
+    collects reuse the path) and a ``write_failed`` entry is built LOCALLY —
+    the shared ``recording.video`` is never mutated here (the heavy worker
+    runs outside the per-recording lock, so a parallel collect must never see
+    a half-updated entry)."""
+    written_video_path: str | None = None
+    write_failed_entry: dict[str, Any] | None = None
+    delivery_write_error: str | None = None
+    if delivery == "file" and want_video and video_bytes is not None:
+        written_video_path = _write_delivered_video_once(recording, video_bytes)
+        if written_video_path is None:
+            delivery_write_error = str(
+                getattr(recording, "_written_video_error", "") or "the MP4 write failed"
+            )
+            write_failed_entry = {
+                "omitted": VIDEO_OMITTED_WRITE_FAILED,
+                "bytes": len(video_bytes),
+                "detail": delivery_write_error,
+            }
+            video_bytes = None
+    if write_failed_entry is not None:
+        video_entry = write_failed_entry
+    elif delivery == "file" and written_video_path is not None and want_video:
+        info = dict(getattr(recording, "video", None) or {})
+        info.update(
+            {
+                "included": True,
+                "delivery": "file",
+                "path": written_video_path,
+            }
+        )
+        info.setdefault("codec", "h264")
+        video_entry = info
+    else:
+        video_entry = _video_entry(recording, blob_attached=blob_attached, want_video=want_video)
     payload = _finished_payload(session_id, recording, video_entry=video_entry)
     if video_entry.get("included") and video_entry.get("uri") is None:
         video_entry["uri"] = f"cortex://recording/{recording.record_id}.mp4"
+    if written_video_path is not None:
+        payload["video_path"] = written_video_path
     blob_b64: str | None = None
     if blob_attached and video_bytes is not None:
         blob_b64 = base64.b64encode(video_bytes).decode("ascii")
@@ -428,7 +664,18 @@ def _finished_reply_worker(
     if save:
         # DELTA 2 M7: an existing MP4 is written even when this reply attaches
         # no blob (save=true + explicit include_video=false writes the file).
-        payload.update(_save_recording(recording, video_bytes))
+        # WP-E E2: with the file delivery the MP4 is already on disk at the
+        # shared path — report it, never write it twice.  DELTA 3 M-A: a
+        # delivery write failure rides into the save dict as ``save_error``,
+        # so ``saved`` is honestly False (never saved:true without a file).
+        payload.update(
+            _save_recording(
+                recording,
+                video_bytes,
+                written_video_path=written_video_path,
+                delivery_write_error=delivery_write_error,
+            )
+        )
     return payload, sheet_tuple, blob_b64
 
 
@@ -459,10 +706,12 @@ async def _finished_reply(
     result_token: str,
     handle: "_RecordHandle | None" = None,
     include_video: bool | None = None,
+    video_delivery: str | None = None,
     started_monotonic: float | None = None,
 ) -> Any:
     """The verified/stopped reply: TextContent JSON + ImageContent contact sheet
-    (+ the MP4 ``EmbeddedResource`` when video is attached to THIS reply).
+    (+ the MP4 as a written file path for the "file" delivery default, or as an
+    ``EmbeddedResource`` for "inline", when video is attached to THIS reply).
 
     DELTA 1: the encode is single-flight per recording (M5) and carries the
     client-budget deadline (M3); every heavy piece runs in ONE to_thread
@@ -474,7 +723,7 @@ async def _finished_reply(
     if getattr(recording, "error", None):
         return _failed_reply(recording)
     pool = recording_store(bundle.extra)
-    want_video, save = _resolve_flags(recording, handle, include_video)
+    want_video, save, delivery = _resolve_flags(recording, handle, include_video, video_delivery)
     video_bytes: bytes | None = None
     if want_video or save:
         # M5: ONE encode per recording at a time — concurrent result calls
@@ -565,7 +814,9 @@ async def _finished_reply(
                         recording.release_frame_payloads()
                         if pool is not None:
                             pool.remove_frames(recording.record_id)
-    blob_attached = bool(video_bytes is not None and want_video)
+    # WP-E E2: the MP4 attaches as a blob ONLY for the "inline" delivery; the
+    # default "file" delivery writes the file inside the reply worker instead.
+    blob_attached = bool(video_bytes is not None and want_video and delivery == "inline")
     payload, sheet_tuple, blob_b64 = await asyncio.to_thread(
         _finished_reply_worker,
         session_id,
@@ -574,6 +825,7 @@ async def _finished_reply(
         want_video=want_video,
         save=save,
         video_bytes=video_bytes,
+        delivery=delivery,
     )
     payload["result"] = result_token
     payload["ok"] = result_token == "verified"
@@ -629,6 +881,7 @@ async def _resolve_finished(
     *,
     result_token: str,
     include_video: bool | None,
+    video_delivery: str | None = None,
     handle: "_RecordHandle | None",
     started_monotonic: float | None = None,
 ) -> Any:
@@ -650,134 +903,197 @@ async def _resolve_finished(
         result_token=result_token,
         handle=handle,
         include_video=include_video,
+        video_delivery=video_delivery,
         started_monotonic=started_monotonic,
     )
 
 
-# --- the tools --------------------------------------------------------------------------------
+# --- shared parameter validation + the launch path (computer_record AND the
+# --- execute surface's ``record`` object, WP-E E1: ONE code path, same bands,
+# --- same typed rejection codes) -------------------------------------------------
 
 
-@mcp.tool()
-@_session_scoped
-async def computer_record(
-    session_id: str,
-    duration_s: float,
-    region: NullableRegion = None,
-    fps: NullableInt = None,
-    max_keyframes: NullableInt = None,
-    include_video: NullableBool = None,
-    save: NullableBool = None,
-) -> Any:
-    """Start recording 0.5–10 s of the screen IN THE BACKGROUND and return AT ONCE.
+@dataclass
+class _ResolvedRecordArgs:
+    """DELTA 2 N1/N2: the COERCED record values the shared validator returns on
+    success — no caller ever runs a second ``int()``/``float()`` on raw
+    values.  ``region`` rides through verbatim (its shape/bounds are
+    validated separately, by ``_resolve_recording_space`` on the execute
+    surface and at launch on computer_record)."""
 
-    Returns a marker reply: ``record_id`` ("rec_" + 16 hex), ``status:
-    "recording"``, ``ends_at`` (epoch seconds) and the effective fps/region.
-    KEEP CALLING TOOLS while it records — the whole point.  Collect the product
-    with computer_record_result(session_id, record_id): a change timeline plus
-    the Cortex actions dispatched inside the window, a contact sheet of
-    timestamped keyframes (each fetchable at full size by ``image_id`` through
-    computer_fetch_image, the Cortex cursor composited), and on request the
-    FULL video as an MP4 EmbeddedResource.
+    duration_s: float
+    fps: int
+    max_keyframes: int
+    include_video: bool | None
+    save: bool | None
+    video_delivery: str
+    region: Any = None
 
-    Bands (fail-closed, never silently shortened): ``duration_s`` 0.5..10 s;
-    ``fps`` 1..10 (default 5); ``max_keyframes`` 2..12 (default 8).  ``region``
-    is ``[left, top, width, height]`` in CANONICAL screenshot space (the space
-    actions are grounded in); with no region the session's monitor is recorded
-    (the same monitor choice computer_observe uses).  Malformed, out-of-bounds
-    or unverifiable coordinates are refused with the typed ``invalid_region``
-    error (monitor mode included).
 
-    ``include_video=true`` also encodes an H.264 MP4 right after capture (in
-    the recording worker — the result call usually only fetches it; the default
-    blob cap is 2 MiB raw, ``CORTEX_RECORD_VIDEO_MAX_MB`` band 1..8, encoder
-    preference ``CORTEX_RECORD_ENCODER``, default h264_mf then libx264).  A
-    larger/budgeted-out encode is honestly omitted: ``video.omitted`` names
-    the closed reason — ALL of them: ``not_requested`` / ``too_large`` /
-    ``encoder_unavailable`` / ``encode_failed`` / ``over_budget`` (the client
-    budget could not fit the next ladder rung; retried on a later call) /
-    ``frames_released`` (the held frames were evicted under the recording
-    pool's byte cap before any video was stored).  ``save=true`` writes the
-    MP4 + the contact-sheet PNG under the Cortex recordings directory and
-    returns ``video_path`` / ``sheet_path`` (it implies video production).
-    An ``encode_failed`` carrying ``aborted: true`` (a stop/cancel aborted
-    the encode) is NOT final — a later collect retries while the frames are
-    held.  Peek replies carry ``status`` ``"recording"`` or ``"encoding"``
-    (the capture finished, the video encode is still running).  Fetched
-    keyframes publish ``frame_to_canonical`` (``{"scale", "origin"}``) that
-    maps the STORED keyframe pixels: a copy served downscaled must first be
-    divided by its ``image_outbound_scale``.
+def _validate_record_arguments(
+    duration_s: Any,
+    fps: Any,
+    max_keyframes: Any,
+    include_video: Any,
+    save: Any,
+    video_delivery: Any = None,
+    region: Any = None,
+) -> "tuple[str, str, _ResolvedRecordArgs | None]":
+    """The SHARED validation + coercion.  Returns ``(code, message, resolved)``:
+    on success ``(None, None, _ResolvedRecordArgs)`` with the COERCED values;
+    on the first violation ``(code, message, None)``.  computer_record maps
+    the pair onto its typed ``rejected`` envelope; the execute surface maps
+    the SAME pair onto the §1.1 execute rejection envelope — same codes, same
+    messages, one path, and BOTH tools consume the same resolved values.
 
-    If the screen capture fails (or the worker dies), the result reply is
-    ``result:"failed"`` with reasons ``["capture_failed" | "record_worker_failed"]``
-    — never a silent empty ``verified``.  A capture error after some frames is
-    still ``failed``: a partially captured timeline is untrustworthy; the
-    frames captured before the failure are counted in the message.
-
-    Both recording tools stay ALLOWED while a plan lease is active (they
-    dispatch no input; recording a plan's effect is a main use).  Caps: 1
-    active recording per session, 2 per process (typed ``recording_limit``).
-    """
-    try:
-        bundle = _get_live_bundle(session_id)
-    except (_StoppedSession, _UnknownSession) as exc:
-        return _error_response(exc)
-    # DELIBERATELY no plan-lease refusal here: recording a plan's effect is a
-    # main use of the surface (plan_surface's allow side lists both tools).
-    # Text sessions have no screen images — typed rejection before anything starts.
-    if bundle.extra.get("image_delivery") == "text":
-        return _record_rejection(
-            "text_session_no_screen",
-            "This session is in image_delivery=text mode (non-vision-safe): there "
-            "are no screen images to record. Start an image-mode session to record.",
-        )
-    if isinstance(duration_s, bool) or not isinstance(duration_s, (int, float)):
-        return _record_rejection(
+    DELTA 2 N1/N2 (Commander decision): ONE rule for both tools — the
+    TOLERANT rule.  ``fps`` / ``max_keyframes`` go through EXACTLY the same
+    coercion as computer_record's ``NullableInt`` boundary —
+    :func:`~computer_use_mcp.server.schemas._coerce_tolerant_int` is REUSED,
+    never copied: non-integral floats and numeric strings ROUND the same way
+    (``2.7`` → 3, ``"5.0"`` → 5, ``"1e1"`` → 10); booleans, lists, dicts and
+    non-numeric strings raise the typed ``invalid_record_fps`` /
+    ``invalid_record_keyframes``.  ``duration_s`` accepts the same shapes
+    pydantic's lax float accepts for ``computer_record(duration_s)`` —
+    numbers and numeric strings (``"4"`` → 4.0); a bool or a non-numeric
+    string is the typed ``invalid_record_duration``.  Band checks run AFTER
+    coercion, for both tools, with the same codes."""
+    if isinstance(duration_s, bool):
+        return (
             "invalid_record_duration",
             f"duration_s must be a number of seconds; got {duration_s!r}.",
+            None,
         )
-    requested = float(duration_s)
+    try:
+        requested = float(duration_s) if duration_s is not None else None
+    except (TypeError, ValueError):
+        return (
+            "invalid_record_duration",
+            f"duration_s must be a number of seconds; got {duration_s!r}.",
+            None,
+        )
+    if requested is None:
+        return (
+            "invalid_record_duration",
+            f"duration_s must be a number of seconds; got {duration_s!r}.",
+            None,
+        )
     if not math.isfinite(requested) or not (
         RECORD_DURATION_BAND[0] <= requested <= RECORD_DURATION_BAND[1]
     ):
-        return _record_rejection(
+        return (
             "invalid_record_duration",
             f"duration_s must be between {RECORD_DURATION_BAND[0]} and "
             f"{RECORD_DURATION_BAND[1]} seconds; got {duration_s!r}. Nothing was started.",
+            None,
         )
-    resolved_fps = RECORD_FPS_DEFAULT if fps is None else int(fps)
+    try:
+        resolved_fps = (
+            RECORD_FPS_DEFAULT
+            if fps is None
+            else _coerce_tolerant_int(fps, field="fps")
+        )
+    except ValueError as exc:
+        return (
+            "invalid_record_fps",
+            f"fps must be an integer between {RECORD_FPS_BAND[0]} and "
+            f"{RECORD_FPS_BAND[1]} (default {RECORD_FPS_DEFAULT}); {exc} "
+            "Nothing was started.",
+            None,
+        )
     if not RECORD_FPS_BAND[0] <= resolved_fps <= RECORD_FPS_BAND[1]:
-        return _record_rejection(
+        return (
             "invalid_record_fps",
             f"fps must be between {RECORD_FPS_BAND[0]} and {RECORD_FPS_BAND[1]} "
             f"(default {RECORD_FPS_DEFAULT}); got {fps!r}. Nothing was started.",
+            None,
         )
-    resolved_keyframes = (
-        RECORD_MAX_KEYFRAMES_DEFAULT if max_keyframes is None else int(max_keyframes)
-    )
+    try:
+        resolved_keyframes = (
+            RECORD_MAX_KEYFRAMES_DEFAULT
+            if max_keyframes is None
+            else _coerce_tolerant_int(max_keyframes, field="max_keyframes")
+        )
+    except ValueError as exc:
+        return (
+            "invalid_record_keyframes",
+            f"max_keyframes must be an integer between {RECORD_MAX_KEYFRAMES_BAND[0]} and "
+            f"{RECORD_MAX_KEYFRAMES_BAND[1]} (default {RECORD_MAX_KEYFRAMES_DEFAULT}); "
+            f"{exc} Nothing was started.",
+            None,
+        )
     if not RECORD_MAX_KEYFRAMES_BAND[0] <= resolved_keyframes <= RECORD_MAX_KEYFRAMES_BAND[1]:
-        return _record_rejection(
+        return (
             "invalid_record_keyframes",
             f"max_keyframes must be between {RECORD_MAX_KEYFRAMES_BAND[0]} and "
             f"{RECORD_MAX_KEYFRAMES_BAND[1]} (default {RECORD_MAX_KEYFRAMES_DEFAULT}); "
             f"got {max_keyframes!r}. Nothing was started.",
+            None,
         )
     if include_video is not None and not isinstance(include_video, bool):
-        return _record_rejection(
+        return (
             "invalid_record_param",
             f"include_video must be a boolean or null; got {include_video!r}.",
+            None,
         )
     if save is not None and not isinstance(save, bool):
-        return _record_rejection(
+        return (
             "invalid_record_param",
             f"save must be a boolean or null; got {save!r}.",
+            None,
         )
-    # N2 (Commander decision): the capture NEVER runs on an executor thread —
-    # the backend's mss instance and payload cache are thread-bound, and this
-    # is the same on-the-loop capture every other tool performs.  Only the
-    # PIL/base64/save reply work moves into the to_thread worker (M4).
+    if not _valid_video_delivery(video_delivery):
+        return (
+            "invalid_video_delivery",
+            "video_delivery must be \"file\" or \"inline\" (null = the default "
+            f"\"file\"); got {video_delivery!r}.",
+            None,
+        )
+    return (
+        None,
+        None,
+        _ResolvedRecordArgs(
+            duration_s=requested,
+            fps=int(resolved_fps),
+            max_keyframes=int(resolved_keyframes),
+            include_video=include_video,
+            save=save,
+            video_delivery=(
+                video_delivery if video_delivery in VIDEO_DELIVERY_CHOICES else VIDEO_DELIVERY_DEFAULT
+            ),
+            region=region,
+        ),
+    )
+
+
+def _launch_recording(
+    bundle: Any,
+    session_id: str,
+    *,
+    requested: float,
+    resolved_fps: int,
+    resolved_keyframes: int,
+    region: Any,
+    include_video: bool,
+    save: bool,
+    video_delivery: str,
+    audit_source: str,
+) -> tuple["_RecordHandle | None", "dict[str, Any] | None", "dict[str, Any] | None"]:
+    """The ONE launch path (WP-E E1): resolve the recording space, build the
+    handle + recorder, check the caps under the insert lock, start the thread.
+
+    Returns ``(handle, refusal, context_info)``.  ``refusal`` is ``None`` on
+    success; otherwise ``{"reason": <typed code>, "message": str, "detail":
+    <the raw reply the computer_record surface returns verbatim>}`` — the
+    execute surface NEVER refuses the action for a recording problem, it only
+    reads ``reason``/``message`` for its ``{"started": false}`` block."""
     resolved = _resolve_recording_space(bundle, region)
     if isinstance(resolved, dict):
-        return resolved
+        return None, {
+            "reason": "invalid_region",
+            "message": str(resolved.get("message", "invalid recording region.")),
+            "detail": resolved,
+        }, None
     (
         context_info,
         region_physical,
@@ -799,8 +1115,9 @@ async def computer_record(
         fps=resolved_fps,
         max_keyframes=resolved_keyframes,
         region_requested=region_requested,
-        include_video=bool(include_video) or bool(save),
-        save=bool(save),
+        include_video=include_video,
+        save=save,
+        video_delivery=video_delivery,
         started_at=_record_iso_utc(),
         started_epoch=started_epoch,
         deadline_monotonic=_record_now() + requested,
@@ -886,25 +1203,36 @@ async def computer_record(
         _start()
     except _LimitRefusal as refusal:
         if refusal.reason == "session_stopped":
-            return refusal.detail
-        return _record_rejection(refusal.reason, refusal.message)
+            return None, {
+                "reason": refusal.reason,
+                "message": refusal.message,
+                "detail": refusal.detail,
+            }, None
+        return None, {"reason": refusal.reason, "message": refusal.message, "detail": None}, None
     try:
         thread.start()
     except Exception as exc:  # noqa: BLE001 - no phantom registration
         from .record_machine import _retire_record
 
         _retire_record(handle)
-        return {
-            "ok": False,
-            "result": "failed",
-            "error": "record_failed",
-            "session_id": session_id,
-            "record_id": record_id,
+        return None, {
+            "reason": "record_start_failed",
             "message": (
                 f"The recording could not be started ({type(exc).__name__}: {exc}); "
                 "nothing is registered and no slot is consumed."
             ),
-        }
+            "detail": {
+                "ok": False,
+                "result": "failed",
+                "error": "record_failed",
+                "session_id": session_id,
+                "record_id": record_id,
+                "message": (
+                    f"The recording could not be started ({type(exc).__name__}: {exc}); "
+                    "nothing is registered and no slot is consumed."
+                ),
+            },
+        }, None
     _audit(
         "record_start",
         result="ok",
@@ -914,24 +1242,316 @@ async def computer_record(
             "fps": resolved_fps,
             "region": context_info.get("region"),
             "include_video": handle.include_video,
+            "source": audit_source,
         },
     )
+    return handle, None, context_info
+
+
+def _execute_record_block(
+    session_id: str, handle: "_RecordHandle", context_info: "dict[str, Any] | None"
+) -> dict[str, Any]:
+    """WP-E E1: the reply's ``record`` block for a recording started around an
+    execute call — the marker facts plus the collect hint (the agent collects
+    with computer_record_result, which blocks until the end)."""
+    record_id = handle.record_id
+    return {
+        "started": True,
+        "record_id": record_id,
+        "status": "recording",
+        "ends_at": handle.ends_at,
+        "duration_s": handle.duration_s,
+        "fps": handle.fps,
+        "region": (context_info or {}).get("region"),
+        "message": (
+            f"Recording {record_id} started around this action (a "
+            f"{RECORD_PRE_ROLL_SECONDS}s pre-roll is part of the window so the "
+            '"before" state is captured); collect with computer_record_result('
+            f'session_id, record_id="{record_id}") — it blocks until the '
+            "recording ends and its timeline contains THIS call's actions."
+        ),
+    }
+
+
+def _execute_record_not_started(reason: str, message: str) -> dict[str, Any]:
+    """WP-E E1: the ``record`` block when no recording started.  The ACTION
+    still runs — a recording problem never refuses an execute call."""
+    return {
+        "started": False,
+        "reason": reason,
+        "message": message,
+    }
+
+
+def _text_session_record_block() -> dict[str, Any]:
+    """WP-E E1: the ``record`` block for a text-mode session — the recording
+    reports {"started": false} and the action still runs."""
+    return _execute_record_not_started(
+        "text_session_no_screen",
+        "This session is in image_delivery=text mode (non-vision-safe): there "
+        "are no screen images to record. The action still runs.",
+    )
+
+
+def start_execute_recording(
+    bundle: Any, session_id: str, record: "dict[str, Any] | None"
+) -> "dict[str, Any] | None":
+    """WP-E E1: launch the execute call's recording.  Call AFTER the record
+    argument has been validated (DELTA 2 N1/N2: ``record`` is the COERCED
+    ``_ResolvedRecordArgs``-shaped dict the shared validator returned — the
+    values are final, there is NO second ``int()``/``float()`` on raw input)
+    and the region pre-resolved (the typed rejections happened earlier); this
+    helper NEVER raises and NEVER refuses the action — every launch problem
+    becomes ``{"started": false, ...}`` in the reply's ``record`` block.
+    DELTA 1 m5: the whole launch is guarded — ANY exception before or inside
+    it (grabber/recorder construction, context attributes, ...) becomes
+    ``{"started": false, "reason": "record_start_failed"}`` and the action
+    still runs.  ``None`` (no ``record`` argument) returns ``None`` so the
+    reply stays byte-identical."""
+    if record is None:
+        return None
+    if bundle.extra.get("image_delivery") == "text":
+        return _text_session_record_block()
+    try:
+        handle, refusal, context_info = _launch_recording(
+            bundle,
+            session_id,
+            requested=float(record.duration_s),
+            resolved_fps=int(record.fps),
+            resolved_keyframes=int(record.max_keyframes),
+            region=record.region,
+            include_video=bool(record.include_video) or bool(record.save),
+            save=bool(record.save),
+            video_delivery=(
+                record.video_delivery
+                if record.video_delivery in VIDEO_DELIVERY_CHOICES
+                else VIDEO_DELIVERY_DEFAULT
+            ),
+            audit_source="computer_execute",
+        )
+    except Exception as exc:  # noqa: BLE001 - m5: the launch NEVER refuses the action
+        logger.warning("execute record launch failed", exc_info=True)
+        return _execute_record_not_started(
+            "record_start_failed",
+            f"The recording could not be launched ({type(exc).__name__}: {exc}); "
+            "the action still runs.",
+        )
+    if refusal is not None:
+        return _execute_record_not_started(refusal["reason"], refusal["message"])
+    assert handle is not None
+    return _execute_record_block(session_id, handle, context_info)
+
+
+def _no_action_record_block() -> dict[str, Any]:
+    """DELTA 1 n7: the ``record`` block when the call carries a valid ``record``
+    but dispatches no input at all (``plan_action="stop"``; a continue past the
+    walk's end) — nothing is recorded and the closed ``no_action`` reason says
+    so (in ``EXECUTE_RECORD_NOT_STARTED_REASONS`` and the docs)."""
+    return _execute_record_not_started(
+        "no_action",
+        "This call dispatches no input (plan stop, or the walk already ended), "
+        "so there is nothing to record; the record object was not ignored.",
+    )
+
+
+def cancel_execute_recording(session_id: str, record_block: Any) -> bool:
+    """DELTA 1 m4: cancel a recording started around this execute call — the
+    cancel flag plus the loop wake, EXACTLY like ``cancel=true`` — so the
+    session's recording slot frees immediately instead of holding for up to
+    ``duration_s``.  Best-effort (False when there is nothing to cancel or the
+    recording already retired); never raises."""
+    try:
+        if not isinstance(record_block, dict) or not record_block.get("started"):
+            return False
+        record_id = record_block.get("record_id")
+        with _lock:
+            handle = _RECORDINGS_IN_FLIGHT.get(session_id, {}).get(record_id)
+        if handle is None:
+            return False
+        handle.cancel.set()
+        _signal_loop_waiters(handle)
+        return True
+    except Exception:  # noqa: BLE001 - best-effort, never a gate
+        return False
+
+
+def execute_record_input_dispatched(session_id: str, record_block: Any) -> bool:
+    """DELTA 2 n6: the EXACT zero-input test for the detect-and-cancel rule —
+    True when at least one Cortex action was stamped in the session's DISPATCH
+    RING since this recording started.  The ring is stamped at the ONE
+    dispatch choke point immediately before ``_backend_execute``
+    (``pipeline/agent.py``), so an empty window between the recording's start
+    and now PROVES nothing was dispatched, whatever the outcome kind says —
+    the cancel can never fire after input left the process (the
+    unsupported-key-after-dispatch envelope included).  Best-effort ``False``
+    on any failure (never gates)."""
+    try:
+        if not isinstance(record_block, dict) or not record_block.get("started"):
+            return False
+        with _lock:
+            handle = _RECORDINGS_IN_FLIGHT.get(session_id, {}).get(
+                record_block.get("record_id")
+            )
+        if handle is None:
+            return False
+        started_monotonic = handle.deadline_monotonic - handle.duration_s
+        from ..vision.recorder import peek_actions_in_window
+
+        return bool(
+            peek_actions_in_window(session_id, started_monotonic, _record_now() + 1.0)
+        )
+    except Exception:  # noqa: BLE001 - best-effort, never a gate
+        return False
+
+
+# --- the tools --------------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_session_scoped
+async def computer_record(
+    session_id: str,
+    duration_s: RecordDuration,
+    region: NullableRegion = None,
+    fps: NullableInt = None,
+    max_keyframes: NullableInt = None,
+    include_video: NullableBool = None,
+    save: NullableBool = None,
+    video_delivery: NullableStr = None,
+) -> Any:
+    """Start recording 0.5–10 s of the screen IN THE BACKGROUND and return AT ONCE.
+
+    Returns a marker reply: ``record_id`` ("rec_" + 16 hex), ``status:
+    "recording"``, ``ends_at`` (epoch seconds) and the effective fps/region.
+    KEEP CALLING TOOLS while it records — the whole point.  Collect the product
+    with computer_record_result(session_id, record_id): a change timeline plus
+    the Cortex actions dispatched inside the window, a contact sheet of
+    timestamped keyframes (each fetchable at full size by ``image_id`` through
+    computer_fetch_image, the Cortex cursor composited), and on request the
+    FULL video — as a written MP4 file path (the ``"file"`` delivery default)
+    or as an MP4 EmbeddedResource (``"inline"``).
+
+    Bands (fail-closed, never silently shortened): ``duration_s`` 0.5..10 s;
+    ``fps`` 1..10 (default 5); ``max_keyframes`` 2..12 (default 8).  ``region``
+    is ``[left, top, width, height]`` in CANONICAL screenshot space (the space
+    actions are grounded in); with no region the session's monitor is recorded
+    (the same monitor choice computer_observe uses).  Malformed, out-of-bounds
+    or unverifiable coordinates are refused with the typed ``invalid_region``
+    error (monitor mode included).
+
+    ``include_video=true`` also encodes an H.264 MP4 right after capture (in
+    the recording worker — the result call usually only fetches it; the default
+    blob cap is 2 MiB raw, ``CORTEX_RECORD_VIDEO_MAX_MB`` band 1..8, encoder
+    preference ``CORTEX_RECORD_ENCODER``, default h264_mf then libx264).  A
+    larger/budgeted-out encode is honestly omitted: ``video.omitted`` names
+    the closed reason — ALL of them: ``not_requested`` / ``too_large`` /
+    ``encoder_unavailable`` / ``encode_failed`` / ``over_budget`` (the client
+    budget could not fit the next ladder rung; retried on a later call) /
+    ``frames_released`` (the held frames were evicted under the recording
+    pool's byte cap before any video was stored) / ``write_failed`` (WP-E E2:
+    the default file delivery could not write the MP4; retried on a later
+    collect).  ``save=true`` writes the MP4 + the contact-sheet PNG under the
+    Cortex recordings directory and returns ``video_path`` / ``sheet_path``
+    (it implies video production).
+    ``video_delivery`` (trailing optional, WP-E E2): "file" (the DEFAULT) or
+    "inline".  Most hosts TRUNCATE large tool results — a 196-562 KB MP4 blob
+    never reached the model in the field — so "file" is the default: the MP4
+    is written under the recordings folder and the reply carries its absolute
+    ``path`` instead of a blob.  "inline" is only for hosts known to pass
+    video to the model (the legacy EmbeddedResource).  The result call's
+    explicit ``video_delivery`` wins over this start flag.
+    An ``encode_failed`` carrying ``aborted: true`` (a stop/cancel aborted
+    the encode) is NOT final — a later collect retries while the frames are
+    held.  Peek replies carry ``status`` ``"recording"`` or ``"encoding"``
+    (the capture finished, the video encode is still running).  Fetched
+    keyframes publish ``frame_to_canonical`` (``{"scale", "origin"}``) that
+    maps the STORED keyframe pixels: a copy served downscaled must first be
+    divided by its ``image_outbound_scale``.
+
+    If the screen capture fails (or the worker dies), the result reply is
+    ``result:"failed"`` with reasons ``["capture_failed" | "record_worker_failed"]``
+    — never a silent empty ``verified``.  A capture error after some frames is
+    still ``failed``: a partially captured timeline is untrustworthy; the
+    frames captured before the failure are counted in the message.
+
+    Both recording tools stay ALLOWED while a plan lease is active (they
+    dispatch no input; recording a plan's effect is a main use).  Caps: 1
+    active recording per session, 2 per process (typed ``recording_limit``).
+    """
+    try:
+        bundle = _get_live_bundle(session_id)
+    except (_StoppedSession, _UnknownSession) as exc:
+        return _error_response(exc)
+    # DELIBERATELY no plan-lease refusal here: recording a plan's effect is a
+    # main use of the surface (plan_surface's allow side lists both tools).
+    # Text sessions have no screen images — typed rejection before anything starts.
+    if bundle.extra.get("image_delivery") == "text":
+        return _record_rejection(
+            "text_session_no_screen",
+            "This session is in image_delivery=text mode (non-vision-safe): there "
+            "are no screen images to record. Start an image-mode session to record.",
+        )
+    # DELTA 3 NIT: the MCP boundary's lax float coerces True/False to 1.0/0.0
+    # (verified live through the instance gate), so the bool rejection the
+    # record object applies must happen HERE — the same typed code, the same
+    # message, one rule for both tools.
+    if isinstance(duration_s, bool):
+        return _record_rejection(
+            "invalid_record_duration",
+            f"duration_s must be a number of seconds; got {duration_s!r}.",
+        )
+    code, message, resolved = _validate_record_arguments(
+        duration_s, fps, max_keyframes, include_video, save, video_delivery, region
+    )
+    if code is not None or resolved is None:
+        return _record_rejection(code or "invalid_record_param", message or "invalid record arguments.")
+    requested = resolved.duration_s
+    resolved_fps = resolved.fps
+    resolved_keyframes = resolved.max_keyframes
+    delivery = resolved.video_delivery
+    # N2 (Commander decision): the capture NEVER runs on an executor thread —
+    # the backend's mss instance and payload cache are thread-bound, and this
+    # is the same on-the-loop capture every other tool performs.  Only the
+    # PIL/base64/save reply work moves into the to_thread worker (M4).
+    handle, refusal, context_info = _launch_recording(
+        bundle,
+        session_id,
+        requested=requested,
+        resolved_fps=resolved_fps,
+        resolved_keyframes=resolved_keyframes,
+        region=region,
+        include_video=bool(include_video) or bool(save),
+        save=bool(save),
+        video_delivery=delivery,
+        audit_source="computer_record",
+    )
+    if refusal is not None:
+        # The launch path hands back the SAME typed replies computer_record has
+        # always returned for these conditions (invalid_region error dict,
+        # session_stopped error dict, record_failed failure dict) or the typed
+        # ``recording_limit`` rejection.
+        if refusal.get("detail") is not None:
+            return refusal["detail"]
+        return _record_rejection(refusal["reason"], refusal["message"])
+    assert handle is not None
+    _record_marker_reply_extra = {
+        "region": context_info.get("region"),
+        "monitor_bounds": context_info.get("monitor_bounds"),
+        "max_keyframes": resolved_keyframes,
+        "include_video": handle.include_video,
+        "started_at": handle.started_at,
+        "video_delivery": delivery,
+    }
     return _record_marker_reply(
         session_id=session_id,
         handle=handle,
         message=(
-            f"Recording {record_id} started ({requested} s at {resolved_fps} fps). "
+            f"Recording {handle.record_id} started ({requested} s at {resolved_fps} fps). "
             "Keep calling tools; collect with computer_record_result(session_id, "
-            f'record_id="{record_id}") — it blocks until the recording ends (≤ 10 s '
+            f'record_id="{handle.record_id}") — it blocks until the recording ends (≤ 10 s '
             "plus the encode) or peeks with block=false."
         ),
-        extra={
-            "region": context_info.get("region"),
-            "monitor_bounds": context_info.get("monitor_bounds"),
-            "max_keyframes": resolved_keyframes,
-            "include_video": handle.include_video,
-            "started_at": handle.started_at,
-        },
+        extra=_record_marker_reply_extra,
     )
 
 
@@ -959,6 +1579,7 @@ async def computer_record_result(
     block: bool = True,
     cancel: bool = False,
     include_video: NullableBool = None,
+    video_delivery: NullableStr = None,
 ) -> Any:
     """Collect a recording: block until it ends (≤ 10 s plus the encode), peek,
     or cancel early.
@@ -969,14 +1590,20 @@ async def computer_record_result(
     ``region``, the timeline segments, the window's ``actions``, and
     ``keyframes`` — each with its fetchable ``image_id``) plus the contact
     sheet as an ImageContent (the Cortex cursor composited into every cell),
-    plus the MP4 as an EmbeddedResource when video is attached to THIS reply
+    plus the MP4 video when it is attached to THIS reply — as a written file
+    path (the ``"file"`` delivery default; the entry carries ``delivery:
+    "file"`` and the absolute ``path``, plus ``video_path`` on the payload) or
+    as an EmbeddedResource (``"inline"``, the legacy blob) —
     (``video.included`` with ``bytes``/``width``/``height``/``fps``/``codec``/
     ``encoder``, or ``video.omitted`` naming the closed reason — ALL of them:
     not_requested / too_large / encoder_unavailable / encode_failed /
-    over_budget (retried on a later call) / frames_released).  An
+    over_budget (retried on a later call) / frames_released / write_failed).
+    Most hosts truncate large tool results, so the file path is the default;
+    ``video_delivery="inline"`` is ONLY for hosts known to pass video to the
+    model.  An
     `encode_failed` carrying `aborted: true` (a stop/cancel aborted the
-    encode) is NOT final — a later collect retries while the frames are
-    held.  A peek may
+    encode) is NOT final — a later collect retries while the frames are held.
+    A peek may
     report ``status:`` ``"recording"`` or ``"encoding"`` (the capture
     finished, the video encode is still running).  Fetched keyframes publish
     ``frame_to_canonical`` (``{"scale", "origin"}``) that maps the STORED
@@ -984,10 +1611,11 @@ async def computer_record_result(
     ``image_outbound_scale``.
 
     The video is encoded right after capture (in the recording worker), so the
-    blocking call usually only fetches; a fallback encode is bounded by the
+    blocking call usually only fetches (or, with the default file delivery,
+    only writes the file); a fallback encode is bounded by the
     client budget and returns ``over_budget`` when the next ladder rung cannot
-    fit.  The result call's explicit ``include_video`` wins over the start
-    call's; ``save`` (start only) keeps writing the files.
+    fit.  The result call's explicit ``include_video`` and ``video_delivery``
+    win over the start call's; ``save`` (start only) keeps writing the files.
 
     ``block=false`` peeks a RUNNING recording: result ``marker``, status
     ``recording``, with ``elapsed`` and ``remaining``.  ``cancel=true`` stops
@@ -1011,6 +1639,12 @@ async def computer_record_result(
         return _record_rejection(
             "unknown_record",
             "record_id must be a non-empty string as returned by computer_record.",
+        )
+    if not _valid_video_delivery(video_delivery):
+        return _record_rejection(
+            "invalid_video_delivery",
+            "video_delivery must be \"file\" or \"inline\" (null = the recording's "
+            f"start flag, default \"file\"); got {video_delivery!r}.",
         )
     with _lock:
         handle = _RECORDINGS_IN_FLIGHT.get(session_id, {}).get(record_id)
@@ -1041,6 +1675,7 @@ async def computer_record_result(
             record_id,
             result_token="verified",
             include_video=include_video,
+            video_delivery=video_delivery,
             handle=None,
             started_monotonic=call_started,
         )
@@ -1060,6 +1695,7 @@ async def computer_record_result(
             record_id,
             result_token="stopped",
             include_video=include_video,
+            video_delivery=video_delivery,
             handle=handle,
             started_monotonic=call_started,
             cancel_requested=True,
@@ -1075,6 +1711,7 @@ async def computer_record_result(
             record_id,
             result_token="verified",
             include_video=include_video,
+            video_delivery=video_delivery,
             handle=handle,
             started_monotonic=call_started,
             cancel_requested=False,
@@ -1118,6 +1755,7 @@ async def _after_wake(
     *,
     result_token: str,
     include_video: bool | None,
+    video_delivery: str | None = None,
     handle: "_RecordHandle",
     started_monotonic: float,
     cancel_requested: bool,
@@ -1147,6 +1785,7 @@ async def _after_wake(
             result_token=result_token,
             handle=handle,
             include_video=include_video,
+            video_delivery=video_delivery,
             started_monotonic=started_monotonic,
         )
     if getattr(handle, "outcome", None) is not None and getattr(handle.outcome, "error", None):

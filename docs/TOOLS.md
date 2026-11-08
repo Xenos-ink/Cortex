@@ -159,7 +159,8 @@ Observation-only: no action surface, no queue interaction. Behavior:
 computer_execute(session_id, action, x=None, y=None, text=None, keys=None,
                  delta=0, approved=False, expected_effect=None, x2=None, y2=None,
                  target=None, via=None, include_screenshot_after=None,
-                 follow_ups=None, visual_view=None, plan=None, plan_action=None)
+                 follow_ups=None, visual_view=None, plan=None, plan_action=None,
+                 record=None)
 ```
 
 Validates and executes one action through the full pipeline: grounding →
@@ -251,6 +252,78 @@ There is deliberately no `key` action (single keys use `keypress`) and no
   interference event. An executed item's `uncertain`/`failed` verdict rides its
   `follow_up_results` entry while the batch continues; results arrive in
   `follow_up_results` + `follow_ups_stopped_reason` (`null` = ran to completion).
+- Batch replies (WP-E E3): the attached image — and its `image_id`, `pointer`,
+  `last_click` and the frame registered in the evidence store — is the
+  post-action frame of the LAST item that executed (a trailing `wait` counts:
+  click + click + wait 8 shows the board after the opponent replied). If the
+  batch stopped early it is the last item that actually executed. The additive
+  `image_after_item` key names that item's index — ALWAYS present on a
+  multi-item batch's image-bearing reply (including the value 0, when item 0
+  is the last executed one), absent on single-action calls (byte-identical to
+  before) and on replies that serve no image; the verdict fields
+  (`result` / `verification` / `ok`) keep their item-0 meaning. Pressed/Normal
+  follows the same rule applied to the shown item: Pressed if it was a click
+  type and the frame is its own post-click frame.
+
+### Record around the action (`record`, WP-E E1)
+
+- `record` (trailing optional object) starts a background screen recording JUST
+  BEFORE this call's first input is dispatched — the F1 field fix (a recording
+  started in a SEPARATE call always ended 15–30 s before the model's next tool
+  call). Shape: `{"duration_s": 4, "region": null, "fps": null,
+  "max_keyframes": null, "include_video": null, "save": null,
+  "video_delivery": null}` — the SAME bands
+  and validation as `computer_record` (duration 0.5..10 s; fps 1..10, default 5;
+  `max_keyframes` 2..12, default 8; region `[l,t,w,h]` canonical or null = the
+  session monitor; `video_delivery` `"file"` | `"inline"`), through the SAME
+  code path with the SAME typed rejections. ONE coercion rule for BOTH tools
+  (DELTA 2 N1/N2, the Commander's tolerant decision): `fps`/`max_keyframes`
+  go through exactly the same `_coerce_tolerant_int` coercion as
+  `computer_record`'s `NullableInt` boundary — non-integral floats and
+  numeric strings ROUND the same way (`2.7` → 3, `"5.0"` → 5, `"1e1"` → 10);
+  `duration_s` accepts the same shapes pydantic's lax float accepts for
+  `computer_record` — numbers and numeric strings (`"4"` → 4.0); booleans,
+  lists, dicts and non-numeric strings give the typed
+  `invalid_record_fps` / `invalid_record_keyframes` /
+  `invalid_record_duration`. Band checks run AFTER coercion, for both tools,
+  with the same codes. Booleans are rejected on BOTH tools for `duration_s`
+  too: inside the `record` object with the typed `invalid_record_duration`,
+  and on `computer_record`'s own parameter at the boundary (its lax-float
+  conversion would otherwise coerce `True` to a 1-second recording).
+- An INVALID `record` argument (out of band, malformed region, an UNKNOWN KEY
+  inside the object) is a typed rejection of the whole call BEFORE any input —
+  consistent with the unknown-argument rejection; the unknown-key message
+  names the allowed keys.
+- A short pre-roll (`RECORD_PRE_ROLL_SECONDS`, 0.3 s, part of the recording
+  window — never added on top of `duration_s`) captures the "before" state.
+- The reply gains an additive `record` block: `{"started": true, "record_id",
+  "status": "recording", "ends_at", "duration_s", "fps", "region", "message"}`
+  with the collect hint ("collect with computer_record_result(record_id)" — it
+  blocks until the end and its change timeline contains THIS call's own
+  actions). The execute call itself returns as usual and does NOT wait for the
+  recording to end. If the call is refused BEFORE any input (safety denial,
+  approval hold, a zero-effect rejection) the recording is cancelled
+  immediately and the block gains `cancelled: "action_refused"`; if the call
+  dies after the recording started (a cancellation or any exception) the
+  recording is cancelled before the error propagates.
+- Works with flat actions, `follow_ups` batches and plan steps (accepted on the
+  plan submission call and on `plan_action="continue"` calls; the recording
+  starts just before the step's input). `plan_action="stop"` and a continue
+  past the walk's end dispatch no input and answer
+  `{"started": false, "reason": "no_action"}`.
+- Caps/lease/idle/audit/stop_session behave exactly as for `computer_record`
+  (same registry): if a cap is reached the action STILL runs and the block
+  says `{"started": false, "reason": ...}` — a recording problem never refuses
+  the action. The closed `started:false` reason set (derived from
+  `EXECUTE_RECORD_NOT_STARTED_REASONS` in `server/record.py`):
+  `recording_limit` / `text_session_no_screen` / `invalid_region` /
+  `session_stopped` / `record_start_failed` / `no_action`.
+- ON-DISK HONESTY (DELTA 1 m7): whenever `include_video` is requested (or
+  `save=true`) under the default `video_delivery="file"`, the screen video is
+  SAVED TO DISK under the Cortex recordings folder (the audit dir's
+  `recordings/` — the same folder `save=true` uses) and there is NO automatic
+  cleanup. The write is atomic (temp file + rename) and happens ONCE per
+  recording; later collects reuse the path.
 
 ### Waypoint plans (`plan`, `plan_action`)
 
@@ -332,7 +405,8 @@ read-only retrieval and stays ALLOWED during a plan lease.
 
 ```text
 computer_record(session_id, duration_s, region=None, fps=None,
-                max_keyframes=None, include_video=None, save=None)
+                max_keyframes=None, include_video=None, save=None,
+                video_delivery=None)
 ```
 
 Starts recording the session's monitor (or a canonical `region`) IN THE
@@ -389,7 +463,7 @@ computer_execute(session_id, action="click", x=980, y=44,
 
 ```text
 computer_record_result(session_id, record_id, block=True, cancel=False,
-                       include_video=None)
+                       include_video=None, video_delivery=None)
 ```
 
 Collect a recording: block until it ends (≤ 10 s plus the encode), peek, or
@@ -408,10 +482,22 @@ cancel early.
   `not_requested` / `too_large` / `encoder_unavailable` / `encode_failed` /
   `over_budget` (the client budget could not fit the next ladder rung; retried on
   a later call) / `frames_released` (the held frames were evicted under the
-  recording pool's byte cap before any video was stored). The final omissions are
+  recording pool's byte cap before any video was stored) / `write_failed` (WP-E:
+  the default file delivery could not write the MP4; retried on a later
+  collect). The final omissions are
   reused on later collections without re-running the ladder; only `over_budget`
-  retries. An `encode_failed` carrying `aborted: true` (a stop/cancel aborted the
-  encode) is NOT final — a later collect retries while the frames are held.
+  and `write_failed` retry. An `encode_failed` carrying `aborted: true` (a
+  stop/cancel aborted the encode) is NOT final — a later collect retries while
+  the frames are held.
+- `video_delivery` (WP-E, on BOTH recording tools, trailing optional): `"file"`
+  (the DEFAULT) or `"inline"`. Most hosts truncate large tool results — a
+  196-562 KB MP4 blob never reached the model in the field — so `"file"` is the
+  default: the MP4 is written under the recordings folder (the same place
+  `save=true` uses; one file, no double write) and the video entry carries its
+  absolute `path` (plus `video_path` on the payload) with NO blob. `"inline"`
+  keeps today's EmbeddedResource — only for hosts known to pass video to the
+  model. The result call's explicit `video_delivery` wins over the start call's.
+  The contact sheet image stays inline either way.
 - The result call's explicit `include_video` wins over the start call's; `save`
   (a start-only flag) keeps writing the files either way.
 - `block=false` peeks a RUNNING recording: `result:"marker"`, `status`

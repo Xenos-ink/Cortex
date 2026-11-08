@@ -43,6 +43,16 @@ from computer_use_mcp.vision.recorder import (
 import computer_use_mcp.server.record as server_record
 
 
+@pytest.fixture(autouse=True)
+def _recordings_under_tmp_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """DELTA 1 M1: NO test in this file may write outside tmp_path — the
+    data-dir resolver (``COMPUTER_USE_MCP_LOG_DIR``) points at the per-test
+    tmp audit dir, so even a direct ``_finished_reply`` unit call that forgets
+    ``video_delivery="inline"`` (the default "file" delivery writes MP4s) can
+    never touch the real user dir."""
+    monkeypatch.setenv("COMPUTER_USE_MCP_LOG_DIR", str(tmp_path / "audit"))
+
+
 # --- harness ---------------------------------------------------------------------------------
 
 
@@ -542,7 +552,12 @@ def test_ladder_reuses_a_final_omission_and_retries_over_budget(
     monkeypatch.setattr(recorder_module, "_encode_one", counter2)
     third = _run(
         server_record._finished_reply(
-            "sess_reuse", bundle, recording2, result_token="verified", include_video=True
+            "sess_reuse",
+            bundle,
+            recording2,
+            result_token="verified",
+            include_video=True,
+            video_delivery="inline",  # CHANGED PIN (WP-E E2): default is now "file"
         )
     )
     assert counter2.count == 1  # the retry actually ran
@@ -592,7 +607,12 @@ def test_finished_reply_carries_the_mp4_embedded_resource() -> None:
     bundle = SimpleNamespace(extra={RECORDING_STORE_KEY: pool})
     blocks = _run(
         server_record._finished_reply(
-            "sess_video", bundle, recording, result_token="verified", include_video=True
+            "sess_video",
+            bundle,
+            recording,
+            result_token="verified",
+            include_video=True,
+            video_delivery="inline",  # WP-E E2 CHANGED PIN: default is now "file"
         )
     )
     texts = [block for block in blocks if block.type == "text"]
@@ -637,7 +657,12 @@ def test_video_entry_is_per_reply_after_a_stored_encode() -> None:
     bundle = SimpleNamespace(extra={RECORDING_STORE_KEY: pool})
     _run(
         server_record._finished_reply(
-            "sess_video", bundle, recording, result_token="verified", include_video=True
+            "sess_video",
+            bundle,
+            recording,
+            result_token="verified",
+            include_video=True,
+            video_delivery="inline",  # CHANGED PIN (WP-E E2): default is now "file"
         )
     )
     assert recording.video is not None and recording.video.get("included")
@@ -657,7 +682,12 @@ def test_video_stays_retrievable_by_record_id_while_retained() -> None:
     bundle = SimpleNamespace(extra={RECORDING_STORE_KEY: pool})
     _run(
         server_record._finished_reply(
-            "sess_video", bundle, recording, result_token="verified", include_video=True
+            "sess_video",
+            bundle,
+            recording,
+            result_token="verified",
+            include_video=True,
+            video_delivery="inline",  # WP-E E2 CHANGED PIN: default is now "file"
         )
     )
     retained = pool.lookup_video(recording.record_id)
@@ -667,7 +697,12 @@ def test_video_stays_retrievable_by_record_id_while_retained() -> None:
     # fixed reuse test: nothing is reset, the pool is the source of truth).
     blocks = _run(
         server_record._finished_reply(
-            "sess_video", bundle, recording, result_token="verified", include_video=True
+            "sess_video",
+            bundle,
+            recording,
+            result_token="verified",
+            include_video=True,
+            video_delivery="inline",  # WP-E E2 CHANGED PIN: default is now "file"
         )
     )
     resource = [block for block in blocks if block.type == "resource"][0]
@@ -709,10 +744,20 @@ def test_concurrent_double_result_encodes_once(monkeypatch: pytest.MonkeyPatch) 
     async def _double() -> list[Any]:
         return await asyncio.gather(
             server_record._finished_reply(
-                "sess_flight", bundle, recording, result_token="verified", include_video=True
+                "sess_flight",
+                bundle,
+                recording,
+                result_token="verified",
+                include_video=True,
+                video_delivery="inline",  # WP-E E2 CHANGED PIN: default is now "file"
             ),
             server_record._finished_reply(
-                "sess_flight", bundle, recording, result_token="verified", include_video=True
+                "sess_flight",
+                bundle,
+                recording,
+                result_token="verified",
+                include_video=True,
+                video_delivery="inline",  # WP-E E2 CHANGED PIN: default is now "file"
             ),
         )
 

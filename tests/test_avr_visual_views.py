@@ -1086,11 +1086,16 @@ def test_visual_view_is_trailing_optional_none_default_on_both_tools() -> None:
     # CHANGED PIN (WP7b, §-reason: contract item (a) — `plan`/`plan_action` join as
     # trailing optionals AFTER visual_view, so visual_view is no longer the LAST
     # parameter; the pinned property "trailing optional, None == legacy" is
-    # unchanged, and visual_view keeps its position and None default)
-    assert execute_params[-1].name == "plan_action"
+    # unchanged, and visual_view keeps its position and None default.
+    # CHANGED PIN again (WP-E, ORVEX-2026-109): `record` joins as the newest
+    # trailing optional after plan_action — same property, position after the
+    # plan handshake parameters).
+    assert execute_params[-1].name == "record"
     assert execute_params[-1].default is None
-    assert execute_params[-3].name == "visual_view"
-    assert execute_params[-3].default is None
+    assert execute_params[-2].name == "plan_action"
+    assert execute_params[-2].default is None
+    assert execute_params[-4].name == "visual_view"
+    assert execute_params[-4].default is None
     assert [p.name for p in execute_params][:12] == [
         "session_id", "action", "x", "y", "text", "keys", "delta", "approved",
         "expected_effect", "x2", "y2", "target",

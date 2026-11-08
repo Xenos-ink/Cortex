@@ -140,6 +140,12 @@ VIDEO_OMITTED_ENCODER_UNAVAILABLE = "encoder_unavailable"
 VIDEO_OMITTED_ENCODE_FAILED = "encode_failed"
 VIDEO_OMITTED_OVER_BUDGET = "over_budget"
 VIDEO_OMITTED_FRAMES_RELEASED = "frames_released"
+#: WP-E (ORVEX-2026-109 E2): with the default ``video_delivery="file"`` the MP4
+#: is written under the recordings folder instead of travelling as a blob (most
+#: hosts truncate large tool results — a 196-562 KB blob never reached the
+#: model).  A FAILED FILE WRITE is its own closed omission reason; it is NOT
+#: final — a later collect retries the write from the retained/stored video.
+VIDEO_OMITTED_WRITE_FAILED = "write_failed"
 VIDEO_OMISSION_REASONS = (
     VIDEO_OMITTED_NOT_REQUESTED,
     VIDEO_OMITTED_TOO_LARGE,
@@ -147,6 +153,7 @@ VIDEO_OMISSION_REASONS = (
     VIDEO_OMITTED_ENCODE_FAILED,
     VIDEO_OMITTED_OVER_BUDGET,
     VIDEO_OMITTED_FRAMES_RELEASED,
+    VIDEO_OMITTED_WRITE_FAILED,
 )
 
 #: DELTA 2 n3: omissions that are FINAL for the recording — later result
@@ -498,6 +505,9 @@ class Recording:
     video: dict[str, Any] | None = None
     want_video: bool = False  # B2: persisted from the start call
     save: bool = False  # B2: persisted from the start call
+    #: WP-E E2: the start call's video delivery ("file" default | "inline") —
+    #: persisted like want_video/save so a late result call honours it.
+    video_delivery: str = "file"
     error: str | None = None
     error_kind: str | None = None  # "capture_failed" | "record_worker_failed"
     started_at_epoch: float = 0.0
@@ -506,6 +516,15 @@ class Recording:
     # pointer metadata (fetch draws nothing either way; this makes the worker's
     # encode and the fallback encode honour the session even without the handle).
     composite_pointer: bool = True
+    # DELTA 2 N3: the per-recording video-file lock — created WHEN THE
+    # RECORDING IS BUILT (never a check-then-set inside the reply worker, where
+    # two concurrent collects could each create their own lock and both
+    # write).
+    _video_file_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    # DELTA 2 N4: the write-once memo for the delivered MP4 (set by
+    # ``server.record._write_delivered_video_once`` under the lock above).
+    _written_video_path: str | None = None
+    _written_video_error: str | None = None
 
     @property
     def effective_fps(self) -> float:
