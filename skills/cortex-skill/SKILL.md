@@ -5,7 +5,7 @@ description: Use when about to drive a desktop through the Cortex MCP server (st
 
 # Driving Cortex
 
-This file is the operating manual for the ten Cortex tools; references are linked at the end.
+This file is the operating manual for the twelve Cortex tools; references are linked at the end.
 
 ## The loop
 
@@ -27,7 +27,7 @@ for staleness, risk and approval), **execution** (input dispatched), **verificat
   that stopped has already dispatched its earlier items — after a batch stop, send only
   the unexecuted items (`follow_up_results`; a `time_budget` stop = the call's wall clock ran out — resend the rest in a new call).
 
-## The ten tools
+## The twelve tools
 
 | Tool | For | Use it when |
 |---|---|---|
@@ -41,6 +41,8 @@ for staleness, risk and approval), **execution** (input dispatched), **verificat
 | `computer_wait_status` | block for the next wait segment, or peek with `block=false` | you were told `status:"running"` |
 | `computer_cancel_wait` | end a wait early; reports elapsed/remaining | you no longer need the wait |
 | `computer_fetch_image` | re-serve a frame this session captured earlier, by `image_id` | look BACK at a frame a reply carried |
+| `computer_record` | record 0.5–10 s of the screen in the background; returns at once with a `record_id` | you want evidence of what a sequence of actions does to the screen |
+| `computer_record_result` | collect a recording: timeline + actions, keyframe contact sheet, optional MP4 video | after `computer_record`, to block for / peek at / cancel the recording |
 
 `computer_observe` / `computer_screenshot` / `computer_zoom` / `computer_execute` /
 `computer_fetch_image` return MCP content blocks; judge them by what you actually

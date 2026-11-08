@@ -116,12 +116,12 @@ def _table_tool_names(text: str) -> set[str]:
     ) | set(re.findall(r"^\| `([a-z][a-z_0-9]+)`\s+\|", text, re.M))
 
 
-def test_the_served_surface_is_exactly_the_documented_ten_tools() -> None:
+def test_the_served_surface_is_exactly_the_documented_twelve_tools() -> None:
     live = _live_tool_names()
     assert live == EXPECTED_TOOLS  # the probe constant and the served surface agree
     for doc, heading in (
-        (ROOT / "README.md", "The ten tools at a glance"),
-        (ROOT / "docs" / "TOOLS.md", "The ten tools"),
+        (ROOT / "README.md", "The twelve tools at a glance"),
+        (ROOT / "docs" / "TOOLS.md", "The twelve tools"),
     ):
         text = _read(doc)
         assert _table_tool_names(_section(text, heading)) == EXPECTED_TOOLS, doc

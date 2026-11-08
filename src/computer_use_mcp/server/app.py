@@ -71,7 +71,8 @@ from __future__ import annotations
 import asyncio
 
 # Registration order (plan.md section 4): tool modules imported in the exact source
-# order of the ten @mcp.tool() decorators of the old monolith. lifecycle FIRST also
+# order of the ten @mcp.tool() decorators of the old monolith (the surface has since
+# grown to twelve — the WP-R recording tools register last). lifecycle FIRST also
 # initializes instance/schemas/state/replies/wait_machine/plan_surface before any
 # registration (matches the old 161-163 -> 183-195 -> 3643 -> registrations order).
 from . import lifecycle  # start_session, stop_session
@@ -79,6 +80,7 @@ from . import wait  # computer_wait, computer_wait_status, computer_cancel_wait
 from . import observe  # computer_observe, computer_screenshot, computer_zoom
 from . import execute  # computer_execute
 from . import fetch  # computer_fetch_image
+from . import record  # computer_record, computer_record_result (ORVEX-2026-109 WP-R)
 from .instance import mcp
 
 

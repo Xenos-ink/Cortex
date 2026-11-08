@@ -14,7 +14,7 @@ JSON Schema to the maximally-compatible type-array form via a reusable
 (``Annotated[TolerantX | None, marker]``), COMPOSING the REM-F runtime
 validators — runtime validation is byte-identical, only the wire shape changes.
 
-  pin A — every inputSchema property of all 10 tools contains NO "anyOf" key,
+  pin A — every inputSchema property of all 12 tools contains NO "anyOf" key,
           enumerated through the REAL FastMCP tool metadata, with the flattened
           type-array shapes asserted and "default": null preserved;
   pin B — REM-F no-regression: x still validates 679 / 679.0 / "679" and
@@ -54,6 +54,8 @@ from computer_use_mcp.core.state import SessionRegistry
 # RESTATED (ORVEX-2026-108 WP6, decision D-1): the wait family — ``computer_wait``,
 # ``computer_cancel_wait``, ``computer_wait_status`` — joins as tools 7-9.
 # RESTATED (ORVEX-2026-108 WP5): ``computer_fetch_image`` joins as the tenth.
+# RESTATED (ORVEX-2026-109 WP-R): the recording family — ``computer_record``,
+# ``computer_record_result`` — joins as tools 11-12.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
@@ -65,6 +67,8 @@ ALL_TOOLS = (
     "computer_cancel_wait",
     "computer_wait_status",
     "computer_fetch_image",
+    "computer_record",
+    "computer_record_result",
 )
 
 
@@ -155,7 +159,7 @@ def _payload(response: Any) -> dict[str, Any]:
     return response
 
 
-# --- pin A: NO anyOf in ANY inputSchema property of the 10 tools -------------------------------
+# --- pin A: NO anyOf in ANY inputSchema property of the 12 tools -------------------------------
 
 
 def test_pin_a_no_anyof_in_any_tool_input_schema(fresh_server: Any) -> None:
@@ -166,7 +170,7 @@ def test_pin_a_no_anyof_in_any_tool_input_schema(fresh_server: Any) -> None:
     live client-side validator rejected. This pin walks the FULL inputSchema of
     each tool (nested, including $defs) through the REAL FastMCP tool metadata.
     """
-    assert len(ALL_TOOLS) == 10  # six deterministic/observation + wait family (D-1) + fetch (WP5)
+    assert len(ALL_TOOLS) == 12  # six deterministic/observation + wait family (D-1) + fetch (WP5) + recording family (WP-R)
     total_hits: list[str] = []
     for name in ALL_TOOLS:
         schema = _meta(name).arg_model.model_json_schema()

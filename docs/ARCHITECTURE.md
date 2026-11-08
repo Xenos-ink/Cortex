@@ -103,7 +103,7 @@ pipeline/agent.py     direct-action pipeline (run_single) + queue +       -> aud
 planning/plan.py      waypoint plans, lease aggregate, failure taxonomy   -> models, security.redaction
 planning/*            checkpoint/resume/context (live) + subtask/plan     -> models, limits,
                       validator helpers (checkpoint path)                   redaction
-server/*              the ten MCP tools, reply shaping, wait machine,     -> everything above
+server/*              the twelve MCP tools, reply shaping, wait machine,     -> everything above
                       lifecycle/kill funnel/idle reaper, schemas            (+ mcp SDK)
 cli.py                install/update/probe/uninstall-ocr CLI              (stdlib only)
 ```

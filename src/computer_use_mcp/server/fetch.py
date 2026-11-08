@@ -20,6 +20,7 @@ from ..vision.evidence import (
     RETIRE_BYTE_CAP,
     RETIRE_COUNT_CAP,
     evidence_store,
+    recording_store,
 )
 from ..vision.pointer_sprite import composite
 from ..vision.visual_views import encode_png_b64
@@ -94,12 +95,18 @@ def _fetch_outbound_worker(
     pointer: tuple[float, float] | None,
     pointer_state: str | None,
     crop_region: Any,
+    sprite_scale: float = 1.0,
 ) -> tuple[str, str, float | None, bool]:
     """DELTA 1 M5: ALL fetch PIL work — decode, composite, PNG encode AND the
     outbound ladder — in ONE synchronous worker, run via ``asyncio.to_thread``
     (the loop never touches pixels). Returns ``(bounded_b64, mime, scale,
     pointer_in_image)``; without a drawable pointer this is the plain ladder of
     the clean stored bytes.
+
+    DELTA 2 NIT: ``sprite_scale`` sizes the sprite for the FRAME it is drawn
+    on — recording keyframes carry their capture-time frame scale, so the
+    cursor looks the same size there as in the sheet and the video (never
+    oversized on a downscaled keyframe).
     """
     composited: Image.Image | None = None
     in_image = False
@@ -113,7 +120,9 @@ def _fetch_outbound_worker(
             if crop_region:
                 x_local -= crop_region[0]
                 y_local -= crop_region[1]
-            composited, in_image = composite(image, x_local, y_local, pointer_state, 1.0)
+            composited, in_image = composite(
+                image, x_local, y_local, pointer_state, sprite_scale
+            )
             if in_image:
                 serving_b64 = encode_png_b64(composited)
         except Exception:  # noqa: BLE001 - additive decoration, never a reply-breaker
@@ -205,6 +214,21 @@ async def _fetch_image_response(store: EvidenceStore, image_id: str, bundle: Any
         and pointer_y is not None
     ):
         pointer_x = pointer_y = pointer_state = None
+    # DELTA 2 N1: recording keyframes carry their frame→canonical mapping —
+    # the sprite is drawn at the keyframe's own sprite scale (NIT: never
+    # oversized on a downscaled keyframe) and the reply's pointer block is
+    # reported in CANONICAL coordinates (canonical = origin + frame × scale).
+    frame_to_canonical: dict[str, Any] | None = None
+    sprite_scale = 1.0
+    if frame.source == "computer_record" and hasattr(store, "frame_to_canonical"):
+        try:
+            frame_to_canonical = store.frame_to_canonical(frame.image_id)
+        except Exception:  # noqa: BLE001 - additive metadata, never a reply-breaker
+            frame_to_canonical = None
+        if frame_to_canonical is not None and frame_to_canonical.get("scale", 0) > 0:
+            sprite_scale = round(1.0 / float(frame_to_canonical["scale"]), 6)
+        else:
+            frame_to_canonical = None
     (
         bounded_b64,
         mime_type,
@@ -216,15 +240,25 @@ async def _fetch_image_response(store: EvidenceStore, image_id: str, bundle: Any
         None if pointer_x is None or pointer_y is None else (pointer_x, pointer_y),
         pointer_state,
         frame.crop_region,
+        sprite_scale,
     )
     if pointer_x is not None and pointer_state is not None:
-        # The additive pointer block describes the FRAME: canonical coordinates
-        # as stored, the composite's honest in_image verdict, and the stored
-        # capture-time last_click snapshot (never a ring read at fetch time).
+        # The additive pointer block describes the FRAME.  DELTA 2 N1: for
+        # RECORDING keyframes it reports CANONICAL coordinates — the same
+        # space observation fetches use — via the published frame→canonical
+        # mapping (canonical = origin + frame px × scale); the sprite itself
+        # was drawn at the stored FRAME-space point, at the keyframe's own
+        # sprite scale.  For observation frames the stored pointer is already
+        # canonical and nothing changes.
+        block_x, block_y = pointer_x, pointer_y
+        if frame_to_canonical is not None:
+            origin = frame_to_canonical["origin"]
+            block_x = origin[0] + pointer_x * frame_to_canonical["scale"]
+            block_y = origin[1] + pointer_y * frame_to_canonical["scale"]
         pointer_block = {
             "pointer": {
-                "x": pointer_x,
-                "y": pointer_y,
+                "x": block_x,
+                "y": block_y,
                 "state": pointer_state,
                 "in_image": bool(pointer_in_image),
             },
@@ -263,6 +297,12 @@ async def _fetch_image_response(store: EvidenceStore, image_id: str, bundle: Any
         "evidence_retention": store.retention(),
         "freshness_note": FETCH_FRESHNESS_NOTE,
     }
+    # DELTA 2 N1: recording keyframes publish their frame→canonical mapping —
+    # a keyframe pixel maps back with canonical = origin + pixel × scale.
+    # (The inverted coordinate_scale_* is deliberately omitted for recording
+    # frames; observation frames keep their documented direction.)
+    if frame.source == "computer_record" and frame_to_canonical is not None:
+        metadata["frame_to_canonical"] = frame_to_canonical
     # WP-C3: the additive pointer block rides the verified image reply only, and
     # describes the FRAME (capture-time snapshot; DELTA 1 M4).
     if pointer_block is not None:
@@ -338,4 +378,18 @@ async def computer_fetch_image(session_id: str, image_id: str) -> Any:
         return _evidence_rejection(
             EVIDENCE_REFUSE_DISPOSED, _EVIDENCE_STORE_DISPOSED_MESSAGE
         )
+    # WP-R (ORVEX-2026-109): recording keyframes live in the SEPARATE recording
+    # pool.  An id is resolved against the observation pool FIRST (unchanged for
+    # observation ids — including their expiry answers); only a clean
+    # not_found consults the recording pool, so a retired observation frame
+    # still answers image_expired naming ITS policy.  Recording keyframes keep
+    # the img_ id format and composite the cursor from the stored pointer
+    # exactly like observation frames (WP-C).
+    lookup: EvidenceLookup = store.lookup(image_id)
+    if lookup.outcome == "not_found":
+        recording_pool = recording_store(bundle.extra)
+        if recording_pool is not None:
+            recording_lookup = recording_pool.lookup(image_id)
+            if recording_lookup.outcome != "not_found":
+                return await _fetch_image_response(recording_pool, image_id, bundle)
     return await _fetch_image_response(store, image_id, bundle)

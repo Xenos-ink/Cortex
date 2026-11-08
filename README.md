@@ -14,7 +14,7 @@
 
 Cortex (current release: 0.7.6) is a Model Context Protocol (MCP) server that
 gives AI agents a safe, verifiable way to operate a Windows desktop. An agent
-connects over stdio and gets a guarded, ten-tool surface: open a session,
+connects over stdio and gets a guarded, twelve-tool surface: open a session,
 capture the screen (full, aliased, or zoomed to a region), execute actions
 (click, type, hotkeys, drags, window focus, app attach-or-launch, waypoint
 plans), wait with explicit completion, re-serve captured frames, and stop
@@ -79,7 +79,7 @@ drive it:
    `start_session(resume_from_checkpoint=…)` (reply keys `resumed` /
    `continuation_of` / `resumed_from_checkpoint`; honest scope in docs/TOOLS.md).
 
-## The ten tools at a glance
+## The twelve tools at a glance
 
 | Tool | For |
 |---|---|
@@ -93,6 +93,8 @@ drive it:
 | `computer_wait_status` | block for the next wait segment, or peek with `block=false` |
 | `computer_cancel_wait` | end a wait early; reports elapsed/remaining |
 | `computer_fetch_image` | re-serve a frame a reply carried, by `image_id` |
+| `computer_record` | record 0.5–10 s of the screen in the background; returns at once |
+| `computer_record_result` | collect a recording: timeline, keyframe contact sheet, optional MP4 |
 
 `computer_execute` dispatches exactly 13 actions — `click`, `double_click`,
 `right_click`, `drag`, `type`, `keypress`, `hotkey`, `scroll`, `wait`, `done`,
@@ -122,7 +124,7 @@ Full reference: **[docs/REPLY-CONTRACT.md](docs/REPLY-CONTRACT.md)**.
 ## The cortex-skill (fast-path driving)
 
 `cortex-skill` is a small agent skill that teaches any LLM/VLM driving Cortex
-to spend fewer turns: the operating loop, the ten-tool table, reply reading,
+to spend fewer turns: the operating loop, the twelve-tool table, reply reading,
 decision policy, efficiency defaults, and escalation — with the detailed
 protocol in `references/` (plan protocol, reply contract, glossary, worked
 examples). It changes nothing in the server; it shapes how the driving host
@@ -220,7 +222,7 @@ published**; every harness artifact carries
 | Document | Contents |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | install, update, the `cortex-mcp` CLI, agent install prompts |
-| [docs/TOOLS.md](docs/TOOLS.md) | the ten tools: parameters, bounds, semantics |
+| [docs/TOOLS.md](docs/TOOLS.md) | the twelve tools: parameters, bounds, semantics |
 | [docs/REPLY-CONTRACT.md](docs/REPLY-CONTRACT.md) | the unified reply contract, token sets, error codes |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | limits (live/reserved) and every env var |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the layered package, pipeline, pinned contracts |

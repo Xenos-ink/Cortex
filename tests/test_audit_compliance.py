@@ -241,6 +241,11 @@ async def test_audit_event_types_fields_and_jsonl_conformance(
         "session_stop",
     }
     expected -= _LOOP_ONLY_EVENT_TYPES
+    # WP-R (ORVEX-2026-109): the recording lifecycle events are emitted by the
+    # computer_record path, exercised by the dedicated tests/test_record_tools.py
+    # module, not by this scenario drive.
+    _RECORDING_EVENT_TYPES = {"record_start", "record_complete", "record_cancelled"}
+    expected -= _RECORDING_EVENT_TYPES
     missing = expected - audit_types(all_events)
     assert not missing, f"audit event types never emitted: {sorted(missing)}"
 

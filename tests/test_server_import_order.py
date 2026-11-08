@@ -10,8 +10,9 @@ observe → fetch is GONE (D8b: the shared def's home is observe); execute →
 observe (``_resolve_view_param``) remains — real-server registration is
 unaffected because app.py imports observe BEFORE execute.
 
-A2: the TEN tools are registered in exactly the monolith's decorator (source)
-order, proven through the PUBLIC ``list_tools()`` API on a clean-state import of
+A2: the TWELVE tools are registered in exactly the monolith's decorator (source)
+order with the WP-R recording tools LAST (server/record.py imported after
+computer_fetch_image), proven through the PUBLIC ``list_tools()`` API on a clean-state import of
 ``computer_use_mcp.server.app`` (registration = decoration at def site; app.py
 imports the tool modules in registration order; the installed SDK stores tools
 in an insertion-ordered dict — mcp/server/fastmcp/tools/tool_manager.py:28/:72).
@@ -48,7 +49,9 @@ SUBMODULES = (
     "app",
 )
 
-#: the exact monolith registration order (plan.md §4) = tools/list order
+#: the exact monolith registration order (plan.md §4) = tools/list order;
+#: WP-R (ORVEX-2026-109): the recording tools register AFTER computer_fetch_image
+#: (server/app.py imports ``record`` last).
 EXPECTED_TOOL_ORDER = (
     "start_session",
     "stop_session",
@@ -60,6 +63,8 @@ EXPECTED_TOOL_ORDER = (
     "computer_zoom",
     "computer_execute",
     "computer_fetch_image",
+    "computer_record",
+    "computer_record_result",
 )
 
 
@@ -95,7 +100,8 @@ def test_a2_tool_registration_order_is_the_monolith_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Clean-state import of server.app, then the PUBLIC list_tools() must list
-    exactly the ten tools in the old decorator (source) order."""
+    exactly the twelve tools in the old decorator (source) order, with the WP-R
+    recording tools registered after computer_fetch_image."""
     _clean_server_modules(monkeypatch)
     app_module = importlib.import_module(f"{SERVER_PKG}.app")
     tools = asyncio.run(app_module.mcp.list_tools())

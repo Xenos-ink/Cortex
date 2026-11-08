@@ -1,7 +1,7 @@
 # Installing and updating Cortex
 
 Ways to install, register, verify, and update the Cortex MCP server. Current
-truth; the served tool set the probes below check is the ten-tool surface
+truth; the served tool set the probes below check is the twelve-tool surface
 documented in [TOOLS.md](TOOLS.md).
 
 ## Requirements
@@ -178,10 +178,11 @@ STEP 3 — INSTALL (inside the canonical clone):
       python -m venv .venv
   - Refresh the editable install:
       "<venv python>" -m pip install -e "<canonical>"
-  - Verify with the probe from STEP 1a. It MUST print PASS and list exactly these 10 tools:
+  - Verify with the probe from STEP 1a. It MUST print PASS and list exactly these 12 tools:
       start_session, stop_session, computer_observe, computer_screenshot,
       computer_execute, computer_zoom, computer_wait, computer_cancel_wait,
-      computer_wait_status, computer_fetch_image
+      computer_wait_status, computer_fetch_image, computer_record,
+      computer_record_result
     If it prints FAIL: report the printed reason to the user and stop.
 
 STEP 4 — REGISTER THE SERVER FOR YOURSELF (your own config, not anyone else's):
@@ -238,10 +239,11 @@ STEP 2 — RECORD THE CURRENT STATE, THEN FAST-FORWARD:
 STEP 3 — REFRESH AND VERIFY:
   - Refresh the editable install:
       "<venv python>" -m pip install -e "<canonical>"
-  - Re-run the probe. It MUST print PASS (exactly the 10 tools: start_session,
+  - Re-run the probe. It MUST print PASS (exactly the 12 tools: start_session,
     stop_session, computer_observe, computer_screenshot, computer_execute,
     computer_zoom, computer_wait, computer_cancel_wait, computer_wait_status,
-    computer_fetch_image). If it prints FAIL: report the printed reason and stop.
+    computer_fetch_image, computer_record, computer_record_result). If it
+    prints FAIL: report the printed reason and stop.
 
 STEP 4 — REPORT to the user:
   - version BEFORE -> version AFTER (re-run the version command if needed),

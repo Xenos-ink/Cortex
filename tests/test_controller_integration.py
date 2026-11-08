@@ -215,6 +215,14 @@ def fresh_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setattr(srv_server_lifecycle, "_bundles", {})
     monkeypatch.setattr(srv_server_wait_machine, "_bundles", srv_server_lifecycle._bundles)
     monkeypatch.setattr(srv_server_wait, "_bundles", srv_server_lifecycle._bundles)
+    # WP-R (ORVEX-2026-109): the recording machinery keeps its own module binding.
+    import computer_use_mcp.server.record_machine as srv_server_record_machine
+
+    monkeypatch.setattr(srv_server_record_machine, "_bundles", srv_server_lifecycle._bundles)
+    # DELTA 1 m11 (test isolation): a failed assertion before a cancel cleanup
+    # must not leak an in-flight recording (and the process cap of 2) into
+    # later tests.
+    srv_server_record_machine.reset_registries()
     return None
 
 
@@ -317,7 +325,7 @@ async def test_type_action_verified_via_expected_text(
 
 
 async def test_wait_action_uncertain_verification_is_tolerated(
-    fresh_server: Any, monkeypatch: PatchMonkey
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Identical screenshots: the wait's visual-change check is uncertain. Documented
     # carve-out: a wait makes no semantic claim, so uncertain continues (never success).

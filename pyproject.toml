@@ -11,6 +11,11 @@ dependencies = [
   "mss>=9.0.1",
   "pyautogui>=0.9.54; sys_platform == 'win32'",
   "httpx>=0.27.0",
+  # WP-R (ORVEX-2026-109): the screen recording's MP4 encoder (H.264).
+  # DELTA 1 m10: constrained to <19 — only 18.1.0 on cp311 was gated; the
+  # 19.x API and wheel contents are unverified. The import is lazy and an
+  # encoder_unavailable reply (never a crash) covers an environment without it.
+  "av>=18.1.0,<19",
 ]
 
 [project.optional-dependencies]

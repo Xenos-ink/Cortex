@@ -88,6 +88,17 @@ Per-surface subsets:
 - The terminal plan: `verified` / `unknown` / `failed` / `stopped`.
 - The wait family: `marker` / `rejected` / `failed`.
 - Fetch: `verified` / `rejected`.
+- The record family (`computer_record` / `computer_record_result`): `marker`
+  (a start or a peek), `verified` (a finished recording, collected),
+  `stopped` (a recording cancelled early — the frames captured so far are
+  kept and reported; for a recording this is NOT the terminal-plan meaning),
+  `failed` (`capture_failed` / `record_worker_failed`), `rejected` (bands,
+  caps, text session).  A malformed / out-of-bounds / unverifiable REGION is
+  the typed `invalid_region` ERROR (`ok:false`, an `error` key, NO `result`
+  token — the same shape as the observe family's refusals), never a
+  `rejected` reply.  A peek may report `status: "encoding"` (DELTA 2: the
+  capture finished and the video encode is still running) instead of
+  `"recording"`.
 - `computer_observe` / `computer_screenshot` / `computer_zoom` carry NO `result`
   token (read-only; their refusals are `ok:false` + typed error).
 
@@ -100,6 +111,44 @@ plan declared but that produced no evidence is an absence of evidence, not a
 success); any failed step caps it at `failed`. Plan STEP replies report
 `uncertain`; the `unknown` token is reserved for the terminal aggregate. Read
 `failure_reason` + `not_executed` before choosing continue/stop/replace.
+
+## The recording family (computer_record / computer_record_result)
+
+The screen recorder (ORVEX-2026-109 WP-R + DELTA 1) follows the same envelope:
+
+- Start and peek replies are `marker` (`status: "recording"`, with
+  `elapsed_seconds` / `remaining_seconds`); a finished collection is
+  `verified`; an early cancel is `stopped` — for a RECORDING this means the
+  capture ended early and the frames captured so far are kept and reported
+  (`cancelled: true` in the payload), NOT the terminal-plan meaning.
+- A broken capture is `failed` with reasons `["capture_failed"]` (the grabber
+  raised — secure desktop, UAC, locked workstation) or
+  `["record_worker_failed"]` (any worker exception), plus the error text in
+  `message` and the frames captured before the failure. Never a silent empty
+  `verified`.
+- The `video` entry on a finished payload ALWAYS says what happened, from a
+  closed omission set: `included` (a blob is attached to THIS reply), or
+  `omitted` = `not_requested` | `too_large` | `encoder_unavailable` |
+  `encode_failed` | `over_budget` | `frames_released` (the held frames were
+  evicted under the recording pool's byte cap before any video was stored).
+  `included` appears only when a blob is attached to THIS reply; the encoder
+  actually used rides as `encoder` (`h264_mf` or `libx264`).  `too_large` /
+  `encoder_unavailable` / `encode_failed` / `frames_released` are FINAL for
+  the recording (later calls reuse them), with two retried cases:
+  `over_budget` (a later call has a fresh budget) and an `encode_failed`
+  carrying `aborted: true` (a stop/cancel aborted the encode; a later collect
+  retries while the frames are held).  Video may be requested on EITHER call.
+- Recording keyframes fetch through `computer_fetch_image` like observation
+  frames.  DELTA 2: the fetch publishes `frame_to_canonical` —
+  `{"scale": <canonical px per frame px>, "origin": [x, y]}` (the canonical
+  region origin) — so a keyframe pixel maps back with
+  `canonical = origin + pixel × scale`.  This maps the STORED keyframe
+  pixels: a copy served downscaled must first be divided by its
+  `image_outbound_scale`.  The `pointer` block is reported in
+  CANONICAL coordinates (the same space observation fetches use); the
+  inverted `coordinate_scale_*` is deliberately OMITTED for recording
+  frames.  `coordinate_space: "recording_frame"` names the frame space the
+  sprite was drawn in.
 
 ## The `failure_reason` vocabulary (closed)
 

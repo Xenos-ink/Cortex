@@ -80,7 +80,7 @@ REFERENCE_FILES = (
     "glossary.md",
     "examples.md",
 )
-_NUM_WORDS = {10: "ten"}
+_NUM_WORDS = {12: "twelve"}
 
 
 def _read(path: Path) -> str:
@@ -131,7 +131,7 @@ def _registered_tool_names() -> set[str]:
     return {tool.name for tool in asyncio.run(mcp.list_tools())}
 
 
-def test_the_served_surface_is_exactly_the_documented_ten_tools() -> None:
+def test_the_served_surface_is_exactly_the_documented_twelve_tools() -> None:
     assert _registered_tool_names() == set(EXPECTED_TOOLS), (
         "the served tool surface changed; the skill is a contract and must be "
         "restated in the SAME change that adds or removes a tool"
@@ -140,7 +140,7 @@ def test_the_served_surface_is_exactly_the_documented_ten_tools() -> None:
 
 def test_the_core_names_the_tool_count_from_the_live_surface() -> None:
     count = len(EXPECTED_TOOLS)
-    assert _NUM_WORDS[count] == "ten"
+    assert _NUM_WORDS[count] == "twelve"
     assert f"## The {_NUM_WORDS[count]} tools" in _core()
     assert f"the {_NUM_WORDS[count]} Cortex tools" in _core()
 

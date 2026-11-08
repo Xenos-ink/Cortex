@@ -992,13 +992,14 @@ def test_fetch_image_is_an_async_def_with_plain_parameters(fresh_server: Any) ->
     assert set(meta.fn_metadata.arg_model.model_fields) == {"session_id", "image_id"}
 
 
-async def test_the_served_surface_is_ten_tools() -> None:
-    """WP5 restates the two tool-count pins to 10, never deletes them."""
+async def test_the_served_surface_is_twelve_tools() -> None:
+    """WP5 restated the tool-count pins to 10; WP-R (ORVEX-2026-109) restates
+    them to 12 — the pins are restated, never deleted."""
     names = {tool.name for tool in await srv_server_app.mcp.list_tools()}
-    assert len(names) == 10, sorted(names)
+    assert len(names) == 12, sorted(names)
     assert "computer_fetch_image" in names
     assert cli_module.EXPECTED_TOOLS == names
-    assert len(cli_module.EXPECTED_TOOLS) == 10
+    assert len(cli_module.EXPECTED_TOOLS) == 12
 
 
 # --- concurrency and leak -------------------------------------------------------------------

@@ -890,6 +890,8 @@ async def test_every_registered_tool_rejects_an_unknown_argument() -> None:
         "computer_zoom",
         "computer_execute",
         "computer_fetch_image",
+        "computer_record",
+        "computer_record_result",
     }
     tools = await mcp.list_tools()
     assert {tool.name for tool in tools} == expected, sorted(tool.name for tool in tools)

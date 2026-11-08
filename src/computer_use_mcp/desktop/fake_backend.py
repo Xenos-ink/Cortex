@@ -7,7 +7,7 @@ import io
 import os
 import time
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from ..core.models import MonitorInfo, Observation, WindowInfo
 from .backend import (
@@ -399,6 +399,29 @@ class FakeComputerBackend(ComputerBackend):
     def set_cursor(self, position: tuple[int, int]) -> None:
         """Set the fake cursor in physical virtual-screen coordinates (GetCursorPos convention)."""
         self._cursor_physical = position
+
+    def record_cursor_position(self) -> tuple[int, int] | None:
+        """WP-R: the recorder's per-frame pointer read — the fake cursor, never
+        the real ``GetCursorPos`` (fake sessions never touch the desktop)."""
+        return self._cursor_physical
+
+    def record_frame_grab(self, left: int, top: int, width: int, height: int) -> Image.Image:
+        """WP-R: the fake recording grabber — a synthetic frame for the requested
+        PHYSICAL rectangle (white base + the frame counter, so consecutive grabs
+        change pixels and the change timeline has something honest to diff).
+
+        Real sessions never see this method (the recorder builds its own mss
+        instance through ``_resolve_grabber``); the fake never touches the
+        desktop or the backend's identical-pixel cache.
+        """
+        self.record_grab_counter = getattr(self, "record_grab_counter", 0) + 1
+        image = Image.new("RGB", (max(1, int(width)), max(1, int(height))), (250, 250, 250))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle(
+            (0, 0, max(1, min(width, 8 + self.record_grab_counter * 4)) - 1, 8),
+            fill=(20, 20, 20),
+        )
+        return image
 
     def last_click(self) -> dict[str, object] | None:
         """WP-C2: the most recent completed press from the pointer ring (real-backend parity)."""

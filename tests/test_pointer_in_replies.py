@@ -405,10 +405,11 @@ def test_show_pointer_advertised_plain_schema_with_none_default() -> None:
     assert observe_params[-1] == "show_pointer"
 
 
-async def test_tool_count_stays_10(fresh_server: Any) -> None:
-    """WP-C adds NO new tool: the stdio surface stays exactly 10 tools."""
+async def test_tool_count_stays_12(fresh_server: Any) -> None:
+    """WP-C added no tool and WP-R adds the recording family: the stdio surface
+    is exactly 12 tools (10 + computer_record + computer_record_result)."""
     tools = await srv_server_app.mcp.list_tools()
-    assert len(tools) == 10
+    assert len(tools) == 12
     names = {tool.name for tool in tools}
     assert "computer_fetch_image" in names and "computer_observe" in names
 

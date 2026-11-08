@@ -53,6 +53,7 @@ import base64
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -603,3 +604,518 @@ def register_frame(
         pointer_state=pointer_state,
         last_click=last_click,
     )
+
+
+# --- WP-R (ORVEX-2026-109): the SEPARATE recording pool ---------------------------------------
+# Recording keyframes live in their OWN bounded per-session pool so a recording
+# can NEVER evict an observation frame (and vice versa): 24 frames / 16 MB /
+# 3600 s, the entries of at most the LAST 2 recordings per session.  The held
+# MP4 bytes (``include_video``) are priced against the same byte cap — they are
+# resident memory exactly like the frames.  The lifecycle shape is the
+# observation store's: the key is written once at bundle construction, every
+# accessor only READS it, and :func:`dispose_recording_store` is the single
+# removal site (session teardown).
+
+#: The ``bundle.extra`` key the recording pool lives under.
+RECORDING_STORE_KEY = "recording_store"
+
+#: Keyframes retained per session (across the last recordings).
+RECORDING_MAX_FRAMES = 24
+
+#: Bytes retained per session — keyframe base64 AND held MP4 bytes together.
+RECORDING_MAX_BYTES = 16 * 1024 * 1024
+
+#: Seconds recording entries stay retrievable.
+RECORDING_MAX_AGE_SECONDS = 3600.0
+
+#: Entries from the last N completed recordings per session are kept; older
+#: recordings' entries are retired wholesale on each new completion.
+RECORDING_KEEP_RECORDINGS = 2
+
+
+@dataclass(frozen=True)
+class RecordingEntry:
+    """One retained recording-pool entry.
+
+    ``kind`` is ``"keyframe"`` (a JPEG frame, fetchable by ``image_id`` through
+    ``computer_fetch_image`` exactly like an observation frame) or ``"video"``
+    (the held MP4, retrievable later by ``record_id`` while retained).
+    """
+
+    entry_id: str
+    kind: str  # "keyframe" | "video"
+    session_id: str
+    record_id: str
+    image_base64: str | None  # keyframe JPEG, base64
+    video_bytes: bytes | None  # MP4
+    byte_size: int
+    captured_monotonic: float
+    captured_at: str
+    width: int
+    height: int
+    t_ms: float = 0.0
+    pointer_x: float | None = None
+    pointer_y: float | None = None
+    pointer_state: str | None = None
+    fps: int | None = None
+    mime: str = "image/jpeg"
+    uri: str | None = None
+
+
+class RecordingEvidenceStore:
+    """The bounded, in-memory, per-session recording pool (own lock)."""
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        clock: Callable[[], float] | None = None,
+        wall_clock: Callable[[], float] | None = None,
+        max_frames: int = RECORDING_MAX_FRAMES,
+        max_bytes: int = RECORDING_MAX_BYTES,
+        max_age_seconds: float = RECORDING_MAX_AGE_SECONDS,
+        keep_recordings: int = RECORDING_KEEP_RECORDINGS,
+    ) -> None:
+        self.session_id = session_id
+        self._clock = clock or _monotonic
+        self._wall_clock = wall_clock or _wall_clock
+        self.max_frames = max(1, int(max_frames))
+        self.max_bytes = max(1, int(max_bytes))
+        self.max_age_seconds = float(max_age_seconds)
+        self.keep_recordings = max(1, int(keep_recordings))
+        self._lock = threading.Lock()
+        self._entries: "OrderedDict[str, RecordingEntry]" = OrderedDict()
+        self._retired: "OrderedDict[str, str]" = OrderedDict()
+        # DELTA 2 N1: per-keyframe frame metadata — entry_id -> (scale, origin)
+        # where scale is FRAME px per CANONICAL px and origin is the canonical
+        # region origin.  Published as `frame_to_canonical` (the INVERSE scale
+        # — canonical px per frame px — plus the origin); the inverted
+        # `coordinate_scale_*` is deliberately OMITTED for recording frames.
+        self._frame_meta: dict[str, tuple[float, tuple[int, int]]] = {}
+        # DELTA 3 BLOCKER: held-frames entry id -> weakref to the owning
+        # Recording; eviction frees the Recording's JPEGs through it.
+        self._frames_owners: dict[str, Any] = {}
+        self._bytes = 0
+        self._disposed = False
+
+    # --- introspection ----------------------------------------------------------------------
+
+    @property
+    def disposed(self) -> bool:
+        with self._lock:
+            return self._disposed
+
+    @property
+    def max_bytes(self) -> int:  # noqa: A003 - mirrors EvidenceStore's shape
+        return self._max_bytes
+
+    @max_bytes.setter
+    def max_bytes(self, value: int) -> None:
+        self._max_bytes = max(1, int(value))
+
+    def entry_count(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def total_bytes(self) -> int:
+        with self._lock:
+            return self._bytes
+
+    def age_seconds(self, entry_id: str) -> float:
+        """Monotonic age of one retained entry (0.0 when unknown / retired)."""
+        with self._lock:
+            entry = self._entries.get(entry_id)
+            if entry is None:
+                return 0.0
+            return round(max(0.0, self._clock() - entry.captured_monotonic), 3)
+
+    def retention(self) -> dict[str, Any]:
+        return {
+            "max_frames": self.max_frames,
+            "max_bytes": self._max_bytes,
+            "max_age_seconds": self.max_age_seconds,
+            "keep_recordings": self.keep_recordings,
+        }
+
+    # --- internals --------------------------------------------------------------------------
+
+    def _retire_locked(self, entry_id: str, reason: str) -> None:
+        entry = self._entries.pop(entry_id, None)
+        if entry is not None:
+            self._bytes -= entry.byte_size
+            # DELTA 3 BLOCKER: when a held-frames entry is evicted, FREE the
+            # Recording's JPEGs via the registered owner callback — no phantom
+            # memory outside the cap.
+            if entry.kind == "frames":
+                owner = self._frames_owners.pop(entry_id, None)
+                if owner is not None:
+                    recording = owner()
+                    if recording is not None:
+                        try:
+                            recording.release_frame_payloads()
+                        except Exception:  # noqa: BLE001 - never break eviction
+                            pass
+        self._frame_meta.pop(entry_id, None)
+        self._retired[entry_id] = reason
+        while len(self._retired) > EVIDENCE_RETIRED_TOMBSTONES:
+            self._retired.popitem(last=False)
+
+    def _sweep_locked(self) -> None:
+        now = self._clock()
+        for entry_id, entry in list(self._entries.items()):
+            if (now - entry.captured_monotonic) > self.max_age_seconds:
+                self._retire_locked(entry_id, RETIRE_AGE_CAP)
+
+    def _evict_frames_entries_locked(self, *, exclude_record_id: str | None = None) -> None:
+        """DELTA 3 BLOCKER: held-frames entries are the FIRST thing evicted
+        under pressure — dropped (oldest first) before any keyframe, video or
+        observation frame.  Each drop FREES the owning Recording's JPEGs."""
+        frames_ids = [
+            entry_id
+            for entry_id, entry in self._entries.items()
+            if entry.kind == "frames"
+            and (exclude_record_id is None or entry.record_id != exclude_record_id)
+        ]
+        for entry_id in frames_ids:
+            self._retire_locked(entry_id, RETIRE_BYTE_CAP)
+
+    def _evict_older_recordings_locked(self, record_id: str) -> None:
+        """Keep only the last ``keep_recordings`` recordings' entries."""
+        record_ids: list[str] = []
+        for entry in self._entries.values():
+            if entry.record_id not in record_ids:
+                record_ids.append(entry.record_id)
+        while len(record_ids) > self.keep_recordings:
+            oldest = record_ids.pop(0)
+            if oldest == record_id:
+                continue
+            for entry_id, entry in list(self._entries.items()):
+                if entry.record_id == oldest:
+                    self._retire_locked(entry_id, RETIRE_COUNT_CAP)
+
+    def _oldest_frames_entry_locked(self) -> str | None:
+        """DELTA 4 F2: the OLDEST ``kind=="frames"`` entry, or None."""
+        for entry_id, entry in self._entries.items():
+            if entry.kind == "frames":
+                return entry_id
+        return None
+
+    def _make_room_locked(self, byte_size: int) -> bool:
+        """Evict until the new byte size fits; False when hopeless.
+
+        DELTA 3 BLOCKER + DELTA 4 F2: held-frames entries are evicted FIRST
+        (oldest frames first, each drop freeing the owning Recording's
+        JPEGs) — but ONLY while the pool is actually OVER one of its caps
+        (the incoming store would not fit, or the count cap is full).  A
+        store that fits never evicts a frames entry."""
+        while (
+            self._oldest_frames_entry_locked() is not None
+            and (
+                len(self._entries) >= self.max_frames
+                or self._bytes + byte_size > self._max_bytes
+            )
+        ):
+            oldest_frames = self._oldest_frames_entry_locked()
+            if oldest_frames is None:
+                break
+            self._retire_locked(oldest_frames, RETIRE_BYTE_CAP)
+        while self._entries and len(self._entries) >= self.max_frames:
+            self._retire_locked(next(iter(self._entries)), RETIRE_COUNT_CAP)
+        while self._entries and self._bytes + byte_size > self._max_bytes:
+            self._retire_locked(next(iter(self._entries)), RETIRE_BYTE_CAP)
+        return self._bytes + byte_size <= self._max_bytes
+
+    # --- the two public operations ----------------------------------------------------------
+
+    def store_keyframe(
+        self,
+        *,
+        record_id: str,
+        jpeg_base64: str,
+        width: int,
+        height: int,
+        t_ms: float,
+        pointer_x: float | None,
+        pointer_y: float | None,
+        pointer_state: str | None,
+        frame_scale: float | None = None,
+        origin: tuple[int, int] = (0, 0),
+    ) -> str | None:
+        """Retain one recording keyframe; return its ``img_`` id (None when
+        disposed or refused — the reply simply carries no id for that frame).
+
+        DELTA 1 M2/DELTA 2 N1: ``pointer_x``/``pointer_y`` arrive in FRAME
+        space (the frame's own pixels — fetch composites at exactly those
+        pixels); ``frame_scale`` (FRAME px per CANONICAL px) and ``origin``
+        (the canonical region origin) are stored as the keyframe's
+        ``frame_to_canonical`` metadata — the fetch publishes
+        ``{"scale": 1/frame_scale, "origin": [x, y]}`` and the pointer block
+        in CANONICAL coordinates (never the inverted ``coordinate_scale_*``)."""
+        byte_size = len(jpeg_base64)
+        with self._lock:
+            if self._disposed:
+                return None
+            if byte_size > self._max_bytes:
+                return None
+            self._evict_older_recordings_locked(record_id)
+            if not self._make_room_locked(byte_size):
+                return None
+            entry = RecordingEntry(
+                entry_id=_new_image_id(),
+                kind="keyframe",
+                session_id=self.session_id,
+                record_id=record_id,
+                image_base64=jpeg_base64,
+                video_bytes=None,
+                byte_size=byte_size,
+                captured_monotonic=self._clock(),
+                captured_at=_iso_utc(self._wall_clock()),
+                width=width,
+                height=height,
+                t_ms=t_ms,
+                pointer_x=pointer_x,
+                pointer_y=pointer_y,
+                pointer_state=pointer_state,
+                mime="image/jpeg",
+                uri=None,
+            )
+            self._entries[entry.entry_id] = entry
+            self._bytes += byte_size
+            self._frame_meta[entry.entry_id] = (
+                float(frame_scale) if frame_scale else 1.0,
+                (int(origin[0]), int(origin[1])),
+            )
+            return entry.entry_id
+
+    def frame_to_canonical(self, image_id: str) -> dict[str, Any] | None:
+        """DELTA 2 N1: the keyframe's frame→canonical mapping —
+        ``{"scale": <canonical px per frame px>, "origin": [x, y]}`` — or
+        None for unknown ids and non-recording frames.  A keyframe pixel
+        maps back with ``canonical = origin + pixel × scale``."""
+        with self._lock:
+            meta = self._frame_meta.get(image_id)
+        if meta is None:
+            return None
+        scale, origin = meta
+        effective = scale if scale > 0 else 1.0
+        return {"scale": round(1.0 / effective, 6), "origin": [origin[0], origin[1]]}
+
+    def store_frames(self, *, record_id: str, total_bytes: int, owner: Any = None) -> bool:
+        """DELTA 2 N3 / DELTA 3 BLOCKER: account for the recording's held
+        frame JPEGs under the SAME byte cap (the Recording keeps the bytes;
+        this entry is the accounting + eviction marker, with ``owner`` a
+        WEAK-reference-able callback target whose JPEGs are FREED when the
+        entry is evicted — no phantom memory).
+
+        Eviction priority: OTHER recordings' held-frames entries are dropped
+        first (oldest first, each freeing its Recording); THIS recording's
+        keyframes and video are NEVER evicted to make room for its frames —
+        if they still do not fit, the entry is REFUSED (False) and the caller
+        releases the JPEGs at once and marks the recording
+        ``frames_released`` (``frames_accounted`` stays False — honest)."""
+        with self._lock:
+            if self._disposed or total_bytes <= 0 or total_bytes > self._max_bytes:
+                return False
+            entry_id = f"{record_id}:frames"
+            old = self._entries.pop(entry_id, None)
+            if old is not None:
+                self._bytes -= old.byte_size
+                self._frames_owners.pop(entry_id, None)
+            # DELTA 4 F2: held frames of OTHER recordings die first ONLY
+            # while the pool is over one of its caps (this store would not
+            # fit, or the count cap is full) — never merely because a store
+            # happened.  Each drop frees its Recording's JPEGs; THIS
+            # recording's keyframes and video are never touched for its
+            # frames.
+            over_caps = (
+                len(self._entries) >= self.max_frames
+                or self._bytes + total_bytes > self._max_bytes
+            )
+            if over_caps:
+                self._evict_frames_entries_locked(exclude_record_id=record_id)
+            self._evict_older_recordings_locked(record_id)
+            if self._bytes + total_bytes > self._max_bytes:
+                return False
+            if len(self._entries) >= self.max_frames and entry_id not in self._entries:
+                return False
+            entry = RecordingEntry(
+                entry_id=entry_id,
+                kind="frames",
+                session_id=self.session_id,
+                record_id=record_id,
+                image_base64=None,
+                video_bytes=None,
+                byte_size=total_bytes,
+                captured_monotonic=self._clock(),
+                captured_at=_iso_utc(self._wall_clock()),
+                width=0,
+                height=0,
+                mime="application/octet-stream",
+                uri=None,
+            )
+            self._entries[entry_id] = entry
+            self._bytes += total_bytes
+            try:
+                self._frames_owners[entry_id] = weakref.ref(owner) if owner is not None else None
+            except TypeError:
+                self._frames_owners[entry_id] = None
+            return True
+
+    def remove_frames(self, record_id: str) -> bool:
+        """DELTA 3 BLOCKER: drop the recording's held-frames accounting entry
+        — called whenever the payloads are RELEASED (for example after a
+        successful fallback encode), so the pool's byte count always matches
+        real held memory."""
+        with self._lock:
+            entry = self._entries.pop(f"{record_id}:frames", None)
+            if entry is None:
+                return False
+            self._bytes -= entry.byte_size
+            self._frames_owners.pop(entry.entry_id, None)
+            return True
+
+    def has_frames(self, record_id: str) -> bool:
+        """DELTA 2 N3: the recording's held frames are STILL accounted (not
+        evicted).  False ⇒ the frames are gone (released)."""
+        with self._lock:
+            if self._disposed:
+                return False
+            entry = self._entries.get(f"{record_id}:frames")
+            return entry is not None and entry.kind == "frames"
+
+    def store_video(
+        self,
+        *,
+        record_id: str,
+        mp4_bytes: bytes,
+        width: int,
+        height: int,
+        fps: int,
+        frames: int,
+    ) -> bool:
+        """Retain the held MP4; best-effort.
+
+        DELTA 1: the entry is priced exactly like a keyframe — the length of
+        the base64 string the blob travels as (the NIT: pricing is consistent
+        across both entry kinds) — and REPLACING an existing video for the
+        same record_id subtracts the old entry's size first (no phantom
+        bytes, no premature eviction)."""
+        with self._lock:
+            if self._disposed or len(mp4_bytes) > self._max_bytes:
+                return False
+            # Replace accounting: the old entry's bytes leave the pool before
+            # the new ones are counted (DELTA 1 M5).
+            old = self._entries.pop(record_id, None)
+            if old is not None:
+                self._bytes -= old.byte_size
+                self._frame_meta.pop(record_id, None)
+            blob_b64 = base64.b64encode(mp4_bytes).decode("ascii")
+            byte_size = len(blob_b64)
+            self._evict_older_recordings_locked(record_id)
+            if not self._make_room_locked(byte_size):
+                return False
+            entry = RecordingEntry(
+                entry_id=record_id,
+                kind="video",
+                session_id=self.session_id,
+                record_id=record_id,
+                image_base64=None,
+                video_bytes=mp4_bytes,
+                byte_size=byte_size,
+                captured_monotonic=self._clock(),
+                captured_at=_iso_utc(self._wall_clock()),
+                width=width,
+                height=height,
+                fps=fps,
+                mime="video/mp4",
+                uri=f"cortex://recording/{record_id}.mp4",
+            )
+            self._entries[record_id] = entry
+            self._bytes += byte_size
+            return True
+
+    def lookup(self, image_id: Any) -> EvidenceLookup:
+        """Session-scoped keyframe lookup (the EvidenceStore answer shape, so
+        ``computer_fetch_image`` can consult both pools through one code path)."""
+        if not isinstance(image_id, str) or not image_id:
+            return EvidenceLookup("not_found")
+        with self._lock:
+            if self._disposed:
+                return EvidenceLookup("disposed", reason=EVIDENCE_REFUSE_DISPOSED)
+            entry = self._entries.get(image_id)
+            if entry is not None and entry.kind == "keyframe":
+                age = self._clock() - entry.captured_monotonic
+                if age > self.max_age_seconds:
+                    self._retire_locked(image_id, RETIRE_AGE_CAP)
+                    return EvidenceLookup("expired", reason=RETIRE_AGE_CAP)
+                frame = StoredFrame(
+                    image_id=entry.entry_id,
+                    session_id=self.session_id,
+                    image_base64=entry.image_base64 or "",
+                    byte_size=entry.byte_size,
+                    captured_monotonic=entry.captured_monotonic,
+                    captured_at=entry.captured_at,
+                    width=entry.width,
+                    height=entry.height,
+                    source="computer_record",
+                    # DELTA 1 M2: the pointer is stored in FRAME space (the
+                    # frame's own pixels — fetch composites at scale 1.0 on
+                    # exactly those pixels); the frame↔canonical scale rides
+                    # the coordinate metadata so a consumer can convert.
+                    # DELTA 2 N1: the inverted coordinate_scale_* is OMITTED
+                    # for recording frames — the direction (frame px per
+                    # canonical px) is the OPPOSITE of the field's documented
+                    # meaning elsewhere; the mapping is published as
+                    # `frame_to_canonical` instead.
+                    coordinate_scale_x=None,
+                    coordinate_scale_y=None,
+                    coordinate_space="recording_frame",
+                    pointer_x=entry.pointer_x,
+                    pointer_y=entry.pointer_y,
+                    pointer_state=entry.pointer_state,
+                )
+                return EvidenceLookup("found", frame=frame)
+            if image_id in self._retired:
+                return EvidenceLookup("expired", reason=self._retired[image_id])
+            return EvidenceLookup("not_found")
+
+    def lookup_video(self, record_id: str) -> RecordingEntry | None:
+        """The retained MP4 for one record_id, or None (expired/never held)."""
+        with self._lock:
+            if self._disposed:
+                return None
+            self._sweep_locked()
+            entry = self._entries.get(record_id)
+            if entry is not None and entry.kind == "video":
+                return entry
+            return None
+
+    def dispose(self) -> int:
+        with self._lock:
+            released = len(self._entries)
+            self._entries.clear()
+            self._retired.clear()
+            self._frame_meta.clear()
+            self._frames_owners.clear()
+            self._bytes = 0
+            self._disposed = True
+            return released
+
+
+def new_recording_store(session_id: str) -> RecordingEvidenceStore:
+    """Build the recording pool for a NEW session (once, at bundle construction)."""
+    return RecordingEvidenceStore(session_id)
+
+
+def recording_store(extra: dict[str, Any]) -> RecordingEvidenceStore | None:
+    """The session's recording pool, or None when there is none (never creates)."""
+    store = extra.get(RECORDING_STORE_KEY)
+    return store if isinstance(store, RecordingEvidenceStore) else None
+
+
+def dispose_recording_store(extra: dict[str, Any]) -> int:
+    """Pop the key and empty the pool (the single removal site, session teardown)."""
+    store = extra.pop(RECORDING_STORE_KEY, None)
+    if isinstance(store, RecordingEvidenceStore):
+        return store.dispose()
+    return 0

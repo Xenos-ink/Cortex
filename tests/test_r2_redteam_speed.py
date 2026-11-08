@@ -832,6 +832,8 @@ async def test_r2_d11_fault_injection_window_and_focus_change_must_not_verify_ty
 #: ``computer_wait_status`` — joins as tools 7-9.
 #: RESTATED (ORVEX-2026-108 WP5): ``computer_fetch_image`` — the evidence store's
 #: retrieval tool — joins as the tenth.
+#: RESTATED (ORVEX-2026-109 WP-R): ``computer_record`` / ``computer_record_result``
+#: — the background screen-recording family — join as tools 11-12.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
@@ -843,13 +845,16 @@ ALL_TOOLS = (
     "computer_cancel_wait",
     "computer_wait_status",
     "computer_fetch_image",
+    "computer_record",
+    "computer_record_result",
 )
 
 
-async def test_r2_surface_is_exactly_ten_plain_tools() -> None:
-    """Exactly 10 registered tools (AL-002 zoom was the sixth; ORVEX-2026-108 WP6
+async def test_r2_surface_is_exactly_twelve_plain_tools() -> None:
+    """Exactly 12 registered tools (AL-002 zoom was the sixth; ORVEX-2026-108 WP6
     decision D-1 added the wait family as 7-9; WP5 added the evidence-retrieval
-    tool as the tenth); every advertised inputSchema contains ZERO anyOf and
+    tool as the tenth; ORVEX-2026-109 WP-R added the recording family as 11-12);
+    every advertised inputSchema contains ZERO anyOf and
     ZERO $ref/$defs (the wire-compat contract, re-walked independently)."""
     tools = await srv_server_app.mcp.list_tools()
     assert sorted(tool.name for tool in tools) == sorted(ALL_TOOLS)

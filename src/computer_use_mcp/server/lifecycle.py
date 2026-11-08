@@ -28,7 +28,14 @@ from ..planning.long_running import LongRunningRuntime
 from ..planning.resume_manager import ResumeBundle, ResumeRefusalError
 from ..security.audit import AuditLogger, Metrics
 from ..security.safety import SafetyPolicy
-from ..vision.evidence import EVIDENCE_STORE_KEY, dispose_store, new_store
+from ..vision.evidence import (
+    EVIDENCE_STORE_KEY,
+    RECORDING_STORE_KEY,
+    dispose_recording_store,
+    dispose_store,
+    new_recording_store,
+    new_store,
+)
 from .instance import logger, mcp
 from .plan_surface import _audit_plan_terminal, _plan_guard, _plan_terminal_audit_lock
 from .pointer_reply import resolve_show_pointer
@@ -36,6 +43,7 @@ from .schemas import NullableBool, NullableNumberMap, NullableStr, NullableStrLi
 
 if TYPE_CHECKING:
     from .wait_machine import _WaitHandle
+from .record_machine import _cancel_all_recordings, _join_record_threads
 from .state import (
     IMAGE_DELIVERY_TEXT_NOTE,
     _LazyProvider,
@@ -58,7 +66,6 @@ from .state import (
     _stopped_sessions,
 )
 from .wait_machine import _cancel_all_waits, _join_wait_threads
-
 
 
 def _get_bundle(session_id: str) -> _SessionBundle:
@@ -110,7 +117,7 @@ def _close_stopped_bundle(
     audit_stop_events: bool = True,
     audit_metadata: dict[str, Any] | None = None,
     snapshot_extra: dict[str, Any] | None = None,
-) -> list["_WaitHandle"]:
+) -> tuple[list["_WaitHandle"], list[Any]]:
     """Shared kill-path cleanup (F7): one stopping flavor, one hygiene outcome.
 
     Arms the token (idempotent), mirrors the flag onto the legacy session state, audits
@@ -137,7 +144,9 @@ def _close_stopped_bundle(
     tombstone ring is dropped with it (a stopped session performs no further work).
     The cancelled handles are RETURNED — the caller MUST join them OUTSIDE the
     server lock (K-5: the workers' own ``finally`` needs that lock; joining under
-    it deadlocks). ``_join_wait_threads`` is the bounded join helper.
+    it deadlocks). ``_join_wait_threads`` is the bounded join helper. DELTA 2
+    N4: the RETURN is a tuple ``(wait_handles, record_handles)`` — stop_session
+    joins BOTH via ``asyncio.to_thread`` (never on the loop).
     """
     bundle.context.stop.stop()
     bundle.state.stopped = True
@@ -161,6 +170,10 @@ def _close_stopped_bundle(
         # WP6: cancel-and-detach the session's waits while the teardown is atomic
         # (cancel flags set + registries cleaned under ``_lock``, before the pop).
         cancelled_wait_handles = _cancel_all_waits(session_id)
+        # WP-R: cancel-and-detach the session's recordings too — same shape, the
+        # join happens OUTSIDE the lock below (K-5: the workers' own ``finally``
+        # needs that lock; joining under it deadlocks).
+        cancelled_record_handles = _cancel_all_recordings(session_id)
         # WP7b: release the plan lease HERE — inside the locked teardown, before
         # the bundle is popped. This is the ONE session-end funnel (stop_session,
         # the WP-S idle reaper and the internal kill path all call this), so an
@@ -176,6 +189,10 @@ def _close_stopped_bundle(
         # tool call resuming after the pop cannot find a store — the resurrection race
         # dies here.  A second call finds no key and releases nothing (exactly-once).
         released_frames = dispose_store(bundle.extra)
+        # WP-R: dispose the recording pool HERE too — the same ONE session-end
+        # path, so a recording session's keyframes/video bytes are released
+        # exactly once with the rest of the session's evidence.
+        released_recordings = dispose_recording_store(bundle.extra)
         # WP13 DELTA-3 m3 (VAL-WP13-01): stop the backend's UIA COM owner thread
         # (releases the CUIAutomation pointer ON the owner thread +
         # CoUninitialize) — no leaked thread or COM object per session. The
@@ -207,6 +224,16 @@ def _close_stopped_bundle(
         logger.debug(
             "evidence store disposed on stop; released %d frame(s)", released_frames
         )
+    if released_recordings:
+        logger.debug(
+            "recording pool disposed on stop; released %d recording entry(ies)",
+            released_recordings,
+        )
+    # DELTA 2 N4: the recording JOIN moved out of _close_stopped_bundle — the
+    # function RETURNS the cancelled recording handles and stop_session joins
+    # them via asyncio.to_thread (exactly like the wait family).  The
+    # worker's encode carries a stop check, so a stop during an encode
+    # aborts it promptly and the bounded join never blocks the loop.
     if active_plan_lease is not None:
         # WP8: a killed session (stop_session / idle reap / internal kill path)
         # ends any active plan as cancelled — audited OUTSIDE the lock, after the
@@ -236,7 +263,10 @@ def _close_stopped_bundle(
                 failure_reason="cancelled",
                 source=source,
             )
-    return cancelled_wait_handles
+    # DELTA 2 N4: the cancelled RECORDING handles ride the return — the caller
+    # (stop_session) joins them OFF the loop via asyncio.to_thread, exactly
+    # like the wait handles.
+    return cancelled_wait_handles, cancelled_record_handles
 
 
 
@@ -807,6 +837,10 @@ def start_session(
                 # "this session is gone", and every evidence hook treats it as exactly
                 # that: it writes nothing and creates nothing.
                 EVIDENCE_STORE_KEY: new_store(session_id, image_delivery=image_mode),
+                # WP-R: the SEPARATE recording pool — created once here, next to
+                # the observation store (a lazily-created key could be resurrected
+                # by a tool call racing a teardown, the WP5 doctrine).
+                RECORDING_STORE_KEY: new_recording_store(session_id),
             },
         )
     try:
@@ -845,6 +879,8 @@ def start_session(
                 # failed resume start is a session END — dispose the store exactly
                 # once before the bundle is dropped, like every other end path.
                 dispose_store(bundle.extra)
+                # WP-R: the recording pool too (same exactly-once disposal shape).
+                dispose_recording_store(bundle.extra)
                 # WP13 DELTA-4 N3 (VAL-WP13-02): stop the backend's UIA COM owner
                 # thread too — never let close() raise into the refusal path.
                 resume_backend_close = getattr(backend, "close", None)
@@ -990,9 +1026,17 @@ async def stop_session(session_id: str) -> dict[str, object]:
     # the loop thread via asyncio.to_thread — starvation-safe because the F1
     # loop-signal design never uses the default executor for waits, so one short
     # bounded join thread can never delay a wait wake.
-    cancelled_wait_handles = _close_stopped_bundle(session_id, bundle, source="stop_session")
+    # DELTA 2 N4: the cancelled RECORDINGS are joined the SAME way — OFF the
+    # loop via asyncio.to_thread (never on it); the worker's encode carries a
+    # stop check, so a stop during an encode aborts it promptly and the join
+    # budget bounds it.
+    cancelled_wait_handles, cancelled_record_handles = _close_stopped_bundle(
+        session_id, bundle, source="stop_session"
+    )
     if cancelled_wait_handles:
         await asyncio.to_thread(_join_wait_threads, cancelled_wait_handles)
+    if cancelled_record_handles:
+        await asyncio.to_thread(_join_record_threads, cancelled_record_handles)
     return {
         "ok": True,
         "session_id": session_id,

@@ -2161,6 +2161,51 @@ class ComputerUseAgent:
     ) -> tuple[SingleActionOutcome, Observation | None]:
         """One direct action through the full pipeline; returns (outcome, post-capture).
 
+        DELTA 2 n6 (WP-R): the dispatched-action ring keeps its DISPATCH-time
+        stamp (m4) and this thin wrapper UPDATES that entry's result with the
+        final §1 outcome token once the pipeline settles — best-effort, never
+        a gate; an action that died mid-dispatch (``TaskStopped``) keeps its
+        ``"dispatched"`` result.
+        """
+        outcome, post = await self._run_single_pipeline_inner(
+            state,
+            action,
+            approved=approved,
+            expected_effect=expected_effect,
+            source_observation=source_observation,
+            strict_digest=strict_digest,
+        )
+        try:
+            from ..vision.recorder import update_action_result
+
+            token = (
+                execute_result_token(outcome)
+                if outcome.kind == "executed"
+                else str(outcome.kind)
+            )
+            # DELTA 3 n6: match the ring entry by its DISPATCH IDENTITY —
+            # stamped at the dispatch choke point and carried on the action
+            # (an action refused before dispatch has no id and updates
+            # NOTHING).
+            dispatch_id = getattr(action, "_ring_dispatch_id", None)
+            if dispatch_id is not None:
+                update_action_result(self.session_id, dispatch_id, token)
+        except Exception:  # noqa: BLE001 - best-effort metadata, never a gate
+            pass
+        return outcome, post
+
+    async def _run_single_pipeline_inner(
+        self,
+        state: Any,
+        action: GroundedAction,
+        *,
+        approved: bool,
+        expected_effect: str | None = None,
+        source_observation: Observation | None = None,
+        strict_digest: bool = False,
+    ) -> tuple[SingleActionOutcome, Observation | None]:
+        """One direct action through the full pipeline; returns (outcome, post-capture).
+
         ``source_observation`` (PERF-004 C1 observe reuse) injects the caller's fresh
         post-action capture as the grounding source; ``None`` captures at
         ``direct_request`` (rate-gated, host-driven). ``strict_digest`` (queued
@@ -2524,6 +2569,23 @@ class ComputerUseAgent:
             self.enforcer.begin_action()
             self.stop_token.ensure_live()
             started = time.perf_counter()
+            # DELTA 1 m4 (WP-R): the dispatched-action ring is stamped at the
+            # DISPATCH choke point — the dispatch instant is what the
+            # recorder's ±100 ms sheet labels correlate against (the old
+            # finalize-time stamp landed 0.2–2 s late).  An action that dies
+            # mid-dispatch (TaskStopped raised inside the backend) is still
+            # recorded, with result "dispatched".  Best-effort, never a gate.
+            try:
+                from ..vision.recorder import record_dispatched_action
+
+                # DELTA 3 n6: the returned DISPATCH IDENTITY rides the action
+                # so the post-pipeline wrapper updates THIS entry by identity
+                # (never by action name).
+                dispatch_id = record_dispatched_action(self.session_id, action, "dispatched")
+                if dispatch_id is not None and dispatch_id > 0:
+                    action._ring_dispatch_id = dispatch_id
+            except Exception:  # noqa: BLE001 - best-effort metadata, never a gate
+                pass
             try:
                 message = self._backend_execute(action, self.stop_token)
             except FocusDriftError as exc:

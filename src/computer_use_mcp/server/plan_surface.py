@@ -175,7 +175,12 @@ def _active_plan_tool_rejection(bundle: Any) -> dict[str, Any] | None:
     Read-only surfaces that CONSUME the lease's own state stay allowed:
     ``computer_wait_status`` (read-only, master-mission WP6 decision) and
     ``computer_fetch_image`` (S-04: a fetch is a READ-ONLY retrieval of evidence the
-    session already holds). Refused: flat computer_execute (its own gate inside
+    session already holds). WP-R (ORVEX-2026-109): the recording tools
+    ``computer_record`` / ``computer_record_result`` are ALLOWED during a lease
+    too — they dispatch NO input and their capture worker is independent of the
+    lease's grounding premise, and recording a plan's on-screen effect while
+    the plan runs is a main use, so the record tools never consult this guard.
+    Refused: flat computer_execute (its own gate inside
     computer_execute), computer_wait, computer_cancel_wait, and the independent
     observation tools computer_observe / computer_zoom / computer_screenshot (dev
     parity: a mid-plan independent observation would desynchronize the lease's

@@ -1851,10 +1851,11 @@ def test_the_legacy_single_call_plan_path_is_absent() -> None:
 
 
 def test_the_expected_tools_count_is_unchanged() -> None:
-    """Contract item (i): EXPECTED_TOOLS stays at 10 — no tool was added or removed."""
+    """Contract item (i): the tool surface only ever grows by explicit amendment —
+    WP-R (ORVEX-2026-109) grew EXPECTED_TOOLS from 10 to 12 (the recording family)."""
     from computer_use_mcp.cli import EXPECTED_TOOLS
 
-    assert len(EXPECTED_TOOLS) == 10
+    assert len(EXPECTED_TOOLS) == 12
 
 
 # --- DELTA 1 #3: interference events from the ACTION item (not just the move) ---------------------

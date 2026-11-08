@@ -8,7 +8,7 @@ specified once in
 [REPLY-CONTRACT.md](REPLY-CONTRACT.md); configuration knobs are in
 [CONFIGURATION.md](CONFIGURATION.md).
 
-## The ten tools
+## The twelve tools
 
 | Tool | Kind | For |
 |---|---|---|
@@ -22,6 +22,8 @@ specified once in
 | `computer_wait_status` | wait | block for the next wait segment, or peek with `block=false` |
 | `computer_cancel_wait` | wait | end a wait early; reports elapsed/remaining |
 | `computer_fetch_image` | evidence | re-serve a frame this session's replies carried, by `image_id` |
+| `computer_record` | recording | record 0.5–10 s of the screen in the background; returns at once |
+| `computer_record_result` | recording | collect a recording: timeline, actions, keyframe contact sheet, optional MP4 |
 
 The set is exactly `EXPECTED_TOOLS` (`src/computer_use_mcp/cli.py`); the
 `cortex-mcp probe` verifier refuses any tool not in it.
