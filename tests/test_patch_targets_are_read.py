@@ -55,10 +55,13 @@ driven-reader proof — it shows the module reads the name somewhere in a body,
 not that THE CODE THE TEST DRIVES reads it. Step 1 carries a per-site
 driven-reader table reviewed by the validator (plan §5).
 
-On the CURRENT tree the scan finds ONE module-never-reads site, recorded in
+On the CURRENT tree the scan finds THREE module-never-reads sites, recorded in
 :data:`EXPECTED_NOOP_PATCH_SITES` (equality-checked — a new site fails, a
 pruned site must be removed from the list): the e2e harness's reviewed
-``stop_session`` spy, whose reader lives OUTSIDE the patched module. WP10a
+``stop_session`` spy, whose reader lives OUTSIDE the patched module, and the
+two recording-test ``pointer_sprite.composite`` spies (VAL-WP-D-01 M2),
+whose reader — vision/recorder.py — from-imports the name inside its own
+function bodies. WP10a
 deleted the dead ``_clipboard_read_text`` binding patches together with the
 dead function itself, pruning those sites from the list.
 """
@@ -732,6 +735,20 @@ EXPECTED_NOOP_PATCH_SITES: dict[tuple[str, str, str, int], str] = {
     # x2, test_d13_nontext_clipboard_annotated, test_d13_clipboard_restore_after_settle)
     # were PRUNED per this list's own rule — the patches and the dead function were
     # deleted together, so the sites no longer exist to be listed.
+    # VAL-WP-D-01 M2: the two ``pointer_sprite.composite`` spy sites in
+    # test_record_tools.py (the show_pointer OFF/ON recording tests). REVIEWED
+    # cross-module reader: pointer_sprite itself never calls ``composite``, but
+    # vision/recorder.py does ``from .pointer_sprite import composite`` INSIDE
+    # its function bodies (``_composite_frame`` and ``_iter_encode_frames``), so
+    # the attribute is looked up at CALL time and the spy patch IS live — it
+    # counts the sheet-build and video-encode composite calls the M2 assertions
+    # are built on.
+    ("tests/test_record_tools.py", "computer_use_mcp.vision.pointer_sprite", "composite", 9):
+        "REVIEWED cross-module reader: recorder.py from-imports ``composite`` "
+        "inside its function bodies (call-time lookup) — the spy is live.",
+    ("tests/test_record_tools.py", "computer_use_mcp.vision.pointer_sprite", "composite", 10):
+        "REVIEWED cross-module reader: recorder.py from-imports ``composite`` "
+        "inside its function bodies (call-time lookup) — the spy is live.",
 }
 
 

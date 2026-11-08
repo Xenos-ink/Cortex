@@ -74,6 +74,7 @@ from ..vision.recorder import (
 )
 from .instance import logger, mcp
 from .lifecycle import _get_live_bundle, _session_scoped
+from .pointer_reply import session_show_pointer
 from .record_machine import (
     MAX_FINISHED_RECORDINGS_PER_SESSION,
     MAX_RECORDINGS_PER_PROCESS,
@@ -539,6 +540,9 @@ async def _finished_reply(
                         encode_video,
                         recording,
                         fps=recording.fps,
+                        # VAL-WP-D-01 M2: the session's show_pointer default
+                        # rides the Recording — OFF composites no sprite.
+                        composite=bool(getattr(recording, "composite_pointer", True)),
                         deadline=deadline,
                         should_abort=stop_check,
                     )
@@ -834,6 +838,9 @@ async def computer_record(
         cursor=cursor,
         pressed_at=pressed_at,
         cancel=handle.cancel,
+        # VAL-WP-D-01 M2: the session's show_pointer default — OFF composites
+        # no cursor into the sheet, the keyframes or the MP4.
+        composite_pointer=session_show_pointer(bundle),
     )
     thread = threading.Thread(
         target=_record_worker_from(handle),

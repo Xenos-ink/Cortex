@@ -21,9 +21,12 @@ origin).  Keyframe pointer metadata is stored in FRAME space (fetch composites
 at scale 1.0 on the frame's own pixels, exactly right).
 
 **The encoder is license-aware (item 11).**  Preference list
-``h264_mf`` (Windows Media Foundation, LGPL-safe) first, then ``libx264``
-(GPL-bundled), configurable via ``CORTEX_RECORD_ENCODER`` (fallback-not-clamp
-to ``"h264_mf,libx264"``); the video entry reports the encoder actually used.
+``h264_mf`` (Windows Media Foundation) first, then ``libx264``, configurable
+via ``CORTEX_RECORD_ENCODER`` (fallback-not-clamp to ``"h264_mf,libx264"``);
+the video entry reports the encoder actually used.  License note: the av wheel
+bundles GPL-licensed FFmpeg/libx264 components that are loaded whichever
+encoder runs — preferring ``h264_mf`` only keeps Cortex itself from encoding
+through libx264.
 
 **The encode respects a deadline (M3).**  ``encode_video(deadline=...)`` —
 the ladder checks the clock before every rung and returns
@@ -112,8 +115,10 @@ _SHEET_GAP = 6
 VIDEO_MAX_MB_ENV = RECORD_VIDEO_MAX_MB_ENV
 
 #: DELTA 1 item 11: the closed encoder choice set and the fallback-not-clamp
-#: default preference.  ``h264_mf`` (Windows Media Foundation) is LGPL-safe —
-#: Cortex is MIT and the av wheel otherwise bundles GPL libx264/libx265.
+#: default preference.  License note: the av wheel bundles GPL-licensed
+#: FFmpeg/libx264/libx265 components that are loaded whichever encoder runs —
+#: ``h264_mf`` (Windows Media Foundation) is preferred so Cortex itself never
+#: ENCODES through GPL libx264; the preference does not unload them.
 ENCODER_ENV = "CORTEX_RECORD_ENCODER"
 ENCODER_CHOICES = ("h264_mf", "libx264")
 ENCODER_DEFAULT = "h264_mf,libx264"
@@ -496,6 +501,11 @@ class Recording:
     error: str | None = None
     error_kind: str | None = None  # "capture_failed" | "record_worker_failed"
     started_at_epoch: float = 0.0
+    # VAL-WP-D-01 M2: the session's show_pointer default at record time — OFF
+    # means no sprite in the sheet, the keyframes or the video, and no keyframe
+    # pointer metadata (fetch draws nothing either way; this makes the worker's
+    # encode and the fallback encode honour the session even without the handle).
+    composite_pointer: bool = True
 
     @property
     def effective_fps(self) -> float:
@@ -612,6 +622,7 @@ class ScreenRecorder:
         pressed_at: Callable[[float], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
         cancel: threading.Event | None = None,
+        composite_pointer: bool = True,
     ) -> None:
         self.record_id = str(record_id)
         self.duration_s = float(duration_s)
@@ -627,6 +638,11 @@ class ScreenRecorder:
         self._pressed_at = pressed_at
         self._clock = clock
         self.cancel = cancel or threading.Event()
+        # VAL-WP-D-01 M2: the session's show_pointer default — OFF composites
+        # NO cursor into the sheet cells or the video, and stores no keyframe
+        # pointer metadata (the frames keep their canonical pointer coordinates
+        # for the timeline; only the sprite is dropped).
+        self.composite_pointer = bool(composite_pointer)
 
     # --- capture loop -----------------------------------------------------------------------
 
@@ -650,6 +666,9 @@ class ScreenRecorder:
             canonical_origin=self.canonical_origin,
             canonical_size=self.canonical_size,
         )
+        # VAL-WP-D-01 M2: the flag rides the Recording so the worker's encode
+        # and the result-call fallback encode honour it after the handle is gone.
+        recording.composite_pointer = self.composite_pointer
         if self.cancel.is_set():
             recording.cancelled = True
             recording.actual_duration_s = 0.0
@@ -974,7 +993,10 @@ class ScreenRecorder:
         """Decode one held JPEG and composite the Cortex pointer (WP-C).
 
         DELTA 1 M1: the composite point is computed in FRAME space — the
-        canonical point minus the region origin, times the frame scale."""
+        canonical point minus the region origin, times the frame scale.
+        VAL-WP-D-01 M2: with ``composite_pointer`` OFF (the session's
+        show_pointer default) NO sprite is drawn — the cell is the clean
+        decode."""
         try:
             from .pointer_sprite import composite
 
@@ -982,7 +1004,12 @@ class ScreenRecorder:
             image.load()
             if image.mode not in ("RGB", "L"):
                 image = image.convert("RGB")
-            if frame.pointer_x is None or frame.pointer_y is None or not frame.in_image:
+            if (
+                not self.composite_pointer
+                or frame.pointer_x is None
+                or frame.pointer_y is None
+                or not frame.in_image
+            ):
                 return image
             scale = self._frame_scale(recording)
             local_x = (frame.pointer_x - self.canonical_origin[0]) * scale
@@ -1149,10 +1176,12 @@ def _encode_one(
     numpy.
     numpy.
 
-    DELTA 2 n7/N4: an encoder that cannot OPEN raises the typed
+    DELTA 2 n7/N4 + VAL-WP-D-01 M1: an encoder that cannot OPEN raises the typed
     :class:`EncoderOpenError` (the ladder falls back to the next encoder
-    immediately); a MID-encode failure returns ``None`` after closing the
-    container (also a fallback signal); an abort (``should_abort`` — checked
+    immediately) — and because PyAV opens the codec lazily, a failure on the
+    FIRST ``stream.encode(frame)`` counts as an open failure too; a MID-encode
+    failure (after at least one frame encoded) returns ``None`` after closing
+    the container (also a fallback signal); an abort (``should_abort`` — checked
     between frames, N4) raises :class:`_EncodeAborted` after best-effort
     cleanup."""
     container: Any = None
@@ -1205,8 +1234,28 @@ def _encode_one(
                 plane.update(bytes(padded))
             # m3: REAL timestamps — dropped frames keep real-time duration.
             frame.pts = pts
+            try:
+                packets = stream.encode(frame)
+            except _EncodeAborted:
+                raise
+            except Exception as exc:  # noqa: BLE001 - VAL-WP-D-01 M1
+                # PyAV opens the codec LAZILY, on the FIRST stream.encode(frame)
+                # — a failure there is an OPEN failure (EncoderOpenError: the
+                # ladder falls back to the next encoder; every encoder failing
+                # here ends as encoder_unavailable).  A failure AFTER at least
+                # one frame encoded stays a MID-encode failure (None).
+                try:
+                    container.close()
+                except Exception:  # noqa: BLE001 - best-effort close
+                    pass
+                if pushed == 0:
+                    raise EncoderOpenError(
+                        f"{encoder} failed on the first frame encode (codec open): "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                return None
             pushed += 1
-            for packet in stream.encode(frame):
+            for packet in packets:
                 container.mux(packet)
         if pushed == 0:
             # DELTA 4 F1: close the container — never leak the muxer.
@@ -1218,6 +1267,15 @@ def _encode_one(
         return buffer.getvalue()
     except _EncodeAborted:
         # NIT: close the container on failure — never leak the muxer.
+        try:
+            container.close()
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
+        raise
+    except EncoderOpenError:
+        # VAL-WP-D-01 M1: raised by the FIRST-frame-encode open failure inside
+        # the loop — re-raise through the generic mid-encode handler below
+        # (never classified as a mid failure).
         try:
             container.close()
         except Exception:  # noqa: BLE001 - best-effort
@@ -1255,8 +1313,10 @@ def encode_video(
 ) -> tuple[bytes | None, dict[str, Any]]:
     """Encode the held JPEG frames into an in-memory H.264 MP4 (≤ ``target_bytes``).
 
-    The cursor is composited into every frame before encoding (WP-C).  The
-    size ladder steps QUALITY before resolution at each size (DELTA 1 nit):
+    The cursor is composited into every frame before encoding when ``composite``
+    is True (VAL-WP-D-01 M2: the caller passes the session's show_pointer
+    default — False composites NO sprite).  The size ladder steps QUALITY
+    before resolution at each size (DELTA 1 nit):
     at every resolution step (1.0, 0.75, … down to the 480 px floor) the
     encoder's full quality rung list is tried before the next downscale.  The
     encoder preference list is tried in order; the first rung that fits wins

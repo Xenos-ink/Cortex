@@ -462,7 +462,9 @@ async def test_collect_while_recording_is_encoding_reports_encoding_status(
     session_id, _bundle, _backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)
     real_encode = srv_record_machine._encode_video
 
-    def slow_encode(recording: Any, *, fps: int, should_abort: Any = None) -> Any:
+    def slow_encode(
+        recording: Any, *, fps: int, composite: bool = True, should_abort: Any = None
+    ) -> Any:
         time.sleep(1.2)  # the encode is still running when the peek lands
         return real_encode(recording, fps=fps, should_abort=should_abort)
 
@@ -487,7 +489,9 @@ async def test_stop_session_during_the_encode_aborts_promptly(
     real_encode = srv_record_machine._encode_video
     encode_started = threading.Event()
 
-    def unbounded_encode(recording: Any, *, fps: int, should_abort: Any = None) -> Any:
+    def unbounded_encode(
+        recording: Any, *, fps: int, composite: bool = True, should_abort: Any = None
+    ) -> Any:
         encode_started.set()
         # Would run far longer than the 5 s join budget — ONLY the stop check
         # (consulted between rungs/frames by the real ladder) ends it.
@@ -822,7 +826,9 @@ async def test_double_collection_encodes_once_in_the_worker(
     counter = {"encodes": 0}
     real_encode = srv_record_machine._encode_video
 
-    def counting_encode(recording: Any, *, fps: int, should_abort: Any = None) -> Any:
+    def counting_encode(
+        recording: Any, *, fps: int, composite: bool = True, should_abort: Any = None
+    ) -> Any:
         counter["encodes"] += 1
         return real_encode(recording, fps=fps)
 
@@ -854,7 +860,9 @@ async def test_stop_session_during_the_worker_encode_gives_session_stopped(
     session_id, _bundle, _backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)
     real_encode = srv_record_machine._encode_video
 
-    def slow_encode(recording: Any, *, fps: int, should_abort: Any = None) -> Any:
+    def slow_encode(
+        recording: Any, *, fps: int, composite: bool = True, should_abort: Any = None
+    ) -> Any:
         time.sleep(0.6)  # the encode runs while the stop lands
         return real_encode(recording, fps=fps)
 
@@ -1171,3 +1179,214 @@ async def test_frames_accounted_and_eviction_answers_frames_released(
     }
     assert not resource_blocks(result)
     assert settled.frames_released is True  # released on the eviction check
+
+
+# --- VAL-WP-D-01 M2: show_pointer=false turns the cursor off in recordings ------------------------
+
+
+def _scripted_frame_grab(clean_jpegs: list[bytes]) -> Any:
+    """A DETERMINISTIC recording grabber: every produced frame is remembered
+    (its q90 JPEG bytes), so the tests can decode the MP4 and compare the
+    hotspot neighbourhood against the CLEAN frame — noise frames would make
+    that comparison meaningless."""
+
+    def grab(left: int, top: int, width: int, height: int) -> Image.Image:
+        image = Image.new("RGB", (320, 240), (200, 200, 200))
+        bar_x = 20 + (len(clean_jpegs) * 17) % 200
+        image.paste((10, 10, 10), (bar_x, 20, bar_x + 40, 60))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=90)
+        clean_jpegs.append(buffer.getvalue())
+        return Image.open(io.BytesIO(buffer.getvalue()))
+
+    return grab
+
+
+def _mean_luma_diff(a: Image.Image, b: Image.Image, box: tuple[int, int, int, int]) -> float:
+    """Mean per-pixel luma difference of two same-size images inside ``box``."""
+    diff = ImageChops.difference(a.crop(box), b.crop(box)).convert("L")
+    histogram = diff.histogram()
+    total = sum(histogram)
+    return sum(level * count for level, count in enumerate(histogram)) / total
+
+
+def _decode_last_mp4_frame(mp4_bytes: bytes) -> Image.Image:
+    """Decode the LAST frame of a held MP4 with the real av (imported lazily —
+    an ImportError here must fail the test, never pass it vacuously)."""
+    import av  # type: ignore[import-not-found]  # lazy: test-only cost
+
+    container = av.open(io.BytesIO(mp4_bytes))
+    frames = list(container.decode(container.streams.video[0]))
+    container.close()
+    assert frames, "the MP4 decoded to ZERO frames"
+    return frames[-1].to_image().convert("RGB")
+
+
+async def test_show_pointer_off_session_records_no_sprite_anywhere(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VAL-WP-D-01 M2 (+DELTA 2 MP4 leg): with the session's show_pointer
+    default OFF, a recording composites NO cursor anywhere — not in the
+    contact sheet, not in the MP4 (zero sprite-composite calls), the stored
+    keyframes carry NO pointer metadata, and the DECODED MP4's hotspot
+    neighbourhood is UNCHANGED against the clean frame.  The MP4 decode runs
+    with the real av: if the encode produces nothing the test FAILS (the
+    ``video.included`` assert), never passes vacuously.  A show_pointer-on
+    control recording proves the spy intercepts the composite path."""
+    import computer_use_mcp.vision.pointer_sprite as sprite_module
+    import computer_use_mcp.vision.recorder as recorder_module
+
+    session_id, bundle, backend, _ = make_session(
+        monkeypatch, limits=FAST_LIMITS, show_pointer=False
+    )
+    monkeypatch.setattr(backend, "record_cursor_position", lambda: (600, 400))
+    clean_jpegs: list[bytes] = []
+    monkeypatch.setattr(backend, "record_frame_grab", _scripted_frame_grab(clean_jpegs))
+
+    composite_calls: list[tuple[float, float, str]] = []
+    real_composite = sprite_module.composite
+
+    def spying_composite(image: Any, x: float, y: float, state: str, scale: float) -> Any:
+        composite_calls.append((x, y, state))
+        return real_composite(image, x, y, state, scale)
+
+    monkeypatch.setattr(sprite_module, "composite", spying_composite)
+
+    start = await _start(session_id, duration_s=0.8, fps=5, include_video=True)
+    record_id = str(start["record_id"])
+    await asyncio.sleep(1.2)
+    result = await _collect(session_id, record_id, include_video=True)
+    payload = payload_of(result)
+    assert payload["result"] == "verified"
+    # The encode produced a real MP4 on this box — the checks below are never
+    # vacuous.
+    assert payload["video"]["included"] is True, payload["video"]
+    # NO sprite anywhere: the sheet build AND the video encode made zero
+    # composite calls.
+    assert composite_calls == [], composite_calls
+    # The stored keyframes carry NO pointer metadata — nothing for fetch to
+    # composite even if the default were misread.
+    pool = recording_store(bundle.extra)
+    assert pool is not None
+    keyframe_entries = [
+        entry
+        for entry in pool._entries.values()
+        if entry.kind == "keyframe" and getattr(entry, "pointer_state", "?") != "?"
+    ]
+    assert keyframe_entries, "the recording stored keyframe entries"
+    assert all(entry.pointer_state is None for entry in keyframe_entries)
+    assert payload["keyframes"], "keyframes were produced"
+    for keyframe in payload["keyframes"]:
+        fetched = await srv_server_fetch.computer_fetch_image(session_id, keyframe["image_id"])
+        fetched_payload = payload_of(fetched)
+        assert fetched_payload["ok"] is True
+        assert "pointer" not in fetched_payload and "last_click" not in fetched_payload
+    # DELTA 2 MP4 leg: decode the video with the real av and prove the hotspot
+    # neighbourhood is UNCHANGED against the clean frame (codec noise only).
+    retained = pool.lookup_video(record_id)
+    assert retained is not None and retained.video_bytes
+    entry = keyframe_entries[0]
+    scale, origin = pool._frame_meta[entry.entry_id]
+    hotspot_x = (600 - origin[0]) * scale
+    hotspot_y = (400 - origin[1]) * scale
+    decoded = _decode_last_mp4_frame(retained.video_bytes)
+    clean = Image.open(io.BytesIO(clean_jpegs[-1])).convert("RGB")
+    assert decoded.size == clean.size, (decoded.size, clean.size)
+    box = (
+        max(0, int(hotspot_x) - 14),
+        max(0, int(hotspot_y) - 14),
+        min(decoded.width, int(hotspot_x) + 14),
+        min(decoded.height, int(hotspot_y) + 14),
+    )
+    far = (decoded.width - 32, decoded.height - 24, decoded.width - 2, decoded.height - 2)
+    hotspot_diff = _mean_luma_diff(decoded, clean, box)
+    far_diff = _mean_luma_diff(decoded, clean, far)
+    assert hotspot_diff <= 4.0, (
+        f"a sprite moved the hotspot neighbourhood of the OFF recording's MP4 "
+        f"(mean luma diff {hotspot_diff:.2f}; far {far_diff:.2f})"
+    )
+    assert far_diff <= 4.0, f"unexpected codec drift far from the pointer: {far_diff:.2f}"
+
+
+async def test_show_pointer_on_session_still_composites_the_cursor(
+    fresh_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VAL-WP-D-01 M2 positive control (+DELTA 2 MP4 leg): the SAME recording
+    on a default (ON) session composites the cursor into the sheet AND the
+    video — at least one composite call comes from the encode path, and the
+    DECODED MP4's hotspot neighbourhood is CHANGED against the clean frame
+    (the sprite is really in the video, proven with the real av decode)."""
+    import computer_use_mcp.vision.pointer_sprite as sprite_module
+    import computer_use_mcp.vision.recorder as recorder_module
+
+    session_id, bundle, backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)
+    monkeypatch.setattr(backend, "record_cursor_position", lambda: (600, 400))
+    clean_jpegs: list[bytes] = []
+    monkeypatch.setattr(backend, "record_frame_grab", _scripted_frame_grab(clean_jpegs))
+
+    composite_calls: list[tuple[float, float, str]] = []
+    real_composite = sprite_module.composite
+
+    def spying_composite(image: Any, x: float, y: float, state: str, scale: float) -> Any:
+        composite_calls.append((x, y, state))
+        return real_composite(image, x, y, state, scale)
+
+    monkeypatch.setattr(sprite_module, "composite", spying_composite)
+
+    # Count ENCODE-path composite chances separately from the sheet's: each
+    # encode rung drives exactly one _iter_encode_frames call.
+    encode_rungs: list[int] = []
+    real_iter = recorder_module._iter_encode_frames
+
+    def counting_iter(*args: Any, **kwargs: Any) -> Any:
+        encode_rungs.append(1)
+        return real_iter(*args, **kwargs)
+
+    monkeypatch.setattr(recorder_module, "_iter_encode_frames", counting_iter)
+
+    start = await _start(session_id, duration_s=0.8, fps=5, include_video=True)
+    record_id = str(start["record_id"])
+    await asyncio.sleep(1.2)
+    result = await _collect(session_id, record_id, include_video=True)
+    payload = payload_of(result)
+    assert payload["result"] == "verified"
+    assert payload["video"]["included"] is True, payload["video"]
+    assert composite_calls, "the ON session never composites — the spy is broken"
+    assert encode_rungs, "the encode path never ran — the MP4 leg is unproven"
+    pool = recording_store(bundle.extra)
+    assert pool is not None
+    keyframe_entries = [
+        entry
+        for entry in pool._entries.values()
+        if entry.kind == "keyframe" and getattr(entry, "pointer_state", "?") != "?"
+    ]
+    pressed_entry = next((e for e in keyframe_entries if e.pointer_state is not None), None)
+    assert pressed_entry is not None, "the ON session stored no pointer metadata"
+    # DELTA 2 MP4 leg: the sprite is REALLY in the decoded video — the hotspot
+    # neighbourhood of the decoded last frame differs strongly from the clean
+    # frame, while far regions stay at codec-noise level.
+    retained = pool.lookup_video(record_id)
+    assert retained is not None and retained.video_bytes
+    scale, origin = pool._frame_meta[pressed_entry.entry_id]
+    hotspot_x = (600 - origin[0]) * scale
+    hotspot_y = (400 - origin[1]) * scale
+    decoded = _decode_last_mp4_frame(retained.video_bytes)
+    clean = Image.open(io.BytesIO(clean_jpegs[-1])).convert("RGB")
+    assert decoded.size == clean.size, (decoded.size, clean.size)
+    box = (
+        max(0, int(hotspot_x) - 14),
+        max(0, int(hotspot_y) - 14),
+        min(decoded.width, int(hotspot_x) + 14),
+        min(decoded.height, int(hotspot_y) + 14),
+    )
+    far = (decoded.width - 32, decoded.height - 24, decoded.width - 2, decoded.height - 2)
+    hotspot_diff = _mean_luma_diff(decoded, clean, box)
+    far_diff = _mean_luma_diff(decoded, clean, far)
+    assert hotspot_diff > 8.0, (
+        f"no sprite found in the ON recording's decoded MP4 at the hotspot "
+        f"(mean luma diff {hotspot_diff:.2f}; far {far_diff:.2f})"
+    )
+    assert hotspot_diff > far_diff * 3, (
+        f"the hotspot change is not sprite-shaped (hot {hotspot_diff:.2f} vs "
+        f"far {far_diff:.2f})"
+    )

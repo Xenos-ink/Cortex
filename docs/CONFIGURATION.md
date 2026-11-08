@@ -1,4 +1,4 @@
-# Configuration — limits and environment variables (Cortex 0.7.6)
+# Configuration — limits and environment variables (Cortex 0.7.7)
 
 Current truth for every knob the code reads. Pinned by
 `tests/test_docs_truth.py`: the limits table below is re-derived at test time
@@ -65,7 +65,7 @@ typo into a different meaning where the row says "fallback-not-clamp").
 | `CORTEX_SESSION_IDLE_TIMEOUT_SECONDS` | 900 (15 min) | accepted 60..86400; `0` disabled; out-of-band → default (fallback-not-clamp) | the idle reaper: a session with no tool call this long, and nothing in flight, is stopped through the stop_session kill path; any call resets the count |
 | `CORTEX_IMAGE_DELIVERY` | `image` | `text` \| `image`; garbage → `image` | default screenshot delivery for ALL sessions; `text` suppresses every outbound image block (non-vision-safe). Overridden per session by `start_session(image_delivery=...)` |
 | `CORTEX_RESULT_IMAGE_MAX_KB` | 180 | KB, > 0, capped at 100000 | the outbound image budget on observe/zoom/execute replies (JPEG q85 + downscale ladder; internal PNG untouched) |
-| `CORTEX_RECORD_ENCODER` | `h264_mf,libx264` | comma-separated list from the closed set {`h264_mf`, `libx264`}; garbage → the default (fallback-not-clamp) | the recording's encoder preference: `h264_mf` (Windows Media Foundation, LGPL-safe) first, `libx264` (GPL-bundled in the av wheel) second; the video entry reports the encoder actually used |
+| `CORTEX_RECORD_ENCODER` | `h264_mf,libx264` | comma-separated list from the closed set {`h264_mf`, `libx264`}; garbage → the default (fallback-not-clamp) | the recording's encoder preference: `h264_mf` (Windows Media Foundation) first, `libx264` second — note the av wheel bundles GPL-licensed FFmpeg/libx264 components that are loaded whichever encoder runs; `h264_mf` only keeps Cortex itself from encoding through libx264; the video entry reports the encoder actually used |
 | `CORTEX_RECORD_VIDEO_MAX_MB` | 2 | MiB raw, band 1..8; garbage → 2 (fallback-not-clamp) | the recording's video blob cap before the quality/resolution ladder (and the honest `too_large` / `over_budget` omissions) |
 | `CORTEX_ACTION_IMAGE_FULL` | off | exactly `1` = on | restore FULL-resolution defaults for the executed-response image (the default is a half-resolution JPEG) |
 | `CORTEX_SHOW_POINTER` | on | `1`/`true`/`yes`/`on` \| `0`/`false`/`no`/`off`; garbage → on (fallback-not-clamp) | default source for the session's pointer sprite: ON draws the Cortex cursor into every image-bearing reply (observe/zoom/execute/fetch/plan) at the real pointer position — an outbound-only decoration (captures, digests, verification and the stored frames stay clean). Overridden per session by `start_session(show_pointer=...)` and per call by `computer_observe(show_pointer=...)` (the per-call value does not persist) |

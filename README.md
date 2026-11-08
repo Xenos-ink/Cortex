@@ -12,7 +12,7 @@
 
 ## What is Cortex
 
-Cortex (current release: 0.7.6) is a Model Context Protocol (MCP) server that
+Cortex (current release: 0.7.7) is a Model Context Protocol (MCP) server that
 gives AI agents a safe, verifiable way to operate a Windows desktop. An agent
 connects over stdio and gets a guarded, twelve-tool surface: open a session,
 capture the screen (full, aliased, or zoomed to a region), execute actions
@@ -78,6 +78,25 @@ drive it:
    Resuming from a checkpoint file is available via
    `start_session(resume_from_checkpoint=…)` (reply keys `resumed` /
    `continuation_of` / `resumed_from_checkpoint`; honest scope in docs/TOOLS.md).
+
+## What's new in 0.7.7
+
+- **The Cortex cursor in every image.** Each image-bearing reply now carries the
+  Cortex cursor composited at the real pointer — the arrow tip is the exact
+  pointer point, the Pressed shape plus a ring marks where that call clicked,
+  and the replies add `pointer` / `last_click` fields. Off switch:
+  `start_session(show_pointer=false)` or env `CORTEX_SHOW_POINTER` (verification
+  frames, digests and stored evidence stay clean either way).
+- **Screen recording.** Two new tools (10 → 12): `computer_record` records
+  0.5–10 s of the screen in the background and returns at once;
+  `computer_record_result` collects a change timeline, the actions inside the
+  window, a timestamped keyframe contact sheet (each keyframe fetchable by
+  `image_id`), and on request the full MP4 (`include_video=true`, PyAV-encoded,
+  Windows Media Foundation `h264_mf` first with a libx264 fallback). Built for
+  the evidence a single screenshot misses: animations, toasts, menus that
+  close, loading states.
+- **New dependency:** `av` (PyAV, with a bundled FFmpeg) — about 30 MB on the
+  wheel; license note in docs/INSTALL.md.
 
 ## The twelve tools at a glance
 

@@ -223,8 +223,7 @@ def test_real_timestamps_keep_duration_through_drops() -> None:
 
 def test_real_h264_mf_encode_or_clean_skip(monkeypatch: pytest.MonkeyPatch) -> None:
     """DELTA 1 item 11: one REAL encode per available encoder.  h264_mf
-    (Media Foundation, LGPL-safe) is tried first; N editions without MF skip
-    cleanly."""
+    (Media Foundation) is tried first; N editions without MF skip cleanly."""
     monkeypatch.setenv(recorder_module.ENCODER_ENV, "h264_mf")
     recording = _recording(count=3, fps=5)
     data, info = encode_video(recording, fps=5)
@@ -749,3 +748,111 @@ def test_released_frames_give_the_frames_released_omission(monkeypatch: pytest.M
     assert data is None
     assert info["omitted"] == "frames_released"
     assert "evicted" in info.get("detail", "")
+
+
+# --- VAL-WP-D-01 M1: the lazy codec open IS the first frame encode -------------------------------
+
+
+class _LazyOpenFailingStream(_FakeStream):
+    """A stream whose codec opens only when the FIRST frame is encoded — the
+    real PyAV behaviour that M1 pins: add_stream succeeds, the lazy open
+    happens inside ``stream.encode(frame)``."""
+
+    def __init__(self, fake: "_FakeAvModule", codec: str, rate: int, fail_on_first: bool) -> None:
+        super().__init__(fake, codec, rate)
+        self._fail_on_first = fail_on_first
+        self._encoded_any = 0
+
+    def encode(self, frame: Any = None) -> list[Any]:
+        if self._encoded_any == 0 and self._fail_on_first:
+            raise RuntimeError(f"{self.codec} cannot open (lazy Media Foundation load)")
+        self._encoded_any += 1
+        return []
+
+
+class _LazyOpenFakeContainer(_FakeContainer):
+    def add_stream(self, codec: str, rate: int) -> Any:
+        if codec in self.fake.failing_encoders:
+            self.fake.failures.append((codec, "add_stream"))
+            raise RuntimeError(f"encoder {codec} cannot open (fake)")
+        self.stream = _LazyOpenFailingStream(
+            self.fake, codec, rate, codec in self.fake.first_frame_failures
+        )
+        return self.stream
+
+
+class _LazyOpenFakeAvModule(_FakeAvModule):
+    def __init__(self, blob: bytes, first_frame_failures: set[str]) -> None:
+        super().__init__(blob, failing_encoders=set())
+        self.first_frame_failures = first_frame_failures
+
+    def open(self, buffer: Any, mode: str, format: str) -> _LazyOpenFakeContainer:
+        return _LazyOpenFakeContainer(self, buffer)
+
+
+def test_first_frame_encode_failure_falls_back_to_the_next_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VAL-WP-D-01 M1: PyAV opens the codec lazily on the FIRST
+    ``stream.encode(frame)`` — a failure there is an OPEN failure: the ladder
+    falls back to the next encoder (here h264_mf → libx264, which works)."""
+    blob = b"\x01" * 1024
+    fake = _LazyOpenFakeAvModule(blob, first_frame_failures={"h264_mf"})
+    monkeypatch.setattr(recorder_module, "_import_av", lambda: fake)
+    recording = _recording(count=2, fps=5)
+    data, info = encode_video(recording, fps=5)
+    assert data == blob
+    assert info["included"] is True
+    assert info["encoder"] == "libx264"
+    # The lazy-open failure ran the h264_mf rung exactly once, then fell back.
+    assert ("h264_mf", "add_stream") not in fake.failures
+
+
+def test_first_frame_failure_on_every_encoder_is_encoder_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VAL-WP-D-01 M1: when every encoder fails at the lazy open (the first
+    frame encode), the reason is encoder_unavailable — the Windows N shape."""
+    fake = _LazyOpenFakeAvModule(b"\x00" * 16, first_frame_failures={"h264_mf", "libx264"})
+    monkeypatch.setattr(recorder_module, "_import_av", lambda: fake)
+    recording = _recording(count=2, fps=5)
+    data, info = encode_video(recording, fps=5)
+    assert data is None
+    assert info["omitted"] == VIDEO_OMITTED_ENCODER_UNAVAILABLE
+
+
+def test_failure_after_an_encoded_frame_is_still_mid_encode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VAL-WP-D-01 M1: a failure AFTER at least one frame encoded stays a
+    MID-encode failure (encode_failed semantics), not an open failure."""
+    monkeypatch.setenv(recorder_module.ENCODER_ENV, "h264_mf")
+
+    class _MidStream(_FakeStream):
+        def __init__(self, fake: "_FakeAvModule", codec: str, rate: int) -> None:
+            super().__init__(fake, codec, rate)
+            self._encoded_any = 0
+
+        def encode(self, frame: Any = None) -> list[Any]:
+            self._encoded_any += 1
+            if self._encoded_any == 2:
+                raise RuntimeError("mf device lost after one frame")
+            return []
+
+    class _MidContainer(_FakeContainer):
+        def add_stream(self, codec: str, rate: int) -> Any:
+            self.stream = _MidStream(self.fake, codec, rate)
+            return self.stream
+
+    class _MidFake(_FakeAvModule):
+        def open(self, buffer: Any, mode: str, format: str) -> _MidContainer:
+            return _MidContainer(self, buffer)
+
+    monkeypatch.setattr(recorder_module, "_import_av", lambda: _MidFake(b"", failing_encoders=set()))
+    recording = _recording(count=3, fps=5)  # 3 frames: the 2nd encode raises
+    data, info = encode_video(recording, fps=5)
+    assert data is None
+    # Only h264_mf is configured: the mid failure is NOT retried across rungs
+    # and NOT classified as an open failure — encode_failed.
+    assert info["omitted"] == VIDEO_OMITTED_ENCODE_FAILED
+    monkeypatch.delenv(recorder_module.ENCODER_ENV, raising=False)

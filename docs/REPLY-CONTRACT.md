@@ -1,4 +1,4 @@
-# Reply contract — Cortex 0.7.6
+# Reply contract — Cortex 0.7.7
 
 The full reference for reply shapes. One envelope, identical semantics for every
 tool reply, every `follow_up_results[i]` item, every plan step, the terminal
@@ -96,8 +96,8 @@ Per-surface subsets:
   caps, text session).  A malformed / out-of-bounds / unverifiable REGION is
   the typed `invalid_region` ERROR (`ok:false`, an `error` key, NO `result`
   token — the same shape as the observe family's refusals), never a
-  `rejected` reply.  A peek may report `status: "encoding"` (DELTA 2: the
-  capture finished and the video encode is still running) instead of
+  `rejected` reply.  A peek may report `status: "encoding"` (the capture
+  finished and the video encode is still running) instead of
   `"recording"`.
 - `computer_observe` / `computer_screenshot` / `computer_zoom` carry NO `result`
   token (read-only; their refusals are `ok:false` + typed error).
@@ -114,7 +114,7 @@ success); any failed step caps it at `failed`. Plan STEP replies report
 
 ## The recording family (computer_record / computer_record_result)
 
-The screen recorder (ORVEX-2026-109 WP-R + DELTA 1) follows the same envelope:
+The screen recorder follows the same envelope:
 
 - Start and peek replies are `marker` (`status: "recording"`, with
   `elapsed_seconds` / `remaining_seconds`); a finished collection is
@@ -139,7 +139,7 @@ The screen recorder (ORVEX-2026-109 WP-R + DELTA 1) follows the same envelope:
   carrying `aborted: true` (a stop/cancel aborted the encode; a later collect
   retries while the frames are held).  Video may be requested on EITHER call.
 - Recording keyframes fetch through `computer_fetch_image` like observation
-  frames.  DELTA 2: the fetch publishes `frame_to_canonical` —
+  frames.  The fetch publishes `frame_to_canonical` —
   `{"scale": <canonical px per frame px>, "origin": [x, y]}` (the canonical
   region origin) — so a keyframe pixel maps back with
   `canonical = origin + pixel × scale`.  This maps the STORED keyframe
@@ -206,12 +206,18 @@ interference-label tables.
 
 `invalid_action` (malformed action, teach-in message) · `invalid_limits` ·
 `invalid_interference` · `invalid_image_delivery` · `invalid_show_pointer` ·
-`invalid_visual_view` · `invalid_region` (zoom crop outside the frame) ·
+`invalid_visual_view` · `invalid_region` (a crop or a recording region outside
+the frame; a recording answers with this typed `error` reply, never a
+`rejected` result) ·
 `invalid_pixel_evidence` · `view_derive_failed` · `session_stopped` · `session_limit_exceeded` (with
 `live_sessions` + `idle_timeout_seconds`) · `invalid_wait_duration` ·
 `wait_duration_exceeds_max` · `too_many_waits` · `unknown_wait` · `wait_failed` ·
 `image_expired` · `image_not_found` · `frame_too_large` · `store_disposed` ·
-`plan_lease` · `invalid_plan_action` · `digest_surprise` · `limit_exceeded`
+`plan_lease` · `invalid_plan_action` · `invalid_record_duration` ·
+`invalid_record_fps` · `invalid_record_keyframes` · `invalid_record_param` ·
+`text_session_no_screen` · `recording_limit` · `unknown_record` ·
+`record_expired` · `record_failed` (the recording worker could not start) ·
+`digest_surprise` · `limit_exceeded`
 (with the `limit` key naming the cap) · `invalid_checkpoint` ·
 `checkpoint_error` (a non-validation checkpoint failure during a resume) ·
 `resume_refused`.

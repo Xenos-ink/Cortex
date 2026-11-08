@@ -105,3 +105,35 @@ tail went in UNPACED — re-observe and never retype blind. One `via="clipboard"
 type pastes the whole text in a single step instead. `text` is capped at 2000
 characters on every type, clipboard included: split longer code at line
 boundaries into several clipboard types, and re-observe after each one.
+
+## Recording an effect a screenshot misses
+
+A ribbon toggle animates and its toast disappears in under a second; the
+post-action screenshot cannot say whether it ran. Record the window while you act:
+
+```text
+computer_record(session_id, duration_s=6)              # returns at once: record_id, status:"recording"
+computer_execute(session_id, action="click", x=980, y=44, expected_effect="the ribbon toggle is on")
+computer_record_result(session_id, "<record_id>")      # blocks until the recording ends
+```
+
+Read the reply: the change timeline shows WHEN the screen moved (each segment
+with its bbox and how much of the frame changed), `actions` names what Cortex
+dispatched inside the window, and the contact sheet shows the timestamped
+keyframes — each fetchable at full size by its `image_id`, the Cortex cursor
+composited. A frame captured DURING a press shows Pressed plus a ring; at the
+recording fps most frames show Normal, and a missing Pressed shape does NOT
+mean the click missed — the timeline and the actions list answer that. The
+toast mid-animation and its absence two seconds later are both in the frames —
+evidence no single screenshot could hold. Need a closer look at one moment?
+`computer_fetch_image` that keyframe's `image_id`.
+
+- `include_video=true` only when the host model can actually watch video; if the
+  reply's `video` entry says `omitted`, the reason names why (retried on a later
+  collect: `over_budget`, or an `encode_failed` carrying `aborted: true` — the
+  others are final).
+- To turn a keyframe pixel into a screen coordinate, use the keyframe's
+  `frame_to_canonical` scale/origin (a downscaled served copy is divided by its
+  `image_outbound_scale` first).
+- You can keep calling any tool while the recording runs — that is the point:
+  the recording above brackets the click you were making anyway.

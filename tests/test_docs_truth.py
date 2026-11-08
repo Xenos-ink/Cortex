@@ -545,6 +545,116 @@ def test_tools_md_states_the_wait_and_evidence_bounds_derived_from_the_code() ->
     ) in doc
 
 
+def test_tools_md_states_the_recording_and_pointer_facts_derived_from_the_code() -> None:
+    """0.7.7: the recording bands, the closed omission/status/encoder sets, the
+    pointer reply fields and the env knobs — every value read from the code at
+    test time, then required in docs/TOOLS.md."""
+    from computer_use_mcp.core.limits import (
+        RECORD_DURATION_BAND,
+        RECORD_FPS_BAND,
+        RECORD_FPS_DEFAULT,
+        RECORD_MAX_KEYFRAMES_BAND,
+        RECORD_MAX_KEYFRAMES_DEFAULT,
+        RECORD_VIDEO_MAX_MB_BAND,
+        RECORD_VIDEO_MAX_MB_DEFAULT,
+        RECORD_VIDEO_MAX_MB_ENV,
+    )
+    from computer_use_mcp.server import pointer_reply
+    from computer_use_mcp.server.record_machine import (
+        MAX_RECORDINGS_PER_PROCESS,
+        MAX_RECORDINGS_PER_SESSION,
+    )
+    from computer_use_mcp.vision.evidence import (
+        RECORDING_KEEP_RECORDINGS,
+        RECORDING_MAX_AGE_SECONDS,
+        RECORDING_MAX_BYTES,
+        RECORDING_MAX_FRAMES,
+    )
+    from computer_use_mcp.vision.recorder import (
+        ENCODER_CHOICES,
+        ENCODER_DEFAULT,
+        ENCODER_ENV,
+        RECORD_STATUS_ENCODING,
+        RECORD_STATUS_RECORDING,
+        VIDEO_OMISSION_REASONS,
+    )
+
+    doc = _norm(_read(ROOT / "docs" / "TOOLS.md"))
+    lo, hi = (f"{bound:g}" for bound in RECORD_DURATION_BAND)
+    assert f"`duration_s` {lo}..{hi} s" in doc
+    assert (
+        f"`fps` {RECORD_FPS_BAND[0]}..{RECORD_FPS_BAND[1]} (default {RECORD_FPS_DEFAULT})"
+    ) in doc
+    assert (
+        f"`max_keyframes` {RECORD_MAX_KEYFRAMES_BAND[0]}..{RECORD_MAX_KEYFRAMES_BAND[1]}"
+        f" (default {RECORD_MAX_KEYFRAMES_DEFAULT})"
+    ) in doc
+    assert f"cap is {RECORD_VIDEO_MAX_MB_DEFAULT} MiB raw" in doc
+    assert (
+        f"`{RECORD_VIDEO_MAX_MB_ENV}`, band {RECORD_VIDEO_MAX_MB_BAND[0]}.."
+        f"{RECORD_VIDEO_MAX_MB_BAND[1]}"
+    ) in doc
+    for encoder in ENCODER_CHOICES:
+        assert f"`{encoder}`" in doc, f"TOOLS.md never names encoder {encoder!r}"
+    assert f"`{ENCODER_DEFAULT}`" in doc
+    assert f"`{ENCODER_ENV}`" in doc
+    for status in (RECORD_STATUS_RECORDING, RECORD_STATUS_ENCODING):
+        assert f"`{status}`" in doc, f"TOOLS.md never names status {status!r}"
+    for reason in VIDEO_OMISSION_REASONS:
+        assert f"`{reason}`" in doc, f"TOOLS.md never names omission reason {reason!r}"
+    assert "`frame_to_canonical`" in doc
+    assert "`rec_` + 16" in doc
+    # the pointer composite fields and knobs
+    assert "`pointer {x, y, state, in_image}`" in doc
+    assert "`last_click {x, y, button, age_ms} | null`" in doc
+    assert pointer_reply.SHOW_POINTER_ENV in doc
+    assert "show_pointer" in doc
+    # VAL-WP-D-01 M5: the record rejections/errors are documented.
+    for token in (
+        "invalid_record_duration",
+        "invalid_record_fps",
+        "invalid_record_keyframes",
+        "invalid_record_param",
+        "record_failed",
+    ):
+        assert f"`{token}`" in doc, f"TOOLS.md never names the record error {token!r}"
+    # VAL-WP-D-01 L6: the caps and the pool numbers the docs state, derived
+    # from the code (TOOLS.md states the caps; VERSIONS states the pool).
+    assert (MAX_RECORDINGS_PER_SESSION, MAX_RECORDINGS_PER_PROCESS) == (1, 2)
+    assert f"{MAX_RECORDINGS_PER_SESSION} active recording per session, {MAX_RECORDINGS_PER_PROCESS} per process" in doc
+    assert (RECORDING_MAX_FRAMES, RECORDING_MAX_BYTES, RECORDING_MAX_AGE_SECONDS, RECORDING_KEEP_RECORDINGS) == (
+        24, 16 * 1024 * 1024, 3600.0, 2,
+    )
+    versions = _norm(_read(ROOT / "VERSIONS.md"))
+    assert (
+        f"{RECORDING_MAX_FRAMES} keyframes / {RECORDING_MAX_BYTES // (1024 * 1024)} MB / "
+        f"{int(RECORDING_MAX_AGE_SECONDS)} s" in versions
+    )
+    assert f"the last {RECORDING_KEEP_RECORDINGS} recordings" in versions
+    assert f"caps {MAX_RECORDINGS_PER_SESSION} active recording per session / {MAX_RECORDINGS_PER_PROCESS} per process" in versions
+
+
+def test_configuration_md_states_the_recording_and_pointer_knob_rows_from_the_code() -> None:
+    from computer_use_mcp.core.limits import (
+        RECORD_VIDEO_MAX_MB_BAND,
+        RECORD_VIDEO_MAX_MB_DEFAULT,
+        RECORD_VIDEO_MAX_MB_ENV,
+    )
+    from computer_use_mcp.server import pointer_reply
+    from computer_use_mcp.vision.recorder import ENCODER_CHOICES, ENCODER_DEFAULT, ENCODER_ENV
+
+    doc = _read(ROOT / "docs" / "CONFIGURATION.md")
+    assert f"| `{RECORD_VIDEO_MAX_MB_ENV}` | {RECORD_VIDEO_MAX_MB_DEFAULT} |" in doc
+    assert (
+        f"band {RECORD_VIDEO_MAX_MB_BAND[0]}..{RECORD_VIDEO_MAX_MB_BAND[1]}"
+    ) in doc
+    assert f"`{ENCODER_ENV}`" in doc
+    assert f"`{ENCODER_DEFAULT}`" in doc
+    for encoder in ENCODER_CHOICES:
+        assert f"`{encoder}`" in doc
+    assert f"`{pointer_reply.SHOW_POINTER_ENV}`" in doc
+
+
 def test_configuration_md_states_the_wait_and_idle_knob_rows_from_the_code() -> None:
     doc = _read(ROOT / "docs" / "CONFIGURATION.md")
     assert (

@@ -1,4 +1,4 @@
-# Safety — Cortex 0.7.6
+# Safety — Cortex 0.7.7
 
 The current safety model. Every live rule is enforced in a named module and
 exercised by the test suite. Removed safety machinery (approval epochs, the
@@ -251,6 +251,25 @@ still fires first. Pinned trade: narrative past tense with a class noun flags
   explicit client tools. Every capture emits an audit row, so a hammering client
   generates audit volume at its own discretion; it cannot bypass any safety
   gate (observation alone never acts).
+- **Recordings dispatch no input.** `computer_record` / `computer_record_result`
+  are read-only captures: the recorder grabs frames through its own mss
+  instance (read-only `GetCursorPos` is the only desktop read it adds — the
+  same read `observe` already makes) and no new user32 effect call exists
+  anywhere on the recording path; the tripwire allow-list is unchanged. The
+  recorder never touches the backend's grabber or its identical-pixel cache,
+  and the pointer composite draws on outbound copies only. One caveat stated
+  honestly: when the session has no capture context yet, `computer_record`
+  runs ONE `backend.observe()` to establish it — the same read-only capture
+  every other tool performs.
+- **`save=true` writes unredacted files.** The recording `save=true` writes
+  the recorded MP4 and the contact-sheet PNG UNREDACTED (raw captured pixels,
+  no text redaction applies to images) under a
+  `recordings/` folder of the audit-log directory (`COMPUTER_USE_MCP_LOG_DIR`
+  or `%TEMP%\cortex\logs`) — the same directory that already holds the
+  per-session audit JSONL, which is Cortex's other file write. The files are
+  NOT auto-cleaned — the user manages
+  their lifetime. In-memory recording evidence (keyframes, video, held frames)
+  stays in the recording pool's caps and never touches disk unless `save=true`.
 - **Per-session isolation**: each session owns its context, state, backend,
   agent, enforcer, audit logger, and metrics. No shared mutable state between
   sessions; unknown ids fail closed (`unknown_session`). Sessions are in-process

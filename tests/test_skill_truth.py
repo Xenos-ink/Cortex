@@ -464,6 +464,138 @@ def test_the_evidence_retention_bounds_are_stated() -> None:
     assert expected in _flat()
 
 
+# --- 0.7.7: the pointer sprite and the recording family, derived from the code ---------------------
+
+
+def test_the_pointer_teachings_are_derived_from_the_code() -> None:
+    """Every pointer fact the skill teaches is read from the code first: the
+    trailing `show_pointer` parameters (None defaults), the reply field names the
+    builder emits, the sprite states the compositor draws, and the env knob."""
+    import inspect
+    from types import SimpleNamespace
+
+    from computer_use_mcp.server import lifecycle, observe, pointer_reply
+    from computer_use_mcp.vision import pointer_sprite
+
+    start_params = inspect.signature(lifecycle.start_session).parameters
+    observe_params = inspect.signature(observe.computer_observe).parameters
+    assert start_params["show_pointer"].default is None
+    assert observe_params["show_pointer"].default is None
+    reply_src = inspect.getsource(pointer_reply)
+    assert '"pointer"' in reply_src and '"last_click"' in reply_src
+    composite_params = inspect.signature(pointer_sprite.composite).parameters
+    assert composite_params["state"].default == "normal"
+    sprite_src = inspect.getsource(pointer_sprite)
+    assert '"pressed"' in sprite_src
+    assert pointer_reply.SHOW_POINTER_ENV == "CORTEX_SHOW_POINTER"
+
+    flat = _flat()
+    assert "`pointer`" in flat and "`last_click`" in flat
+    assert "`in_image`" in flat
+    assert "show_pointer=false" in flat
+    assert f"`{pointer_reply.SHOW_POINTER_ENV}`" in flat
+    assert "ARROW TIP" in flat
+    assert 'means "this call clicked here"' in flat
+    assert "Plan-step images show Normal" in flat
+    assert "button, age_ms" in flat
+    # VAL-WP-D-01 L6: the taught field SHAPES are derived from the builder's
+    # emitted structure, not from literals here.
+    fields = pointer_reply.pointer_reply_fields(
+        SimpleNamespace(backend=None), x=1, y=2, state="normal", in_image=False
+    )
+    assert list(fields) == ["pointer", "last_click"]
+    assert list(fields["pointer"]) == ["x", "y", "state", "in_image"]
+    assert f"`pointer {{{', '.join(fields['pointer'])}}}`" in flat
+
+    class _Ring:
+        def last_click(self) -> dict[str, Any]:
+            return {"x": 3.0, "y": 4.0, "button": "left", "t": None}
+
+    fields_with_click = pointer_reply.pointer_reply_fields(
+        SimpleNamespace(backend=_Ring()), x=1, y=2, state="normal", in_image=True
+    )
+    assert list(fields_with_click["last_click"]) == ["x", "y", "button", "age_ms"]
+    assert f"`last_click {{{', '.join(fields_with_click['last_click'])}}} | null`" in flat
+
+
+def test_the_recording_teachings_are_derived_from_the_code() -> None:
+    """Every recording value the skill states is derived at test time from the
+    bands in core/limits.py and the closed sets in vision/recorder.py — never
+    hard-coded here."""
+    from computer_use_mcp.core.limits import (
+        RECORD_DURATION_BAND,
+        RECORD_FPS_BAND,
+        RECORD_FPS_DEFAULT,
+        RECORD_MAX_KEYFRAMES_BAND,
+        RECORD_MAX_KEYFRAMES_DEFAULT,
+        RECORD_VIDEO_MAX_MB_BAND,
+        RECORD_VIDEO_MAX_MB_DEFAULT,
+        RECORD_VIDEO_MAX_MB_ENV,
+    )
+    from computer_use_mcp.vision.recorder import (
+        ENCODER_CHOICES,
+        ENCODER_DEFAULT,
+        ENCODER_ENV,
+        RECORD_STATUS_ENCODING,
+        RECORD_STATUS_RECORDING,
+        VIDEO_FINAL_OMISSIONS,
+        VIDEO_OMISSION_REASONS,
+        VIDEO_OMITTED_ENCODE_FAILED,
+        VIDEO_OMITTED_NOT_REQUESTED,
+    )
+
+    flat = _flat()
+    lo, hi = (f"{bound:g}" for bound in RECORD_DURATION_BAND)
+    assert f"`duration_s` band {lo}..{hi} s" in flat
+    assert f"`fps` band {RECORD_FPS_BAND[0]}..{RECORD_FPS_BAND[1]} (default {RECORD_FPS_DEFAULT})" in flat
+    assert (
+        f"`max_keyframes` band {RECORD_MAX_KEYFRAMES_BAND[0]}..{RECORD_MAX_KEYFRAMES_BAND[1]}"
+        f" (default {RECORD_MAX_KEYFRAMES_DEFAULT})" in flat
+    )
+    assert f"cap is {RECORD_VIDEO_MAX_MB_DEFAULT} MiB raw" in flat
+    assert f"`{RECORD_VIDEO_MAX_MB_ENV}`, band {RECORD_VIDEO_MAX_MB_BAND[0]}..{RECORD_VIDEO_MAX_MB_BAND[1]}" in flat
+    for encoder in ENCODER_CHOICES:
+        assert f"`{encoder}`" in flat, f"the skill never names encoder {encoder!r}"
+    assert f"`{ENCODER_DEFAULT}`" in flat
+    assert f"`{ENCODER_ENV}`" in flat
+    for status in (RECORD_STATUS_RECORDING, RECORD_STATUS_ENCODING):
+        assert f"`{status}`" in flat, f"the skill never names the status {status!r}"
+    for reason in VIDEO_OMISSION_REASONS:
+        assert f"`{reason}`" in flat, f"the skill never names omission reason {reason!r}"
+    # VAL-WP-D-01 L6/M4: the retried set derives from the code's reuse rule —
+    # final omissions are reused EXCEPT an `encode_failed` carrying
+    # `aborted: true` (server/record.py's abort check in front of the
+    # final-reuse gate); `not_requested` is never a retry candidate.
+    retried = set(VIDEO_OMISSION_REASONS) - set(VIDEO_FINAL_OMISSIONS) - {
+        VIDEO_OMITTED_NOT_REQUESTED,
+    }
+    assert retried == {"over_budget"}
+    assert VIDEO_OMITTED_ENCODE_FAILED in VIDEO_FINAL_OMISSIONS
+    import inspect as _inspect
+
+    from computer_use_mcp.server import record as _server_record
+
+    reuse_src = _inspect.getsource(_server_record)
+    assert 'is_aborted = bool(stored.get("aborted"))' in reuse_src, (
+        "the aborted-encode retry rule moved; restate the skill's retried set"
+    )
+    assert "Retried on a later collect" in flat
+    assert "`over_budget`, or an `encode_failed` carrying `aborted: true`" in flat
+    assert "`frame_to_canonical`" in flat
+    # VAL-WP-D-01 L6: the caps the skill states are the code's constants.
+    from computer_use_mcp.server.record_machine import (
+        MAX_RECORDINGS_PER_PROCESS,
+        MAX_RECORDINGS_PER_SESSION,
+    )
+
+    assert (MAX_RECORDINGS_PER_SESSION, MAX_RECORDINGS_PER_PROCESS) == (1, 2)
+    assert (
+        f"caps {MAX_RECORDINGS_PER_SESSION} active recording per session, "
+        f"{MAX_RECORDINGS_PER_PROCESS} per process" in flat
+    )
+
+
+
 def test_the_session_idle_timeout_default_is_stated() -> None:
     assert SESSION_IDLE_TIMEOUT_ENV == "CORTEX_SESSION_IDLE_TIMEOUT_SECONDS"
     flat = _flat()

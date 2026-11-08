@@ -270,6 +270,9 @@ def _record_worker(handle: _RecordHandle) -> None:
                 data, info = _encode_video(
                     recording,
                     fps=recording.fps,
+                    # VAL-WP-D-01 M2: the session's show_pointer default rides
+                    # the Recording — OFF composites no sprite into the MP4.
+                    composite=bool(getattr(recording, "composite_pointer", True)),
                     should_abort=lambda: (
                         handle.cancel.is_set()
                         or pool.disposed
@@ -294,9 +297,13 @@ def _record_worker(handle: _RecordHandle) -> None:
                 # space, with the frame→canonical metadata (scale + origin)
                 # — fetch composites at exactly those pixels and reports the
                 # pointer in CANONICAL coordinates via the published mapping.
+                # VAL-WP-D-01 M2: with the session's show_pointer OFF no
+                # pointer metadata is stored at all (no sprite will ever be
+                # drawn for this recording — fetch respects the same default).
                 scale = recording.frame_scale if recording.frame_scale > 0 else 1.0
+                composite_pointer = bool(getattr(recording, "composite_pointer", True))
                 pointer_fx = pointer_fy = None
-                if frame.pointer_x is not None and frame.pointer_y is not None:
+                if composite_pointer and frame.pointer_x is not None and frame.pointer_y is not None:
                     pointer_fx = (frame.pointer_x - recording.canonical_origin[0]) * scale
                     pointer_fy = (frame.pointer_y - recording.canonical_origin[1]) * scale
                 image_id = pool.store_keyframe(
@@ -307,7 +314,9 @@ def _record_worker(handle: _RecordHandle) -> None:
                     t_ms=round(frame.t_ms, 1),
                     pointer_x=pointer_fx,
                     pointer_y=pointer_fy,
-                    pointer_state=frame.pointer_state if frame.in_image else None,
+                    pointer_state=(
+                        frame.pointer_state if composite_pointer and frame.in_image else None
+                    ),
                     frame_scale=scale,
                     origin=recording.canonical_origin,
                 )

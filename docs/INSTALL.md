@@ -12,6 +12,24 @@ documented in [TOOLS.md](TOOLS.md).
 - No vision API key required: the deterministic surface never calls a model.
   The provider is configured only for the optional model-judge verification
   tier (see [CONFIGURATION.md](CONFIGURATION.md)).
+- The screen-recording encoder needs `av` (PyAV, constrained `>=18.1.0,<19` in
+  `pyproject.toml`). The Windows wheel is about 30 MB because it BUNDLES
+  FFmpeg (plus the libx264 / libx265 encoder libraries) — there is no separate
+  FFmpeg install. The import is lazy: a missing or broken `av` degrades the
+  recording tools' video to the typed `encoder_unavailable` reply (frames,
+  timeline and contact sheet still work), never a crash.
+
+### License note (screen recording)
+
+Cortex is MIT. The `av` (PyAV) wheel is BSD-3-Clause, but the av wheel bundles
+a GPL-enabled FFmpeg build together with libx264 and libx265 (GPL-2.0-or-later);
+they are installed and loaded with `av` whichever encoder runs. Cortex prefers
+`h264_mf` (Windows Media Foundation) and runs libx264 only as a fallback;
+`CORTEX_RECORD_ENCODER=h264_mf` stops Cortex from ever encoding through
+libx264. It does not remove the GPL components from the installation; on
+Windows N editions without the Media Feature Pack, video is then unavailable
+(`encoder_unavailable`) while frames and the timeline still work. These are
+packaging facts, not legal advice.
 
 ## Manual install
 

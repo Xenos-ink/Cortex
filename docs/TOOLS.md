@@ -1,4 +1,4 @@
-# Tools — Cortex 0.7.6 tool reference
+# Tools — Cortex 0.7.7 tool reference
 
 Current truth for the served MCP surface. The tool set, the action bounds, the
 wait/evidence sentences and the reply token vocabulary here are pinned by
@@ -85,7 +85,8 @@ reaper (below) frees forgotten sessions automatically.
 ## computer_observe / computer_screenshot
 
 ```text
-computer_observe(session_id, visual_view=None, visual_view_density=None, pixel_evidence=None)
+computer_observe(session_id, visual_view=None, visual_view_density=None,
+                 pixel_evidence=None, show_pointer=None)
 computer_screenshot(session_id)   # alias, same reply
 ```
 
@@ -111,6 +112,18 @@ omits the field entirely. Unknown view/density values
 (`invalid_pixel_evidence`) are rejected BEFORE any capture; a view that cannot
 be derived returns the executed/observed result honestly with no image block and
 the `view_derive_failed` marker — never a silent raw substitution.
+
+`show_pointer` (trailing optional, `None` = the session default) governs the
+Cortex cursor sprite composited into the OUTBOUND image at the real pointer (the
+ARROW TIP is the exact pointer point; `state` is `normal`, or `pressed` plus a
+ring at an executed call's own click point). The default source is
+`start_session(show_pointer=...)` > env `CORTEX_SHOW_POINTER` > on. Compositing
+is outbound-only: verification frames, digests, the identical-pixel cache and the
+stored evidence frames stay clean. Image-bearing replies add
+`pointer {x, y, state, in_image}` (canonical coordinates; `in_image` false = the
+pointer was off that image and nothing was drawn) and
+`last_click {x, y, button, age_ms} | null`; a capture with no known cursor emits
+neither key.
 
 ## computer_zoom
 
@@ -314,6 +327,120 @@ or malformed id answers the byte-identical `image_not_found` (an id can never
 probe another session's images); `store_disposed` after teardown. A text-mode
 session never produces image bytes, so no id is ever issued on one. Fetch is a
 read-only retrieval and stays ALLOWED during a plan lease.
+
+## computer_record
+
+```text
+computer_record(session_id, duration_s, region=None, fps=None,
+                max_keyframes=None, include_video=None, save=None)
+```
+
+Starts recording the session's monitor (or a canonical `region`) IN THE
+BACKGROUND and returns AT ONCE — a marker reply with `record_id` (`rec_` + 16
+hex), `status: "recording"`, `ends_at` (epoch seconds) and the effective
+fps/region. Keep calling tools while it records; collect the product with
+`computer_record_result`.
+
+- Bands (fail-closed refusals, never silently shortened): `duration_s` 0.5..10 s;
+  `fps` 1..10 (default 5); `max_keyframes` 2..12 (default 8).
+- `region` is `[left, top, width, height]` in canonical screenshot space; with no
+  region the session's monitor is recorded (the same monitor choice
+  `computer_observe` uses). Malformed, out-of-bounds or unverifiable coordinates
+  are the typed `invalid_region` error (monitor mode included) — never clipped.
+- `include_video=true` also encodes an H.264 MP4 right after capture, in the
+  recording worker (the result call usually only fetches it). The default blob
+  cap is 2 MiB raw (`CORTEX_RECORD_VIDEO_MAX_MB`, band 1..8, fallback-not-clamp);
+  the encoder preference is `CORTEX_RECORD_ENCODER` (default `h264_mf,libx264`:
+  `h264_mf` — Windows Media Foundation — first, `libx264` fallback; the video
+  entry reports the encoder actually used). A larger-than-cap or budgeted-out
+  encode is honestly omitted (see `computer_record_result`).
+- `save=true` writes the MP4 + the contact-sheet PNG under the Cortex recordings
+  directory (a `recordings/` folder of the audit-log directory — the same
+  directory that holds the per-session audit JSONL) and the result carries
+  `video_path` / `sheet_path`; it implies video production.
+- Text sessions are refused (`text_session_no_screen`). Both recording tools stay
+  ALLOWED during a plan lease (recording a plan's effect is a main use). Caps: 1
+  active recording per session, 2 per process (typed `recording_limit` — the
+  per-session refusal names the active `record_id`; the process-wide refusal
+  reports the live count).
+- Failures surface: the result reply is `result:"failed"` with reasons
+  `["capture_failed" | "record_worker_failed"]` and the error text — never a
+  silent empty `verified`. A capture error after some frames is still `failed`
+  (a partially captured timeline is untrustworthy); the message counts the frames
+  captured before the failure.
+- Rejections and errors: the band/argument refusals `invalid_record_duration` /
+  `invalid_record_fps` / `invalid_record_keyframes` / `invalid_record_param`
+  (`result:"rejected"`, nothing started); the typed `invalid_region` error reply
+  for a malformed/out-of-bounds region; `text_session_no_screen`;
+  `recording_limit` at the caps; and `record_failed` (`result:"failed"`,
+  `error` token) when the recording worker thread could not start.
+
+Example — record a transient effect while you act:
+
+```text
+computer_record(session_id, duration_s=6)             # returns at once
+# -> result:"marker", status:"recording", record_id:"rec_16hex", ends_at, effective fps/region
+computer_execute(session_id, action="click", x=980, y=44,
+                 expected_effect="the ribbon toggle is on")
+# keep working — the recording runs in the background the whole time
+```
+
+## computer_record_result
+
+```text
+computer_record_result(session_id, record_id, block=True, cancel=False,
+                       include_video=None)
+```
+
+Collect a recording: block until it ends (≤ 10 s plus the encode), peek, or
+cancel early.
+
+- `block=true` (the default) waits until the recording ends and returns
+  `result:"verified"` with a TextContent carrying the JSON (`record_id`,
+  `duration_ms`, `effective_fps`, `dropped_frames`, `region`, the timeline
+  segments, the window's `actions`, `keyframes` — each with its fetchable
+  `image_id`), the contact sheet as an ImageContent (the Cortex cursor composited
+  into every cell when the session's show_pointer default is on — off sessions
+  record no sprite anywhere), and the MP4 as an EmbeddedResource (`video/mp4`)
+  when video is attached to THIS reply.
+- The `video` entry is per reply: `included` (`bytes` / `width` / `height` /
+  `fps` / `codec` / `encoder`) or `omitted` naming one closed reason —
+  `not_requested` / `too_large` / `encoder_unavailable` / `encode_failed` /
+  `over_budget` (the client budget could not fit the next ladder rung; retried on
+  a later call) / `frames_released` (the held frames were evicted under the
+  recording pool's byte cap before any video was stored). The final omissions are
+  reused on later collections without re-running the ladder; only `over_budget`
+  retries. An `encode_failed` carrying `aborted: true` (a stop/cancel aborted the
+  encode) is NOT final — a later collect retries while the frames are held.
+- The result call's explicit `include_video` wins over the start call's; `save`
+  (a start-only flag) keeps writing the files either way.
+- `block=false` peeks a RUNNING recording: `result:"marker"`, `status`
+  `recording` or `encoding` (the capture finished, the video encode still
+  running), with `elapsed_seconds` and `remaining_seconds`. `cancel=true` stops
+  the recording
+  early and returns what was captured (`result:"stopped"`).
+- Fetched recording keyframes publish `frame_to_canonical` (`{"scale", "origin"}`)
+  that maps the STORED keyframe pixels to canonical screenshot coordinates: a
+  copy served downscaled must first be divided by its `image_outbound_scale`.
+- An unknown or foreign-session `record_id` is the typed `unknown_record`
+  rejection (byte-identical for both); a finished recording that fell out of the
+  per-session retention ring answers `record_expired`. The video stays retrievable
+  later by `record_id` (`block=false, include_video=true`) while the recording is
+  retained.
+
+Example — collect and drill into a moment:
+
+```text
+computer_record_result(session_id, "rec_16hex")       # blocks until the end
+# -> result:"verified"; payload: duration_ms, effective_fps, dropped_frames,
+#    timeline segments, actions, keyframes[{image_id, t_ms}], the contact sheet,
+#    and video {included | omitted: reason}
+computer_record_result(session_id, "rec_16hex", block=false)
+# -> while STILL running: result:"marker", status:"recording"|"encoding",
+#    elapsed_seconds, remaining_seconds; after the recording finished:
+#    result:"verified" (the same payload as the blocking collect)
+computer_fetch_image(session_id, keyframes[2].image_id)   # one moment, full size
+```
 
 ## stop_session
 
