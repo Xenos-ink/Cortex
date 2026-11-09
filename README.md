@@ -261,9 +261,12 @@ Research that informed the design (no code redistributed):
 Built on: [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk),
 [pydantic](https://docs.pydantic.dev/), [Pillow](https://python-pillow.org/),
 [mss](https://github.com/BoboTiG/python-mss),
-[PyAutoGUI](https://pyautogui.readthedocs.io/),
+[PyAutoGUI](https://pyautogui.readthedocs.io/) (optional extra, for
+`CORTEX_INPUT_BACKEND=pyautogui`; not installed by default),
 [httpx](https://www.python-httpx.org/).
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Xenos-ink.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Xenos-ink. Third-party
+runtime dependencies and their licences are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

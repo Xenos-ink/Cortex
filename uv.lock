@@ -202,16 +202,19 @@ dependencies = [
     { name = "mcp" },
     { name = "mss" },
     { name = "pillow" },
-    { name = "pyautogui", marker = "sys_platform == 'win32'" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
 ]
 
 [package.optional-dependencies]
 dev = [
+    { name = "pyautogui", marker = "sys_platform == 'win32'" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+]
+pyautogui = [
+    { name = "pyautogui", marker = "sys_platform == 'win32'" },
 ]
 
 [package.metadata]
@@ -221,14 +224,15 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.9.0,<2.0.0" },
     { name = "mss", specifier = ">=9.0.1" },
     { name = "pillow", specifier = ">=10.0.0" },
-    { name = "pyautogui", marker = "sys_platform == 'win32'", specifier = ">=0.9.54" },
+    { name = "pyautogui", marker = "sys_platform == 'win32' and extra == 'dev'", specifier = ">=0.9.54" },
+    { name = "pyautogui", marker = "sys_platform == 'win32' and extra == 'pyautogui'", specifier = ">=0.9.54" },
     { name = "pydantic", specifier = ">=2.7.0" },
     { name = "pydantic-settings", specifier = ">=2.2.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["pyautogui", "dev"]
 
 [[package]]
 name = "cryptography"

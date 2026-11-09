@@ -169,9 +169,16 @@ def test_tripwire_blocks_os_startfile(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_tripwire_blocks_pyautogui_effects_when_loaded() -> None:
+    # WP-L/M DELTA 2: nothing in the offline suite imports pyautogui anymore
+    # (it is the optional extra). Import it HERE, inside the test body, so the
+    # import goes through the tripwire's own first-import path
+    # (_PyautoguiTripwireFinder/_TrapLoader replays the backend's DPI setter
+    # then traps the effects) — which exercises MORE than the old
+    # "skip unless already loaded" version. Order-independent: if an earlier
+    # test already imported it, we use that trapped module.
     pyautogui = sys.modules.get("pyautogui")
     if pyautogui is None:
-        pytest.skip("pyautogui not loaded (the fixture must NOT import it — see M3 pin)")
+        pyautogui = pytest.importorskip("pyautogui", reason="pyautogui not installed (dev extra)")
     for name in sorted(_PINNED_PYAUTOGUI_EFFECTS):
         effect = getattr(pyautogui, name)
         assert getattr(effect, "_cortex_tripwire_trap", False), (

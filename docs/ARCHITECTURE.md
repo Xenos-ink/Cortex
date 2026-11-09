@@ -55,8 +55,9 @@ Companions: [TOOLS.md](TOOLS.md) (tool reference),
 - Windows-first execution (`desktop/backend.py` `LocalComputerBackend`); a
   faithful in-memory `FakeComputerBackend` implements the same contracts for
   tests and non-Windows import. Python >= 3.11; runtime deps: `mcp`,
-  `pydantic`, `pydantic-settings`, `Pillow`, `mss`, `pyautogui` (selectable
-  fallback input engine; the default physical-input path is raw Win32
+  `pydantic`, `pydantic-settings`, `Pillow`, `mss`, `pyautogui` (optional
+  extra, selectable fallback input engine; NOT installed by default since WP-M;
+  the default physical-input path is raw Win32
   `SendInput` via stdlib ctypes), `httpx`, `av` (PyAV — the screen-recording
   encoder; imported lazily by `vision/recorder.py`, so a missing wheel degrades
   to the typed `encoder_unavailable` reply, never an import crash).

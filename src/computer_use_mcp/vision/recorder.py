@@ -24,9 +24,13 @@ at scale 1.0 on the frame's own pixels, exactly right).
 ``h264_mf`` (Windows Media Foundation) first, then ``libx264``, configurable
 via ``CORTEX_RECORD_ENCODER`` (fallback-not-clamp to ``"h264_mf,libx264"``);
 the video entry reports the encoder actually used.  License note: the av wheel
-bundles GPL-licensed FFmpeg/libx264 components that are loaded whichever
-encoder runs — preferring ``h264_mf`` only keeps Cortex itself from encoding
-through libx264.
+bundles FFmpeg, which self-reports LGPL-3.0-or-later, plus GPL-2.0-or-later
+libx264/libx265; avcodec is linked against those GPL libraries and FFmpeg's
+LICENSE.md makes the GPL apply to that combination, so for redistribution the
+av.libs set must be treated as GPL (in practice GPL-3.0-or-later). Cortex's
+own MIT source distribution is unaffected. The
+components are loaded whichever encoder runs — preferring ``h264_mf`` only
+keeps Cortex itself from encoding through libx264.
 
 **The encode respects a deadline (M3).**  ``encode_video(deadline=...)`` —
 the ladder checks the clock before every rung and returns
@@ -115,8 +119,13 @@ _SHEET_GAP = 6
 VIDEO_MAX_MB_ENV = RECORD_VIDEO_MAX_MB_ENV
 
 #: DELTA 1 item 11: the closed encoder choice set and the fallback-not-clamp
-#: default preference.  License note: the av wheel bundles GPL-licensed
-#: FFmpeg/libx264/libx265 components that are loaded whichever encoder runs —
+#: default preference.  License note: the av wheel bundles FFmpeg, which
+#: self-reports LGPL-3.0-or-later, plus GPL-2.0-or-later libx264/libx265;
+#: avcodec is linked against those GPL libraries, and FFmpeg's LICENSE.md
+#: makes the GPL apply to that combination, so the av.libs set must be
+#: treated as GPL for redistribution — in practice GPL-3.0-or-later. Cortex's
+#: own MIT source distribution is unaffected. The components are loaded
+#: whichever encoder runs —
 #: ``h264_mf`` (Windows Media Foundation) is preferred so Cortex itself never
 #: ENCODES through GPL libx264; the preference does not unload them.
 ENCODER_ENV = "CORTEX_RECORD_ENCODER"

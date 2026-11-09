@@ -12,7 +12,7 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
-## v0.7.7 (2026-11-08, ORVEX-2026-109 — the Cortex cursor in the agent's images and screen recording)
+## v0.7.7 (2026-11-09, ORVEX-2026-109 — the Cortex cursor in the agent's images and screen recording)
 
 0.7.7 closes the two evidence gaps a single screenshot leaves. First, the agent
 judged images that did not show WHERE its pointer was or where it had clicked:
@@ -91,7 +91,12 @@ timestamped keyframe contact sheet and, on request, the full MP4.
   lines (+1,600 chars total, under the 2,500 budget). New
   `tests/test_wp_t_examples.py` parses every example block and validates it
   against the live tool schemas, action vocabulary and bands, and pins the
-  card/heading coverage.
+  card/heading coverage. Three mistakes a model made in the 2026-11-09 live
+  tool test are now named in the cards:
+  - raising only `max_steps` past 100 (the default `max_actions` still caps);
+  - a top-level `duration_ms`/`hold_ms` (with a validated timed-move example);
+  - mixing a plan with flat arguments (`action` must be `"done"`; `on_failure`
+    and the timing fields live inside `plan`).
 - **Record around the action (WP-E E1)** — `computer_execute` gains a trailing
   optional `record` object (`{"duration_s", "region", "fps", "max_keyframes",
   "include_video", "save"}`) that starts the background recording JUST BEFORE
@@ -125,9 +130,15 @@ timestamped keyframe contact sheet and, on request, the full MP4.
 - **Tool count 10 → 12** — the CLI probe, the docs and the skill tables carry
   the recording family, and every tool-count pin in the repo is restated
   against the new count.
+- **Third-party notices: THIRD_PARTY_NOTICES.md lists every runtime dependency
+  with its licence, and third_party/licenses/ carries their licence texts.**
+- **pyautogui (and with it MouseInfo, PyMsgBox, PyScreeze, PyGetWindow,
+  PyTweening, pyperclip, PyRect) is no longer installed by default; it is the
+  optional extra `pyautogui`, needed only for
+  `CORTEX_INPUT_BACKEND=pyautogui`.**
 - **Dependencies** — new dependency `av` (PyAV) `>=18.1.0,<19`, lazily
-  imported by the recorder; about 30 MB of wheel (bundled FFmpeg). Everything
-  else is unchanged.
+  imported by the recorder; about 30 MB of wheel (bundled FFmpeg). Apart from
+  the pyautogui change above, the other runtime dependencies are unchanged.
 - **Batch replies show the state after the batch (WP-E E3)** — when a
   `computer_execute` call carries `follow_ups`, the reply's attached image (and
   its `image_id`, `pointer`, `last_click` and the registered evidence frame) is
@@ -219,14 +230,39 @@ Measured on the reference Windows box; machine-relative, not guarantees.
   reply.
 - **New dependency** `av` (PyAV) `>=18.1.0,<19` — about 30 MB of wheel with a
   bundled FFmpeg; see the license note in docs/INSTALL.md: Cortex is MIT, the
-  PyAV wheel is BSD-3-Clause, but the av wheel bundles a GPL-enabled FFmpeg
-  build together with libx264 and libx265 (GPL-2.0-or-later); they are
-  installed and loaded with `av` whichever encoder runs. Cortex prefers
+  PyAV wheel is BSD-3-Clause, and the wheel bundles FFmpeg, which
+  self-reports LGPL-3.0-or-later (configured with
+  `--enable-version3` and without `--enable-gpl`) together with the codec
+  libraries libx264 and libx265 (GPL-2.0-or-later); the bundled avcodec is
+  linked against libx264/libx265 and FFmpeg's own LICENSE.md states those
+  libraries are GPL and make the GPL apply to the FFmpeg build, so for
+  redistribution the av.libs set must be treated as GPL — in practice
+  GPL-3.0-or-later; Cortex's own MIT source distribution bundles none of it.
+  They are installed and loaded with `av` whichever encoder runs. Cortex prefers
   `h264_mf` (Windows Media Foundation) and runs libx264 only as a fallback;
   `CORTEX_RECORD_ENCODER=h264_mf` stops Cortex from ever encoding through
   libx264 — it does not remove the GPL components from the installation (on
   Windows N editions without the Media Feature Pack video is then
   unavailable, `encoder_unavailable`).
+- **pyautogui is no longer a default dependency** — it (and with it MouseInfo,
+  PyMsgBox, PyScreeze, PyGetWindow, PyTweening, pyperclip and PyRect) moved to
+  the optional extra `pyautogui`, needed only for
+  `CORTEX_INPUT_BACKEND=pyautogui` — install the extra with ONE of:
+  `python -m pip install -e ".[pyautogui]"` (from a clone);
+  `pip install "computer-use-mcp[pyautogui] @ git+https://github.com/Xenos-ink/Cortex.git"`
+  (from git); `uv sync --extra pyautogui` (with uv). The default SendInput
+  engine never imports
+  it, and selecting it without the extra fails closed with an actionable
+  error. The `dev` extra still pins pyautogui so the test suite keeps covering
+  the fallback engine. **Upgrades:** pip never removes dropped dependencies, so
+  an install upgraded from 0.7.6 or earlier keeps the pyautogui family
+  until you remove it with `python -m pip uninstall -y pyautogui mouseinfo
+  pymsgbox pyscreeze pygetwindow pytweening pyperclip pyrect` (skip this if
+  you use `CORTEX_INPUT_BACKEND=pyautogui`); uv-managed installs: a plain
+  `uv sync --frozen` resolves the environment to exactly the locked set and
+  removes the family for default-engine users; pyautogui-engine users run
+  `uv sync --frozen --extra pyautogui`, contributors `uv sync --frozen --extra
+  dev`.
 - **New env vars**: `CORTEX_SHOW_POINTER` (pointer composite default source),
   `CORTEX_RECORD_ENCODER` (encoder preference list),
   `CORTEX_RECORD_VIDEO_MAX_MB` (video blob cap, band 1..8 MiB).

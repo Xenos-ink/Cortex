@@ -844,10 +844,10 @@ class LocalComputerBackend(ComputerBackend):
         self.mss_dpi_neutralized = self._neutralize_mss_dpi_awareness(mss)
         # mss.MSS is the supported factory on mss >= 10.2; mss.mss() is the legacy path.
         self._mss_factory: Callable[[], object] = getattr(mss, "MSS", None) or mss.mss
-        import pyautogui  # type: ignore[import-not-found]
-
-        self._pyautogui = pyautogui
-        pyautogui.FAILSAFE = True
+        # WP-M (ORVEX-2026-109): pyautogui is an optional extra. It is imported
+        # lazily inside _build_input_engine ONLY when the pyautogui engine is
+        # selected; the default SendInput engine never imports it.
+        self._pyautogui: object | None = None
         self._engine = self._build_input_engine(
             input_engine, type_interval, pyautogui_pause, drag_interpolate
         )
@@ -958,6 +958,20 @@ class LocalComputerBackend(ComputerBackend):
         )
         engine: InputEngine
         if name == "pyautogui":
+            try:
+                import pyautogui  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise ValueError(
+                    "the pyautogui input engine (CORTEX_INPUT_BACKEND=pyautogui "
+                    "or input_engine='pyautogui') needs the optional extra: "
+                    'python -m pip install -e ".[pyautogui]" (from a clone) or '
+                    'pip install "computer-use-mcp[pyautogui] @ '
+                    'git+https://github.com/Xenos-ink/Cortex.git" (from git); '
+                    "with uv: uv sync --extra pyautogui"
+                ) from exc
+            # PyAutoGuiInputEngine itself sets FAILSAFE (input_engine.py), so
+            # the engine default already covers the failsafe corner check.
+            self._pyautogui = pyautogui
             pause = (
                 _env_nonnegative_float(PYAUTOGUI_PAUSE_ENV, 0.0)
                 if pyautogui_pause is None
