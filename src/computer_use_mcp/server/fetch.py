@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 from typing import Any
 
 from mcp.types import ImageContent, TextContent
+from PIL import Image
 
 from ..vision.evidence import (
     EVIDENCE_REFUSE_DISPOSED,
@@ -17,9 +20,13 @@ from ..vision.evidence import (
     RETIRE_BYTE_CAP,
     RETIRE_COUNT_CAP,
     evidence_store,
+    recording_store,
 )
+from ..vision.pointer_sprite import composite
+from ..vision.visual_views import encode_png_b64
 from .instance import mcp
 from .lifecycle import _get_live_bundle, _session_scoped
+from .pointer_reply import session_show_pointer
 from .replies import IMAGE_OUTBOUND_SCALE_KEY, _bound_outbound_image
 from .state import _error_response, _StoppedSession, _UnknownSession
 
@@ -83,7 +90,50 @@ def _evidence_rejection(error: str, message: str, **extra: Any) -> dict[str, Any
     return payload
 
 
-async def _fetch_image_response(store: EvidenceStore, image_id: str) -> Any:
+def _fetch_outbound_worker(
+    image_base64: str,
+    pointer: tuple[float, float] | None,
+    pointer_state: str | None,
+    crop_region: Any,
+    sprite_scale: float = 1.0,
+) -> tuple[str, str, float | None, bool]:
+    """DELTA 1 M5: ALL fetch PIL work — decode, composite, PNG encode AND the
+    outbound ladder — in ONE synchronous worker, run via ``asyncio.to_thread``
+    (the loop never touches pixels). Returns ``(bounded_b64, mime, scale,
+    pointer_in_image)``; without a drawable pointer this is the plain ladder of
+    the clean stored bytes.
+
+    DELTA 2 NIT: ``sprite_scale`` sizes the sprite for the FRAME it is drawn
+    on — recording keyframes carry their capture-time frame scale, so the
+    cursor looks the same size there as in the sheet and the video (never
+    oversized on a downscaled keyframe).
+    """
+    composited: Image.Image | None = None
+    in_image = False
+    serving_b64 = image_base64
+    if pointer is not None and pointer_state in ("normal", "pressed"):
+        try:
+            image = Image.open(io.BytesIO(base64.b64decode(image_base64, validate=True)))
+            image.load()
+            x_local = float(pointer[0])
+            y_local = float(pointer[1])
+            if crop_region:
+                x_local -= crop_region[0]
+                y_local -= crop_region[1]
+            composited, in_image = composite(
+                image, x_local, y_local, pointer_state, sprite_scale
+            )
+            if in_image:
+                serving_b64 = encode_png_b64(composited)
+        except Exception:  # noqa: BLE001 - additive decoration, never a reply-breaker
+            composited = None
+            in_image = False
+    frame_arg = composited if composited is not None and composited.mode in ("RGB", "L") else None
+    bounded_b64, mime_type, applied_scale = _bound_outbound_image(serving_b64, frame_arg)
+    return bounded_b64, mime_type, applied_scale, in_image
+
+
+async def _fetch_image_response(store: EvidenceStore, image_id: str, bundle: Any = None) -> Any:
     """Resolve one id against THIS session's store and shape the reply.
 
     The outcomes are distinguishable answers: a frame that is still here is served
@@ -136,9 +186,84 @@ async def _fetch_image_response(store: EvidenceStore, image_id: str) -> Any:
     # served at its original resolution.  VAL-WP5 F5: the PIL re-encode ladder runs
     # OFF the event-loop thread via asyncio.to_thread — the loop stays responsive
     # while a large frame is encoded (pinned by a blocked-encode test).
-    bounded_b64, mime_type, applied_scale = await asyncio.to_thread(
-        _bound_outbound_image, frame.image_base64
+    # WP-C3 (ORVEX-2026-109; DELTA 1 M4/M5): the STORED bytes stay clean (never
+    # drawn on); the pointer sprite is composited onto THIS outbound copy from the
+    # StoredFrame's capture-time pointer metadata (canonical → frame space:
+    # subtract the crop origin for a zoom crop, else 1:1), and ``last_click`` is
+    # served from the CANONICAL capture-time snapshot — the fetch describes the
+    # FRAME, never the ring "now", never physical coordinates. DELTA 1 M5: the
+    # decode, composite, PNG encode AND the ladder all run in ONE
+    # ``asyncio.to_thread`` worker call — no PIL work on the event loop.
+    show = session_show_pointer(bundle)
+    pointer_x = frame.pointer_x
+    pointer_y = frame.pointer_y
+    pointer_state = frame.pointer_state
+    stored_last_click: dict[str, Any] | None = None
+    if frame.last_click_x is not None or frame.last_click_button is not None:
+        stored_last_click = {
+            "x": frame.last_click_x,
+            "y": frame.last_click_y,
+            "button": frame.last_click_button,
+            "age_ms": frame.last_click_age_ms,
+        }
+    pointer_block: dict[str, Any] | None = None
+    if not (
+        show
+        and pointer_state in ("normal", "pressed")
+        and pointer_x is not None
+        and pointer_y is not None
+    ):
+        pointer_x = pointer_y = pointer_state = None
+    # DELTA 2 N1: recording keyframes carry their frame→canonical mapping —
+    # the sprite is drawn at the keyframe's own sprite scale (NIT: never
+    # oversized on a downscaled keyframe) and the reply's pointer block is
+    # reported in CANONICAL coordinates (canonical = origin + frame × scale).
+    frame_to_canonical: dict[str, Any] | None = None
+    sprite_scale = 1.0
+    if frame.source == "computer_record" and hasattr(store, "frame_to_canonical"):
+        try:
+            frame_to_canonical = store.frame_to_canonical(frame.image_id)
+        except Exception:  # noqa: BLE001 - additive metadata, never a reply-breaker
+            frame_to_canonical = None
+        if frame_to_canonical is not None and frame_to_canonical.get("scale", 0) > 0:
+            sprite_scale = round(1.0 / float(frame_to_canonical["scale"]), 6)
+        else:
+            frame_to_canonical = None
+    (
+        bounded_b64,
+        mime_type,
+        applied_scale,
+        pointer_in_image,
+    ) = await asyncio.to_thread(
+        _fetch_outbound_worker,
+        frame.image_base64,
+        None if pointer_x is None or pointer_y is None else (pointer_x, pointer_y),
+        pointer_state,
+        frame.crop_region,
+        sprite_scale,
     )
+    if pointer_x is not None and pointer_state is not None:
+        # The additive pointer block describes the FRAME.  DELTA 2 N1: for
+        # RECORDING keyframes it reports CANONICAL coordinates — the same
+        # space observation fetches use — via the published frame→canonical
+        # mapping (canonical = origin + frame px × scale); the sprite itself
+        # was drawn at the stored FRAME-space point, at the keyframe's own
+        # sprite scale.  For observation frames the stored pointer is already
+        # canonical and nothing changes.
+        block_x, block_y = pointer_x, pointer_y
+        if frame_to_canonical is not None:
+            origin = frame_to_canonical["origin"]
+            block_x = origin[0] + pointer_x * frame_to_canonical["scale"]
+            block_y = origin[1] + pointer_y * frame_to_canonical["scale"]
+        pointer_block = {
+            "pointer": {
+                "x": block_x,
+                "y": block_y,
+                "state": pointer_state,
+                "in_image": bool(pointer_in_image),
+            },
+            "last_click": stored_last_click,
+        }
     metadata: dict[str, Any] = {
         "ok": True,
         "result": "verified",
@@ -172,6 +297,16 @@ async def _fetch_image_response(store: EvidenceStore, image_id: str) -> Any:
         "evidence_retention": store.retention(),
         "freshness_note": FETCH_FRESHNESS_NOTE,
     }
+    # DELTA 2 N1: recording keyframes publish their frame→canonical mapping —
+    # a keyframe pixel maps back with canonical = origin + pixel × scale.
+    # (The inverted coordinate_scale_* is deliberately omitted for recording
+    # frames; observation frames keep their documented direction.)
+    if frame.source == "computer_record" and frame_to_canonical is not None:
+        metadata["frame_to_canonical"] = frame_to_canonical
+    # WP-C3: the additive pointer block rides the verified image reply only, and
+    # describes the FRAME (capture-time snapshot; DELTA 1 M4).
+    if pointer_block is not None:
+        metadata.update(pointer_block)
     return [
         TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
         ImageContent(type="image", data=bounded_b64, mimeType=mime_type),
@@ -222,6 +357,8 @@ async def computer_fetch_image(session_id: str, image_id: str) -> Any:
     This tool can never return a ``RAW:`` placeholder: a text-delivery session
     (``start_session(image_delivery="text")``) has no image bytes at all, so no id
     is ever issued on one.
+
+    Example: {"session_id": "S", "image_id": "I"} — an id from a reply that carried an image.
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -243,4 +380,18 @@ async def computer_fetch_image(session_id: str, image_id: str) -> Any:
         return _evidence_rejection(
             EVIDENCE_REFUSE_DISPOSED, _EVIDENCE_STORE_DISPOSED_MESSAGE
         )
-    return await _fetch_image_response(store, image_id)
+    # WP-R (ORVEX-2026-109): recording keyframes live in the SEPARATE recording
+    # pool.  An id is resolved against the observation pool FIRST (unchanged for
+    # observation ids — including their expiry answers); only a clean
+    # not_found consults the recording pool, so a retired observation frame
+    # still answers image_expired naming ITS policy.  Recording keyframes keep
+    # the img_ id format and composite the cursor from the stored pointer
+    # exactly like observation frames (WP-C).
+    lookup: EvidenceLookup = store.lookup(image_id)
+    if lookup.outcome == "not_found":
+        recording_pool = recording_store(bundle.extra)
+        if recording_pool is not None:
+            recording_lookup = recording_pool.lookup(image_id)
+            if recording_lookup.outcome != "not_found":
+                return await _fetch_image_response(recording_pool, image_id, bundle)
+    return await _fetch_image_response(store, image_id, bundle)

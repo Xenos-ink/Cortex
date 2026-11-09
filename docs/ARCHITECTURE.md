@@ -1,6 +1,6 @@
-# Architecture — Cortex 0.7.6
+# Architecture — Cortex 0.7.7
 
-Current truth for the layered package as it exists in 0.7.6. Every claim is
+Current truth for the layered package as it exists in 0.7.7. Every claim is
 traceable to a named module under `src/computer_use_mcp/`. Superseded and
 removed machinery (the internal loop, the orchestration layer's removed halves,
 the loop-era recovery/approval-epoch/health modules) is recorded, clearly
@@ -16,7 +16,7 @@ Companions: [TOOLS.md](TOOLS.md) (tool reference),
 - Single Python package, `src/` layout, stdio MCP server built on FastMCP
   (`server/` package; `FastMCP("Cortex")` in `server/instance.py`). The pip
   package is `computer-use-mcp`, the Python package `computer_use_mcp`, version
-  0.7.6 (`core` truth: `pyproject.toml` and `src/computer_use_mcp/__init__.py`).
+  0.7.7 (`core` truth: `pyproject.toml` and `src/computer_use_mcp/__init__.py`).
 - Public launch paths (unchanged by the restructure):
   `python -m computer_use_mcp.server` (module entry `server/__main__.py`;
   logger name `computer_use_mcp.server`), `python -m computer_use_mcp.cli`,
@@ -30,13 +30,15 @@ Companions: [TOOLS.md](TOOLS.md) (tool reference),
   security/   safety (risk engine), redaction, audit
   desktop/    backend, fake_backend, capture, clipboard, input_engine, motion,
               coordinates, errors, launch, win32, windows, focus_guard,
-              interference, text_readers
-  vision/     observation, visual_views, text_substrates, evidence
+              interference, text_readers, pointer_ring
+  vision/     observation, visual_views, text_substrates, evidence,
+              pointer_sprite, recorder
   pipeline/   agent, grounding, validator, verification, provider
   planning/   plan, plan_validator, subtask_manager, checkpoint_manager,
               resume_manager, context_manager, long_running
   server/     instance, app, lifecycle, observe, execute, fetch, wait,
-              wait_machine, plan_surface, replies, schemas, state, __main__
+              wait_machine, record, record_machine, plan_surface, pointer_reply,
+              replies, schemas, state, __main__
   cli.py      single module at the package root
   ```
 
@@ -53,9 +55,12 @@ Companions: [TOOLS.md](TOOLS.md) (tool reference),
 - Windows-first execution (`desktop/backend.py` `LocalComputerBackend`); a
   faithful in-memory `FakeComputerBackend` implements the same contracts for
   tests and non-Windows import. Python >= 3.11; runtime deps: `mcp`,
-  `pydantic`, `pydantic-settings`, `Pillow`, `mss`, `pyautogui` (selectable
-  fallback input engine; the default physical-input path is raw Win32
-  `SendInput` via stdlib ctypes), `httpx`.
+  `pydantic`, `pydantic-settings`, `Pillow`, `mss`, `pyautogui` (optional
+  extra, selectable fallback input engine; NOT installed by default since WP-M;
+  the default physical-input path is raw Win32
+  `SendInput` via stdlib ctypes), `httpx`, `av` (PyAV — the screen-recording
+  encoder; imported lazily by `vision/recorder.py`, so a missing wheel degrades
+  to the typed `encoder_unavailable` reply, never an import crash).
 - Test/benchmark layout: `tests/` offline suite (the live-desktop e2e is gated
   behind `CUMCP_RUN_E2E=1` and is the release's final gate, not a dev
   prerequisite); `benchmarks/` measurement scaffolding with `--mode fake` /
@@ -88,6 +93,13 @@ vision/visual_views.py observation view providers (raw pass-through /      -> mo
 vision/text_substrates.py OCR-once spatial text layer (UIA default,       -> models (+PIL)
                       optional side package; pixel_evidence opt-in)
 vision/evidence.py    per-session image evidence store + fetch semantics  -> models
+vision/recorder.py    the screen-recording core (capture loop, timeline,   -> core.limits,
+                      keyframes, contact sheet, the PyAV encode ladder)      pointer_sprite
+                                                                             (+PIL; av lazy)
+vision/pointer_sprite.py the Cortex cursor sprites + the outbound          (stdlib + PIL)
+                      compositor (hotspot-exact, mask pastes)
+desktop/pointer_ring.py the press/release ring fed at the backend's        (stdlib only)
+                      dispatch choke point (pressed-state truth)
 pipeline/grounding.py GroundingStrategy protocol + coordinate/region      -> models
                       impls + text-anchor/accessibility seams
 pipeline/validator.py staleness/binding/allowlists                        -> models
@@ -103,7 +115,8 @@ pipeline/agent.py     direct-action pipeline (run_single) + queue +       -> aud
 planning/plan.py      waypoint plans, lease aggregate, failure taxonomy   -> models, security.redaction
 planning/*            checkpoint/resume/context (live) + subtask/plan     -> models, limits,
                       validator helpers (checkpoint path)                   redaction
-server/*              the ten MCP tools, reply shaping, wait machine,     -> everything above
+server/*              the twelve MCP tools, reply shaping, wait machine,     -> everything above
+                      recording tools + wait-machine-shaped record machine,
                       lifecycle/kill funnel/idle reaper, schemas            (+ mcp SDK)
 cli.py                install/update/probe/uninstall-ocr CLI              (stdlib only)
 ```
@@ -213,6 +226,57 @@ view-derive failure) retains nothing for that call. `computer_fetch_image` is
 read-only, allowed during a plan lease, and answers wrong/foreign/malformed ids
 with the byte-identical `image_not_found`.
 
+### 4.5 The pointer composite (`vision/pointer_sprite.py` + `desktop/pointer_ring.py`)
+
+Every image the agent receives carries the Cortex cursor composited at the real
+pointer: `vision/pointer_sprite.py` loads the shipped sprite assets (16–48 px,
+Normal and Pressed states, hotspot at the arrow tip) lazily and composites the
+sprite onto a COPY of the outbound image — the hotspot lands exactly on
+`(round(x), round(y))` in the image's own pixel space, the Pressed state adds a
+double-stroke ring at the click point, off-image pointers draw nothing and report
+`in_image: false`. The composite runs at the outbound choke points only (observe
+raw/grid, zoom crops, the execute half-res and full-res images, plan-step images,
+fetch output); the internal `Observation` frames, the verification/digest
+captures, the identical-pixel payload cache and the evidence store's held bytes
+stay CLEAN. Pressed state comes from `desktop/pointer_ring.py` — a bounded ring
+of press/release events fed at the backend's single dispatch choke point (both
+input engines flow through it; no new Win32 calls). The additive reply fields
+`pointer {x, y, state, in_image}` and `last_click {x, y, button, age_ms}` ride
+every image-bearing reply; `start_session(show_pointer=...)` /
+`computer_observe(show_pointer=...)` / env `CORTEX_SHOW_POINTER` turn the
+composite off (off = the byte-identical pre-0.7.7 reply).
+
+### 4.6 The recording family (`vision/recorder.py` + `server/record*.py`)
+
+`computer_record` starts a background `ScreenRecorder` (one per session, 2 per
+process): a daemon-side capture loop on its own mss instance, a fixed schedule
+(0.5–10 s at 1–10 fps, exact frame counts with honest `dropped_frames`
+accounting, a HARD wall ceiling an injected clock cannot defeat), frames held as
+bounded JPEG bytes, a 1/4-scale noise-gated diff reduced to a change timeline,
+timestamped keyframes (first, last, segment onsets + settled ends, largest
+changes) and a bounded contact sheet. The dispatched-action ring
+(`ActionRing`, fed from the pipeline's single dispatch finalize choke point)
+correlates Cortex actions into the window. `computer_record_result` collects:
+the timeline, the window's actions, the keyframe contact sheet (each keyframe
+fetchable by `image_id` from the recording evidence pool) and, on request, an
+H.264 MP4 encoded by PyAV (`av`, lazily imported) through a
+bitrate/quality/resolution ladder under the blob cap (`CORTEX_RECORD_VIDEO_MAX_MB`,
+default 2 MiB, band 1..8), the encoder preference (`CORTEX_RECORD_ENCODER`,
+default `h264_mf,libx264` — Windows Media Foundation first, libx264 fallback)
+and the client time budget (`over_budget` when the next rung cannot fit). The
+worker encodes right after capture and is abortable: stop/cancel joins it off
+the event loop, and an aborted encode is retried on a later collect while the
+frames are held. Recordings live in a SEPARATE `RecordingEvidenceStore`
+(`vision/evidence.py`): 24 keyframes / 16 MB / 3600 s covering the last 2
+recordings per session; it never evicts an observation frame, and under pool
+pressure the held frame payloads are evicted FIRST (the owner's JPEGs are freed
+with them; the honest `frames_released` omission answers a later video request).
+`save=true` writes the MP4 + contact-sheet PNG under the audit dir's
+`recordings/` folder. Both tools dispatch no input: text sessions refuse
+(`text_session_no_screen`), a plan lease allows them, and `record_start` /
+`record_complete` / `record_cancelled` audit events fire once each per
+recording.
+
 ## 5. Pinned contracts
 
 **Observation** (`core/models.py`): `observation_id` (uuid hex), UTC
@@ -320,7 +384,7 @@ allowlist gate fails closed.
   long-running runtime — i.e. a session that was itself started with
   `resume_from_checkpoint` — has a runtime to checkpoint with, so a FRESH
   session's stop writes NO checkpoint file (fresh-session checkpoint creation
-  does not exist in 0.7.6; `server/lifecycle.py` guards the write with
+  does not exist in 0.7.7; `server/lifecycle.py` guards the write with
   `isinstance(runtime, LongRunningRuntime)`).
 - **Resume as a continuation** (`planning/resume_manager.py`): seal and
   deterministic ceiling cross-checks verified BEFORE any restore

@@ -78,12 +78,19 @@ def test_a_default_execute_reply_publishes_an_id_whose_fetch_serves_the_same_pic
 ) -> None:
     """N1: the default (half-res JPEG) reply publishes an id; the fetch serves the
     SAME picture at its OWN disclosed image_outbound_scale + the STORED width/height."""
+    # WP-C3: show_pointer=False pins the ROUNDTRIP-sameness property — with the
+    # pointer sprite ON (default), the reply copy and the fetch copy intentionally
+    # composite at different resolutions/scales, which this tiny 64x48 fake capture
+    # amplifies beyond the pixel-error band. The pointer behavior is pinned in
+    # tests/test_pointer_in_replies.py; this test keeps pinning the pre-WP-C
+    # ladder roundtrip.
     session_id, _bundle, _backend, _ = make_session(
         monkeypatch,
         backend=ScriptedBackend(flip=True),
         dry_run=False,
         require_approval=False,
         limits=FAST_LIMITS,
+        show_pointer=False,
     )
     result = asyncio_run_tool(
         srv_server_execute.computer_execute(session_id, "click", x=10, y=10, approved=True)

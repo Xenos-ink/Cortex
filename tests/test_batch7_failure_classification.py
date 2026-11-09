@@ -354,6 +354,10 @@ def test_pre_existing_classifications_are_unchanged() -> None:
         # stable-only (WP13 A): the follow-up chain stops on the host time budget
         # instead of being killed by the host (dev has no such literal).
         "time_budget": "verification_uncertain",
+        # stable-only (WP-I): a follow-up item's SendInput call was PARTIALLY
+        # inserted — half-landed input with possibly stuck keys is an INPUT
+        # ERROR (execution_error), matching the kind table's ``error`` entry.
+        "partial_input": "execution_error",
         "focus_taken_by": "focus_drifted",
         "focus_identity_unknown": "focus_drifted",
         "stuck_modifier": "rejected",

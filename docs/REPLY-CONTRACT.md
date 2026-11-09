@@ -1,4 +1,4 @@
-# Reply contract — Cortex 0.7.6
+# Reply contract — Cortex 0.7.7
 
 The full reference for reply shapes. One envelope, identical semantics for every
 tool reply, every `follow_up_results[i]` item, every plan step, the terminal
@@ -44,8 +44,22 @@ contract checks).
   string `approval_required` exists ONLY as a `failure_reason` value — never as
   a reply key.
 - `partial_delivery: {delivered_chars: N}` appears on a rejected reply whose
-  input may have partially landed (the mid-type focus drift case); absence of
-  the key means nothing was dispatched.
+  input may have partially landed (the mid-type focus drift case) and on the
+  WP-I partial-insert `failed` reply for typing. Absence of the key means
+  nothing was dispatched, UNLESS a `partial_input` block is present (input
+  landed but no character was fully delivered — a non-typing action, or a cut
+  inside the first character).
+- `partial_input: {sent, total, released, still_stuck}` (WP-I) appears on a
+  `failed` reply whose SendInput call was PARTIALLY inserted (`0 < sent <
+  total`): input DID land — never presented as "nothing was dispatched". The
+  engine released exactly the keys/buttons the landed prefix left down
+  (`released`, readable names in release order, e.g. `["shift", "ctrl"]`,
+  `["mouse_left"]`, `["U+0627"]`); `still_stuck` non-empty means keys or
+  buttons may still be PHYSICALLY DOWN and the message says plainly that a
+  human should press and release them. The action is never auto-retried.
+  In a `follow_ups` batch it STOPS the batch with the closed
+  `follow_ups_stopped_reason` token `partial_input` (later items are unsafe
+  while input is half-landed).
 - `ensure_app_outcome`: the typed launch outcome on ensure_app replies
   (`reattached` / `ambiguous` / `not_found` / `launched` / `launch_rejected` /
   `launch_unresolved`), `None` otherwise.
@@ -61,8 +75,38 @@ contract checks).
 - After a batch: `follow_up_results` AND `follow_ups_stopped_reason` (`null` =
   the batch ran to completion; `time_budget` = the call's wall-clock budget ran
   out — executed items keep their entries, nothing new was dispatched, and the
-  driver RESENDS the remaining items in a new call); an `uncertain` or `failed`
-  verdict on an item that already dispatched does NOT stop the batch.
+  driver RESENDS the remaining items in a new call; `partial_input` = WP-I, an
+  item's SendInput call was PARTIALLY inserted, so later items are UNSAFE and
+  must NOT be resent blindly — re-observe first, and check `still_stuck` in the
+  item's `partial_input` block); an `uncertain` or `failed`
+  verdict on an item that already dispatched does NOT stop the batch (a
+  partial-input insert does).
+- Batch replies (WP-E E3) carry `image_after_item`: the attached image (and its
+  `image_id`, `pointer`, `last_click`, the registered evidence frame) is the
+  post-action frame of the LAST executed item, not item 0's; a trailing `wait`
+  counts. The verdict fields keep item 0's meaning; the key is ABSENT on
+  single-action calls (byte-identical to before) and on opt-out replies (no
+  image served).
+- An execute call with `record` (WP-E E1) carries an additive `record` block on
+  every response shape: `{"started": true, "record_id", "status": "recording",
+  "ends_at", "duration_s", "fps", "region", "message"}` (the message names the
+  collect hint — "collect with computer_record_result(record_id)"), or
+  `{"started": false, "reason": ...}` when no recording started (the action
+  still runs; it is NEVER refused for a recording). The closed `started:false`
+  reason set (derived from `EXECUTE_RECORD_NOT_STARTED_REASONS` in
+  `server/record.py`): `recording_limit` | `text_session_no_screen` |
+  `invalid_region` | `session_stopped` | `record_start_failed` | `no_action`
+  (a `plan_action="stop"` or a continue past the walk's end dispatches no
+  input, so nothing is recorded). When the call is refused BEFORE any input
+  (a safety denial, an approval hold, or a zero-effect rejection) the
+  recording it started is cancelled immediately and the started block gains
+  `cancelled: "action_refused"`; when the call dies after the recording
+  started (a cancellation or any exception), the recording is cancelled
+  before the error propagates. An out-of-band `record` argument —
+  out-of-band values, a malformed region, an UNKNOWN KEY inside the object —
+  is a typed `rejected` reply (`invalid_record_duration` /
+  `invalid_record_fps` / `invalid_record_keyframes` / `invalid_record_param`
+  / `invalid_video_delivery` / `invalid_region`) BEFORE any input.
 
 ## The `result` token set (closed)
 
@@ -88,6 +132,17 @@ Per-surface subsets:
 - The terminal plan: `verified` / `unknown` / `failed` / `stopped`.
 - The wait family: `marker` / `rejected` / `failed`.
 - Fetch: `verified` / `rejected`.
+- The record family (`computer_record` / `computer_record_result`): `marker`
+  (a start or a peek), `verified` (a finished recording, collected),
+  `stopped` (a recording cancelled early — the frames captured so far are
+  kept and reported; for a recording this is NOT the terminal-plan meaning),
+  `failed` (`capture_failed` / `record_worker_failed`), `rejected` (bands,
+  caps, text session).  A malformed / out-of-bounds / unverifiable REGION is
+  the typed `invalid_region` ERROR (`ok:false`, an `error` key, NO `result`
+  token — the same shape as the observe family's refusals), never a
+  `rejected` reply.  A peek may report `status: "encoding"` (the capture
+  finished and the video encode is still running) instead of
+  `"recording"`.
 - `computer_observe` / `computer_screenshot` / `computer_zoom` carry NO `result`
   token (read-only; their refusals are `ok:false` + typed error).
 
@@ -100,6 +155,58 @@ plan declared but that produced no evidence is an absence of evidence, not a
 success); any failed step caps it at `failed`. Plan STEP replies report
 `uncertain`; the `unknown` token is reserved for the terminal aggregate. Read
 `failure_reason` + `not_executed` before choosing continue/stop/replace.
+
+## The recording family (computer_record / computer_record_result)
+
+The screen recorder follows the same envelope:
+
+- Start and peek replies are `marker` (`status: "recording"`, with
+  `elapsed_seconds` / `remaining_seconds`); a finished collection is
+  `verified`; an early cancel is `stopped` — for a RECORDING this means the
+  capture ended early and the frames captured so far are kept and reported
+  (`cancelled: true` in the payload), NOT the terminal-plan meaning.
+- A broken capture is `failed` with reasons `["capture_failed"]` (the grabber
+  raised — secure desktop, UAC, locked workstation) or
+  `["record_worker_failed"]` (any worker exception), plus the error text in
+  `message` and the frames captured before the failure. Never a silent empty
+  `verified`.
+- The `video` entry on a finished payload ALWAYS says what happened, from a
+  closed omission set: `included` (the video is attached to THIS reply — as a
+  written file path for the `"file"` delivery default, as an embedded
+  `video/mp4` resource blob for `"inline"`), or
+  `omitted` = `not_requested` | `too_large` | `encoder_unavailable` |
+  `encode_failed` | `over_budget` | `frames_released` (the held frames were
+  evicted under the recording pool's byte cap before any video was stored) |
+  `write_failed` (WP-E: the default file delivery could not write the MP4).
+  With the DEFAULT `video_delivery="file"` `included` carries NO blob — the
+  entry carries `delivery: "file"` and the absolute `path` of the MP4 written
+  under the recordings folder (`video_path` rides the payload too); most hosts
+  truncate large tool results, so the file path is the default and `"inline"`
+  (the embedded `video/mp4` resource) is only for hosts known to pass video to
+  the model. DELTA 1 (m7, on-disk honesty): whenever `include_video` is
+  requested under the default file delivery, the screen video is SAVED TO DISK
+  under the Cortex recordings folder (the audit dir's `recordings/` — the same
+  folder `save=true` uses) and there is NO automatic cleanup; the write is
+  atomic and happens once per recording (later collects reuse the path). The encoder
+  actually used rides as `encoder` (`h264_mf` or `libx264`).  `too_large` /
+  `encoder_unavailable` / `encode_failed` / `frames_released` are FINAL for
+  the recording (later calls reuse them), with retried cases:
+  `over_budget` (a later call has a fresh budget), `write_failed` (a later
+  collect retries the write while the video is retained) and an
+  `encode_failed` carrying `aborted: true` (a stop/cancel aborted the encode;
+  a later collect retries while the frames are held).  Video may be requested
+  on EITHER call.
+- Recording keyframes fetch through `computer_fetch_image` like observation
+  frames.  The fetch publishes `frame_to_canonical` —
+  `{"scale": <canonical px per frame px>, "origin": [x, y]}` (the canonical
+  region origin) — so a keyframe pixel maps back with
+  `canonical = origin + pixel × scale`.  This maps the STORED keyframe
+  pixels: a copy served downscaled must first be divided by its
+  `image_outbound_scale`.  The `pointer` block is reported in
+  CANONICAL coordinates (the same space observation fetches use); the
+  inverted `coordinate_scale_*` is deliberately OMITTED for recording
+  frames.  `coordinate_space: "recording_frame"` names the frame space the
+  sprite was drawn in.
 
 ## The `failure_reason` vocabulary (closed)
 
@@ -156,13 +263,19 @@ interference-label tables.
 ## Error-code cheat sheet (typed `error` / `reasons` tokens)
 
 `invalid_action` (malformed action, teach-in message) · `invalid_limits` ·
-`invalid_interference` · `invalid_image_delivery` · `invalid_visual_view` ·
-`invalid_region` (zoom crop outside the frame) · `invalid_pixel_evidence` ·
-`view_derive_failed` · `session_stopped` · `session_limit_exceeded` (with
+`invalid_interference` · `invalid_image_delivery` · `invalid_show_pointer` ·
+`invalid_visual_view` · `invalid_region` (a crop or a recording region outside
+the frame; a recording answers with this typed `error` reply, never a
+`rejected` result) ·
+`invalid_pixel_evidence` · `view_derive_failed` · `session_stopped` · `session_limit_exceeded` (with
 `live_sessions` + `idle_timeout_seconds`) · `invalid_wait_duration` ·
 `wait_duration_exceeds_max` · `too_many_waits` · `unknown_wait` · `wait_failed` ·
 `image_expired` · `image_not_found` · `frame_too_large` · `store_disposed` ·
-`plan_lease` · `invalid_plan_action` · `digest_surprise` · `limit_exceeded`
+`plan_lease` · `invalid_plan_action` · `invalid_record_duration` ·
+`invalid_record_fps` · `invalid_record_keyframes` · `invalid_record_param` ·
+`text_session_no_screen` · `recording_limit` · `unknown_record` ·
+`record_expired` · `record_failed` (the recording worker could not start) ·
+`digest_surprise` · `limit_exceeded`
 (with the `limit` key naming the cap) · `invalid_checkpoint` ·
 `checkpoint_error` (a non-validation checkpoint failure during a resume) ·
 `resume_refused`.

@@ -297,6 +297,11 @@ EXPECTED_STOP_REASONS = frozenset(
         # keep their entries, the rest were never dispatched (classified
         # verification_uncertain).
         "time_budget",
+        # WP-I (ORVEX-2026-109 Addendum 2): a follow-up item's SendInput call was
+        # PARTIALLY inserted — input half-landed, possibly with stuck keys, so
+        # the batch stopped before the unsafe remainder (classified
+        # execution_error, like every other input error).
+        "partial_input",
     }
 )
 

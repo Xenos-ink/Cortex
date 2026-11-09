@@ -13,7 +13,8 @@ from PIL import Image
 
 from ..planning import plan as plan_layer
 from ..security.redaction import redact_text
-from ..vision.visual_views import outbound_view_scale
+from ..vision.pointer_sprite import composite
+from ..vision.visual_views import encode_png_b64, outbound_view_scale
 from .instance import logger
 
 
@@ -81,6 +82,19 @@ def _result_image_max_bytes() -> int:
         kb = RESULT_IMAGE_MAX_KB_DEFAULT
     kb = min(kb, 100_000.0)
     return int(kb * 1024)
+
+
+def _base64_decoded_byte_size(data_b64: str) -> int:
+    """The DECODED byte size of a base64 payload, from its length and padding —
+    no decode (DELTA 3, ORVEX-2026-109).
+
+    This is EXACTLY the measure the outbound ladder's under-budget check uses
+    (``len(base64.b64decode(data_b64, validate=True))`` — the arithmetic is the
+    standard base64 size formula), so any caller that needs the same
+    over/under-budget comparison WITHOUT paying a full decode uses this helper
+    and the two comparisons can never diverge.
+    """
+    return len(data_b64) * 3 // 4 - data_b64[-2:].count("=")
 
 
 def _outbound_image_scale(
@@ -182,6 +196,36 @@ def _bound_outbound_image(data_b64: str, frame: Any = None) -> tuple[str, str, f
         return data_b64, "image/png", None
 
 
+def _pointer_composited_payload(
+    data_b64: str,
+    frame: Any,
+    pointer: tuple[float, float, str],
+    scale: float | None = 1.0,
+) -> tuple[str, Any, bool]:
+    """WP-C3 (DELTA 1 M2): composite the pointer sprite onto ONE outbound payload.
+
+    Returns ``(composited_png_b64, composited_pil, in_image)`` — ``in_image``
+    is composite()'s honest verdict (the hotspot lies inside the image); when
+    False NOTHING was drawn and the caller's originals come back untouched.
+    The input bytes/frame are never mutated — the caller's stored payload and
+    the verification frame stay clean.
+    """
+    try:
+        px, py, state = pointer
+        if frame is not None and isinstance(frame, Image.Image):
+            image = frame
+        else:
+            image = Image.open(io.BytesIO(base64.b64decode(data_b64, validate=True)))
+            image.load()
+        composited, in_image = composite(image, px, py, state, scale)
+        if not in_image:
+            return data_b64, frame, False
+        return encode_png_b64(composited), composited, True
+    except Exception:  # noqa: BLE001 - additive decoration, never a reply-breaker
+        logger.debug("pointer composite on the full-res payload failed", exc_info=True)
+        return data_b64, frame, False
+
+
 # --- default action-response image weight ---------------------------------------------------
 
 #: Env knob name: ``CORTEX_ACTION_IMAGE_FULL`` — set to exactly ``1`` to restore the
@@ -205,7 +249,12 @@ def _action_image_full() -> bool:
     return os.environ.get(ACTION_IMAGE_FULL_ENV, "").strip() == "1"
 
 
-def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str, float | None] | None:
+def _half_res_action_image(
+    data_b64: str,
+    frame: Any = None,
+    *,
+    pointer: tuple[float, float, str] | None = None,
+) -> tuple[str, str, float | None, bool] | None:
     """Half-resolution JPEG encode of the executed response's default image.
 
     Downscale 0.5 (LANCZOS) then JPEG quality 60 — 960x540 at 1920x1080. Prefers the
@@ -215,7 +264,18 @@ def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str, 
     on any encode failure so the caller falls back to the full-resolution budget
     ladder — a degraded real image beats none. The third value is the MEASURED applied
     scale (§1.1 D-3): the half-res ratio while the half-res encode fits the budget,
-    the ladder's measured ratio when the budget ladder fires on top of it.
+    the ladder's measured ratio when the budget ladder fires on top of it. The fourth
+    is the pointer's honest ``in_image`` verdict (DELTA 1 M2; ``False`` when no
+    pointer was requested or the hotspot fell outside the image).
+
+    WP-C3 (ORVEX-2026-109; DELTA 1 M1/MINOR 4): ``pointer`` is the canonical
+    ``(x, y, state)`` triple — when given, the pointer sprite is composited onto
+    the HALF-RES copy (after the 0.5 resize, coordinates × 0.5, sprite sized for
+    scale 0.5) BEFORE the JPEG encode, so the outbound image the agent receives
+    shows the pointer at a constant amount of screen content; this also covers a
+    derived GRID frame (the sprite lands after the grid labels AND the resize).
+    The caller's bytes and the ``frame`` stash stay clean. ``pointer=None`` (the
+    default) is byte-identical to the pre-WP-C encoder.
     """
     try:
         if frame is not None and isinstance(frame, Image.Image) and frame.mode in ("RGB", "L"):
@@ -234,6 +294,15 @@ def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str, 
             ),
             Image.LANCZOS,
         )
+        if pointer is not None:
+            px, py, state = pointer
+            composited, pointer_in_image = composite(
+                image, px * _ACTION_IMAGE_SCALE, py * _ACTION_IMAGE_SCALE, state, _ACTION_IMAGE_SCALE
+            )
+            if pointer_in_image:
+                image = composited
+        else:
+            pointer_in_image = False
         buffer = io.BytesIO()
         # optimize=True: optimal Huffman tables — free ~5-8% on real frames at the
         # same quality level (context bytes ARE the product here).
@@ -242,7 +311,7 @@ def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str, 
         encoded = base64.b64encode(raw).decode("ascii")
         if len(raw) <= _result_image_max_bytes():
             scale = _outbound_image_scale(image.width, image.height, *source_size)
-            return encoded, "image/jpeg", scale
+            return encoded, "image/jpeg", scale, pointer_in_image
         # H7 budget still governs the outbound copy even at half resolution; the
         # applied scale composes: half-res step x the budget ladder's own scale,
         # measured against the capture the encode started from. MINOR-N3
@@ -252,7 +321,12 @@ def _half_res_action_image(data_b64: str, frame: Any = None) -> tuple[str, str, 
         bounded_b64, mime, ladder_scale = _bound_outbound_image(encoded)
         half_scale = _outbound_image_scale(image.width, image.height, *source_size)
         composed = (half_scale or 1.0) * (ladder_scale or 1.0)
-        return bounded_b64, mime, None if composed >= 1.0 else round(composed, 4)
+        return (
+            bounded_b64,
+            mime,
+            None if composed >= 1.0 else round(composed, 4),
+            pointer_in_image,
+        )
     except Exception:  # noqa: BLE001 - degradation: fall back to the budget ladder
         logger.debug("half-res action-image encode failed; using the budget ladder", exc_info=True)
         return None
@@ -265,6 +339,7 @@ def _execute_response_blocks(
     full_resolution: bool = False,
     view_id: str | None = None,
     view_payload: tuple[str, Any] | None = None,
+    pointer: tuple[float, float, str] | None = None,
 ) -> list[Any]:
     """REM-A H3/H5: executed ``computer_execute`` results as MCP content blocks.
 
@@ -293,24 +368,49 @@ def _execute_response_blocks(
     transform; a header-parse ratio for derived views, 1.0 = undegraded). With
     ``view_id`` set and ``view_payload=None`` (raw) the stock bytes travel untouched.
     ``view_id=None`` (the default path) is byte-identical to the pre-AL-002 builder.
+
+    WP-C3 (ORVEX-2026-109; DELTA 1): ``pointer`` is the canonical ``(x, y,
+    state)`` triple — when given, the pointer sprite is composited onto the
+    OUTBOUND copy only: after the 0.5 resize (scale 0.5) on the default
+    half-res path — derived GRID frames included — or at scale 1.0 on the
+    full-resolution path. The honest ``in_image`` verdict (the hotspot lies
+    inside the image) is written back into ``payload["pointer"]["in_image"]``
+    (DELTA 1 M2). The caller's bytes and every internal frame stay clean.
+    ``pointer=None`` (the default) is byte-identical to the pre-WP-C builder.
     """
     payload = dict(response)
     data_b64 = payload.pop("screenshot_after_base64", None)
     blocks: list[Any] = []
+    pointer_in_image = False
     if data_b64 is not None:
         if view_payload is not None:
             # AL-002: the requested view was derived ONCE by the caller; the derived
             # bytes + frame ride the UNCHANGED stock bounding branch (I-11: the stock
             # ladder's degradation still applies and is reported via visual_view_scale).
+            # DELTA 1 MINOR 4: the pointer is NOT consumed here — the half-res path
+            # composites AFTER the 0.5 resize (scale 0.5), the full-res path at 1.0,
+            # so the grid sprite keeps its constant screen-content size either way.
             data_b64, frame = view_payload
         if full_resolution:
+            if pointer is not None:
+                data_b64, frame, pointer_in_image = _pointer_composited_payload(
+                    str(data_b64), frame, pointer, 1.0
+                )
             bounded_b64, mime, outbound_scale = _bound_outbound_image(str(data_b64), frame=frame)
         else:
-            halved = _half_res_action_image(str(data_b64), frame=frame)
+            halved = _half_res_action_image(str(data_b64), frame=frame, pointer=pointer)
             if halved is None:
+                if pointer is not None:
+                    data_b64, frame, pointer_in_image = _pointer_composited_payload(
+                        str(data_b64), frame, pointer, 1.0
+                    )
                 bounded_b64, mime, outbound_scale = _bound_outbound_image(str(data_b64), frame=frame)
             else:
-                bounded_b64, mime, outbound_scale = halved
+                bounded_b64, mime, outbound_scale, pointer_in_image = halved
+        if pointer is not None and isinstance(payload.get("pointer"), dict):
+            # DELTA 1 M2: the reply reports composite()'s REAL verdict, never a
+            # placeholder — the sprite may legitimately be off-image.
+            payload["pointer"] = {**payload["pointer"], "in_image": pointer_in_image}
         payload["image_format"] = mime
         # §1.1 D-3 (ORVEX-2026-108): image_outbound_scale is the ONLY scale key —
         # the MEASURED scale the image ladder applied to the delivered copy (1.0

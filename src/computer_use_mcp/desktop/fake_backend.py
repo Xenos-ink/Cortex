@@ -7,7 +7,7 @@ import io
 import os
 import time
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from ..core.models import MonitorInfo, Observation, WindowInfo
 from .backend import (
@@ -43,6 +43,7 @@ from .motion import (
     _wait_clamp_note,
     _wait_for_hold,
 )
+from .pointer_ring import PointerRing
 from .windows import _select_target_monitor, _title_match_rank
 
 
@@ -181,6 +182,9 @@ class FakeComputerBackend(ComputerBackend):
         self.clipboard_value: str | None = initial_clipboard
         self.clipboard_pastes: list[str] = []
         self.clipboard_app_latency_s = max(0.0, float(clipboard_app_latency_s))
+        # WP-C2 (ORVEX-2026-109): the SAME pointer-event ring the real backend keeps
+        # (see LocalComputerBackend) — offline tests drive press state through it.
+        self.pointer_ring = PointerRing()
 
     def set_windows(self, windows: list[WindowInfo]) -> None:
         """Replace the fake top-level window list (first entry = top of Z-order)."""
@@ -396,6 +400,33 @@ class FakeComputerBackend(ComputerBackend):
         """Set the fake cursor in physical virtual-screen coordinates (GetCursorPos convention)."""
         self._cursor_physical = position
 
+    def record_cursor_position(self) -> tuple[int, int] | None:
+        """WP-R: the recorder's per-frame pointer read — the fake cursor, never
+        the real ``GetCursorPos`` (fake sessions never touch the desktop)."""
+        return self._cursor_physical
+
+    def record_frame_grab(self, left: int, top: int, width: int, height: int) -> Image.Image:
+        """WP-R: the fake recording grabber — a synthetic frame for the requested
+        PHYSICAL rectangle (white base + the frame counter, so consecutive grabs
+        change pixels and the change timeline has something honest to diff).
+
+        Real sessions never see this method (the recorder builds its own mss
+        instance through ``_resolve_grabber``); the fake never touches the
+        desktop or the backend's identical-pixel cache.
+        """
+        self.record_grab_counter = getattr(self, "record_grab_counter", 0) + 1
+        image = Image.new("RGB", (max(1, int(width)), max(1, int(height))), (250, 250, 250))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle(
+            (0, 0, max(1, min(width, 8 + self.record_grab_counter * 4)) - 1, 8),
+            fill=(20, 20, 20),
+        )
+        return image
+
+    def last_click(self) -> dict[str, object] | None:
+        """WP-C2: the most recent completed press from the pointer ring (real-backend parity)."""
+        return self.pointer_ring.last_click()
+
     def set_screenshot_size(self, width: int, height: int) -> None:
         """Change the fake screenshot dimensions (simulates resolution change/mismatch)."""
         if width <= 0 or height <= 0:
@@ -469,6 +500,7 @@ class FakeComputerBackend(ComputerBackend):
             # right_click parity: the fake performs the identical screenshot->physical
             # transform a real right-button press would (cursor lands on the point).
             self._cursor_physical = self._map_to_physical(action.point.x, action.point.y)
+            button = "right" if action.action == "right_click" else "left"
             # DELTA 1 (F2): the fake MODELS a held click like it models a held key —
             # record the hold (sliced, stop-honouring, always recorded as released).
             # A fake that silently ignored hold_ms would let the unit suite diverge
@@ -478,7 +510,14 @@ class FakeComputerBackend(ComputerBackend):
                     # Unreachable through every gate (model + validator + defense);
                     # kept as the same last-line refusal the real path has.
                     raise ValueError("hold_ms is not valid on double_click actions")
-                self._simulate_held_click(action, "right" if action.action == "right_click" else "left", stop)
+                self._simulate_held_click(action, button, stop)
+            else:
+                # WP-C2: the same ring record the real dispatch site writes — one
+                # down/up pair per click batch, in PHYSICAL coordinates, after the
+                # simulated dispatch completes (ordering/timing unchanged).
+                point = self._cursor_physical
+                self.pointer_ring.record("down", point[0], point[1], button)
+                self.pointer_ring.record("up", point[0], point[1], button)
         elif action.action == "move":
             if action.point is None:
                 raise ValueError("A point is required for move actions")
@@ -618,6 +657,9 @@ class FakeComputerBackend(ComputerBackend):
             if stop is not None:
                 stop.ensure_live()  # before mouseDown
             self._drag_button_down = True
+            # DELTA 1 MINOR 3 parity: the fake's drag press is tagged source="drag"
+            # (never surfaces in last_click — click-type presses only).
+            self.pointer_ring.record("down", start[0], start[1], "left", source="drag")
             _mark_action_dispatched(action)
             try:
                 for segment_x, segment_y in _drag_segment_points(start, end):
@@ -630,6 +672,7 @@ class FakeComputerBackend(ComputerBackend):
                 # Same release guarantee as the real backend: the button is never left
                 # held, including on a mid-stroke TaskStopped.
                 self._drag_button_down = False
+                self.pointer_ring.record("up", end[0], end[1], "left", source="drag")
             self.drags.append((start, end))
         self.executed.append(action)
         _mark_action_dispatched(action)
@@ -684,6 +727,8 @@ class FakeComputerBackend(ComputerBackend):
                 stop.ensure_live()  # before the simulated press
             self.held_buttons.append(button)
             pressed = True
+            point = self._cursor_physical or (0, 0)
+            self.pointer_ring.record("down", point[0], point[1], button)
             _mark_action_dispatched(action)
             _wait_for_hold(hold_seconds, stop)
             if stop is not None:
@@ -691,6 +736,8 @@ class FakeComputerBackend(ComputerBackend):
         finally:
             if pressed:
                 self.held_buttons.remove(button)  # the release ALWAYS runs
+                point = self._cursor_physical or (0, 0)
+                self.pointer_ring.record("up", point[0], point[1], button)
 
     def _simulate_type_clipboard(self, action: GroundedAction, stop: StopToken | None) -> str:
         """Fake parity for ``via="clipboard"`` (v0.7.1 Defect C): save/set/paste/restore.

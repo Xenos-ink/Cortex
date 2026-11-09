@@ -50,8 +50,11 @@ SKIPPED_NOT_FOUND = "SKIPPED-NOT-FOUND"
 #: cancellable-wait family — ``computer_wait``, ``computer_cancel_wait`` and the NEW
 #: consumer ``computer_wait_status`` (finding S-02: dev's wait was fire-and-forget with
 #: no completion signal). ``computer_fetch_image`` (WP5) is the evidence store's
-#: retrieval tool. The constant is what the live ``probe`` compares the served surface
-#: against; the drift guard test fails when this set and the registered surface diverge.
+#: retrieval tool. ``computer_record`` / ``computer_record_result`` (ORVEX-2026-109
+#: WP-R) are the background screen-recording family — they dispatch no input and
+#: stay allowed during a plan lease. The constant is what the live ``probe``
+#: compares the served surface against; the drift guard test fails when this set
+#: and the registered surface diverge.
 EXPECTED_TOOLS = {
     "start_session",
     "stop_session",
@@ -72,6 +75,11 @@ EXPECTED_TOOLS = {
     # 16 frames / 24 MB / 3600 s retention bounds. Additive; the probe still refuses
     # any tool NOT in this set.
     "computer_fetch_image",
+    # ORVEX-2026-109 WP-R: the background screen recording — start returns at
+    # once (status "recording"), the result call blocks/peeks/cancels and
+    # returns the timeline + keyframe contact sheet + optional MP4.
+    "computer_record",
+    "computer_record_result",
 }
 
 SERVER_MODULE = "computer_use_mcp.server"

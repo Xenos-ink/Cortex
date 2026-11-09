@@ -12,6 +12,276 @@ topmost `## Unreleased` heading; at release time they are folded into a new
 sections and a **Compatibility notes** line, and `## Unreleased` is emptied again.
 Planned work per upcoming version: see **[ROADMAP.md](ROADMAP.md)**.
 
+## v0.7.7 (2026-11-09, ORVEX-2026-109 — the Cortex cursor in the agent's images and screen recording)
+
+0.7.7 closes the two evidence gaps a single screenshot leaves. First, the agent
+judged images that did not show WHERE its pointer was or where it had clicked:
+every image-bearing reply now carries the Cortex cursor composited at the real
+pointer (the arrow tip is the exact pointer point; the Pressed shape plus a ring
+marks the call's own click), with the additive `pointer` / `last_click` reply
+fields. Second, anything that happens over TIME — an animation, a toast, a menu
+that closes, a loading state — could not be proven by one frame: the served
+surface grows from ten to twelve tools with a background screen recorder that
+returns a change timeline, the actions dispatched inside the window, a
+timestamped keyframe contact sheet and, on request, the full MP4.
+
+### Added
+
+- **The Cortex cursor in the agent's images** — the sprite (Normal and Pressed
+  states, hotspot at the arrow tip) is composited into every outbound image
+  (observe raw/grid, zoom crops, the execute half-res and full-res images, plan
+  step images, fetch output). The Pressed state plus a ring marks an executed
+  call's own click point; plan-step images show Normal at the captured cursor
+  (the frame is post-move, pre-click). Compositing is OUTBOUND-ONLY: internal
+  observation frames, verification/digest captures, the identical-pixel cache
+  and the stored evidence frames stay clean, so digests and verification are
+  byte-identical with the pointer on or off. Off-image pointers draw nothing
+  and report `in_image: false`. Additive reply fields `pointer
+  {x, y, state, in_image}` and `last_click {x, y, button, age_ms}` ride every
+  image-bearing reply; fetch serves the capture-time snapshot in canonical
+  coordinates.
+- **The recording family** — `computer_record` records 0.5–10 s of the session
+  monitor or a canonical region (fps 1..10, default 5; 2..12 keyframes, default
+  8) and returns AT ONCE, so the agent keeps calling any tool while it records
+  (a plan lease allows both recording tools — recording a plan's effect is a
+  main use). `computer_record_result` collects: the noise-gated change timeline
+  (segments with bbox + change ratio), the window's actions, the contact sheet
+  of timestamped keyframes (each fetchable at full size by `image_id`, cursor
+  composited, `frame_to_canonical` publishing the pixel→canonical mapping), and
+  on request (`include_video=true`, the result call's value wins) the full H.264
+  MP4 as a `video/mp4` embedded resource. Failures surface honestly:
+  `result:"failed"` with `capture_failed` / `record_worker_failed`, never a
+  silent empty `verified`.
+- **The PyAV encode path** — the MP4 is encoded right after capture, in the
+  recording worker, through a bitrate/quality/resolution ladder under a 2 MiB
+  default blob cap (env `CORTEX_RECORD_VIDEO_MAX_MB`, band 1..8), the client
+  time budget (`over_budget` when the next rung cannot fit — the one omission a
+  later collect retries) and the encoder preference `CORTEX_RECORD_ENCODER`
+  (default `h264_mf,libx264`: Windows Media Foundation first, libx264
+  fallback; the video entry reports the encoder actually used). Stop/cancel
+  joins the encode off the event loop; an encode aborted by a stop is retried
+  on a later collect while the frames are held.
+- **The recording evidence pool** — a separate per-session store (24 keyframes
+  / 16 MB / 3600 s, the last 2 recordings) whose keyframes and video never
+  evict observation frames; under pool pressure the held frame payloads are
+  evicted first and their memory freed. `save=true` writes the MP4 +
+  contact-sheet PNG for the user under the audit dir's `recordings/` folder
+  (unredacted, not auto-cleaned — see SAFETY.md). Recording start/complete/
+  cancelled audit events fire once each; caps 1 active recording per session /
+  2 per process (`recording_limit`), tombstones and `record_expired` for
+  retention-ring evictions, `text_session_no_screen` for text sessions.
+- **Skill + docs** — the cortex-skill gains the pointer and recording sections
+  (a worked recording example in references/examples.md, the new reply fields
+  and tokens in references/reply-contract.md and glossary.md), and
+  docs/TOOLS.md gains complete entries for both recording tools; the truth
+  tests (`test_skill_truth.py`, `test_docs_truth.py`) derive every new taught
+  value (bands, encoder names, omission reasons, statuses, reply fields) from
+  the code at test time.
+- **skill: which-tool table, per-tool cards, task recipes, examples in tool
+  descriptions, all validated by tests** (ORVEX-2026-109 Addendum 1 "T") —
+  the cortex-skill gains a which-tool decision table keyed by agent intent
+  (the "Not this" column names the wasteful call the field session made),
+  references/tool-cards.md (one card per tool: use/don't use when, a
+  copy-paste minimal call, variants, the reply fields that matter, the common
+  mistake; `computer_execute` gets sub-cards per action family plus
+  `follow_ups`, `record=`, the approval flow and the plan handshake) and
+  references/recipes.md (open a URL, click and verify, a game move plus
+  waiting for the opponent in ONE call, record around an action, and more,
+  each with its call count); every tool description gains short `Example:`
+  lines (+1,600 chars total, under the 2,500 budget). New
+  `tests/test_wp_t_examples.py` parses every example block and validates it
+  against the live tool schemas, action vocabulary and bands, and pins the
+  card/heading coverage. Three mistakes a model made in the 2026-11-09 live
+  tool test are now named in the cards:
+  - raising only `max_steps` past 100 (the default `max_actions` still caps);
+  - a top-level `duration_ms`/`hold_ms` (with a validated timed-move example);
+  - mixing a plan with flat arguments (`action` must be `"done"`; `on_failure`
+    and the timing fields live inside `plan`).
+- **Record around the action (WP-E E1)** — `computer_execute` gains a trailing
+  optional `record` object (`{"duration_s", "region", "fps", "max_keyframes",
+  "include_video", "save"}`) that starts the background recording JUST BEFORE
+  the call's first input is dispatched — the F1 field fix (a recording started
+  in a separate call always ended 15–30 s before the model's next tool call, so
+  every recording finished before anything happened). Same bands and validation
+  as `computer_record` through the same code path (same typed rejections; an
+  out-of-band value rejects the whole call before any input), a documented
+  0.3 s pre-roll captures the "before" state, and the reply carries an additive
+  `record` block with the collect hint. Works with flat actions, `follow_ups`
+  batches and plan steps (submission and `plan_action="continue"`); a
+  recording problem NEVER refuses the action (the block says
+  `{"started": false, "reason": ...}`), and caps/lease/idle/audit/stop_session
+  behave exactly as for `computer_record` (same registry).
+- **Video delivered as a file path by default (WP-E E2)** — both recording
+  tools gain `video_delivery`: `"file"` (the DEFAULT) writes the MP4 under the
+  recordings folder (the same place `save=true` uses; one file, no double
+  write) and the video entry carries its absolute `path` with NO blob; most
+  hosts truncate large tool results (the field session cut every video result
+  at 49,998 characters and the 196–562 KB blob was lost), so `"inline"` (the
+  legacy embedded `video/mp4` resource) is only for hosts known to pass video
+  to the model. A failed file write answers the new closed omission reason
+  `write_failed` (retryable on a later collect).
+
+### Changed
+
+- **`show_pointer`** — new trailing optional on `start_session` and
+  `computer_observe` (env default `CORTEX_SHOW_POINTER`), with the typed
+  `invalid_show_pointer` rejection for non-boolean values. Fetch and execute
+  follow the session default.
+- **Tool count 10 → 12** — the CLI probe, the docs and the skill tables carry
+  the recording family, and every tool-count pin in the repo is restated
+  against the new count.
+- **Third-party notices: THIRD_PARTY_NOTICES.md lists every runtime dependency
+  with its licence, and third_party/licenses/ carries their licence texts.**
+- **pyautogui (and with it MouseInfo, PyMsgBox, PyScreeze, PyGetWindow,
+  PyTweening, pyperclip, PyRect) is no longer installed by default; it is the
+  optional extra `pyautogui`, needed only for
+  `CORTEX_INPUT_BACKEND=pyautogui`.**
+- **Dependencies** — new dependency `av` (PyAV) `>=18.1.0,<19`, lazily
+  imported by the recorder; about 30 MB of wheel (bundled FFmpeg). Apart from
+  the pyautogui change above, the other runtime dependencies are unchanged.
+- **Batch replies show the state after the batch (WP-E E3)** — when a
+  `computer_execute` call carries `follow_ups`, the reply's attached image (and
+  its `image_id`, `pointer`, `last_click` and the registered evidence frame) is
+  the post-action frame of the LAST executed item — a trailing `wait` counts,
+  so click + click + wait 8 shows the board after the opponent replied. The
+  additive `image_after_item` key names the item; the verdict fields
+  (`result`/`verification`/`ok`) keep their item-0 meaning; single-action
+  calls are byte-identical to before. Pressed/Normal follows the shown item
+  (a plan step ending on a click now shows Pressed at that click).
+
+### Fixed
+
+- **SendInput partial insert is detected; exactly the pressed keys/buttons are
+  released; reported, never retried (WP-I, ORVEX-2026-109 Addendum 2)** — a
+  `SendInput` return that is neither 0 nor the full count used to pass silently
+  as success (e.g. the input desktop switching mid-batch), leaving a chord's
+  modifier stuck or a button held. The engine now walks the landed prefix,
+  releases exactly what it left down (reverse press order, ONE halt-safe
+  release batch, never a resend), and reports the typed
+  `PartialInputError` (an `InputBlockedError` subclass — every existing
+  handler keeps failing closed) with `sent`/`total`/`released`/`still_stuck`.
+  The reply carries the `partial_input` block on the same `failed` shape a
+  blocked input uses (never "nothing was dispatched"), `partial_delivery`
+  counts the characters fully delivered for typing, a partial press of an
+  intentional hold is undone entirely (the hold is not recorded), a partial
+  insert inside a `follow_ups` batch STOPS it with the closed
+  `partial_input` token, and a non-empty `still_stuck` says plainly that keys
+  or buttons may still be physically down for a human to press and release.
+- Recording frames carry real timestamps, so dropped frames keep real-time
+  duration; `effective_fps` never exceeds the requested fps and the frame
+  count is exact (no catch-up bursts, `dropped_frames` counts only missed
+  slots inside the window).
+- The change timeline is computed from decoded JPEG bytes on both sides of the
+  diff (a pre-encode image vs a decoded previous frame used to light up every
+  frame), and the noise gate diffs at 1/4 scale so a small real change (a
+  checkbox tick on a 1920 monitor) is seen while dithering noise stays out.
+- One `record_id` end to end (payload, resource URI, saved filenames, pool
+  keys); start-call flags persist until a late collection; a stalled injected
+  clock ends the recording at a hard wall ceiling instead of looping.
+
+### Performance
+
+Measured on the reference Windows box; machine-relative, not guarantees.
+
+- **Encode bench** (`tools/perf/wp_r_encode_bench.py`, re-run at release with
+  the FINAL h264_mf rung derivation — the first rung's bitrate derives from
+  cap × 8 / duration × 0.85, ≈ 1.43 Mbps at 2 MiB / 10 s): 10 s × 5 fps at
+  1280×720, 50 frames, real PyAV path — h264_mf encodes in **0.852 s** (MP4
+  ≈ 156 KB); libx264 in **0.793 s** (MP4 ≈ 55 KB). Both land far under the
+  2 MiB default cap, so no ladder step fires at typical sizes; decoded-back
+  round trips are exact (50 frames / size / fps / duration).
+- **Observe composite cost** — both pairs are 3-observe means, pointer ON vs
+  OFF, on the SAME synthetic 1920×1080 frame:
+  - *Earlier measurement*: 158.9 ms ON vs 172.1 ms OFF — inside run-to-run
+    noise.
+  - *After the over-budget PNG skip*: 508.65 ms ON vs 459.07 ms OFF — the
+    composite is ~10% over the off path there.
+  With the pointer ON the outbound ladder runs ONCE on the composited copy
+  (the clean ladder never also runs); captures with no known cursor pay two
+  dict lookups and remain byte-identical to the pre-pointer reply.
+
+### Known limitations
+
+- **Video delivery is host-dependent**: whether the host model can consume the
+  `video/mp4` embedded resource depends on the host; the timeline, contact
+  sheet and fetchable keyframes carry the same evidence as stills.
+- **Windows N editions**: without the Media Feature Pack the Media Foundation
+  encoder is absent; with `CORTEX_RECORD_ENCODER=h264_mf` pinned, video is
+  then unavailable (`encoder_unavailable`) while frames and the timeline still
+  work.
+- **Held frames are evictable**: under recording-pool pressure the held frame
+  payloads are the first thing dropped (the video entry then answers
+  `frames_released`); keyframes and video already stored are protected.
+- **The timeline noise gate**: changes below a per-pixel gray delta of 8/255
+  or smaller than a few thumbnail pixels at 1/4 scale do not reach the
+  timeline (caret antialiasing and dithering stay out; a sub-threshold real
+  change may be missed by the segments while the keyframes still show it).
+
+### Compatibility notes
+
+- The served surface grows **10 → 12 tools** (`computer_record`,
+  `computer_record_result`); the CLI probe and the docs/skill truth tests pin
+  the new count.
+- **Additive reply fields**: `pointer {x, y, state, in_image}` and
+  `last_click {x, y, button, age_ms}` appear on image-bearing replies (no
+  cursor known → the keys are absent). Turn the composite off with
+  `start_session(show_pointer=false)` / `computer_observe(show_pointer=false)`
+  / env `CORTEX_SHOW_POINTER` — off restores the byte-identical previous
+  reply.
+- **New dependency** `av` (PyAV) `>=18.1.0,<19` — about 30 MB of wheel with a
+  bundled FFmpeg; see the license note in docs/INSTALL.md: Cortex is MIT, the
+  PyAV wheel is BSD-3-Clause, and the wheel bundles FFmpeg, which
+  self-reports LGPL-3.0-or-later (configured with
+  `--enable-version3` and without `--enable-gpl`) together with the codec
+  libraries libx264 and libx265 (GPL-2.0-or-later); the bundled avcodec is
+  linked against libx264/libx265 and FFmpeg's own LICENSE.md states those
+  libraries are GPL and make the GPL apply to the FFmpeg build, so for
+  redistribution the av.libs set must be treated as GPL — in practice
+  GPL-3.0-or-later; Cortex's own MIT source distribution bundles none of it.
+  They are installed and loaded with `av` whichever encoder runs. Cortex prefers
+  `h264_mf` (Windows Media Foundation) and runs libx264 only as a fallback;
+  `CORTEX_RECORD_ENCODER=h264_mf` stops Cortex from ever encoding through
+  libx264 — it does not remove the GPL components from the installation (on
+  Windows N editions without the Media Feature Pack video is then
+  unavailable, `encoder_unavailable`).
+- **pyautogui is no longer a default dependency** — it (and with it MouseInfo,
+  PyMsgBox, PyScreeze, PyGetWindow, PyTweening, pyperclip and PyRect) moved to
+  the optional extra `pyautogui`, needed only for
+  `CORTEX_INPUT_BACKEND=pyautogui` — install the extra with ONE of:
+  `python -m pip install -e ".[pyautogui]"` (from a clone);
+  `pip install "computer-use-mcp[pyautogui] @ git+https://github.com/Xenos-ink/Cortex.git"`
+  (from git); `uv sync --extra pyautogui` (with uv). The default SendInput
+  engine never imports
+  it, and selecting it without the extra fails closed with an actionable
+  error. The `dev` extra still pins pyautogui so the test suite keeps covering
+  the fallback engine. **Upgrades:** pip never removes dropped dependencies, so
+  an install upgraded from 0.7.6 or earlier keeps the pyautogui family
+  until you remove it with `python -m pip uninstall -y pyautogui mouseinfo
+  pymsgbox pyscreeze pygetwindow pytweening pyperclip pyrect` (skip this if
+  you use `CORTEX_INPUT_BACKEND=pyautogui`); uv-managed installs: a plain
+  `uv sync --frozen` resolves the environment to exactly the locked set and
+  removes the family for default-engine users; pyautogui-engine users run
+  `uv sync --frozen --extra pyautogui`, contributors `uv sync --frozen --extra
+  dev`.
+- **New env vars**: `CORTEX_SHOW_POINTER` (pointer composite default source),
+  `CORTEX_RECORD_ENCODER` (encoder preference list),
+  `CORTEX_RECORD_VIDEO_MAX_MB` (video blob cap, band 1..8 MiB).
+- **Batch replies now attach the frame after the last executed item** (WP-E
+  E3): a host that compared a batch reply's image against item 0's post-action
+  frame must read `image_after_item` instead — the frame (and its registered
+  evidence entry) is now the LAST executed item's, with a trailing wait
+  counting; single-action calls and opt-out replies are unchanged.
+- **Video delivered as a file path by default** (WP-E E2): `video_delivery`
+  defaults to `"file"` — the MP4 arrives as an absolute `path` on disk, not as
+  an embedded resource blob. Hosts that pass video blobs to the model must pass
+  `video_delivery="inline"` on the start or the result call; the contact sheet
+  image stays inline either way. The closed omission set gained `write_failed`
+  (retryable). **On-disk honesty (WP-E DELTA 1):** whenever `include_video` is
+  requested under the default file delivery, the screen video is SAVED TO DISK
+  under the Cortex recordings folder (the audit dir's `recordings/` — the same
+  folder `save=true` uses) and there is NO automatic cleanup; the write is
+  atomic and happens once per recording.
+
 ## v0.7.6 (2026-11-01, ORVEX-2026-108 — the unified-contract port; Addendum 4 field fixes WP13, 2026-11-06)
 
 0.7.6 re-implements the release's full feature set under a single unified reply
@@ -24,8 +294,8 @@ from six to ten tools; the code is restructured into a layered package
 (`core` / `security` / `desktop` / `vision` / `pipeline` / `planning` / `server`)
 with the public launch paths unchanged. The shipped `cortex-skill` is rewritten
 (core ≤ 250 lines + `references/`) and pinned by truth tests that derive every
-taught value from the code. Full offline suite at release: 3319 passed +
-19 skipped with `-W error::RuntimeWarning` (≈1.9× the v0.7.5 suite's
+taught value from the code. Full offline suite at release: 3525 passed +
+21 skipped with `-W error::RuntimeWarning` (≈1.9× the v0.7.5 suite's
 1753+11; the live-desktop e2e is the final gate).
 
 ### Added

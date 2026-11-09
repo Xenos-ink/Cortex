@@ -1,6 +1,6 @@
 [project]
 name = "computer-use-mcp"
-version = "0.7.6"
+version = "0.7.7"
 description = "Cortex - a safe, screenshot-grounded computer-use MCP server that lets AI agents see, decide and act on the Windows desktop with semantic verification"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,15 +9,21 @@ dependencies = [
   "pydantic-settings>=2.2.1",
   "Pillow>=10.0.0",
   "mss>=9.0.1",
-  "pyautogui>=0.9.54; sys_platform == 'win32'",
   "httpx>=0.27.0",
+  # WP-R (ORVEX-2026-109): the screen recording's MP4 encoder (H.264).
+  # DELTA 1 m10: constrained to <19 — only 18.1.0 on cp311 was gated; the
+  # 19.x API and wheel contents are unverified. The import is lazy and an
+  # encoder_unavailable reply (never a crash) covers an environment without it.
+  "av>=18.1.0,<19",
 ]
 
 [project.optional-dependencies]
+pyautogui = ["pyautogui>=0.9.54; sys_platform == 'win32'"]
 dev = [
   "pytest>=8.0.0",
   "pytest-asyncio>=0.23.0",
   "ruff>=0.6.0",
+  "pyautogui>=0.9.54; sys_platform == 'win32'",
 ]
 
 [project.scripts]
@@ -32,10 +38,22 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# WP-C1 (ORVEX-2026-109): the pointer sprites ship in the wheel. Explicit
+# package-data (setuptools' VCS-driven include-package-data alone does not
+# reliably cover a newly added assets/ tree on every build backend invocation).
+[tool.setuptools.package-data]
+"computer_use_mcp" = [
+  "assets/cursor/*.png",
+  "assets/cursor/cursor.json",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+  "slow: long-running smoke test (e.g. a real wheel build); skipped or gated in fast runs",
+]
 pythonpath = ["src"]

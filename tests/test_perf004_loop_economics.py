@@ -410,14 +410,16 @@ def test_computer_execute_signature_additions_are_trailing_optional() -> None:
     # tests/test_avr_visual_views.py). The pre-AL-002 pins below are otherwise intact.
     # CHANGED PIN (WP7b, §-reason: contract item (a) — `plan`/`plan_action` join as
     # trailing optionals AFTER visual_view; the pinned property "the perf-004
-    # additions stay trailing optionals with None defaults" is unchanged)
+    # additions stay trailing optionals with None defaults" is unchanged).
+    # CHANGED PIN again (WP-E, ORVEX-2026-109): `record` joins as the newest
+    # trailing optional after plan_action — same property.
     parameters = list(inspect.signature(srv_server_execute.computer_execute).parameters.values())
     assert [p.name for p in parameters][-5:] == [
-        "include_screenshot_after",
         "follow_ups",
         "visual_view",
         "plan",
         "plan_action",
+        "record",
     ]
     assert all(p.default is None for p in parameters[-5:])
 

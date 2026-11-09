@@ -1,4 +1,4 @@
-# Tools — Cortex 0.7.6 tool reference
+# Tools — Cortex 0.7.7 tool reference
 
 Current truth for the served MCP surface. The tool set, the action bounds, the
 wait/evidence sentences and the reply token vocabulary here are pinned by
@@ -8,7 +8,14 @@ specified once in
 [REPLY-CONTRACT.md](REPLY-CONTRACT.md); configuration knobs are in
 [CONFIGURATION.md](CONFIGURATION.md).
 
-## The ten tools
+Examples: copy-paste arguments per tool (tool cards) and whole-task recipes
+with expected replies live in the agent skill —
+`skills/cortex-skill/references/tool-cards.md` and
+`skills/cortex-skill/references/recipes.md`, selected by the which-tool table
+at the top of `skills/cortex-skill/SKILL.md`; the examples are validated
+against the real tool schemas by `tests/test_wp_t_examples.py`.
+
+## The twelve tools
 
 | Tool | Kind | For |
 |---|---|---|
@@ -22,6 +29,8 @@ specified once in
 | `computer_wait_status` | wait | block for the next wait segment, or peek with `block=false` |
 | `computer_cancel_wait` | wait | end a wait early; reports elapsed/remaining |
 | `computer_fetch_image` | evidence | re-serve a frame this session's replies carried, by `image_id` |
+| `computer_record` | recording | record 0.5–10 s of the screen in the background; returns at once |
+| `computer_record_result` | recording | collect a recording: timeline, actions, keyframe contact sheet, optional MP4 |
 
 The set is exactly `EXPECTED_TOOLS` (`src/computer_use_mcp/cli.py`); the
 `cortex-mcp probe` verifier refuses any tool not in it.
@@ -83,7 +92,8 @@ reaper (below) frees forgotten sessions automatically.
 ## computer_observe / computer_screenshot
 
 ```text
-computer_observe(session_id, visual_view=None, visual_view_density=None, pixel_evidence=None)
+computer_observe(session_id, visual_view=None, visual_view_density=None,
+                 pixel_evidence=None, show_pointer=None)
 computer_screenshot(session_id)   # alias, same reply
 ```
 
@@ -109,6 +119,18 @@ omits the field entirely. Unknown view/density values
 (`invalid_pixel_evidence`) are rejected BEFORE any capture; a view that cannot
 be derived returns the executed/observed result honestly with no image block and
 the `view_derive_failed` marker — never a silent raw substitution.
+
+`show_pointer` (trailing optional, `None` = the session default) governs the
+Cortex cursor sprite composited into the OUTBOUND image at the real pointer (the
+ARROW TIP is the exact pointer point; `state` is `normal`, or `pressed` plus a
+ring at an executed call's own click point). The default source is
+`start_session(show_pointer=...)` > env `CORTEX_SHOW_POINTER` > on. Compositing
+is outbound-only: verification frames, digests, the identical-pixel cache and the
+stored evidence frames stay clean. Image-bearing replies add
+`pointer {x, y, state, in_image}` (canonical coordinates; `in_image` false = the
+pointer was off that image and nothing was drawn) and
+`last_click {x, y, button, age_ms} | null`; a capture with no known cursor emits
+neither key.
 
 ## computer_zoom
 
@@ -144,7 +166,8 @@ Observation-only: no action surface, no queue interaction. Behavior:
 computer_execute(session_id, action, x=None, y=None, text=None, keys=None,
                  delta=0, approved=False, expected_effect=None, x2=None, y2=None,
                  target=None, via=None, include_screenshot_after=None,
-                 follow_ups=None, visual_view=None, plan=None, plan_action=None)
+                 follow_ups=None, visual_view=None, plan=None, plan_action=None,
+                 record=None)
 ```
 
 Validates and executes one action through the full pipeline: grounding →
@@ -232,10 +255,93 @@ There is deliberately no `key` action (single keys use `keypress`) and no
 - `follow_ups` (≤ 5 items) queues actions that each re-ground from the fresh
   post-action capture. The queue continues while the attached window identity
   (hwnd/title/bounds) is unchanged and stops on TRUE staleness, safety
-  rejection, approval requirement, validator/grounding rejection, or a named
-  interference event. An executed item's `uncertain`/`failed` verdict rides its
+  rejection, approval requirement, validator/grounding rejection, a named
+  interference event, or a PARTIAL input insert (`partial_input`, WP-I: the
+  item's SendInput call half-landed, so later items are unsafe). An executed
+  item's `uncertain`/`failed` verdict rides its
   `follow_up_results` entry while the batch continues; results arrive in
-  `follow_up_results` + `follow_ups_stopped_reason` (`null` = ran to completion).
+  `follow_up_results` + `follow_ups_stopped_reason` (`null` = ran to completion;
+  `partial_input` = input half-landed — never resend the remaining items
+  blindly, re-observe and check the item's `partial_input` block:
+  `{"sent", "total", "released", "still_stuck"}`; a non-empty `still_stuck`
+  means keys/buttons may still be physically down — a human should press and
+  release them). A partial insert is reported honestly and NEVER auto-retried;
+  for typing the reply also carries `partial_delivery.delivered_chars`.
+- Batch replies (WP-E E3): the attached image — and its `image_id`, `pointer`,
+  `last_click` and the frame registered in the evidence store — is the
+  post-action frame of the LAST item that executed (a trailing `wait` counts:
+  click + click + wait 8 shows the board after the opponent replied). If the
+  batch stopped early it is the last item that actually executed. The additive
+  `image_after_item` key names that item's index — ALWAYS present on a
+  multi-item batch's image-bearing reply (including the value 0, when item 0
+  is the last executed one), absent on single-action calls (byte-identical to
+  before) and on replies that serve no image; the verdict fields
+  (`result` / `verification` / `ok`) keep their item-0 meaning. Pressed/Normal
+  follows the same rule applied to the shown item: Pressed if it was a click
+  type and the frame is its own post-click frame.
+
+### Record around the action (`record`, WP-E E1)
+
+- `record` (trailing optional object) starts a background screen recording JUST
+  BEFORE this call's first input is dispatched — the F1 field fix (a recording
+  started in a SEPARATE call always ended 15–30 s before the model's next tool
+  call). Shape: `{"duration_s": 4, "region": null, "fps": null,
+  "max_keyframes": null, "include_video": null, "save": null,
+  "video_delivery": null}` — the SAME bands
+  and validation as `computer_record` (duration 0.5..10 s; fps 1..10, default 5;
+  `max_keyframes` 2..12, default 8; region `[l,t,w,h]` canonical or null = the
+  session monitor; `video_delivery` `"file"` | `"inline"`), through the SAME
+  code path with the SAME typed rejections. ONE coercion rule for BOTH tools
+  (DELTA 2 N1/N2, the Commander's tolerant decision): `fps`/`max_keyframes`
+  go through exactly the same `_coerce_tolerant_int` coercion as
+  `computer_record`'s `NullableInt` boundary — non-integral floats and
+  numeric strings ROUND the same way (`2.7` → 3, `"5.0"` → 5, `"1e1"` → 10);
+  `duration_s` accepts the same shapes pydantic's lax float accepts for
+  `computer_record` — numbers and numeric strings (`"4"` → 4.0); booleans,
+  lists, dicts and non-numeric strings give the typed
+  `invalid_record_fps` / `invalid_record_keyframes` /
+  `invalid_record_duration`. Band checks run AFTER coercion, for both tools,
+  with the same codes. Booleans are rejected on BOTH tools for `duration_s`
+  too: inside the `record` object with the typed `invalid_record_duration`,
+  and on `computer_record`'s own `duration_s` parameter at the MCP argument
+  boundary — the boundary validator refuses the boolean BEFORE pydantic's lax
+  float can coerce `True` into a 1-second recording, so over MCP it is an
+  isError naming `duration_s` (not the typed envelope); a direct (non-MCP)
+  call gets the tool's typed `invalid_record_duration`.
+- An INVALID `record` argument (out of band, malformed region, an UNKNOWN KEY
+  inside the object) is a typed rejection of the whole call BEFORE any input —
+  consistent with the unknown-argument rejection; the unknown-key message
+  names the allowed keys.
+- A short pre-roll (`RECORD_PRE_ROLL_SECONDS`, 0.3 s, part of the recording
+  window — never added on top of `duration_s`) captures the "before" state.
+- The reply gains an additive `record` block: `{"started": true, "record_id",
+  "status": "recording", "ends_at", "duration_s", "fps", "region", "message"}`
+  with the collect hint ("collect with computer_record_result(record_id)" — it
+  blocks until the end and its change timeline contains THIS call's own
+  actions). The execute call itself returns as usual and does NOT wait for the
+  recording to end. If the call is refused BEFORE any input (safety denial,
+  approval hold, a zero-effect rejection) the recording is cancelled
+  immediately and the block gains `cancelled: "action_refused"`; if the call
+  dies after the recording started (a cancellation or any exception) the
+  recording is cancelled before the error propagates.
+- Works with flat actions, `follow_ups` batches and plan steps (accepted on the
+  plan submission call and on `plan_action="continue"` calls; the recording
+  starts just before the step's input). `plan_action="stop"` and a continue
+  past the walk's end dispatch no input and answer
+  `{"started": false, "reason": "no_action"}`.
+- Caps/lease/idle/audit/stop_session behave exactly as for `computer_record`
+  (same registry): if a cap is reached the action STILL runs and the block
+  says `{"started": false, "reason": ...}` — a recording problem never refuses
+  the action. The closed `started:false` reason set (derived from
+  `EXECUTE_RECORD_NOT_STARTED_REASONS` in `server/record.py`):
+  `recording_limit` / `text_session_no_screen` / `invalid_region` /
+  `session_stopped` / `record_start_failed` / `no_action`.
+- ON-DISK HONESTY (DELTA 1 m7): whenever `include_video` is requested (or
+  `save=true`) under the default `video_delivery="file"`, the screen video is
+  SAVED TO DISK under the Cortex recordings folder (the audit dir's
+  `recordings/` — the same folder `save=true` uses) and there is NO automatic
+  cleanup. The write is atomic (temp file + rename) and happens ONCE per
+  recording; later collects reuse the path.
 
 ### Waypoint plans (`plan`, `plan_action`)
 
@@ -312,6 +418,133 @@ or malformed id answers the byte-identical `image_not_found` (an id can never
 probe another session's images); `store_disposed` after teardown. A text-mode
 session never produces image bytes, so no id is ever issued on one. Fetch is a
 read-only retrieval and stays ALLOWED during a plan lease.
+
+## computer_record
+
+```text
+computer_record(session_id, duration_s, region=None, fps=None,
+                max_keyframes=None, include_video=None, save=None,
+                video_delivery=None)
+```
+
+Starts recording the session's monitor (or a canonical `region`) IN THE
+BACKGROUND and returns AT ONCE — a marker reply with `record_id` (`rec_` + 16
+hex), `status: "recording"`, `ends_at` (epoch seconds) and the effective
+fps/region. Keep calling tools while it records; collect the product with
+`computer_record_result`.
+
+- Bands (fail-closed refusals, never silently shortened): `duration_s` 0.5..10 s;
+  `fps` 1..10 (default 5); `max_keyframes` 2..12 (default 8).
+- `region` is `[left, top, width, height]` in canonical screenshot space; with no
+  region the session's monitor is recorded (the same monitor choice
+  `computer_observe` uses). Malformed, out-of-bounds or unverifiable coordinates
+  are the typed `invalid_region` error (monitor mode included) — never clipped.
+- `include_video=true` also encodes an H.264 MP4 right after capture, in the
+  recording worker (the result call usually only fetches it). The default blob
+  cap is 2 MiB raw (`CORTEX_RECORD_VIDEO_MAX_MB`, band 1..8, fallback-not-clamp);
+  the encoder preference is `CORTEX_RECORD_ENCODER` (default `h264_mf,libx264`:
+  `h264_mf` — Windows Media Foundation — first, `libx264` fallback; the video
+  entry reports the encoder actually used). A larger-than-cap or budgeted-out
+  encode is honestly omitted (see `computer_record_result`).
+- `save=true` writes the MP4 + the contact-sheet PNG under the Cortex recordings
+  directory (a `recordings/` folder of the audit-log directory — the same
+  directory that holds the per-session audit JSONL) and the result carries
+  `video_path` / `sheet_path`; it implies video production.
+- Text sessions are refused (`text_session_no_screen`). Both recording tools stay
+  ALLOWED during a plan lease (recording a plan's effect is a main use). Caps: 1
+  active recording per session, 2 per process (typed `recording_limit` — the
+  per-session refusal names the active `record_id`; the process-wide refusal
+  reports the live count).
+- Failures surface: the result reply is `result:"failed"` with reasons
+  `["capture_failed" | "record_worker_failed"]` and the error text — never a
+  silent empty `verified`. A capture error after some frames is still `failed`
+  (a partially captured timeline is untrustworthy); the message counts the frames
+  captured before the failure.
+- Rejections and errors: the band/argument refusals `invalid_record_duration` /
+  `invalid_record_fps` / `invalid_record_keyframes` / `invalid_record_param`
+  (`result:"rejected"`, nothing started); the typed `invalid_region` error reply
+  for a malformed/out-of-bounds region; `text_session_no_screen`;
+  `recording_limit` at the caps; and `record_failed` (`result:"failed"`,
+  `error` token) when the recording worker thread could not start.
+
+Example — record a transient effect while you act:
+
+```text
+computer_record(session_id, duration_s=6)             # returns at once
+# -> result:"marker", status:"recording", record_id:"rec_16hex", ends_at, effective fps/region
+computer_execute(session_id, action="click", x=980, y=44,
+                 expected_effect="the ribbon toggle is on")
+# keep working — the recording runs in the background the whole time
+```
+
+## computer_record_result
+
+```text
+computer_record_result(session_id, record_id, block=True, cancel=False,
+                       include_video=None, video_delivery=None)
+```
+
+Collect a recording: block until it ends (≤ 10 s plus the encode), peek, or
+cancel early.
+
+- `block=true` (the default) waits until the recording ends and returns
+  `result:"verified"` with a TextContent carrying the JSON (`record_id`,
+  `duration_ms`, `effective_fps`, `dropped_frames`, `region`, the timeline
+  segments, the window's `actions`, `keyframes` — each with its fetchable
+  `image_id`), the contact sheet as an ImageContent (the Cortex cursor composited
+  into every cell when the session's show_pointer default is on — off sessions
+  record no sprite anywhere), and the MP4 as an EmbeddedResource (`video/mp4`)
+  when video is attached to THIS reply.
+- The `video` entry is per reply: `included` (`bytes` / `width` / `height` /
+  `fps` / `codec` / `encoder`) or `omitted` naming one closed reason —
+  `not_requested` / `too_large` / `encoder_unavailable` / `encode_failed` /
+  `over_budget` (the client budget could not fit the next ladder rung; retried on
+  a later call) / `frames_released` (the held frames were evicted under the
+  recording pool's byte cap before any video was stored) / `write_failed` (WP-E:
+  the default file delivery could not write the MP4; retried on a later
+  collect). The final omissions are
+  reused on later collections without re-running the ladder; only `over_budget`
+  and `write_failed` retry. An `encode_failed` carrying `aborted: true` (a
+  stop/cancel aborted the encode) is NOT final — a later collect retries while
+  the frames are held.
+- `video_delivery` (WP-E, on BOTH recording tools, trailing optional): `"file"`
+  (the DEFAULT) or `"inline"`. Most hosts truncate large tool results — a
+  196-562 KB MP4 blob never reached the model in the field — so `"file"` is the
+  default: the MP4 is written under the recordings folder (the same place
+  `save=true` uses; one file, no double write) and the video entry carries its
+  absolute `path` (plus `video_path` on the payload) with NO blob. `"inline"`
+  keeps today's EmbeddedResource — only for hosts known to pass video to the
+  model. The result call's explicit `video_delivery` wins over the start call's.
+  The contact sheet image stays inline either way.
+- The result call's explicit `include_video` wins over the start call's; `save`
+  (a start-only flag) keeps writing the files either way.
+- `block=false` peeks a RUNNING recording: `result:"marker"`, `status`
+  `recording` or `encoding` (the capture finished, the video encode still
+  running), with `elapsed_seconds` and `remaining_seconds`. `cancel=true` stops
+  the recording
+  early and returns what was captured (`result:"stopped"`).
+- Fetched recording keyframes publish `frame_to_canonical` (`{"scale", "origin"}`)
+  that maps the STORED keyframe pixels to canonical screenshot coordinates: a
+  copy served downscaled must first be divided by its `image_outbound_scale`.
+- An unknown or foreign-session `record_id` is the typed `unknown_record`
+  rejection (byte-identical for both); a finished recording that fell out of the
+  per-session retention ring answers `record_expired`. The video stays retrievable
+  later by `record_id` (`block=false, include_video=true`) while the recording is
+  retained.
+
+Example — collect and drill into a moment:
+
+```text
+computer_record_result(session_id, "rec_16hex")       # blocks until the end
+# -> result:"verified"; payload: duration_ms, effective_fps, dropped_frames,
+#    timeline segments, actions, keyframes[{image_id, t_ms}], the contact sheet,
+#    and video {included | omitted: reason}
+computer_record_result(session_id, "rec_16hex", block=false)
+# -> while STILL running: result:"marker", status:"recording"|"encoding",
+#    elapsed_seconds, remaining_seconds; after the recording finished:
+#    result:"verified" (the same payload as the blocking collect)
+computer_fetch_image(session_id, keyframes[2].image_id)   # one moment, full size
+```
 
 ## stop_session
 

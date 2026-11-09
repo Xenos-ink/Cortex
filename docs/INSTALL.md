@@ -1,7 +1,7 @@
 # Installing and updating Cortex
 
 Ways to install, register, verify, and update the Cortex MCP server. Current
-truth; the served tool set the probes below check is the ten-tool surface
+truth; the served tool set the probes below check is the twelve-tool surface
 documented in [TOOLS.md](TOOLS.md).
 
 ## Requirements
@@ -12,10 +12,47 @@ documented in [TOOLS.md](TOOLS.md).
 - No vision API key required: the deterministic surface never calls a model.
   The provider is configured only for the optional model-judge verification
   tier (see [CONFIGURATION.md](CONFIGURATION.md)).
+- The screen-recording encoder needs `av` (PyAV, constrained `>=18.1.0,<19` in
+  `pyproject.toml`). The Windows wheel is about 30 MB because it BUNDLES
+  FFmpeg (plus the libx264 / libx265 encoder libraries) — there is no separate
+  FFmpeg install. The import is lazy: a missing or broken `av` degrades the
+  recording tools' video to the typed `encoder_unavailable` reply (frames,
+  timeline and contact sheet still work), never a crash.
+
+### License note (screen recording)
+
+Cortex is MIT. The `av` (PyAV) wheel is BSD-3-Clause. The wheel bundles FFmpeg,
+which self-reports LGPL-3.0-or-later (its configure line has
+`--enable-version3` and no `--enable-gpl`) together
+with the codec libraries libx264 and libx265 (GPL-2.0-or-later); the bundled
+avcodec is linked against libx264/libx265, and FFmpeg's own LICENSE.md states
+those libraries are GPL and that using them makes the GPL apply to the FFmpeg
+build — so for redistribution the av.libs set must be treated as GPL, in
+practice GPL-3.0-or-later. Cortex's own MIT source distribution bundles none
+of it. They are installed and loaded with `av` whichever encoder runs. Cortex prefers
+`h264_mf` (Windows Media Foundation) and runs libx264 only as a fallback;
+`CORTEX_RECORD_ENCODER=h264_mf` stops Cortex from ever encoding through
+libx264. It does not remove the GPL components from the installation; on
+Windows N editions without the Media Feature Pack, video is then unavailable
+(`encoder_unavailable`) while frames and the timeline still work. These are
+packaging facts, not legal advice. The full third-party licence listing —
+every runtime dependency with its licence and the copied licence texts in
+`third_party/licenses/` — is in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 
 ## Manual install
 
-Two distinct routes — pick deliberately:
+First, a note on the optional pyautogui engine (WP-M); then the two install
+routes:
+
+- **Optional pyautogui engine (WP-M):** pyautogui is no longer a default
+  dependency (it drags in MouseInfo, PyMsgBox, PyScreeze, PyGetWindow,
+  PyTweening, pyperclip and PyRect; Cortex's default SendInput engine never
+  imports it). To use the pyautogui input engine (`CORTEX_INPUT_BACKEND=pyautogui`
+  or `input_engine='pyautogui'`), install the extra with ONE of:
+  `python -m pip install -e ".[pyautogui]"` (from a clone),
+  `pip install "computer-use-mcp[pyautogui] @ git+https://github.com/Xenos-ink/Cortex.git"`
+  (from git), or `uv sync --extra pyautogui` (with uv). Selecting the engine
+  without the extra fails closed with a `ValueError` naming these commands.
 
 - **Clone + editable install (the full route; required for `cortex-mcp install`
   / `update`)**: the CLI's `install`/`update` subcommands manage a repository
@@ -29,8 +66,11 @@ Two distinct routes — pick deliberately:
   cd Cortex
   py -3.11 -m venv .venv
   .\.venv\Scripts\Activate.ps1        # Git Bash / WSL: source .venv/Scripts/activate
-  python -m pip install -e ".[dev]"
+  python -m pip install -e .
   ```
+
+  `.[dev]` is for contributors only (tests; it includes pyautogui) —
+  `python -m pip install -e ".[dev]"`.
 
 - **Package only (`pip install git+…`)**: installs the server so an MCP client
   can run it, but `cortex-mcp install`/`update` will not find a clone to manage
@@ -53,8 +93,22 @@ Updating:
 ```bash
 pip install --upgrade git+https://github.com/Xenos-ink/Cortex.git
 # or, from a clone:
-git pull && python -m pip install -e ".[dev]"
+git pull && python -m pip install -e .
 ```
+
+Upgrade note (WP-M): pip never removes dependencies dropped from the
+requirements, so an install upgraded from 0.7.6 or earlier keeps the old
+pyautogui family on disk. To remove it (SKIP this if you use
+`CORTEX_INPUT_BACKEND=pyautogui`):
+
+```bash
+python -m pip uninstall -y pyautogui mouseinfo pymsgbox pyscreeze pygetwindow pytweening pyperclip pyrect
+```
+
+For uv-managed installs, `uv sync --frozen` instead resolves the environment
+to exactly the locked set and drops the family on the next sync — pyautogui-
+engine users must run `uv sync --frozen --extra pyautogui`, and contributors
+`uv sync --frozen --extra dev`.
 
 ## Running the server
 
@@ -178,10 +232,11 @@ STEP 3 — INSTALL (inside the canonical clone):
       python -m venv .venv
   - Refresh the editable install:
       "<venv python>" -m pip install -e "<canonical>"
-  - Verify with the probe from STEP 1a. It MUST print PASS and list exactly these 10 tools:
+  - Verify with the probe from STEP 1a. It MUST print PASS and list exactly these 12 tools:
       start_session, stop_session, computer_observe, computer_screenshot,
       computer_execute, computer_zoom, computer_wait, computer_cancel_wait,
-      computer_wait_status, computer_fetch_image
+      computer_wait_status, computer_fetch_image, computer_record,
+      computer_record_result
     If it prints FAIL: report the printed reason to the user and stop.
 
 STEP 4 — REGISTER THE SERVER FOR YOURSELF (your own config, not anyone else's):
@@ -238,10 +293,11 @@ STEP 2 — RECORD THE CURRENT STATE, THEN FAST-FORWARD:
 STEP 3 — REFRESH AND VERIFY:
   - Refresh the editable install:
       "<venv python>" -m pip install -e "<canonical>"
-  - Re-run the probe. It MUST print PASS (exactly the 10 tools: start_session,
+  - Re-run the probe. It MUST print PASS (exactly the 12 tools: start_session,
     stop_session, computer_observe, computer_screenshot, computer_execute,
     computer_zoom, computer_wait, computer_cancel_wait, computer_wait_status,
-    computer_fetch_image). If it prints FAIL: report the printed reason and stop.
+    computer_fetch_image, computer_record, computer_record_result). If it
+    prints FAIL: report the printed reason and stop.
 
 STEP 4 — REPORT to the user:
   - version BEFORE -> version AFTER (re-run the version command if needed),

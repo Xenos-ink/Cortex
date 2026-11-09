@@ -111,7 +111,8 @@ from ..desktop.backend import (
     type_action_deadline_seconds,
 )
 from ..desktop.client_budget import semantic_read_timeout_seconds
-from ..desktop.errors import FocusDriftError, UnsupportedKeyError
+from ..desktop.coordinates import CoordinateTransform
+from ..desktop.errors import FocusDriftError, PartialInputError, UnsupportedKeyError
 from ..desktop.motion import WAIT_MAX_SECONDS
 from ..desktop.focus_guard import GuardVerdict, InterferenceGuard
 from .grounding import GroundingRouter
@@ -651,6 +652,15 @@ class SingleActionOutcome:
     least one chunk already landed in the (now foreign) field, ``partial_delivery``
     carries ``{"delivered_chars": N}`` — the count of characters actually dispatched
     before the abort. Absence means "nothing was dispatched".
+
+    WP-I (ORVEX-2026-109 Addendum 2, additive): on a PARTIAL SendInput insert
+    (:class:`~computer_use_mcp.desktop.errors.PartialInputError`), ``partial_input``
+    carries the closed block ``{"sent", "total", "released", "still_stuck"}`` —
+    input DID partially land (never presented as "nothing was dispatched"), the
+    engine released exactly what the landed prefix left down, and ``still_stuck``
+    non-empty means keys/buttons may still be physically down. For typing the
+    SAME outcome also carries ``partial_delivery`` (the characters fully
+    delivered before the cut). Never auto-retried.
     """
 
     kind: str
@@ -659,6 +669,7 @@ class SingleActionOutcome:
     message: str = ""
     requires_approval: bool = False
     partial_delivery: dict[str, int] | None = None
+    partial_input: dict[str, Any] | None = None
     model_confidence: float | None = None
     grounding_confidence: float | None = None
     verification_confidence: float | None = None
@@ -671,6 +682,16 @@ class SingleActionOutcome:
     # publishing ``interference_events`` (item 0's) unchanged, while the plan-step
     # machinery publishes the merged list. ``None`` = the queue path did not run.
     follow_up_interference_events: list[str] | None = None
+    #: WP-E E3 (ORVEX-2026-109): when the batch ran, the reply's ATTACHED IMAGE
+    #: is the post-action frame of the LAST item that executed (a trailing wait
+    #: counts — click + click + wait 8 shows the board after the opponent
+    #: replied), not item 0's.  ``image_after_item`` is that item's queue index
+    #: (``None`` = the single-action path, byte-identical to before); the
+    #: verdict fields (``result``/``verification``/``ok``) stay item 0's.
+    image_after_item: int | None = None
+    #: The GroundedAction of the item whose frame the reply shows (E3: the
+    #: Pressed/Normal pointer rule applies to THAT item).
+    image_after_action: Any | None = None
 
 
 class ComputerUseAgent:
@@ -1811,6 +1832,11 @@ class ComputerUseAgent:
         source_observation: Observation | None = None
         executed_count = 0
         first_outcome: SingleActionOutcome | None = None
+        # WP-E E3: the LAST item that actually executed (with a post-action
+        # frame) — its frame rides the reply instead of item 0's.
+        last_frame_outcome: SingleActionOutcome | None = None
+        last_frame_index: int | None = None
+        last_frame_action: GroundedAction | None = None
         # WP13 A (field e1/e2): ONE wall-clock budget per call, DERIVED from the
         # host's client timeout (60 -> 45 as shipped; a 30 s ZCode host -> 15 s).
         # Checked at the TOP of every queue item (never mid-item): when the budget
@@ -1932,6 +1958,16 @@ class ComputerUseAgent:
             # counted as executed.
             if limit_trip is None:
                 executed_count += 1
+                # WP-E E3: track the LAST executed item with a post-action frame —
+                # its frame (and its Pressed/Normal pointer rule) rides the reply.
+                if (
+                    outcome.kind == "executed"
+                    and outcome.result is not None
+                    and outcome.result.screenshot_after_base64
+                ):
+                    last_frame_outcome = outcome
+                    last_frame_index = index
+                    last_frame_action = item
             follow_up_results.append(self._queue_entry(index, item, outcome))
             if limit_trip is not None:
                 stopped_reason = "limit_exceeded"
@@ -1943,6 +1979,15 @@ class ComputerUseAgent:
             ensure_outcome = outcome.result.ensure_app_outcome if outcome.result is not None else None
             if ensure_outcome in ("not_found", "launch_rejected", "launch_unresolved", "ambiguous"):
                 stopped_reason = "ensure_app_failed"
+                break
+            # WP-I (ORVEX-2026-109 Addendum 2): a PARTIAL input insert means the
+            # item's input half-landed — later speculative items would run against
+            # a machine state the batch no longer controls, so the batch STOPS
+            # with the closed ``partial_input`` token (consistent with the named
+            # interference stops). The action is never auto-retried; the per-item
+            # entry carries ``partial_input`` (+ ``partial_delivery`` for typing).
+            if outcome.partial_input is not None:
+                stopped_reason = "partial_input"
                 break
             # T8 named interference stops take precedence over the generic stop reasons:
             # a modal dialog or a post-keyboard focus drift halts the batch with a NAMED
@@ -2061,6 +2106,33 @@ class ComputerUseAgent:
         # for the plan-step machinery; the flat reply's ``interference_events`` key
         # keeps publishing item 0's list (byte-identical flat contract).
         first_outcome.follow_up_interference_events = step_events
+        # WP-E E3 / DELTA 1 m2: on a batch with MORE THAN ONE item the reply
+        # ALWAYS names the item whose frame it shows — including the value 0
+        # (item 0 is the last executed item, e.g. item 1 was rejected).  Only
+        # the image FIELDS move when the shown item is not item 0; the verdict
+        # fields keep item 0's meaning either way.  A single-item queue (the
+        # single-action path, a one-action plan point) never sets the key —
+        # byte-identical to before.
+        if len(queue_items) > 1:
+            first_outcome.image_after_item = (
+                last_frame_index if last_frame_index is not None else 0
+            )
+        if (
+            last_frame_outcome is not None
+            and last_frame_index is not None
+            and last_frame_index != 0
+            and first_outcome.result is not None
+            and last_frame_outcome.result is not None
+        ):
+            last_result = last_frame_outcome.result
+            first_outcome.result.screenshot_after_base64 = last_result.screenshot_after_base64
+            first_outcome.result._frame = getattr(last_result, "_frame", None)
+            first_outcome.result._pointer = getattr(last_result, "_pointer", None)
+            first_outcome.result._pointer_transform = getattr(
+                last_result, "_pointer_transform", None
+            )
+            first_outcome.image_after_item = last_frame_index
+            first_outcome.image_after_action = last_frame_action
         return first_outcome
 
     @staticmethod
@@ -2132,6 +2204,11 @@ class ComputerUseAgent:
             entry["reasons"] = rejection_reasons(outcome)
         if outcome.partial_delivery is not None:
             entry["partial_delivery"] = dict(outcome.partial_delivery)
+        if outcome.partial_input is not None:
+            # WP-I: the partial-input evidence rides the per-item entry exactly
+            # like the flat reply's block (input partially LANDED — never
+            # presented as "nothing was dispatched").
+            entry["partial_input"] = dict(outcome.partial_input)
         if result is not None and result.verification is not None:
             # §1 (ORVEX-2026-108): every follow_up_results[i] carries the SAME
             # envelope fields as the flat reply — including a compact verification
@@ -2149,6 +2226,51 @@ class ComputerUseAgent:
         return entry
 
     async def _run_single_pipeline(
+        self,
+        state: Any,
+        action: GroundedAction,
+        *,
+        approved: bool,
+        expected_effect: str | None = None,
+        source_observation: Observation | None = None,
+        strict_digest: bool = False,
+    ) -> tuple[SingleActionOutcome, Observation | None]:
+        """One direct action through the full pipeline; returns (outcome, post-capture).
+
+        DELTA 2 n6 (WP-R): the dispatched-action ring keeps its DISPATCH-time
+        stamp (m4) and this thin wrapper UPDATES that entry's result with the
+        final §1 outcome token once the pipeline settles — best-effort, never
+        a gate; an action that died mid-dispatch (``TaskStopped``) keeps its
+        ``"dispatched"`` result.
+        """
+        outcome, post = await self._run_single_pipeline_inner(
+            state,
+            action,
+            approved=approved,
+            expected_effect=expected_effect,
+            source_observation=source_observation,
+            strict_digest=strict_digest,
+        )
+        try:
+            from ..vision.recorder import update_action_result
+
+            token = (
+                execute_result_token(outcome)
+                if outcome.kind == "executed"
+                else str(outcome.kind)
+            )
+            # DELTA 3 n6: match the ring entry by its DISPATCH IDENTITY —
+            # stamped at the dispatch choke point and carried on the action
+            # (an action refused before dispatch has no id and updates
+            # NOTHING).
+            dispatch_id = getattr(action, "_ring_dispatch_id", None)
+            if dispatch_id is not None:
+                update_action_result(self.session_id, dispatch_id, token)
+        except Exception:  # noqa: BLE001 - best-effort metadata, never a gate
+            pass
+        return outcome, post
+
+    async def _run_single_pipeline_inner(
         self,
         state: Any,
         action: GroundedAction,
@@ -2523,6 +2645,23 @@ class ComputerUseAgent:
             self.enforcer.begin_action()
             self.stop_token.ensure_live()
             started = time.perf_counter()
+            # DELTA 1 m4 (WP-R): the dispatched-action ring is stamped at the
+            # DISPATCH choke point — the dispatch instant is what the
+            # recorder's ±100 ms sheet labels correlate against (the old
+            # finalize-time stamp landed 0.2–2 s late).  An action that dies
+            # mid-dispatch (TaskStopped raised inside the backend) is still
+            # recorded, with result "dispatched".  Best-effort, never a gate.
+            try:
+                from ..vision.recorder import record_dispatched_action
+
+                # DELTA 3 n6: the returned DISPATCH IDENTITY rides the action
+                # so the post-pipeline wrapper updates THIS entry by identity
+                # (never by action name).
+                dispatch_id = record_dispatched_action(self.session_id, action, "dispatched")
+                if dispatch_id is not None and dispatch_id > 0:
+                    action._ring_dispatch_id = dispatch_id
+            except Exception:  # noqa: BLE001 - best-effort metadata, never a gate
+                pass
             try:
                 message = self._backend_execute(action, self.stop_token)
             except FocusDriftError as exc:
@@ -2561,6 +2700,60 @@ class ComputerUseAgent:
                             "was aborted before further chunks could land in a foreign field."
                         ),
                         partial_delivery=partial,
+                    ),
+                    None,
+                )
+            except PartialInputError as exc:
+                # WP-I (ORVEX-2026-109 Addendum 2): a PARTIAL SendInput insert — the
+                # OS accepted only part of one batch. The engine already released
+                # exactly what the landed prefix left down (never a resend, never a
+                # retry), so this surfaces honestly: the SAME result token/shape
+                # InputBlockedError surfaces today (``failed`` via the ``error``
+                # kind — it is NOT "nothing was dispatched"), PLUS the additive
+                # ``partial_input`` block, and ``partial_delivery`` when the action
+                # was typing and characters fully landed before the cut.
+                self._audit(
+                    "failure",
+                    result="error",
+                    metadata={
+                        "exception": "PartialInputError",
+                        "sent": int(exc.sent),
+                        "total": int(exc.total),
+                        "released": list(exc.released),
+                        "still_stuck": list(exc.still_stuck),
+                    },
+                )
+                if exc.still_stuck:
+                    message = (
+                        "Partial input: SendInput accepted only "
+                        f"{exc.sent} of {exc.total} events; the keys/buttons the landed "
+                        "prefix left down were released, but some keys or buttons may "
+                        f"still be PHYSICALLY DOWN ({', '.join(exc.still_stuck)}) — "
+                        "press and release them by hand. The action was not retried."
+                    )
+                else:
+                    message = (
+                        "Partial input: SendInput accepted only "
+                        f"{exc.sent} of {exc.total} events; everything the landed "
+                        "prefix left down was released. The action was not retried."
+                    )
+                delivered = getattr(exc, "delivered_chars", None)
+                partial = (
+                    {"delivered_chars": int(delivered)}
+                    if isinstance(delivered, int) and not isinstance(delivered, bool) and delivered > 0
+                    else None
+                )
+                return (
+                    SingleActionOutcome(
+                        kind="error",
+                        message=message,
+                        partial_delivery=partial,
+                        partial_input={
+                            "sent": int(exc.sent),
+                            "total": int(exc.total),
+                            "released": [str(name) for name in exc.released],
+                            "still_stuck": [str(name) for name in exc.still_stuck],
+                        },
                     ),
                     None,
                 )
@@ -2843,6 +3036,16 @@ class ComputerUseAgent:
             )
             try:  # R-5 (W4): the post-action frame rides along for outbound bounding
                 outcome.result._frame = getattr(after, "_frame", None)
+            except Exception:  # noqa: BLE001 - never break the executed path
+                pass
+            try:  # WP-C3: the capture-time pointer (canonical) + transform for the
+                # additive pointer sprite / reply fields (never serialized; absent
+                # for legacy results and for consumers that never read it).
+                outcome.result._pointer = (
+                    after.cursor_x,
+                    after.cursor_y,
+                )
+                outcome.result._pointer_transform = CoordinateTransform.from_observation(after)
             except Exception:  # noqa: BLE001 - never break the executed path
                 pass
             return outcome, after

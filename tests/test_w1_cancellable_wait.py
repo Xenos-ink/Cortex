@@ -39,7 +39,8 @@ RECORDS (behavior changes vs dev, all intentional):
   ``status:"error"`` with ``ok:true`` — not contract-conformant).
 * Gate refusals are ``rejected`` replies with ``reasons`` (dev used bare typed
   errors); the message TEXT is byte-identical to dev wherever dev has it.
-* ``computer_fetch_image`` is expected at 10 tools later (WP5); this suite pins 9.
+* ``computer_fetch_image`` joined at 10 tools (WP5) and the recording family at
+  12 tools (WP-R, ORVEX-2026-109); this suite's count pin tracks the surface.
 
 Timing is proven deterministically with an injected monotonic clock
 (``server._wait_now`` monkeypatched) and short REAL segments (the fixture patches
@@ -1142,11 +1143,12 @@ async def test_a_session_with_max_wait_seconds_zero_refuses_every_wait(
 async def test_expected_tools_matches_the_registered_surface(fresh_server: Any) -> None:
     """R17 / K-8 / B-2b: the drift guard.  6 -> 9 with the WP6 wait family
     (decision D-1), 9 -> 10 with WP5's ``computer_fetch_image`` (the evidence
-    store's retrieval tool)."""
+    store's retrieval tool), 10 -> 12 with WP-R's recording family
+    (ORVEX-2026-109)."""
     registered = {tool.name for tool in await srv_server_app.mcp.list_tools()}
     assert cli_module.EXPECTED_TOOLS == registered
     assert {"computer_wait", "computer_cancel_wait", "computer_wait_status"} <= registered
-    assert len(registered) == 10
+    assert len(registered) == 12
     assert "computer_fetch_image" in registered
 
 

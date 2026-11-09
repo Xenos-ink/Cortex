@@ -455,8 +455,15 @@ async def test_r2_d10_full_env_plus_explicit_optin_no_double_encode(
     full-res path wins, and an in-budget PNG travels BYTE-IDENTICAL (no re-encode,
     no double-compress weirdness, no image_scale marker on the full path)."""
     monkeypatch.setenv(ACTION_IMAGE_FULL_ENV, "1")
+    # WP-C3: show_pointer=False pins the PRE-pointer ladder property — the tested
+    # guarantee is "an in-budget PNG travels untouched", which the pointer sprite
+    # (an intentional outbound decoration, default ON) would otherwise change.
     session_id, _bundle, backend, _ = make_session(
-        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch,
+        dry_run=False,
+        require_approval=False,
+        limits=FAST_LIMITS,
+        show_pointer=False,
     )
     structured = _structured_png_b64()
     assert len(base64.b64decode(structured, validate=True)) <= srv_server_replies._result_image_max_bytes()
@@ -476,6 +483,36 @@ async def test_r2_d10_full_env_plus_explicit_optin_no_double_encode(
     # MINOR-b (Commander decision): an untouched PNG is a raw PASS-THROUGH — the
     # honest report is None (no downscale applied), never 1.0.
     assert payload["image_outbound_scale"] is None
+
+
+async def test_r2_d10_pointer_on_ladder_still_governs(
+    monkeypatch: pytest.MonkeyPatch, fresh_server: Any
+) -> None:
+    """DELTA 1 M6 (the pointer-on twin of the d10 variant above): with the
+    pointer sprite ON (the default), an OVER-budget capture still runs the
+    ladder on the composited copy — the delivered image stays JPEG and within
+    the budget, with the pointer drawn and the REAL in_image verdict."""
+    monkeypatch.setenv(ACTION_IMAGE_FULL_ENV, "1")
+    session_id, _bundle, backend, _ = make_session(
+        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+    )
+    noisy = _noise_png_b64()
+    assert len(base64.b64decode(noisy, validate=True)) > srv_server_replies._result_image_max_bytes()
+    backend.observe_override_png = noisy
+    result = await srv_server_execute.computer_execute(
+        session_id, "click", x=10, y=10, include_screenshot_after=True
+    )
+    text_block, image_block = result
+    raw_bytes = len(base64.b64decode(image_block.data, validate=True))
+    assert raw_bytes <= srv_server_replies._result_image_max_bytes(), (
+        image_block.mimeType,
+        raw_bytes,
+    )
+    assert image_block.mimeType == "image/jpeg", "an over-budget composited PNG flips to JPEG"
+    payload = json.loads(text_block.text)
+    pointer = payload["pointer"]
+    assert pointer["in_image"] is True, "the click point (10, 10) is inside the frame"
+    assert pointer["state"] == "pressed" and pointer["x"] == 10 and pointer["y"] == 10
 
 
 async def test_r2_d10_text_mode_with_explicit_optin_zero_image_blocks(
@@ -795,6 +832,8 @@ async def test_r2_d11_fault_injection_window_and_focus_change_must_not_verify_ty
 #: ``computer_wait_status`` — joins as tools 7-9.
 #: RESTATED (ORVEX-2026-108 WP5): ``computer_fetch_image`` — the evidence store's
 #: retrieval tool — joins as the tenth.
+#: RESTATED (ORVEX-2026-109 WP-R): ``computer_record`` / ``computer_record_result``
+#: — the background screen-recording family — join as tools 11-12.
 ALL_TOOLS = (
     "start_session",
     "stop_session",
@@ -806,13 +845,16 @@ ALL_TOOLS = (
     "computer_cancel_wait",
     "computer_wait_status",
     "computer_fetch_image",
+    "computer_record",
+    "computer_record_result",
 )
 
 
-async def test_r2_surface_is_exactly_ten_plain_tools() -> None:
-    """Exactly 10 registered tools (AL-002 zoom was the sixth; ORVEX-2026-108 WP6
+async def test_r2_surface_is_exactly_twelve_plain_tools() -> None:
+    """Exactly 12 registered tools (AL-002 zoom was the sixth; ORVEX-2026-108 WP6
     decision D-1 added the wait family as 7-9; WP5 added the evidence-retrieval
-    tool as the tenth); every advertised inputSchema contains ZERO anyOf and
+    tool as the tenth; ORVEX-2026-109 WP-R added the recording family as 11-12);
+    every advertised inputSchema contains ZERO anyOf and
     ZERO $ref/$defs (the wire-compat contract, re-walked independently)."""
     tools = await srv_server_app.mcp.list_tools()
     assert sorted(tool.name for tool in tools) == sorted(ALL_TOOLS)

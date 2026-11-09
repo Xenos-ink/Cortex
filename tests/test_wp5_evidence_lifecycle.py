@@ -34,6 +34,7 @@ import pytest
 from reply_contract import validate_reply
 from test_controller_integration import (
     FAST_LIMITS,
+    ScriptedBackend,
     SessionRegistry,
     make_session,
 )
@@ -243,10 +244,12 @@ def test_the_idle_reaper_never_reaps_a_fetch_in_flight(
     release = threading.Event()
     real = srv_server_fetch._fetch_image_response
 
-    async def blocking_fetch_response(store: Any, img: str) -> Any:
+    # WP-C3: the response builder now also takes the bundle (pointer seam) —
+    # the wrapper forwards it so the patched signature stays faithful.
+    async def blocking_fetch_response(store: Any, img: str, *args: Any) -> Any:
         entered.set()  # we are INSIDE the tool body: the marks are already held
         await asyncio.to_thread(release.wait, 10)
-        return await real(store, img)
+        return await real(store, img, *args)
 
     monkeypatch.setattr(srv_server_fetch, "_fetch_image_response", blocking_fetch_response)
 
@@ -279,12 +282,24 @@ async def test_a_blocked_fetch_encode_leaves_the_event_loop_free(
 ) -> None:
     """VAL-WP5 F5: the fetch's PIL re-encode ladder runs OFF the loop thread
     (``asyncio.to_thread``) — a fetch whose encode is deliberately BLOCKED does not
-    stop another fetch on the SAME loop from completing."""
+    stop another fetch on the SAME loop from completing. DELTA 1 M5: the pointer
+    decode/composite/encode work is pinned to the same property — it must never
+    run on the loop thread either."""
+    # DELTA 1 M5: a cursor gives the stored frames pointer metadata, so the
+    # fetch's composite path actually runs below.
     sid_a, _bundle_a, _backend_a, _ = make_session(
-        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch,
+        backend=ScriptedBackend(cursor=(10, 10)),
+        dry_run=False,
+        require_approval=False,
+        limits=FAST_LIMITS,
     )
     sid_b, _bundle_b, _backend_b, _ = make_session(
-        monkeypatch, dry_run=False, require_approval=False, limits=FAST_LIMITS
+        monkeypatch,
+        backend=ScriptedBackend(cursor=(10, 10)),
+        dry_run=False,
+        require_approval=False,
+        limits=FAST_LIMITS,
     )
     id_a = _metadata(srv_server_observe.computer_observe(sid_a))["image_id"]
     id_b = _metadata(srv_server_observe.computer_observe(sid_b))["image_id"]
@@ -293,6 +308,15 @@ async def test_a_blocked_fetch_encode_leaves_the_event_loop_free(
     release = threading.Event()
     real = srv_server_fetch._bound_outbound_image
     calls = {"n": 0}
+    loop_thread = threading.current_thread()
+    composite_threads: list[threading.Thread] = []
+    real_composite = srv_server_fetch.composite
+
+    def recording_composite(*args: Any, **kwargs: Any) -> Any:
+        composite_threads.append(threading.current_thread())
+        return real_composite(*args, **kwargs)
+
+    monkeypatch.setattr(srv_server_fetch, "composite", recording_composite)
 
     def blocking_first_encode(data_b64: str, frame: Any = None) -> Any:
         if calls["n"] == 0:
@@ -321,6 +345,10 @@ async def test_a_blocked_fetch_encode_leaves_the_event_loop_free(
 
     await scenario()
     assert calls["n"] == 1, "only the first fetch's encode was blocked"
+    assert composite_threads, "the pointer composite never ran in this scenario"
+    assert all(thread is not loop_thread for thread in composite_threads), (
+        "the fetch decode/composite ran ON the event loop (DELTA 1 M5)"
+    )
 
 
 # --- the age cap end-to-end through the tool ---------------------------------------------------

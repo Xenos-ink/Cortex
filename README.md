@@ -12,9 +12,9 @@
 
 ## What is Cortex
 
-Cortex (current release: 0.7.6) is a Model Context Protocol (MCP) server that
+Cortex (current release: 0.7.7) is a Model Context Protocol (MCP) server that
 gives AI agents a safe, verifiable way to operate a Windows desktop. An agent
-connects over stdio and gets a guarded, ten-tool surface: open a session,
+connects over stdio and gets a guarded, twelve-tool surface: open a session,
 capture the screen (full, aliased, or zoomed to a region), execute actions
 (click, type, hotkeys, drags, window focus, app attach-or-launch, waypoint
 plans), wait with explicit completion, re-serve captured frames, and stop
@@ -79,7 +79,26 @@ drive it:
    `start_session(resume_from_checkpoint=…)` (reply keys `resumed` /
    `continuation_of` / `resumed_from_checkpoint`; honest scope in docs/TOOLS.md).
 
-## The ten tools at a glance
+## What's new in 0.7.7
+
+- **The Cortex cursor in every image.** Each image-bearing reply now carries the
+  Cortex cursor composited at the real pointer — the arrow tip is the exact
+  pointer point, the Pressed shape plus a ring marks where that call clicked,
+  and the replies add `pointer` / `last_click` fields. Off switch:
+  `start_session(show_pointer=false)` or env `CORTEX_SHOW_POINTER` (verification
+  frames, digests and stored evidence stay clean either way).
+- **Screen recording.** Two new tools (10 → 12): `computer_record` records
+  0.5–10 s of the screen in the background and returns at once;
+  `computer_record_result` collects a change timeline, the actions inside the
+  window, a timestamped keyframe contact sheet (each keyframe fetchable by
+  `image_id`), and on request the full MP4 (`include_video=true`, PyAV-encoded,
+  Windows Media Foundation `h264_mf` first with a libx264 fallback). Built for
+  the evidence a single screenshot misses: animations, toasts, menus that
+  close, loading states.
+- **New dependency:** `av` (PyAV, with a bundled FFmpeg) — about 30 MB on the
+  wheel; license note in docs/INSTALL.md.
+
+## The twelve tools at a glance
 
 | Tool | For |
 |---|---|
@@ -93,6 +112,8 @@ drive it:
 | `computer_wait_status` | block for the next wait segment, or peek with `block=false` |
 | `computer_cancel_wait` | end a wait early; reports elapsed/remaining |
 | `computer_fetch_image` | re-serve a frame a reply carried, by `image_id` |
+| `computer_record` | record 0.5–10 s of the screen in the background; returns at once |
+| `computer_record_result` | collect a recording: timeline, keyframe contact sheet, optional MP4 |
 
 `computer_execute` dispatches exactly 13 actions — `click`, `double_click`,
 `right_click`, `drag`, `type`, `keypress`, `hotkey`, `scroll`, `wait`, `done`,
@@ -122,7 +143,7 @@ Full reference: **[docs/REPLY-CONTRACT.md](docs/REPLY-CONTRACT.md)**.
 ## The cortex-skill (fast-path driving)
 
 `cortex-skill` is a small agent skill that teaches any LLM/VLM driving Cortex
-to spend fewer turns: the operating loop, the ten-tool table, reply reading,
+to spend fewer turns: the operating loop, the twelve-tool table, reply reading,
 decision policy, efficiency defaults, and escalation — with the detailed
 protocol in `references/` (plan protocol, reply contract, glossary, worked
 examples). It changes nothing in the server; it shapes how the driving host
@@ -220,7 +241,7 @@ published**; every harness artifact carries
 | Document | Contents |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | install, update, the `cortex-mcp` CLI, agent install prompts |
-| [docs/TOOLS.md](docs/TOOLS.md) | the ten tools: parameters, bounds, semantics |
+| [docs/TOOLS.md](docs/TOOLS.md) | the twelve tools: parameters, bounds, semantics |
 | [docs/REPLY-CONTRACT.md](docs/REPLY-CONTRACT.md) | the unified reply contract, token sets, error codes |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | limits (live/reserved) and every env var |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the layered package, pipeline, pinned contracts |
@@ -240,9 +261,12 @@ Research that informed the design (no code redistributed):
 Built on: [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk),
 [pydantic](https://docs.pydantic.dev/), [Pillow](https://python-pillow.org/),
 [mss](https://github.com/BoboTiG/python-mss),
-[PyAutoGUI](https://pyautogui.readthedocs.io/),
+[PyAutoGUI](https://pyautogui.readthedocs.io/) (optional extra, for
+`CORTEX_INPUT_BACKEND=pyautogui`; not installed by default),
 [httpx](https://www.python-httpx.org/).
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Xenos-ink.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Xenos-ink. Third-party
+runtime dependencies and their licences are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

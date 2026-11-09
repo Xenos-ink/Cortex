@@ -890,6 +890,8 @@ async def test_every_registered_tool_rejects_an_unknown_argument() -> None:
         "computer_zoom",
         "computer_execute",
         "computer_fetch_image",
+        "computer_record",
+        "computer_record_result",
     }
     tools = await mcp.list_tools()
     assert {tool.name for tool in tools} == expected, sorted(tool.name for tool in tools)
@@ -984,7 +986,7 @@ def test_warm_failure_swaps_to_the_win32_reader(monkeypatch: pytest.MonkeyPatch)
 
 def test_server_info_reports_the_cortex_version() -> None:
     options = mcp._mcp_server.create_initialization_options()
-    assert options.server_version == computer_use_mcp.__version__ == "0.7.6"
+    assert options.server_version == computer_use_mcp.__version__ == "0.7.7"
 
 
 # --- D: ensure_app names the owning process of a matching visible window title ----------------

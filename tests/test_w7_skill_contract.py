@@ -2,8 +2,9 @@
 
 Ported from the dev copy's ``test_w7_skill_contract.py`` and ADAPTED to the stable tree:
 
-* the served surface is the TEN-tool set (``computer_wait_status`` joined at WP6; the
-  dev copy asserted nine);
+* the served surface is the TWELVE-tool set (``computer_record`` /
+  ``computer_record_result`` joined at ORVEX-2026-109 WP-R; ``computer_wait_status``
+  joined at WP6; the dev copy asserted nine);
 * imports follow the layered restructure (``core`` / ``desktop`` / ``pipeline`` /
   ``server`` / ``vision`` packages) — no ``computer_use_mcp.server`` module-level
   attribute surface exists anymore;
@@ -99,12 +100,13 @@ def _registered_tool_names() -> set[str]:
 
 
 def test_the_served_surface_is_exactly_the_ten_documented_tools() -> None:
-    """The manual's tool table must BE the served surface, never a hand-kept copy."""
+    """The manual's tool table must BE the served surface, never a hand-kept copy.
+    WP-R (ORVEX-2026-109): the surface grew 10 -> 12 with the recording family."""
     assert _registered_tool_names() == set(EXPECTED_TOOLS), (
         "the served tool surface changed; the skill's tool table is a contract, so it "
         "must be restated in the SAME change that adds or removes a tool"
     )
-    assert len(EXPECTED_TOOLS) == 10
+    assert len(EXPECTED_TOOLS) == 12
 
 
 def test_the_skill_documents_every_registered_tool_in_its_own_table_row() -> None:

@@ -44,6 +44,41 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 ACTIONS_BAND = (1, 500)
 STEPS_BAND = (1, 500)
 
+# --- WP-R (ORVEX-2026-109): the screen-recording bands ---------------------------------------
+# The ``computer_record`` parameter bands live here, next to the other bands, so
+# the tool's refusals and the docs interpolate the SAME constants. Out-of-band
+# requests are REFUSED fail-closed (the wait-duration precedent: never silently
+# shortened) — the bands are refusal bounds, not clamps.
+
+#: ``duration_s`` band, in seconds: 0.5..10.
+RECORD_DURATION_BAND = (0.5, 10.0)
+
+#: ``fps`` default and band: 5 default, 1..10.
+RECORD_FPS_DEFAULT = 5
+RECORD_FPS_BAND = (1, 10)
+
+#: ``max_keyframes`` default and band: 8 default, 2..12.
+RECORD_MAX_KEYFRAMES_DEFAULT = 8
+RECORD_MAX_KEYFRAMES_BAND = (2, 12)
+
+#: Each captured frame is downscaled at once so its longest side never exceeds
+#: this (frames are held as JPEG bytes, never raw RGB).
+RECORD_FRAME_LONG_SIDE_MAX = 1280
+
+#: JPEG quality of the held frames.
+RECORD_JPEG_QUALITY = 70
+
+#: The contact sheet's longest side never exceeds this.
+RECORD_SHEET_LONG_SIDE_MAX = 1600
+
+#: DELTA 1 (VAL-WP-R-01 item 12): the default video blob cap, in MiB raw —
+#: 2 MiB (the review: most hosts cannot pass video to the model, and some cap
+#: tool-output size).  ``CORTEX_RECORD_VIDEO_MAX_MB`` overrides it, band 1..8,
+#: fallback-not-clamp (a typo can never arm an oversize blob).
+RECORD_VIDEO_MAX_MB_DEFAULT = 2
+RECORD_VIDEO_MAX_MB_BAND = (1, 8)
+RECORD_VIDEO_MAX_MB_ENV = "CORTEX_RECORD_VIDEO_MAX_MB"
+
 
 @dataclass(frozen=True)
 class Limits:

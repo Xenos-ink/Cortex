@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import time
 
 from abc import ABC, abstractmethod
 
 from typing import TYPE_CHECKING
 
-from .errors import FocusDriftError, InputBlockedError, UnsupportedActionError, UnsupportedKeyError
+from .errors import (
+    FocusDriftError,
+    InputBlockedError,
+    PartialInputError,
+    UnsupportedActionError,
+    UnsupportedKeyError,
+)
 from .motion import _DRAG_STEP_PAUSE_SECONDS
 
 if TYPE_CHECKING:  # annotation-only names (lazy under __future__ annotations)
@@ -42,6 +49,8 @@ from .win32 import (
 )
 
 from .windows import get_cursor_position
+
+logger = logging.getLogger(__name__)
 
 _TYPE_INTERVAL_SECONDS = 0.01  # legacy per-char pacing (pyautogui fallback parity)
 
@@ -111,6 +120,104 @@ _MOUSE_BUTTON_FLAGS: dict[str, tuple[int, int]] = {
     "right": (_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP),
     "middle": (_MOUSEEVENTF_MIDDLEDOWN, _MOUSEEVENTF_MIDDLEUP),
 }
+
+# WP-I (ORVEX-2026-109 Addendum 2): X-button pair flags (not emitted by this
+# engine; recognized so a partial-insert audit can never misread a batch that
+# carries them).
+_MOUSEEVENTF_XDOWN = 0x0080
+_MOUSEEVENTF_XUP = 0x0100
+
+#: Readable names for the partial-insert audit (WP-I): the STICKY keys matter
+#: most, so every modifier alias maps to its family name; other named VKs fall
+#: back to ``vk_0xNN``. VK_PACKET (KEYEVENTF_UNICODE) events are named
+#: ``U+NNNN`` after their code unit.
+_PARTIAL_KEY_NAMES: dict[int, str] = {
+    0x10: "shift", 0xA0: "shift", 0xA1: "shift",
+    0x11: "ctrl", 0xA2: "ctrl", 0xA3: "ctrl",
+    0x12: "alt", 0xA4: "alt", 0xA5: "alt",
+    0x5B: "win", 0x5C: "win",
+    0x0D: "enter", 0x09: "tab", 0x20: "space", 0x08: "backspace",
+    0x1B: "esc", 0x14: "capslock", 0x90: "numlock", 0x91: "scrolllock",
+}
+
+
+def _partial_key_name(vk: int, scan: int, unicode_flag: bool) -> str:
+    """One readable name for a keyboard event's key (WP-I audit payload)."""
+    if unicode_flag:
+        return f"U+{scan:04X}"
+    return _PARTIAL_KEY_NAMES.get(vk, f"vk_0x{vk:02X}")
+
+
+def _mouse_flag_button(dw_flags: int) -> str | None:
+    """The button a mouse flag event presses/releases (``None`` = move/wheel)."""
+    if dw_flags & (_MOUSEEVENTF_LEFTDOWN | _MOUSEEVENTF_LEFTUP):
+        return "left"
+    if dw_flags & (_MOUSEEVENTF_RIGHTDOWN | _MOUSEEVENTF_RIGHTUP):
+        return "right"
+    if dw_flags & (_MOUSEEVENTF_MIDDLEDOWN | _MOUSEEVENTF_MIDDLEUP):
+        return "middle"
+    if dw_flags & (_MOUSEEVENTF_XDOWN | _MOUSEEVENTF_XUP):
+        return "mouse_x"
+    return None
+
+
+def _partial_input_state(
+    events: list[_INPUT], landed: int
+) -> list[tuple[str, _INPUT]]:
+    """Keys/buttons still DOWN at the end of the LANDED prefix, reverse press order.
+
+    WP-I: ``SendInput`` inserts events IN ORDER, so ``events[:landed]`` landed.
+    Walking that prefix, a key/button is still down when its down event landed
+    and its matching up did not (``downs minus ups``; keyboard identity is the
+    VK, or the UTF-16 code unit for VK_PACKET events; mouse identity is the
+    button). Each entry carries a readable name and the ready-made release
+    event (the down event's own flags + ``KEYEVENTF_KEYUP`` — so a
+    ``KEYEVENTF_UNICODE`` down is released with its matching unicode up).
+    """
+    down: dict[tuple[str, int], tuple[str, _INPUT]] = {}
+    for index, event in enumerate(events[:landed]):
+        if event.type == _INPUT_KEYBOARD:
+            ki = event.union.ki
+            vk = int(ki.wVk)
+            scan = int(ki.wScan)
+            flags = int(ki.dwFlags)
+            unicode_flag = bool(flags & _KEYEVENTF_UNICODE)
+            identity = ("u", scan) if unicode_flag else ("k", vk)
+            if flags & _KEYEVENTF_KEYUP:
+                down.pop(identity, None)
+            else:
+                down.pop(identity, None)
+                down[identity] = (
+                    _partial_key_name(vk, scan, unicode_flag),
+                    _key_event(vk, scan, flags | _KEYEVENTF_KEYUP),
+                )
+        elif event.type == _INPUT_MOUSE:
+            mi = event.union.mi
+            flags = int(mi.dwFlags)
+            button = _mouse_flag_button(flags)
+            if button is None:
+                continue  # move/wheel events change no button state
+            identity = ("m", button)
+            if flags & (_MOUSEEVENTF_LEFTUP | _MOUSEEVENTF_RIGHTUP | _MOUSEEVENTF_MIDDLEUP | _MOUSEEVENTF_XUP):
+                down.pop(identity, None)
+            else:
+                down.pop(identity, None)
+                down[identity] = (
+                    f"mouse_{button}",
+                    _mouse_flag_event(_button_up_flag(flags)),
+                )
+    return [(name, release_event) for name, release_event in reversed(list(down.values()))]
+
+
+def _button_up_flag(dw_flags: int) -> int:
+    """The up flag matching a mouse DOWN flag (WP-I cleanup release events)."""
+    if dw_flags & _MOUSEEVENTF_LEFTDOWN:
+        return _MOUSEEVENTF_LEFTUP
+    if dw_flags & _MOUSEEVENTF_RIGHTDOWN:
+        return _MOUSEEVENTF_RIGHTUP
+    if dw_flags & _MOUSEEVENTF_MIDDLEDOWN:
+        return _MOUSEEVENTF_MIDDLEUP
+    return _MOUSEEVENTF_XUP
 
 
 def _virtual_screen_metrics() -> tuple[int, int, int, int]:
@@ -367,7 +474,7 @@ class InputEngine(ABC):
     """Physical-input contract used by :class:`LocalComputerBackend.execute`.
 
     Implementations must raise :class:`InputBlockedError` when input is blocked
-    (failsafe corner, blocked desktop/UIPI) and must never partially dispatch silently
+    (failsafe corner, a blocked input desktop) and must never partially dispatch silently
     (a zero-event success is a contract violation). Pacing attributes
     (``click_interval``/``type_interval``/``drag_interpolate``/``drag_step_pause``)
     are read by the backend to keep stroke/stop-check policy engine-agnostic;
@@ -614,9 +721,15 @@ class SendInputEngine(InputEngine):
       into one call and modifiers are always released in reverse order.
     - Failsafe parity: the pyautogui screen-corner check is replicated before every
       dispatch batch and raises the same :class:`InputBlockedError`.
-    - Fail-closed: a ``SendInput`` return of 0 (blocked by UIPI or another thread)
-      raises :class:`InputBlockedError` — strictly stronger than pyautogui, which
-      silently swallows ``PermissionError``/``OSError`` from ``mouse_event``.
+    - Fail-closed: a ``SendInput`` return of 0 (the input was blocked by another
+      thread; a desktop switch is a likely cause) raises :class:`InputBlockedError` —
+      strictly stronger than pyautogui, which silently swallows
+      ``PermissionError``/``OSError`` from ``mouse_event``. Microsoft documents
+      that NEITHER the return value NOR ``GetLastError`` indicates that UIPI
+      blocked the input; that hazard is caught by post-action verification
+      instead. A PARTIAL return (``0 < n < len``) releases exactly
+      what the landed prefix left down and raises
+      :class:`PartialInputError` (WP-I, ORVEX-2026-109 Addendum 2).
 
     Pacing: the standalone engine stays batched and unpaced (whole-string
     dispatch); the REAL backend paces it at 0.02 s/char by default via
@@ -688,18 +801,123 @@ class SendInputEngine(InputEngine):
         every later keystroke system-wide, which is strictly worse than the input the
         user is aborting. So every release primitive routes through THIS path: the
         corner check is skipped, and everything else is IDENTICAL to ``_send`` — the
-        non-Windows guard and the zero-return fail-closed check (``InputBlockedError``
-        when SendInput is blocked by UIPI or another input source) both stay.
+        non-Windows guard and the exact-count fail-closed check both stay. Per
+        Microsoft, a ``SendInput`` return of 0 means the input was blocked by
+        another thread (a desktop switch is a likely cause); UIPI blocking is
+        SILENT — neither the return value nor ``GetLastError`` indicates it —
+        and is caught by post-action verification;
+        a PARTIAL return (``0 < n < len``) releases exactly what the landed prefix
+        left down and raises :class:`PartialInputError` (WP-I).
         Press/down/move/click/type/chord/scroll keep the corner check unchanged.
         """
         if not events:
             return
         if not IS_WINDOWS or _user32 is None:
             raise InputBlockedError("Physical input requires Windows.")
-        if self._dispatch(events) == 0:
+        n = self._dispatch(events)
+        try:  # WP-I: clamp defensively BEFORE the comparisons — a broken thunk
+            # or an out-of-band OS value (n > len, negative) can never crash or
+            # misclassify the batch.
+            n = int(n)
+        except (TypeError, ValueError):
+            n = 0
+        if n >= len(events):
+            return
+        self._raise_partial_insert(events, n)
+
+    def _raise_partial_insert(self, events: list[_INPUT], n: int) -> None:
+        """The exact-count contract (WP-I): classify a short SendInput return.
+
+        ``n == len`` -> full success (handled by the callers, byte-identical to
+        before). ``n == 0`` -> today's :class:`InputBlockedError`, unchanged:
+        nothing was inserted, so nothing is stuck. ``0 < n < len`` -> the landed
+        prefix (SendInput inserts events in order) is walked; everything it left
+        down is released in REVERSE press order in ONE batch through the
+        halt-safe release path (this method only ever runs inside
+        ``_send_release``/``_send``, which already skipped the corner check; the
+        cleanup dispatch calls ``_dispatch`` directly, no corner check, no
+        failsafe refusal of a release). The remainder is NEVER resent; no
+        second cleanup attempt is made. Then
+        :class:`~computer_use_mcp.desktop.errors.PartialInputError` (an
+        ``InputBlockedError`` subclass, so every existing handler keeps failing
+        closed) carries sent/total/released/still_stuck.
+        """
+        total = len(events)
+        try:
+            n = int(n)
+        except (TypeError, ValueError):  # defensive: a broken thunk, not the OS
+            n = 0
+        n = max(0, min(n, total))
+        if n == 0:
             raise InputBlockedError(
-                "SendInput was blocked (UIPI or another input source); physical input halted."
+                "SendInput was blocked (by another thread or the input desktop); physical input halted."
             )
+        still_down = _partial_input_state(events, n)
+        prefix_identities: set[tuple[str, int]] = set()
+        # Release-batch honesty: an up event that did NOT land names a key that
+        # was down when the batch was built and is still down (release_modifiers /
+        # key_up cut mid-sweep). It is skipped when its identity was cleaned up
+        # from the landed prefix (already accounted) or when its own DOWN is also
+        # unlanded (the key was never pressed).
+        suffix_up_keys: dict[tuple[str, int], str] = {}  # identity -> name
+        suffix_down_identities: set[tuple[str, int]] = set()
+        for index, event in enumerate(events):
+            if event.type != _INPUT_KEYBOARD:
+                continue
+            ki = event.union.ki
+            flags = int(ki.dwFlags)
+            unicode_flag = bool(flags & _KEYEVENTF_UNICODE)
+            identity = ("u", int(ki.wScan)) if unicode_flag else ("k", int(ki.wVk))
+            if index < n:
+                prefix_identities.add(identity)
+            elif flags & _KEYEVENTF_KEYUP:
+                suffix_up_keys.setdefault(
+                    identity,
+                    _partial_key_name(int(ki.wVk), int(ki.wScan), unicode_flag),
+                )
+            else:
+                suffix_down_identities.add(identity)
+        released: list[str] = []
+        still_stuck: list[str] = []
+        if still_down:
+            cleanup_events = [release_event for _name, release_event in still_down]
+            # still_down is ALREADY in release (reverse press) order — the same
+            # order the cleanup batch dispatches — so the names slice 1:1 with
+            # the landed prefix.
+            release_order_names = [name for name, _release_event in still_down]
+            # ONE cleanup attempt, never a loop; the release is halt-safe (no
+            # corner check — we are already inside the release path).
+            try:
+                m = self._dispatch(cleanup_events)
+            except Exception:
+                # WP-I DELTA 1 (D2) / DELTA 2 (E4): a RAISING cleanup (e.g. an
+                # OSError from the ctypes call) must never replace
+                # PartialInputError — the partial insert is the primary fact.
+                # Treated as m = 0: everything the landed prefix left down goes
+                # to still_stuck. Still ONE attempt, no retry; the swallowed
+                # exception leaves a WARNING trace naming what may remain down.
+                m = 0
+                logger.warning(
+                    "the partial-insert cleanup dispatch itself failed; keys/buttons "
+                    "may remain physically down: %s",
+                    ", ".join(release_order_names),
+                    exc_info=True,
+                )
+            try:
+                m = int(m)
+            except (TypeError, ValueError):
+                m = 0
+            m = max(0, min(m, len(cleanup_events)))
+            released = release_order_names[:m]
+            still_stuck = release_order_names[m:]
+        for identity, name in suffix_up_keys.items():
+            if identity in prefix_identities or identity in suffix_down_identities:
+                continue
+            if name not in still_stuck:
+                still_stuck.append(name)
+        raise PartialInputError(
+            sent=n, total=total, released=released, still_stuck=still_stuck
+        )
 
     # -- InputEngine interface -------------------------------------------------------------
 
@@ -783,7 +1001,15 @@ class SendInputEngine(InputEngine):
                         # the offset of earlier chunks.
                         exc.delivered_chars = sent_chars
                         raise
-                self._send([_key_event(vk, scan, flags) for vk, scan, flags in group])
+                try:
+                    self._send([_key_event(vk, scan, flags) for vk, scan, flags in group])
+                except PartialInputError as exc:
+                    # WP-I: a group is ONE character (its events travel in ONE
+                    # batch), so a cut inside it completes nothing; ``sent_chars``
+                    # is exactly what was fully delivered (down AND up) before
+                    # this batch. The caller adds the offset of earlier chunks.
+                    exc.delivered_chars = sent_chars
+                    raise
                 sent_chars += _batch_code_points(group)
                 time.sleep(self.type_interval)
             return
@@ -792,6 +1018,24 @@ class SendInputEngine(InputEngine):
         # path; the real backend paces by default since WP12a).
         events = [_key_event(vk, scan, flags) for vk, scan, flags in units]
         chunk_size = _SENDINPUT_CHUNK_EVENTS - (_SENDINPUT_CHUNK_EVENTS % 2)
+
+        def _completed_code_points(landed_units: int) -> int:
+            """WP-I: code points FULLY delivered within ``units[:landed_units]``.
+
+            A character counts only when its down AND up both landed (a surrogate
+            pair: all four events). ``_batch_code_points`` stays the single
+            counting primitive — this walks the per-character group boundaries on
+            top of it instead of duplicating the rule.
+            """
+            count = 0
+            offset = 0
+            for group in _char_event_groups(text):
+                group_len = len(group)
+                if offset + group_len > landed_units:
+                    break
+                count += _batch_code_points(group)
+                offset += group_len
+            return count
 
         sent_chars = 0
         for start in range(0, len(events), chunk_size):
@@ -807,7 +1051,12 @@ class SendInputEngine(InputEngine):
                     # call; the caller adds the offset of earlier chunks.
                     exc.delivered_chars = sent_chars
                     raise
-            self._send(events[start : start + chunk_size])
+            try:
+                self._send(events[start : start + chunk_size])
+            except PartialInputError as exc:
+                # WP-I: only COMPLETE characters inside the landed prefix count.
+                exc.delivered_chars = _completed_code_points(start + exc.sent)
+                raise
             sent_chars += _batch_code_points(batch_units)
 
     def chord(self, keys: list[str]) -> None:

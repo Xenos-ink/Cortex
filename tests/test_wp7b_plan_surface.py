@@ -317,6 +317,13 @@ async def test_legacy_flat_call_without_plan_stays_byte_identical(
             "evidence_retention",
             "evidence_source",
             "evidence_fetch",
+            # CHANGED PIN (ORVEX-2026-109 WP-C3, §-reason): the additive pointer
+            # keys of an image-bearing executed reply (the capture-time cursor is
+            # KNOWN here — the move landed on it — so both keys ride; show_pointer
+            # off would keep the old key set). The pointer behavior itself is
+            # pinned in tests/test_pointer_in_replies.py.
+            "pointer",
+            "last_click",
         }
     )
     assert set(payload) == expected_flat_keys, (
@@ -343,6 +350,9 @@ async def test_legacy_flat_call_without_plan_stays_byte_identical(
         "image_stored", "image_attached", "image_id", "image_captured_at",
         "image_age_seconds", "image_bytes", "image_width", "image_height",
         "evidence_retention", "evidence_source", "evidence_fetch",
+        # WP-C3: the pointer keys ride ONLY image-bearing replies — this opt-out
+        # reply serves no image, so it keeps the pre-WP-C key set here.
+        "pointer", "last_click",
     } | {"follow_up_results", "follow_ups_stopped_reason"}
     assert [item["action_type"] for item in followups["follow_up_results"]] == ["click", "wait"]
 
@@ -1841,10 +1851,11 @@ def test_the_legacy_single_call_plan_path_is_absent() -> None:
 
 
 def test_the_expected_tools_count_is_unchanged() -> None:
-    """Contract item (i): EXPECTED_TOOLS stays at 10 — no tool was added or removed."""
+    """Contract item (i): the tool surface only ever grows by explicit amendment —
+    WP-R (ORVEX-2026-109) grew EXPECTED_TOOLS from 10 to 12 (the recording family)."""
     from computer_use_mcp.cli import EXPECTED_TOOLS
 
-    assert len(EXPECTED_TOOLS) == 10
+    assert len(EXPECTED_TOOLS) == 12
 
 
 # --- DELTA 1 #3: interference events from the ACTION item (not just the move) ---------------------

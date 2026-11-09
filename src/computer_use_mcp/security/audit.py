@@ -68,6 +68,12 @@ AuditEventType = Literal[
     "plan_point",
     "plan_complete",
     "plan_stopped",
+    # WP-R (ORVEX-2026-109, additive): bounded screen-recording lifecycle.
+    # Emitted once each per recording (start on the tool call, complete or
+    # cancelled from the worker's single finalize path).
+    "record_start",
+    "record_complete",
+    "record_cancelled",
 ]
 
 _REDACTED_STR_FIELDS = (

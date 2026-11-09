@@ -1,0 +1,35 @@
+{
+  "hotspot": {
+    "16": [
+      0,
+      0
+    ],
+    "20": [
+      0,
+      0
+    ],
+    "24": [
+      0,
+      0
+    ],
+    "32": [
+      0,
+      0
+    ],
+    "48": [
+      0,
+      0
+    ]
+  },
+  "sizes": [
+    16,
+    20,
+    24,
+    32,
+    48
+  ],
+  "source_sha256": {
+    "Cortex Cursor Normal.png": "f3f92d5e8c4e29cc26b27b61d69446d087a88aee37677a3176562e709667e9c2",
+    "Cortex Cursor Pressed.png": "61e64a4f90d65e02a395b363b84eef5fbd85dfc97023c8521394458cd4f8f4c1"
+  }
+}

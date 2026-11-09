@@ -48,6 +48,7 @@ import base64
 import ctypes
 import hashlib
 import io
+import logging
 import math
 import os
 import platform
@@ -107,6 +108,7 @@ from .errors import (
     FocusDriftError,
     InputBlockedError,
     LaunchTargetError,
+    PartialInputError,
     TextIntegrityError,
     UnsupportedActionError,
     WindowFocusError,
@@ -133,6 +135,7 @@ from .input_engine import (
     _SENDINPUT_FACTORY_DRAG_STEP_PIXELS,
 )
 from .errors import UnsupportedKeyError
+from .pointer_ring import PointerRing
 from .launch import _launch_unresolved_suffix, _mapped_launch_path, validate_launch_needle
 from .motion import (
     WAIT_MAX_SECONDS,
@@ -167,6 +170,7 @@ from .windows import (
     query_stuck_modifiers,
 )
 
+logger = logging.getLogger(__name__)
 
 #: Settle/gap policy between queued final-Enter-ish keystrokes (B3): a terminal-key
 #: chord dispatched within this window of the previous keyboard dispatch waits out the
@@ -840,13 +844,17 @@ class LocalComputerBackend(ComputerBackend):
         self.mss_dpi_neutralized = self._neutralize_mss_dpi_awareness(mss)
         # mss.MSS is the supported factory on mss >= 10.2; mss.mss() is the legacy path.
         self._mss_factory: Callable[[], object] = getattr(mss, "MSS", None) or mss.mss
-        import pyautogui  # type: ignore[import-not-found]
-
-        self._pyautogui = pyautogui
-        pyautogui.FAILSAFE = True
+        # WP-M (ORVEX-2026-109): pyautogui is an optional extra. It is imported
+        # lazily inside _build_input_engine ONLY when the pyautogui engine is
+        # selected; the default SendInput engine never imports it.
+        self._pyautogui: object | None = None
         self._engine = self._build_input_engine(
             input_engine, type_interval, pyautogui_pause, drag_interpolate
         )
+        # WP-C2 (ORVEX-2026-109): the per-backend pointer-event ring. Pure Python,
+        # written at the dispatch choke points in ``_execute_dispatched`` AFTER each
+        # engine call returns — no new syscall, dispatch timing/order unchanged.
+        self.pointer_ring = PointerRing()
         self.png_optimize: bool = (
             _env_bool(PNG_OPTIMIZE_ENV, False) if png_optimize is None else png_optimize
         )
@@ -950,6 +958,20 @@ class LocalComputerBackend(ComputerBackend):
         )
         engine: InputEngine
         if name == "pyautogui":
+            try:
+                import pyautogui  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise ValueError(
+                    "the pyautogui input engine (CORTEX_INPUT_BACKEND=pyautogui "
+                    "or input_engine='pyautogui') needs the optional extra: "
+                    'python -m pip install -e ".[pyautogui]" (from a clone) or '
+                    'pip install "computer-use-mcp[pyautogui] @ '
+                    'git+https://github.com/Xenos-ink/Cortex.git" (from git); '
+                    "with uv: uv sync --extra pyautogui"
+                ) from exc
+            # PyAutoGuiInputEngine itself sets FAILSAFE (input_engine.py), so
+            # the engine default already covers the failsafe corner check.
+            self._pyautogui = pyautogui
             pause = (
                 _env_nonnegative_float(PYAUTOGUI_PAUSE_ENV, 0.0)
                 if pyautogui_pause is None
@@ -1464,6 +1486,14 @@ class LocalComputerBackend(ComputerBackend):
             time.sleep(_plan_point_settle_seconds(action))
         return message
 
+    def last_click(self) -> dict[str, object] | None:
+        """WP-C2: the most recent completed press from the pointer ring.
+
+        ``{x, y, button, t}`` in PHYSICAL virtual-screen coordinates (``t`` is the
+        down edge's ``time.monotonic``), or ``None`` when nothing was pressed yet.
+        """
+        return self.pointer_ring.last_click()
+
     def _ensure_keys_dispatchable(self, keys: list[str]) -> dict[str, tuple[int, bool]]:
         """Z2 (LIVE-WP13-02 sess_138fbd60): map EVERY key BEFORE any input.
 
@@ -1543,6 +1573,10 @@ class LocalComputerBackend(ComputerBackend):
                         stop.ensure_live()  # before mouse_down
                     engine.mouse_down(button)
                     button_down = True
+                    # WP-C2 DELTA 1 MINOR 1: recorded AFTER ``button_down = True``
+                    # (and record itself never raises), so a recording failure
+                    # can never skip ``mouse_up`` in the ``finally`` below.
+                    self.pointer_ring.record("down", physical[0], physical[1], button)
                     _wait_for_hold(hold_seconds, stop)
                     if stop is not None:
                         stop.ensure_live()  # before mouse_up
@@ -1557,11 +1591,21 @@ class LocalComputerBackend(ComputerBackend):
                     if button_down:
                         try:
                             engine.mouse_up(button)
+                            self.pointer_ring.record("up", physical[0], physical[1], button)
                         except Exception:
                             if hold_error is None:
                                 raise
             else:
+                # WP-C2 DELTA 1 MINOR 2: the DOWN edge's timestamp is taken
+                # BEFORE ``engine.click`` dispatches, so ``pressed_at`` covers
+                # the real press window (up is recorded after the return).
+                click_down_at = time.monotonic()
                 engine.click(physical[0], physical[1], clicks=clicks, button=button)
+                # WP-C2: the completed click lands in the ring as one down/up pair
+                # (a double_click batch records as one press; the ring is a
+                # pointer-EDGES log, not a click counter).
+                self.pointer_ring.record("down", physical[0], physical[1], button, at=click_down_at)
+                self.pointer_ring.record("up", physical[0], physical[1], button)
                 _mark_action_dispatched(action)
         elif action.action == "drag":
             if action.point is None or action.to_point is None:
@@ -1579,6 +1623,10 @@ class LocalComputerBackend(ComputerBackend):
             try:
                 engine.mouse_down("left")
                 button_down = True
+                # WP-C2 DELTA 1 MINOR 1/3: recorded AFTER ``button_down = True``,
+                # tagged source="drag" — a drag press never surfaces in
+                # ``last_click()`` (click-type presses only).
+                self.pointer_ring.record("down", start[0], start[1], "left", source="drag")
                 for segment_x, segment_y in self._drag_waypoints(start, end):
                     if stop is not None:
                         stop.ensure_live()  # before every stroke segment
@@ -1597,6 +1645,7 @@ class LocalComputerBackend(ComputerBackend):
                 if button_down:
                     try:
                         engine.mouse_up("left")
+                        self.pointer_ring.record("up", end[0], end[1], "left", source="drag")
                     except Exception:
                         if drag_error is None:
                             raise
@@ -1898,6 +1947,28 @@ class LocalComputerBackend(ComputerBackend):
                     # failure is recorded and re-raised only if nothing was in flight.
                     if release_error is None:
                         release_error = error
+                    # WP-I DELTA 1 (D3) / DELTA 2 (E2): a release that itself
+                    # PARTIALLY inserted carries still_stuck. Log a WARNING ONLY
+                    # when this report will actually be DROPPED — an error is
+                    # already in flight (never-mask rule), or an EARLIER release
+                    # error was recorded and wins. When this error is the one
+                    # that propagates, the reply already carries it and a
+                    # warning would double-report.
+                    if (
+                        isinstance(error, PartialInputError)
+                        and error.still_stuck
+                        and (hold_error is not None or release_error is not error)
+                    ):
+                        logger.warning(
+                            "held-key release partially inserted; keys/buttons may "
+                            "still be physically down: %s%s",
+                            ", ".join(error.still_stuck),
+                            (
+                                f" (masked by the in-flight {type(hold_error).__name__})"
+                                if hold_error is not None
+                                else ""
+                            ),
+                        )
             if release_error is not None and hold_error is None:
                 raise release_error
 
@@ -2130,6 +2201,17 @@ class LocalComputerBackend(ComputerBackend):
                         intra if isinstance(intra, int) and intra > 0 else 0
                     )
                     raise
+                except PartialInputError as exc:
+                    # WP-I (ORVEX-2026-109 Addendum 2): the SAME composition for a
+                    # partial SendInput insert — every EARLIER chunk fully landed
+                    # (`delivered`) and the engine reports the characters fully
+                    # delivered (down AND up) inside the landed prefix of the cut
+                    # batch. Compose, never undercount completed work.
+                    intra = exc.delivered_chars
+                    exc.delivered_chars = delivered + (
+                        intra if isinstance(intra, int) and intra > 0 else 0
+                    )
+                    raise
                 delivered += len(chunk)
                 self._last_key_dispatch = time.monotonic()
         finally:
@@ -2256,6 +2338,11 @@ class LocalComputerBackend(ComputerBackend):
                 # characters than may have landed — the count is the UPPER BOUND
                 # ``len(text)`` (everything dispatched), not the read-back-confirmed
                 # prefix.
+                exc.delivered_chars = len(text)
+                raise
+            except PartialInputError as exc:
+                # WP-I: the SAME upper-bound semantics — the retype's landed prefix
+                # may still land late, so everything dispatched counts.
                 exc.delivered_chars = len(text)
                 raise
             finally:
