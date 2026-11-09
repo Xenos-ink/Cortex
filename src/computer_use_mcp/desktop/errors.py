@@ -15,6 +15,67 @@ class InputBlockedError(BackendError):
     """
 
 
+class PartialInputError(InputBlockedError):
+    """WP-I (ORVEX-2026-109 Addendum 2): SendInput accepted only PART of one batch.
+
+    Win32 ``SendInput`` returns the NUMBER of events it inserted, so a partial
+    insert (``0 < n < len(events)``) is neither a block (``0``) nor a full
+    dispatch (``len``) — it used to pass silently as success. The engine now
+    walks the landed prefix, releases exactly the keys/buttons it left down
+    (reverse press order, ONE halt-safe release batch, never a retry), and
+    raises this typed error.
+
+    It is a SUBCLASS of :class:`InputBlockedError` deliberately: every existing
+    ``except InputBlockedError`` site keeps failing closed on a partial insert.
+
+    Attributes:
+        sent: events the OS accepted from the cut batch (clamped ``[0, total]``).
+        total: events the batch carried.
+        released: readable names released by the cleanup batch, in RELEASE
+            (reverse press) order — e.g. ``["shift", "ctrl"]``, ``["mouse_left"]``,
+            ``["U+0627"]``. Empty when nothing was left down or the cleanup
+            itself landed nothing.
+        still_stuck: the same name format — keys/buttons that may still be
+            PHYSICALLY DOWN because the cleanup batch itself returned short,
+            RAISED, or a release-batch suffix never landed. Empty when the
+            release succeeded. The reply says plainly that a human should press
+            and release them.
+    """
+
+    #: Chars fully delivered by a ``type`` batch before the cut (set by the
+    #: engine's typing paths; ``None``/absent = not a typing batch).
+    delivered_chars: int | None = None
+
+    def __init__(
+        self,
+        *,
+        sent: int,
+        total: int,
+        released: list[str] | None = None,
+        still_stuck: list[str] | None = None,
+    ) -> None:
+        self.sent = int(sent)
+        self.total = int(total)
+        self.released = [str(name) for name in (released or [])]
+        self.still_stuck = [str(name) for name in (still_stuck or [])]
+        if self.still_stuck:
+            tail = (
+                " Some keys or buttons may still be PHYSICALLY DOWN ("
+                + ", ".join(self.still_stuck)
+                + ") — a human should press and release them."
+            )
+        else:
+            tail = (
+                " Everything the landed prefix left down was released."
+                if self.released
+                else " Nothing in the landed prefix left a key or button down."
+            )
+        super().__init__(
+            f"SendInput accepted only {self.sent} of {self.total} events (partial "
+            f"insert); the action was not retried.{tail}"
+        )
+
+
 class DisplayUnavailableError(BackendError):
     """Screen capture or monitor enumeration failed.
 

@@ -26,8 +26,16 @@ variants.
 - A gated reply: `ok:false, result:"not_executed", requires_approval:true`. The string
   `approval_required` exists ONLY as a `failure_reason` value — never as a reply key.
 - `partial_delivery: {delivered_chars: N}` appears on a rejected reply whose input may
-  have partially landed (the mid-type focus drift case); absence of the key means
-  nothing was dispatched.
+  have partially landed (the mid-type focus drift case) and on the WP-I partial-insert
+  `failed` reply for typing. Absence of the key means nothing was dispatched, UNLESS a
+  `partial_input` block is present (input landed but no character was fully delivered
+  — a non-typing action, or a cut inside the first character).
+- `partial_input: {sent, total, released, still_stuck}` (WP-I) appears on a `failed`
+  reply whose SendInput call was PARTIALLY inserted: input DID land — never presented
+  as "nothing was dispatched". The engine released exactly what the landed prefix left
+  down; a non-empty `still_stuck` means keys/buttons may still be PHYSICALLY DOWN (a
+  human should press and release them). Never auto-retried; in a batch it stops the
+  queue with `follow_ups_stopped_reason: "partial_input"`.
 - `ensure_app_outcome`: the typed launch outcome on ensure_app replies (`reattached` /
   `ambiguous` / `not_found` / `launched` / `launch_rejected` / `launch_unresolved`),
   `None` otherwise.

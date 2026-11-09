@@ -44,8 +44,22 @@ contract checks).
   string `approval_required` exists ONLY as a `failure_reason` value — never as
   a reply key.
 - `partial_delivery: {delivered_chars: N}` appears on a rejected reply whose
-  input may have partially landed (the mid-type focus drift case); absence of
-  the key means nothing was dispatched.
+  input may have partially landed (the mid-type focus drift case) and on the
+  WP-I partial-insert `failed` reply for typing. Absence of the key means
+  nothing was dispatched, UNLESS a `partial_input` block is present (input
+  landed but no character was fully delivered — a non-typing action, or a cut
+  inside the first character).
+- `partial_input: {sent, total, released, still_stuck}` (WP-I) appears on a
+  `failed` reply whose SendInput call was PARTIALLY inserted (`0 < sent <
+  total`): input DID land — never presented as "nothing was dispatched". The
+  engine released exactly the keys/buttons the landed prefix left down
+  (`released`, readable names in release order, e.g. `["shift", "ctrl"]`,
+  `["mouse_left"]`, `["U+0627"]`); `still_stuck` non-empty means keys or
+  buttons may still be PHYSICALLY DOWN and the message says plainly that a
+  human should press and release them. The action is never auto-retried.
+  In a `follow_ups` batch it STOPS the batch with the closed
+  `follow_ups_stopped_reason` token `partial_input` (later items are unsafe
+  while input is half-landed).
 - `ensure_app_outcome`: the typed launch outcome on ensure_app replies
   (`reattached` / `ambiguous` / `not_found` / `launched` / `launch_rejected` /
   `launch_unresolved`), `None` otherwise.
@@ -61,8 +75,12 @@ contract checks).
 - After a batch: `follow_up_results` AND `follow_ups_stopped_reason` (`null` =
   the batch ran to completion; `time_budget` = the call's wall-clock budget ran
   out — executed items keep their entries, nothing new was dispatched, and the
-  driver RESENDS the remaining items in a new call); an `uncertain` or `failed`
-  verdict on an item that already dispatched does NOT stop the batch.
+  driver RESENDS the remaining items in a new call; `partial_input` = WP-I, an
+  item's SendInput call was PARTIALLY inserted, so later items are UNSAFE and
+  must NOT be resent blindly — re-observe first, and check `still_stuck` in the
+  item's `partial_input` block); an `uncertain` or `failed`
+  verdict on an item that already dispatched does NOT stop the batch (a
+  partial-input insert does).
 - Batch replies (WP-E E3) carry `image_after_item`: the attached image (and its
   `image_id`, `pointer`, `last_click`, the registered evidence frame) is the
   post-action frame of the LAST executed item, not item 0's; a trailing `wait`

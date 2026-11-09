@@ -725,6 +725,13 @@ def _plan_response(
     elif outcome.kind == "error":
         # §1.2: an operation error is ``failed``; the typed code stays.
         response = {"ok": False, "result": "failed", "error": "action_error", "message": outcome.message}
+        if outcome.partial_delivery is not None:
+            # WP-I: typing characters fully landed before the partial insert cut.
+            response["partial_delivery"] = dict(outcome.partial_delivery)
+        if outcome.partial_input is not None:
+            # WP-I (ORVEX-2026-109 Addendum 2): the partial-input evidence rides
+            # the step reply like the flat reply's block.
+            response["partial_input"] = dict(outcome.partial_input)
     else:
         result = outcome.result
         if result is None:

@@ -48,6 +48,7 @@ import base64
 import ctypes
 import hashlib
 import io
+import logging
 import math
 import os
 import platform
@@ -107,6 +108,7 @@ from .errors import (
     FocusDriftError,
     InputBlockedError,
     LaunchTargetError,
+    PartialInputError,
     TextIntegrityError,
     UnsupportedActionError,
     WindowFocusError,
@@ -168,6 +170,7 @@ from .windows import (
     query_stuck_modifiers,
 )
 
+logger = logging.getLogger(__name__)
 
 #: Settle/gap policy between queued final-Enter-ish keystrokes (B3): a terminal-key
 #: chord dispatched within this window of the previous keyboard dispatch waits out the
@@ -1930,6 +1933,28 @@ class LocalComputerBackend(ComputerBackend):
                     # failure is recorded and re-raised only if nothing was in flight.
                     if release_error is None:
                         release_error = error
+                    # WP-I DELTA 1 (D3) / DELTA 2 (E2): a release that itself
+                    # PARTIALLY inserted carries still_stuck. Log a WARNING ONLY
+                    # when this report will actually be DROPPED — an error is
+                    # already in flight (never-mask rule), or an EARLIER release
+                    # error was recorded and wins. When this error is the one
+                    # that propagates, the reply already carries it and a
+                    # warning would double-report.
+                    if (
+                        isinstance(error, PartialInputError)
+                        and error.still_stuck
+                        and (hold_error is not None or release_error is not error)
+                    ):
+                        logger.warning(
+                            "held-key release partially inserted; keys/buttons may "
+                            "still be physically down: %s%s",
+                            ", ".join(error.still_stuck),
+                            (
+                                f" (masked by the in-flight {type(hold_error).__name__})"
+                                if hold_error is not None
+                                else ""
+                            ),
+                        )
             if release_error is not None and hold_error is None:
                 raise release_error
 
@@ -2162,6 +2187,17 @@ class LocalComputerBackend(ComputerBackend):
                         intra if isinstance(intra, int) and intra > 0 else 0
                     )
                     raise
+                except PartialInputError as exc:
+                    # WP-I (ORVEX-2026-109 Addendum 2): the SAME composition for a
+                    # partial SendInput insert — every EARLIER chunk fully landed
+                    # (`delivered`) and the engine reports the characters fully
+                    # delivered (down AND up) inside the landed prefix of the cut
+                    # batch. Compose, never undercount completed work.
+                    intra = exc.delivered_chars
+                    exc.delivered_chars = delivered + (
+                        intra if isinstance(intra, int) and intra > 0 else 0
+                    )
+                    raise
                 delivered += len(chunk)
                 self._last_key_dispatch = time.monotonic()
         finally:
@@ -2288,6 +2324,11 @@ class LocalComputerBackend(ComputerBackend):
                 # characters than may have landed — the count is the UPPER BOUND
                 # ``len(text)`` (everything dispatched), not the read-back-confirmed
                 # prefix.
+                exc.delivered_chars = len(text)
+                raise
+            except PartialInputError as exc:
+                # WP-I: the SAME upper-bound semantics — the retype's landed prefix
+                # may still land late, so everything dispatched counts.
                 exc.delivered_chars = len(text)
                 raise
             finally:

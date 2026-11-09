@@ -816,6 +816,15 @@ async def computer_execute(
             "error": "action_error",
             "message": outcome.message,
         }
+        if outcome.partial_delivery is not None:
+            # §1.1 K-05 + WP-I: typing characters fully landed before the cut.
+            response["partial_delivery"] = dict(outcome.partial_delivery)
+        if outcome.partial_input is not None:
+            # WP-I (ORVEX-2026-109 Addendum 2): a PARTIAL SendInput insert — the
+            # input PARTIALLY landed (never "nothing was dispatched"); the block
+            # carries {"sent", "total", "released", "still_stuck"} and the
+            # message says plainly what may still be physically down.
+            response["partial_input"] = dict(outcome.partial_input)
     else:
         result = outcome.result
         if result is None:  # defensive: executed outcomes always carry a result

@@ -1288,6 +1288,15 @@ _PLAN_STOP_REASON_TO_FAILURE_REASON: dict[str, str] = {
     # dispatched.  The honest class is the same "dispatched, unproven" one §1.2
     # uses; the exact cause stays verbatim in ``follow_ups_stopped_reason``.
     "time_budget": "verification_uncertain",
+    # WP-I (ORVEX-2026-109 Addendum 2, DELTA 1 D1): an item's SendInput call was
+    # PARTIALLY inserted — input half-landed, possibly with keys/buttons still
+    # STUCK (the batch stopped before the unsafe remainder).  That is an INPUT
+    # ERROR, never a mere absence of proof: the SAME class the outcome kind table
+    # already gives an ``error`` outcome (a cut in item 0 classifies through the
+    # KIND table, ``error`` -> ``execution_error``), so both places one literal
+    # appears agree.  The exact cause stays verbatim in
+    # ``follow_ups_stopped_reason`` and the item's ``partial_input`` block.
+    "partial_input": "execution_error",
 }
 # The complete, closed set the reply surface may report.  A strict consumer can
 # validate against it; ``unclassified`` is the documented escalation fallback.

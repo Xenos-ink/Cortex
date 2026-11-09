@@ -140,6 +140,22 @@ timestamped keyframe contact sheet and, on request, the full MP4.
 
 ### Fixed
 
+- **SendInput partial insert is detected; exactly the pressed keys/buttons are
+  released; reported, never retried (WP-I, ORVEX-2026-109 Addendum 2)** — a
+  `SendInput` return that is neither 0 nor the full count used to pass silently
+  as success (e.g. the input desktop switching mid-batch), leaving a chord's
+  modifier stuck or a button held. The engine now walks the landed prefix,
+  releases exactly what it left down (reverse press order, ONE halt-safe
+  release batch, never a resend), and reports the typed
+  `PartialInputError` (an `InputBlockedError` subclass — every existing
+  handler keeps failing closed) with `sent`/`total`/`released`/`still_stuck`.
+  The reply carries the `partial_input` block on the same `failed` shape a
+  blocked input uses (never "nothing was dispatched"), `partial_delivery`
+  counts the characters fully delivered for typing, a partial press of an
+  intentional hold is undone entirely (the hold is not recorded), a partial
+  insert inside a `follow_ups` batch STOPS it with the closed
+  `partial_input` token, and a non-empty `still_stuck` says plainly that keys
+  or buttons may still be physically down for a human to press and release.
 - Recording frames carry real timestamps, so dropped frames keep real-time
   duration; `effective_fps` never exceeds the requested fps and the frame
   count is exact (no catch-up bursts, `dropped_frames` counts only missed

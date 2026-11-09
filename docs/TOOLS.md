@@ -255,10 +255,18 @@ There is deliberately no `key` action (single keys use `keypress`) and no
 - `follow_ups` (≤ 5 items) queues actions that each re-ground from the fresh
   post-action capture. The queue continues while the attached window identity
   (hwnd/title/bounds) is unchanged and stops on TRUE staleness, safety
-  rejection, approval requirement, validator/grounding rejection, or a named
-  interference event. An executed item's `uncertain`/`failed` verdict rides its
+  rejection, approval requirement, validator/grounding rejection, a named
+  interference event, or a PARTIAL input insert (`partial_input`, WP-I: the
+  item's SendInput call half-landed, so later items are unsafe). An executed
+  item's `uncertain`/`failed` verdict rides its
   `follow_up_results` entry while the batch continues; results arrive in
-  `follow_up_results` + `follow_ups_stopped_reason` (`null` = ran to completion).
+  `follow_up_results` + `follow_ups_stopped_reason` (`null` = ran to completion;
+  `partial_input` = input half-landed — never resend the remaining items
+  blindly, re-observe and check the item's `partial_input` block:
+  `{"sent", "total", "released", "still_stuck"}`; a non-empty `still_stuck`
+  means keys/buttons may still be physically down — a human should press and
+  release them). A partial insert is reported honestly and NEVER auto-retried;
+  for typing the reply also carries `partial_delivery.delivered_chars`.
 - Batch replies (WP-E E3): the attached image — and its `image_id`, `pointer`,
   `last_click` and the frame registered in the evidence store — is the
   post-action frame of the LAST item that executed (a trailing `wait` counts:

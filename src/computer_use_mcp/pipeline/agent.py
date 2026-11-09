@@ -112,7 +112,7 @@ from ..desktop.backend import (
 )
 from ..desktop.client_budget import semantic_read_timeout_seconds
 from ..desktop.coordinates import CoordinateTransform
-from ..desktop.errors import FocusDriftError, UnsupportedKeyError
+from ..desktop.errors import FocusDriftError, PartialInputError, UnsupportedKeyError
 from ..desktop.motion import WAIT_MAX_SECONDS
 from ..desktop.focus_guard import GuardVerdict, InterferenceGuard
 from .grounding import GroundingRouter
@@ -652,6 +652,15 @@ class SingleActionOutcome:
     least one chunk already landed in the (now foreign) field, ``partial_delivery``
     carries ``{"delivered_chars": N}`` — the count of characters actually dispatched
     before the abort. Absence means "nothing was dispatched".
+
+    WP-I (ORVEX-2026-109 Addendum 2, additive): on a PARTIAL SendInput insert
+    (:class:`~computer_use_mcp.desktop.errors.PartialInputError`), ``partial_input``
+    carries the closed block ``{"sent", "total", "released", "still_stuck"}`` —
+    input DID partially land (never presented as "nothing was dispatched"), the
+    engine released exactly what the landed prefix left down, and ``still_stuck``
+    non-empty means keys/buttons may still be physically down. For typing the
+    SAME outcome also carries ``partial_delivery`` (the characters fully
+    delivered before the cut). Never auto-retried.
     """
 
     kind: str
@@ -660,6 +669,7 @@ class SingleActionOutcome:
     message: str = ""
     requires_approval: bool = False
     partial_delivery: dict[str, int] | None = None
+    partial_input: dict[str, Any] | None = None
     model_confidence: float | None = None
     grounding_confidence: float | None = None
     verification_confidence: float | None = None
@@ -1970,6 +1980,15 @@ class ComputerUseAgent:
             if ensure_outcome in ("not_found", "launch_rejected", "launch_unresolved", "ambiguous"):
                 stopped_reason = "ensure_app_failed"
                 break
+            # WP-I (ORVEX-2026-109 Addendum 2): a PARTIAL input insert means the
+            # item's input half-landed — later speculative items would run against
+            # a machine state the batch no longer controls, so the batch STOPS
+            # with the closed ``partial_input`` token (consistent with the named
+            # interference stops). The action is never auto-retried; the per-item
+            # entry carries ``partial_input`` (+ ``partial_delivery`` for typing).
+            if outcome.partial_input is not None:
+                stopped_reason = "partial_input"
+                break
             # T8 named interference stops take precedence over the generic stop reasons:
             # a modal dialog or a post-keyboard focus drift halts the batch with a NAMED
             # reason the driver protocol teaches drivers to react to deliberately.
@@ -2185,6 +2204,11 @@ class ComputerUseAgent:
             entry["reasons"] = rejection_reasons(outcome)
         if outcome.partial_delivery is not None:
             entry["partial_delivery"] = dict(outcome.partial_delivery)
+        if outcome.partial_input is not None:
+            # WP-I: the partial-input evidence rides the per-item entry exactly
+            # like the flat reply's block (input partially LANDED — never
+            # presented as "nothing was dispatched").
+            entry["partial_input"] = dict(outcome.partial_input)
         if result is not None and result.verification is not None:
             # §1 (ORVEX-2026-108): every follow_up_results[i] carries the SAME
             # envelope fields as the flat reply — including a compact verification
@@ -2676,6 +2700,60 @@ class ComputerUseAgent:
                             "was aborted before further chunks could land in a foreign field."
                         ),
                         partial_delivery=partial,
+                    ),
+                    None,
+                )
+            except PartialInputError as exc:
+                # WP-I (ORVEX-2026-109 Addendum 2): a PARTIAL SendInput insert — the
+                # OS accepted only part of one batch. The engine already released
+                # exactly what the landed prefix left down (never a resend, never a
+                # retry), so this surfaces honestly: the SAME result token/shape
+                # InputBlockedError surfaces today (``failed`` via the ``error``
+                # kind — it is NOT "nothing was dispatched"), PLUS the additive
+                # ``partial_input`` block, and ``partial_delivery`` when the action
+                # was typing and characters fully landed before the cut.
+                self._audit(
+                    "failure",
+                    result="error",
+                    metadata={
+                        "exception": "PartialInputError",
+                        "sent": int(exc.sent),
+                        "total": int(exc.total),
+                        "released": list(exc.released),
+                        "still_stuck": list(exc.still_stuck),
+                    },
+                )
+                if exc.still_stuck:
+                    message = (
+                        "Partial input: SendInput accepted only "
+                        f"{exc.sent} of {exc.total} events; the keys/buttons the landed "
+                        "prefix left down were released, but some keys or buttons may "
+                        f"still be PHYSICALLY DOWN ({', '.join(exc.still_stuck)}) — "
+                        "press and release them by hand. The action was not retried."
+                    )
+                else:
+                    message = (
+                        "Partial input: SendInput accepted only "
+                        f"{exc.sent} of {exc.total} events; everything the landed "
+                        "prefix left down was released. The action was not retried."
+                    )
+                delivered = getattr(exc, "delivered_chars", None)
+                partial = (
+                    {"delivered_chars": int(delivered)}
+                    if isinstance(delivered, int) and not isinstance(delivered, bool) and delivered > 0
+                    else None
+                )
+                return (
+                    SingleActionOutcome(
+                        kind="error",
+                        message=message,
+                        partial_delivery=partial,
+                        partial_input={
+                            "sent": int(exc.sent),
+                            "total": int(exc.total),
+                            "released": [str(name) for name in exc.released],
+                            "still_stuck": [str(name) for name in exc.still_stuck],
+                        },
                     ),
                     None,
                 )
