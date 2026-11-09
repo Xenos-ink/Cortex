@@ -47,6 +47,7 @@ Unattended driving only where the host policy explicitly allows it:
 
 - **Read the reply**: `session_id` (copy it everywhere); the effective `limits` and the effective action cap — the message warns when `max_steps` and `max_actions` differ (the smaller governs); the `image_delivery` actually in force. Non-vision host: `image_delivery="text"` — one image block in a text-only history kills the session permanently.
 - **Common mistake**: restarting a session because actions hit the cap — the refusal (`limit_exceeded` / the `max_steps` refusal) is fixed by a higher `max_steps` / `limits={"max_actions": N}` in a NEW session, and only then.
+- **Common mistake**: raising ONLY `max_steps` past 100 — `max_actions` still defaults to 100 and the smaller cap governs, so `{"max_steps": 500}` alone is refused at action 101. For more than 100 actions raise BOTH, as in the second example above.
 
 ## stop_session
 
@@ -254,8 +255,16 @@ can — it is what verification checks; the reply carries the post-action image
 {"session_id": "S", "action": "move", "x": 640, "y": 400}
 ```
 
+- **Common variants**: a TIMED move (a visible glide). `duration_ms` is never a top-level argument; it rides INSIDE a `follow_ups` item (or a plan point), like `hold_ms` on a keypress/hotkey/click item:
+
+<!-- tool: computer_execute -->
+```json
+{"session_id": "S", "action": "move", "x": 640, "y": 400, "follow_ups": [{"action": "move", "x": 900, "y": 400, "duration_ms": 600}]}
+```
+
 - **Read the reply**: `pointer` in later image replies confirms where the cursor sits.
 - **Common mistake**: expecting a move to click — it never presses.
+- **Common mistake**: `"duration_ms"` or `"hold_ms"` next to `action` at the top level — rejected `unknown_argument` before anything moves. Put them in a `follow_ups` item, as above.
 
 ### computer_execute · wait / done (markers)
 
@@ -368,6 +377,7 @@ can — it is what verification checks; the reply carries the post-action image
 
 - **Read the reply**: the first call executes ONE step and returns `blocked: true` with `next_step`/`remaining`; a plan LEASE is now active — flat actions, observe/zoom and `computer_wait` are refused with `plan_lease` until the lease releases. Step/terminal replies carry `failure_reason` (closed vocabulary), `not_executed`, `evidence_by_backend`. `ok` is true ONLY when the terminal `result` is `verified`.
 - **Common mistake**: re-observing under a lease (refused — costs nothing but a turn); resubmitting the whole plan after a stop (re-runs the executed prefix — a resubmitted plan starts a fresh lease).
+- **Common mistake**: mixing the plan with the flat surface. A plan call is `"action": "done"` plus `plan` and NOTHING else flat: no `action: "click"`, no `x`/`y`/`text`/`keys`. `on_failure`, `on_uncertain` and every timing field live INSIDE `plan` (or a point), never at the top level. Both mistakes are rejected before any motion.
 
 ## computer_wait
 
