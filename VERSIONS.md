@@ -77,6 +77,21 @@ timestamped keyframe contact sheet and, on request, the full MP4.
   tests (`test_skill_truth.py`, `test_docs_truth.py`) derive every new taught
   value (bands, encoder names, omission reasons, statuses, reply fields) from
   the code at test time.
+- **skill: which-tool table, per-tool cards, task recipes, examples in tool
+  descriptions, all validated by tests** (ORVEX-2026-109 Addendum 1 "T") —
+  the cortex-skill gains a which-tool decision table keyed by agent intent
+  (the "Not this" column names the wasteful call the field session made),
+  references/tool-cards.md (one card per tool: use/don't use when, a
+  copy-paste minimal call, variants, the reply fields that matter, the common
+  mistake; `computer_execute` gets sub-cards per action family plus
+  `follow_ups`, `record=`, the approval flow and the plan handshake) and
+  references/recipes.md (open a URL, click and verify, a game move plus
+  waiting for the opponent in ONE call, record around an action, and more,
+  each with its call count); every tool description gains short `Example:`
+  lines (+1,600 chars total, under the 2,500 budget). New
+  `tests/test_wp_t_examples.py` parses every example block and validates it
+  against the live tool schemas, action vocabulary and bands, and pins the
+  card/heading coverage.
 - **Record around the action (WP-E E1)** — `computer_execute` gains a trailing
   optional `record` object (`{"duration_s", "region", "fps", "max_keyframes",
   "include_video", "save"}`) that starts the background recording JUST BEFORE

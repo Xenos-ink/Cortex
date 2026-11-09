@@ -1367,10 +1367,12 @@ async def test_bool_duration_s_is_not_accepted_on_the_mcp_path(
     fresh_server: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """NIT: ``computer_record(duration_s=True)`` through the REAL MCP gate.
-    pydantic's lax float coerces True to 1.0 (verified live), so computer_record
-    itself rejects bools with the SAME typed code the record object uses
-    (``invalid_record_duration``) — one rule for both tools; no recording
-    starts."""
+    pydantic's lax float would coerce True to 1.0 (verified live), so the
+    ``RecordDuration`` boundary validator rejects the boolean BEFORE that
+    coercion: over MCP it surfaces as a pydantic isError whose message names
+    ``duration_s`` — NOT the typed ``invalid_record_duration`` envelope —
+    while a direct (non-MCP) call reaches computer_record's own typed
+    ``invalid_record_duration`` rejection; no recording starts either way."""
     import mcp as mcp_sdk
 
     session_id, _bundle, _backend, _ = make_session(monkeypatch, limits=FAST_LIMITS)

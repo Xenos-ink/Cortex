@@ -7,41 +7,51 @@ description: Use when about to drive a desktop through the Cortex MCP server (st
 
 This file is the operating manual for the twelve Cortex tools; references are linked at the end.
 
-## The loop
+## The twelve tools — which one do I call?
 
-One action is four stages: **observation** (a fresh capture with dimensions, window
-identity, cursor), **grounding** (coordinates/keys bound to that observation, checked
-for staleness, risk and approval), **execution** (input dispatched), **verification**
-(a post-action capture compared against the stated effect). The last three run inside
-`computer_execute`.
+One row per intent. "Not this" names the wasteful call a real field session made — do not repeat it. Per-tool cards and full copy-paste templates: references/tool-cards.md; whole-task recipes with expected replies: references/recipes.md.
 
-- **Execution is not effect.** The input left the process; whether the app did the thing is a separate question, answered by verification.
-- **The verdict is evidence, not a summary.** `verified` / `failed` / `uncertain` answer "did the stated effect happen" — never "is my task done".
-- **Staleness is checked for you.** A coordinate-bearing action grounded on an old observation gets one automatic re-capture and re-validation before any rejection — do not pre-empt it by re-observing speculatively.
-- **A rejection is produced before input, with two exceptions.** Rejections (`invalid_action`, safety, grounding, interference) dispatch nothing, so on a FLAT single-action call a re-send, after the gate's complaint is fixed, is safe from double-apply. Exceptions: a mid-type focus drift returns only after part of the text was already typed — it carries `partial_delivery` with `delivered_chars` (absence means nothing dispatched), so retype only deliberately; and a QUEUED batch that stopped has already dispatched its earlier items — after a batch stop, send only the unexecuted items (`follow_up_results`; a `time_budget` stop = the call's wall clock ran out — resend the rest in a new call).
-
-## The twelve tools
-
-| Tool | For | Use it when |
+| I want to… | Call | Not this |
 |---|---|---|
-| `start_session` | open a guarded session; returns `session_id` and the effective `limits` | once, first |
-| `stop_session` | arm the kill path and end the session | the user's task is genuinely complete |
-| `computer_observe` | fresh full-screen capture + metadata | ground the next action, or re-read state |
-| `computer_screenshot` | compatibility alias of `computer_observe` | never prefer it; use `computer_observe` |
-| `computer_zoom` | fresh capture cropped to a region `[left, top, width, height]` (observation-only) | detail on one area, or a coordinate grid |
-| `computer_execute` | act: the 13-action vocabulary, `follow_ups`, the waypoint `plan` handshake | every input, every click, every typed character |
-| `computer_wait` | blocking wait, up to one segment per call (default 45 s = the host's client timeout minus a 15 s margin), with a `wait_id` | a pause you may want to cut short |
-| `computer_wait_status` | block for the next wait segment, or peek with `block=false` | you were told `status:"running"` |
-| `computer_cancel_wait` | end a wait early; reports elapsed/remaining | you no longer need the wait |
-| `computer_fetch_image` | re-serve a frame this session captured earlier, by `image_id` | look BACK at a frame a reply carried |
-| `computer_record` | record 0.5–10 s of the screen in the background; returns at once with a `record_id` | you want evidence of what a sequence of actions does to the screen |
-| `computer_record_result` | collect a recording: timeline + actions, keyframe contact sheet, optional MP4 video | after `computer_record`, to block for / peek at / cancel the recording |
+| begin (first call, always) | `start_session` | driving without a session; reopening one mid-task |
+| see the screen now | `computer_observe` | re-observing right after an execute — the reply already carries the post-action image |
+| read small text or one area in detail | `computer_zoom` | repeated full-screen observes for one region |
+| click (any one input) and know whether it worked — state `expected_effect` | `computer_execute` | re-clicking on `uncertain`: read the attached image first, never a blind re-click |
+| do several known-in-advance inputs and see the end state (queue `follow_ups`, ≤ 5) | `computer_execute` | one call per input, or a batch whose steps depend on reading the screen |
+| make a move, wait for the other side (a game, a load, a reply), then see — trail `{"action": "wait", "delta": 8}` as the LAST follow_up | `computer_execute` | `computer_wait` + `computer_observe` after the move: 3 turns where 1 does it |
+| type a long or multi-line text (`via="clipboard"`) | `computer_execute` | per-character typing into an auto-indenting editor; retyping after `paced=partial` |
+| press a key or shortcut (`keypress` / `hotkey`) | `computer_execute` | text inside `keys`; a `key` action (does not exist) |
+| open or focus an app (`ensure_app`, target = "process") | `computer_execute` | clicking a taskbar icon blind |
+| open a URL (`ensure_app` the browser (msedge.exe / chrome.exe / firefox.exe) → only on `reattached` (or a second ensure_app after `launched` — if THAT answers `launched` again, stop and report: each `launched` started another process, do not loop) → `hotkey` ctrl+l → `type` the URL → `enter`; references/recipes.md) | `computer_execute` | the URL inside `target` (launch needles allow `[A-Za-z0-9._ -]` only: `result:"failed"` + `ensure_app_outcome:"launch_rejected"` under launch="server", `not_found` under driver/allowlist); ctrl+l into a non-browser window |
+| wait a stated pause (a TIMED sleep — it does not watch for an element to appear; check the image after) | `computer_wait` | a large flat `{"action": "wait"}` delta (capped at 10 s) or polling `computer_observe` in a loop |
+| keep waiting past one segment (`status: "running"`) | `computer_wait_status` | starting a new wait and losing the remaining seconds |
+| end a wait early | `computer_cancel_wait` | discarding a wait and starting a shorter one |
+| capture an animation / transient effect AROUND an action (`record={"duration_s": 4}`) | `computer_execute` | `computer_record` in a separate call — it ends before your next tool call |
+| record without acting | `computer_record` | idling while it records — keep calling tools |
+| get the video, the timeline, a keyframe (ask with `include_video: true` — without it (or `save`) the reply says `video.omitted: "not_requested"`) | `computer_record_result` | `video_delivery="inline"` on a host that truncates large results (the default "file" path survives) |
+| look back at an earlier frame (by `image_id`) | `computer_fetch_image` | re-observing for something a past reply already carried (fetch looks BACK, observe looks NOW) |
+| a compatibility alias | `computer_screenshot` | preferring it — it is `computer_observe`; use `computer_observe` |
+| finish | `stop_session` | `done` — a marker only, it does not end the session |
 
 `computer_observe` / `computer_screenshot` / `computer_zoom` / `computer_execute` /
 `computer_fetch_image` return MCP content blocks; judge them by what you actually
 received (a text-mode session returns one text block and never an image). On those
 surfaces a rejection, an approval gate or an error is still a plain dict; every other
 tool returns plain dicts.
+
+## The loop
+
+One action is four stages: **observation** (a fresh capture with dimensions, window
+identity, cursor), **grounding** (coordinates/keys bound to that observation, checked
+for staleness, risk and approval), **execution** (input dispatched), **verification**
+(a post-action capture compared against the stated effect). The last three run inside
+`computer_execute` — the input tool: the 13-action vocabulary, `follow_ups`, the
+waypoint `plan` handshake.
+
+- **Execution is not effect.** The input left the process; whether the app did the thing is a separate question, answered by verification.
+- **The verdict is evidence, not a summary.** `verified` / `failed` / `uncertain` answer "did the stated effect happen" — never "is my task done".
+- **Staleness is checked for you.** A coordinate-bearing action grounded on an old observation gets one automatic re-capture and re-validation before any rejection — do not pre-empt it by re-observing speculatively.
+- **A rejection is produced before input, with two exceptions.** Rejections (`invalid_action`, safety, grounding, interference) dispatch nothing, so on a FLAT single-action call a re-send, after the gate's complaint is fixed, is safe from double-apply. Exceptions: a mid-type focus drift returns only after part of the text was already typed — it carries `partial_delivery` with `delivered_chars` (absence means nothing dispatched), so retype only deliberately; and a QUEUED batch that stopped has already dispatched its earlier items — after a batch stop, send only the unexecuted items (`follow_up_results`; a `time_budget` stop = the call's wall clock ran out — resend the rest in a new call).
 
 ## Reading every reply
 
@@ -83,7 +93,7 @@ Every image the agent receives carries the Cortex cursor composited at the real 
 - NEVER re-issue an action whose first attempt may have landed: re-sending an executed-but-unproven input risks a double-apply. Re-issue only after evidence shows the first attempt did not land.
 - A stated `expected_effect` satisfied only by a pixel change still stays `uncertain` (E-03): strict verification, not leniency. State a CHECKABLE effect — a window title or state, a process state, a UI control's text (a field's value), a focus change — not "the screen changes"; the deterministic tiers are the verify path.
 - Rejections name their gate; fix exactly that complaint. STALE_OBSERVATION already got one server-side re-capture — re-observe, never replay old coordinates.
-- A reply with `requires_approval:true` (`ok:false, result:"not_executed", requires_approval:true`): if host/user policy permits, re-send the identical FLAT call with `approved=true`; otherwise stop and report. Inside a plan, approval is decided once on the first plan call — a gated step cannot be fixed by re-sending: `plan_action="stop"`, then resubmit a plan containing ONLY the points not yet executed (from `remaining` / `not_executed`, never the executed prefix; the gated point's transition move may already have dispatched). A resubmitted plan starts a fresh lease and re-runs whatever it contains.
+- A reply with `requires_approval:true` (`ok:false, result:"not_executed", requires_approval:true`): if host/user policy permits, re-send the identical FLAT call with `approved=true`; otherwise stop and report. In a BATCH, `approved` applies to every item and the queue stops at the hold: held at item 0 nothing ran (re-send the identical batch with `approved=true`); held at item k>0 the items before k already ran (send only the unexecuted items, with `approved=true`). A later-item hold shows only as `follow_ups_stopped_reason: "approval_required"` (the same token a plan step's `failure_reason` carries) with `follow_up_results[k].result: "not_executed"`, because the top-level verdict is item 0's. Inside a plan, approval is decided once on the first plan call — a gated step cannot be fixed by re-sending: `plan_action="stop"`, then resubmit a plan containing ONLY the points not yet executed (from `remaining` / `not_executed`, never the executed prefix; the gated point's transition move may already have dispatched). A resubmitted plan starts a fresh lease and re-runs whatever it contains.
 - `integrity` statuses: references/glossary.md — read before concluding anything from a typed field.
 
 ## Input parameters that matter
@@ -132,6 +142,8 @@ loading states, anything transient — record it instead of guessing:
 
 ## References
 
+- references/tool-cards.md — one card per tool: use when / don't use when / a copy-paste minimal call / variants / the reply fields that matter / the common mistake. Read it when unsure how to call a tool or what a reply field means.
+- references/recipes.md — whole-task recipes (open a URL, click and verify, a game move plus waiting for the opponent in ONE call, record an effect, and more), each with the exact call sequence, the replies to expect, the call count it saves, and when to stop.
 - references/plan-protocol.md — plan explicitness, wire rules, handshake, lease and approval rules. Read it before submitting or driving any `plan`.
 - references/reply-contract.md — the full envelope, token set, per-surface shapes and error codes. Read it when a reply shape or key name surprises you.
 - references/glossary.md — interference labels, the `failure_reason` vocabulary, and type-integrity statuses. Read it when a reply names an interference label, a `failure_reason` you do not recognize, or an integrity status.

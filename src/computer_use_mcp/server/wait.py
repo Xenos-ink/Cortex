@@ -86,6 +86,8 @@ async def computer_wait(
 
     This is a different product from the flat ``{"action": "wait", "delta": N}``
     queue item, which stays capped at 10 seconds for short in-queue pauses.
+
+    Example: {"session_id": "S", "duration_seconds": 90, "label": "page load"} -> status "completed" (act now) or "running" (continue with computer_wait_status).
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -306,6 +308,8 @@ async def computer_wait_status(
     ``error`` ``wait_failed``. On a stopped session this is refused with
     ``session_stopped``. If YOUR CLIENT cancels this blocking call, the underlying
     wait is NOT affected — call again to re-attach.
+
+    Example: {"session_id": "S", "wait_id": "W"} — or add "block": false to peek.
     """
     try:
         _get_live_bundle(session_id)
@@ -379,6 +383,8 @@ async def computer_cancel_wait(session_id: str, wait_id: str) -> dict[str, objec
     This call never blocks longer than one cancellation slice (~0.1 s): the wake is
     the worker's own done event, so a ``computer_wait``/``computer_wait_status``
     call blocked on this wait returns ``cancelled`` in under a second.
+
+    Example: {"session_id": "S", "wait_id": "W"}
     """
     try:
         bundle = _get_live_bundle(session_id)

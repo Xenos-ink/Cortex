@@ -75,6 +75,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = REPO_ROOT / "skills" / "cortex-skill"
 SRC_DIR = REPO_ROOT / "src" / "computer_use_mcp"
 REFERENCE_FILES = (
+    "tool-cards.md",
+    "recipes.md",
     "plan-protocol.md",
     "reply-contract.md",
     "glossary.md",

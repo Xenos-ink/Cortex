@@ -45,8 +45,9 @@ Nothing distinguishes "saved" from "not yet saved".
 
 This declaration passes its own explicitness gate (copy it, then edit the values):
 
+<!-- tool: computer_execute -->
 ```json
-{"points": [
+{"session_id": "S", "action": "done", "plan": {"points": [
     {"id": "focus-field", "x": 300, "y": 400, "actions": [],
      "arrival_condition": "the cursor is in the field", "duration_ms": 120,
      "settle_ms": 60, "timeout_ms": 5000, "on_failure": "stop", "on_uncertain": "stop"},
@@ -57,7 +58,7 @@ This declaration passes its own explicitness gate (copy it, then edit the values
      "arrival_condition": "the document is saved", "duration_ms": 0,
      "settle_ms": 100, "timeout_ms": 10000, "on_failure": "stop", "on_uncertain": "continue"}],
  "transition_duration_ms": 120, "point_timeout_ms": 10000, "settle_ms": 60,
- "on_failure": "stop", "on_uncertain": "continue"}
+ "on_failure": "stop", "on_uncertain": "continue"}}
 ```
 
 Drive it: submit with `action="done"`, read the step reply, then

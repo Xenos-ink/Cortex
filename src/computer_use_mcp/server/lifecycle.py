@@ -668,6 +668,9 @@ def start_session(
     still reached, this reply lists the live sessions (``live_sessions``, most idle
     first, with ``idle_seconds``/``in_flight``/``age_seconds`` plus the effective
     ``idle_timeout_seconds``): call stop_session on one of them to free a slot.
+
+    Example: {"max_steps": 100} — the reply carries
+    "session_id"; copy it into every later call.
     """
     try:
         # D9 precedence (documented): the legacy ``max_retries_per_action`` parameter and
@@ -999,6 +1002,8 @@ async def stop_session(session_id: str) -> dict[str, object]:
     audited with ``source="idle_timeout"`` and later calls say it was stopped for
     inactivity after N seconds. Hitting the session limit? start_session's refusal
     lists the live sessions (most idle first) so you can stop_session one.
+
+    Example: {"session_id": "S"}
     """
     bundle = _bundles.get(session_id)
     if bundle is None:

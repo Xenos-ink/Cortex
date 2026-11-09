@@ -384,6 +384,8 @@ def computer_observe(
     decoration: the capture, digest, verification diff, and the stored evidence
     frame keep the clean pixels. The additive ``pointer`` /
     ``last_click`` keys ride image-bearing replies only.
+
+    Example: {"session_id": "S"} — or add "visual_view": "grid" for a coordinate-grid overlay.
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -672,7 +674,10 @@ def computer_observe(
 @mcp.tool()
 @_session_scoped
 def computer_screenshot(session_id: str) -> Any:
-    """Compatibility alias for the raw screenshot observation."""
+    """Compatibility alias for the raw screenshot observation.
+
+    Example: {"session_id": "S"} — prefer computer_observe.
+    """
     return computer_observe(session_id)
 
 
@@ -731,6 +736,8 @@ def computer_zoom(
     (``invalid_visual_view``-class) BEFORE any capture. ``pixel_evidence`` (A2) is a
     STRICT boolean: non-boolean values are rejected fail-closed
     (``invalid_pixel_evidence``) BEFORE any capture.
+
+    Example: {"session_id": "S", "region": [900, 300, 480, 320], "visual_view": "grid"}
     """
     try:
         bundle = _get_live_bundle(session_id)

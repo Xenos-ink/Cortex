@@ -357,6 +357,8 @@ async def computer_fetch_image(session_id: str, image_id: str) -> Any:
     This tool can never return a ``RAW:`` placeholder: a text-delivery session
     (``start_session(image_delivery="text")``) has no image bytes at all, so no id
     is ever issued on one.
+
+    Example: {"session_id": "S", "image_id": "I"} — an id from a reply that carried an image.
     """
     try:
         bundle = _get_live_bundle(session_id)

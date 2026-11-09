@@ -361,6 +361,10 @@ async def computer_execute(
     (byte-identical to before) and on replies that serve no image. Pressed/
     Normal follows the same rule applied to the shown item: Pressed if it was
     a click type and the frame is its own post-click frame.
+
+    Example: {"session_id": "S", "action": "click", "x": 640, "y": 360, "expected_effect": "the OK dialog closes"}
+    Example (act, wait, see — ONE call; the reply image shows the state after the LAST item, "image_after_item" names it): {"session_id": "S", "action": "click", "x": 500, "y": 400, "expected_effect": "my pawn is selected", "follow_ups": [{"action": "click", "x": 500, "y": 320}, {"action": "wait", "delta": 8}]}
+    Example (record around the action): {"session_id": "S", "action": "click", "x": 980, "y": 44, "record": {"duration_s": 4}}
     """
     try:
         bundle = _get_live_bundle(session_id)

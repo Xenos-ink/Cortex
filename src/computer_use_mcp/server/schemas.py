@@ -78,12 +78,13 @@ TolerantInt = Annotated[int, BeforeValidator(_coerce_tolerant_int)]
 
 
 def _reject_bool_duration(value: Any) -> Any:
-    """DELTA 3 NIT boundary: pydantic's LAX float coerces ``True`` to 1.0
-    (verified live through the instance gate), so ``computer_record(
-    duration_s=True)`` would silently start a 1-second recording while the
-    record object rejects bools — this boundary validator rejects a boolean
-    BEFORE the coercion, keeping ONE rule for both tools (the typed
-    ``invalid_record_duration`` message)."""
+    """DELTA 3 NIT boundary: pydantic's LAX float would coerce ``True`` to 1.0
+    (verified live through the instance gate). This boundary validator rejects
+    the boolean BEFORE that coercion — over MCP it surfaces as a pydantic
+    isError whose message names ``duration_s`` (NOT the typed envelope); a
+    direct (non-MCP) caller bypasses this boundary and reaches
+    computer_record's own typed ``invalid_record_duration`` rejection instead
+    (server/record.py)."""
     if isinstance(value, bool):
         raise ValueError(
             f"duration_s must be a number of seconds; got {value!r} "

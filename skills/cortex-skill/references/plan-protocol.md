@@ -7,14 +7,15 @@ missing is rejected with a teach-in message BEFORE any capture or motion (zero e
 
 ## Submitting
 
+<!-- tool: computer_execute -->
 ```json
-{"points": [
+{"session_id": "S", "action": "done", "plan": {"points": [
    {"id": "open", "x": 420, "y": 180,
     "actions": [{"action": "click", "expected_effect": "menu opens"}],
     "arrival_condition": "the menu is open", "duration_ms": 150,
     "settle_ms": 80, "timeout_ms": 5000, "on_failure": "stop", "on_uncertain": "stop"}],
  "transition_duration_ms": 150, "point_timeout_ms": 5000, "settle_ms": 80,
- "on_failure": "stop", "on_uncertain": "continue", "final_wait_ms": 1000}
+ "on_failure": "stop", "on_uncertain": "continue", "final_wait_ms": 1000}}
 ```
 
 - Start with `computer_execute(session_id, action="done", plan={...})`. A plan call

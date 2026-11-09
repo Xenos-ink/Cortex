@@ -8,6 +8,13 @@ specified once in
 [REPLY-CONTRACT.md](REPLY-CONTRACT.md); configuration knobs are in
 [CONFIGURATION.md](CONFIGURATION.md).
 
+Examples: copy-paste arguments per tool (tool cards) and whole-task recipes
+with expected replies live in the agent skill —
+`skills/cortex-skill/references/tool-cards.md` and
+`skills/cortex-skill/references/recipes.md`, selected by the which-tool table
+at the top of `skills/cortex-skill/SKILL.md`; the examples are validated
+against the real tool schemas by `tests/test_wp_t_examples.py`.
+
 ## The twelve tools
 
 | Tool | Kind | For |
@@ -288,8 +295,11 @@ There is deliberately no `key` action (single keys use `keypress`) and no
   `invalid_record_duration`. Band checks run AFTER coercion, for both tools,
   with the same codes. Booleans are rejected on BOTH tools for `duration_s`
   too: inside the `record` object with the typed `invalid_record_duration`,
-  and on `computer_record`'s own parameter at the boundary (its lax-float
-  conversion would otherwise coerce `True` to a 1-second recording).
+  and on `computer_record`'s own `duration_s` parameter at the MCP argument
+  boundary — the boundary validator refuses the boolean BEFORE pydantic's lax
+  float can coerce `True` into a 1-second recording, so over MCP it is an
+  isError naming `duration_s` (not the typed envelope); a direct (non-MCP)
+  call gets the tool's typed `invalid_record_duration`.
 - An INVALID `record` argument (out of band, malformed region, an UNKNOWN KEY
   inside the object) is a typed rejection of the whole call BEFORE any input —
   consistent with the unknown-argument rejection; the unknown-key message

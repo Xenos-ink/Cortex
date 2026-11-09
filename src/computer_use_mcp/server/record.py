@@ -1477,6 +1477,8 @@ async def computer_record(
     Both recording tools stay ALLOWED while a plan lease is active (they
     dispatch no input; recording a plan's effect is a main use).  Caps: 1
     active recording per session, 2 per process (typed ``recording_limit``).
+
+    Example: {"session_id": "S", "duration_s": 6} -> "record_id" + status "recording"; collect with computer_record_result.
     """
     try:
         bundle = _get_live_bundle(session_id)
@@ -1491,10 +1493,13 @@ async def computer_record(
             "This session is in image_delivery=text mode (non-vision-safe): there "
             "are no screen images to record. Start an image-mode session to record.",
         )
-    # DELTA 3 NIT: the MCP boundary's lax float coerces True/False to 1.0/0.0
-    # (verified live through the instance gate), so the bool rejection the
-    # record object applies must happen HERE — the same typed code, the same
-    # message, one rule for both tools.
+    # DELTA 3 NIT: the MCP boundary's lax float would coerce True/False to
+    # 1.0/0.0 (verified live through the instance gate), but the
+    # RecordDuration boundary validator already refuses the boolean BEFORE
+    # that coercion — over MCP this isinstance check is unreachable and the
+    # host sees a pydantic isError naming duration_s (NOT this typed code).
+    # It exists for DIRECT (non-MCP) callers, who bypass the boundary and get
+    # the typed invalid_record_duration rejection here.
     if isinstance(duration_s, bool):
         return _record_rejection(
             "invalid_record_duration",
@@ -1628,6 +1633,8 @@ async def computer_record_result(
     rejection; a finished recording that fell out of the retention ring answers
     ``record_expired``.  The video stays retrievable later by ``record_id``
     (block=false, include_video=true) while the recording is retained.
+
+    Example: {"session_id": "S", "record_id": "R"} — or {"block": false} to peek, {"cancel": true} to stop early.
     """
     call_started = _record_now()
     try:
